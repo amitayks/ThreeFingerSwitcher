@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+*.app
+DerivedData/
+.DS_Store
+
+# Per-user Claude Code local settings (machine-specific; not shared)
+.claude/settings.local.json

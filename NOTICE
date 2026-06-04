@@ -1,0 +1,22 @@
+ThreeFingerSwitcher
+Copyright (C) 2026
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License version 3 as published by the Free
+Software Foundation. See the LICENSE file for the full text.
+
+-------------------------------------------------------------------------------
+Third-party credits
+-------------------------------------------------------------------------------
+
+AltTab (https://github.com/lwouis/alt-tab-macos) — GPL-3.0
+    The window-raising technique (the private `_AXUIElementGetWindow` SPI to
+    correlate an Accessibility window element with its CGWindowID, plus the
+    AX raise + activate sequence) is adapted from AltTab. Because AltTab is
+    GPL-3.0, this project is distributed under GPL-3.0 as well.
+
+OpenMultitouchSupport (https://github.com/Kyome22/OpenMultitouchSupport) — MIT
+    Swift wrapper around the private MultitouchSupport.framework used to read
+    raw, global trackpad touch data. Linking the private framework requires
+    App Sandbox to be disabled, so this app is distributed outside the Mac App
+    Store as a direct, notarized download.
