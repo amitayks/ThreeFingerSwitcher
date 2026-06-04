@@ -17,7 +17,7 @@ Current state: the working tree is **regressed** — `WindowService.swift:271` r
 **Non-Goals:**
 - Changing current-Space listing or raising, or Stage-Manager-off behavior (byte-for-byte unchanged).
 - Curing an already-stuck WindowManager oscillation from inside the app (it is daemon-owned; we prevent triggering).
-- Widening or replacing the enumeration source, adding an AXObserver registry, or touching thumbnails, the gesture, or the grid.
+- Widening or replacing the enumeration source, or touching thumbnails, the gesture, or the grid. (A lightweight persistent element cache — a simplified AXObserver-registry idea — WAS added for the no-AX raise; see Resolution.)
 - Making Chromium expose AX elements off-Space (out of our control; we route around the need).
 
 ## Decisions
@@ -69,14 +69,20 @@ Phased, each phase independently shippable and gated by on-device confirmation:
 
 Rollback: phases are independent; D0 is the safety floor (never worse than the prior shipped behavior for any Stage-Manager user).
 
-## On-device findings (correct the Bug B mechanism)
+## Resolution (as shipped — the Decisions above are the path taken; this is where it landed)
 
-The multi-delay focus trace **revised the Bug B diagnosis**. It is *not* the co-staging singleton war (that was the current-Space oscillation, already fixed): **WindowManager — the Stage Manager daemon (pid 55186) — grabs frontmost with no key window ~300–500ms after EVERY off-Space raise** (lone *and* co-staged: Finder, ASUS GlideX, Terminal all flip to `frontPID=WindowManager key=0` at t+500ms and stay through t+3500ms). Current-Space raises are immune (no Space switch). The +180ms watchdog PASSes because the steal lands after its single check. Consequences for the design:
-- **D4 (co-staging detection) and the lone-vs-co-staged branch are superseded** — co-staging is not the discriminator; *off-Space + Stage Manager* is. The hold must beat a daemon front-grab, not a sibling-window singleton race.
-- **D3 becomes:** re-front the target once after the Space-switch settle (`scheduleSettleReassert`, t+700ms). Whether one shot suffices is the remaining pivot.
+On-device traces revised two hypotheses above. The shipped fixes, all confirmed on-device:
 
-## Open Questions
+**Bug A — listing (D1, as designed).** Off-Space windows list without a live AX element via the CGS heuristic `alpha > 0 && min(width, height) ≥ 130` (real off-Space windows, incl. Stage Manager strip thumbnails, have min-dim ≥ 150; junk toolbars/slivers/alpha-0 shadows are ≤ 106 or alpha 0 — confirmed across two diags). No `(pid, bounds)` de-dup was needed (captures showed thin/zero-alpha junk, not shadow *duplicates*).
 
-1. **Bug A thresholds — RESOLVED.** `alpha > 0 && min(width,height) ≥ 130` (real off-Space windows incl. Stage Manager strip thumbnails: min-dim ≥ 150; junk toolbars/slivers/alpha-0 shadows: min-dim ≤ 106 or alpha 0). Confirmed across two diags.
-2. **Bug B hold sufficiency — PENDING the next capture.** Does the single t+700ms settle re-assert STICK (post-reassert traces PASS), or does WindowManager re-steal (ping-pong, traces still FAIL)? Stick → keep/tune the one-shot; ping-pong → bounded repeat-until-quiet re-assert, or suppress the daemon's post-switch front-grab.
-3. **Settle delay — PROVISIONAL 700ms.** Past the observed ~500ms steal. Tune to the smallest value that reliably beats it once the stick/ping-pong question is answered.
+**Bug A — raising a no-AX off-Space window (Chrome) — NEW (the D2 gate was abandoned).** Listing wasn't enough: selecting an off-Space Chrome window fronted the app but didn't switch Spaces, because the Space switch is driven by `kAXRaiseAction` on an element Chrome doesn't expose. The fix is the AltTab/HyperSwitch strategy — a **persistent `elementCache`** keyed by CGWindowID, seeded when an app activates (its windows are then on the current Space and resolvable) and during snapshots, reused as a fallback when brute force fails. A cached element stays valid across Spaces, so `kAXRaise` on it switches to and focuses the window. Limit: a window off-Space since before launch and never focused has no cached element and can't be navigated to (the documented AltTab limit).
+
+**Bug B — NOT a co-staging war (revises D3/D4).** The multi-delay focus trace showed **WindowManager (the Stage Manager daemon) grabs frontmost with no key window ~300ms after EVERY off-Space raise** — lone *and* co-staged alike — past the +180ms watchdog. The shipped fix is a **bounded polling hold-guard** (`offSpaceHoldTick`, off-Space + Stage Manager only): poll every ~60ms, re-front the target the instant the steal is detected (≈ one-frame flash), cover the occasional late re-steal, capped at 6 re-fronts / ~2.4s, bail on secure input. The co-staging detection (D4) and lone-vs-co-staged branch (D3) were **not built** — co-staging is not the discriminator; the gentler fixed-delay re-assert (D3a) was prototyped, confirmed it sticks, then replaced by the faster polling guard.
+
+**Rejected — direct Space switch (option 1).** `CGSManagedDisplaySetCurrentSpace` resolves but is inert for an unentitled, SIP-on process on Tahoe — the WindowServer gates Space switching to Dock.app's privileged connection (the reason yabai needs SIP disabled). Confirmed on-device (no visible switch despite a valid display UUID) and removed entirely. The `SLSBridgedMoveWindowsToManagedSpaceOperation` "move the window to you" alternative was researched as a fallback but not adopted — the cached-element raise made it unnecessary, and it has a jarring move-vs-navigate semantic.
+
+## Open Questions — all resolved
+
+1. **Bug A thresholds — RESOLVED.** `alpha > 0 && min(width,height) ≥ 130`.
+2. **Bug B hold — RESOLVED.** A polling hold-guard that re-fronts on detection holds focus cleanly; the steal is a WindowManager front-grab, not a co-staging oscillation, so no co-staging branch is needed.
+3. **No-AX raise — RESOLVED.** Cached AX element + `kAXRaise`; a direct Space switch is impossible (Dock-gated) and was removed.

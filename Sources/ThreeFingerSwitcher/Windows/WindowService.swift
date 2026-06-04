@@ -34,9 +34,38 @@ final class WindowService {
     /// toolbars (min dim ≤ 106). Empirically chosen with margin from two cross-space diags.
     private let minOffSpaceDimension: CGFloat = 130
 
+    /// Persistent AX-element cache keyed by CGWindowID (Bug A raise — the AltTab/HyperSwitch strategy).
+    /// A fresh `_AXUIElementCreateWithRemoteToken` brute force can't reach an off-Space Chromium window,
+    /// but an element captured while the window WAS reachable stays valid across Spaces — so we can
+    /// `kAXRaise` it (which switches Space) later. Populated from `snapshot()` and on app activation;
+    /// pruned to live windows each snapshot.
+    private var elementCache: [CGWindowID: AXUIElement] = [:]
+    private var activationObserver: NSObjectProtocol?
+
     init(mru: MRUTracker, settings: AppSettings) {
         self.mru = mru
         self.settings = settings
+        // Seed the element cache when an app activates: its windows are then on the current Space and
+        // resolvable via kAXWindowsAttribute. Capturing the element now lets us raise the window later,
+        // after it has moved off-Space, even for apps a brute force can't reach (e.g. Chrome).
+        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            MainActor.assumeIsolated { self?.seedElementCache(pid: app.processIdentifier) }
+        }
+    }
+
+    deinit {
+        if let activationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
+        }
+    }
+
+    /// Cache `pid`'s current-Space window elements (called on activation). Cheap — one app's windows.
+    private func seedElementCache(pid: pid_t) {
+        guard pid != getpid(), AXIsProcessTrusted() else { return }
+        for (wid, el) in currentSpaceElements(pid: pid) { elementCache[wid] = el }
     }
 
     private struct CGMeta {
@@ -84,27 +113,6 @@ final class WindowService {
         out.append("layer==0 (normal windows): \(layer0)")
         out.append("sample: \n   " + sample.joined(separator: "\n   "))
 
-        // PROBE: for each off-Space layer-0 regular-app window, which AX source resolves it?
-        // brute = remote-token brute force; axWin = kAXWindowsAttribute (process-global).
-        out.append("=== off-Space AX source probe (brute vs kAXWindowsAttribute) ===")
-        var probeBrute: [pid_t: [CGWindowID: AXUIElement]] = [:]
-        var probeAxWin: [pid_t: [CGWindowID: AXUIElement]] = [:]
-        for (wid, placement) in spaceForWindow {
-            guard let m = meta[wid], appsByPid.contains(m.pid), m.layer == 0,
-                  !model.currentSpaceIDs.contains(placement.space) else { continue }
-            if probeBrute[m.pid] == nil {
-                probeBrute[m.pid] = Dictionary(bruteForceWindows(pid: m.pid), uniquingKeysWith: { a, _ in a })
-            }
-            if probeAxWin[m.pid] == nil { probeAxWin[m.pid] = currentSpaceElements(pid: m.pid) }
-            let bEl = probeBrute[m.pid]?[wid]
-            let aEl = probeAxWin[m.pid]?[wid]
-            let sub = (bEl ?? aEl).flatMap { axString($0, kAXSubroleAttribute as String) } ?? "-"
-            // alpha + bounds let us pick the CGS-only switchability thresholds for the no-AX (brute=0)
-            // case (Bug A): real Chromium windows vs invisible shadow/companion windows.
-            let b = m.bounds
-            let boundsStr = "\(Int(b.width))x\(Int(b.height))@\(Int(b.minX)),\(Int(b.minY))"
-            out.append("  wid \(wid) pid \(m.pid) space \(placement.space) brute=\(bEl != nil ? 1 : 0) axWin=\(aEl != nil ? 1 : 0) subrole=\(sub) alpha=\(String(format: "%.2f", m.alpha)) bounds=\(boundsStr) '\(m.name ?? "")'")
-        }
         let final = snapshot()
         out.append("final snapshot().count: \(final.count)")
         for w in final {
@@ -158,7 +166,7 @@ final class WindowService {
             let onCurrent = model.currentSpaceIDs.contains(placement.space)
 
             // Acquire an AX element: current-Space via kAXWindowsAttribute, off-Space via brute force.
-            let element: AXUIElement?
+            var element: AXUIElement?
             if onCurrent {
                 if axCurrentByPid[m.pid] == nil {
                     axCurrentByPid[m.pid] = currentSpaceElements(pid: m.pid)
@@ -169,6 +177,14 @@ final class WindowService {
                     axBruteByPid[m.pid] = Dictionary(bruteForceWindows(pid: m.pid), uniquingKeysWith: { a, _ in a })
                 }
                 element = axBruteByPid[m.pid]?[wid]
+            }
+            // Refresh the persistent cache while the window is reachable; otherwise fall back to a
+            // previously-cached element (still valid off-Space) so a Chromium window a brute force
+            // can't find is still raisable (Bug A raise).
+            if let el = element {
+                elementCache[wid] = el
+            } else if let cached = elementCache[wid], axCopy(cached, kAXRoleAttribute as String) != nil {
+                element = cached
             }
 
             // Decide switchability. When an AX element resolved (current-Space via kAXWindowsAttribute,
@@ -206,6 +222,9 @@ final class WindowService {
             )
             rows.append((info, mru.rank(m.pid), onCurrent ? 0 : 1, model.indexBySpace[placement.space] ?? Int.max, placement.z))
         }
+
+        // Evict cached elements for windows that no longer exist (keep only currently-enumerated ids).
+        elementCache = elementCache.filter { spaceForWindow[$0.key] != nil }
 
         rows.sort { a, b in
             if a.appRank != b.appRank { return a.appRank < b.appRank }   // MRU app first
@@ -259,8 +278,9 @@ final class WindowService {
     ///   • Off Space: keep the SkyLight setFront + makeKeyWindow handshake (the only thing that
     ///     crosses Spaces reliably in one shot), then AX + activate.
     ///
-    /// A post-commit watchdog (see `scheduleWatchdog`) self-heals the residual race so the user
-    /// never needs Mission Control to escape a vacuum.
+    /// A post-commit watchdog (see `scheduleWatchdog`) self-heals the residual vacuum race. For an
+    /// off-Space raise under Stage Manager there is a second, later steal — WindowManager grabs
+    /// frontmost ~300ms after the Space switch — handled by the polling hold-guard (`offSpaceHoldTick`).
     func raise(_ window: WindowInfo) {
         commitSeq &+= 1
         let token = commitSeq
@@ -272,7 +292,6 @@ final class WindowService {
         logEntry(.commit, window: window, passed: nil, state: state, note: "")
 
         scheduleWatchdog(window, token: token, attempt: 0)
-        scheduleFocusTrace(window, token: token)
         if !window.isOnCurrentSpace && StageManager.isEnabled {
             scheduleNextHoldTick(window, token: token, tick: 0, refronts: 0)
         }
@@ -318,27 +337,6 @@ final class WindowService {
         scheduleNextHoldTick(window, token: token, tick: tick + 1, refronts: refronts + 1)
     }
 
-    /// Delays (past the +180ms watchdog) at which the passive focus trace samples state.
-    private let focusTraceDelays: [TimeInterval] = [0.5, 1.0, 2.0, 3.5]
-
-    /// DIAGNOSTIC ONLY — no recovery, no behavior change. Samples the focus state at several delays
-    /// past the watchdog so a diagnostics dump shows WHEN focus is lost: an off-Space raise can pass
-    /// the +180ms verify and then have key stolen by a Stage Manager re-stage once the destination
-    /// Space settles. Bails if a newer commit superseded this one (same token guard as the watchdog).
-    private func scheduleFocusTrace(_ window: WindowInfo, token: UInt64) {
-        for delay in focusTraceDelays {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                MainActor.assumeIsolated {
-                    guard let self, token == self.commitSeq else { return }
-                    let state = FocusLog.probe(targetPID: window.pid)
-                    let healthy = state.frontmostMatchesTarget && state.frontmostHasKeyWindow
-                    self.logEntry(.trace, window: window, passed: healthy, state: state,
-                                  note: "t+\(Int(delay * 1000))ms")
-                }
-            }
-        }
-    }
-
     /// Run one focus sequence for `window`. With `offSpaceHandshake` the SkyLight setFront +
     /// makeKeyWindow byte protocol runs first to cross Spaces; otherwise it is skipped (current
     /// Space uses the battle-tested AX-only path). Always finishes by activating the owning app
@@ -346,19 +344,23 @@ final class WindowService {
     private func focusSequence(_ window: WindowInfo, offSpaceHandshake: Bool) {
         let element = resolveElement(window)
 
-        // Stage Manager groups multiple windows of one app onto the center stage together — on the
-        // current Space, or on the destination Space after an off-Space raise. Asserting the PER-APP
-        // focus singletons (kAXMain on the window + the app's kAXFocusedWindow) toward one of those
-        // co-staged windows makes WindowManager's stage-front arbiter fight back: current-Space
-        // co-staged windows oscillate ~12/sec (a self-sustaining WindowManager loop that even survives
-        // this process quitting, verified by log capture), and an off-Space raise into a co-staged app
-        // (e.g. Terminal) loses focus immediately after landing. So under Stage Manager skip the per-app
-        // singleton writes on the CURRENT-Space path and rely on the window-specific kAXRaise + activate()
-        // to establish key state. The OFF-Space path keeps the singletons: they are load-bearing to hold
-        // key across the Space switch for a LONE off-Space window. (The co-staged off-Space case still
-        // loses key — that is Bug B, fixed separately by branching the off-Space hold on co-staging.)
-        // The +180ms watchdog stays as the focus-vacuum safety net.
+        // Stage Manager: asserting the PER-APP focus singletons (kAXMain on the window + the app's
+        // kAXFocusedWindow) toward a window that shares the center stage with other windows of the same
+        // app makes WindowManager's stage-front arbiter fight back — current-Space co-staged windows
+        // oscillate ~12/sec (a self-sustaining WindowManager loop that survives this process quitting,
+        // verified by log capture). So on the CURRENT-Space path under Stage Manager we skip those
+        // singleton writes and rely on kAXRaise + activate(). The OFF-Space path keeps the singletons
+        // (load-bearing to hold key across the Space switch); the separate steal WindowManager performs
+        // ~300ms after every off-Space switch is handled by the polling hold-guard, not here.
         let stageManagerSafe = !offSpaceHandshake && StageManager.isEnabled
+
+        // NOTE (Bug A, raise): an off-Space window with no LIVE AX element (e.g. Chromium, which a
+        // remote-token brute force can't reach) is raised via a CACHED element (see `elementCache`):
+        // kAXRaiseAction on it drives the Space switch like any other window. We do NOT attempt a direct
+        // Space switch — CGSManagedDisplaySetCurrentSpace is gated by the WindowServer to Dock.app's
+        // privileged connection only (dead for an unentitled, SIP-on process on Tahoe; that is why yabai
+        // must disable SIP to inject into Dock). If no cached element exists yet, the window fronts its
+        // app without switching Space until it has been focused once (the AltTab/HyperSwitch limit).
 
         // 1. SkyLight front + key handshake — only for off-Space windows.
         if offSpaceHandshake,
@@ -483,10 +485,15 @@ final class WindowService {
             return el
         }
         if window.isOnCurrentSpace {
-            return currentSpaceElements(pid: window.pid)[window.id]
+            if let el = currentSpaceElements(pid: window.pid)[window.id] { return el }
         } else {
-            return bruteForceWindows(pid: window.pid).first { $0.0 == window.id }?.1
+            if let el = bruteForceWindows(pid: window.pid).first(where: { $0.0 == window.id })?.1 { return el }
         }
+        // Fall back to an element cached while the window was reachable (off-Space Chromium raise).
+        if let cached = elementCache[window.id], axCopy(cached, kAXRoleAttribute as String) != nil {
+            return cached
+        }
+        return nil
     }
 
     /// SkyLight key-window byte protocol (AltTab-exact): two event records make a specific

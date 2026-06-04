@@ -20,8 +20,8 @@ final class FocusLog {
         case recover1     = "recover-1"
         case recover2     = "recover-2"
         case gaveUp       = "gave-up"
-        /// Passive post-watchdog sample (diagnostic only): records focus state at later delays so a
-        /// dump shows WHEN focus is lost (e.g. a Stage Manager re-stage after the +180ms verify).
+        /// Off-Space hold-guard marker: re-fronted the target (or stopped on secure input) after
+        /// WindowManager stole frontmost ~300ms past the Space switch.
         case trace        = "trace"
     }
 
