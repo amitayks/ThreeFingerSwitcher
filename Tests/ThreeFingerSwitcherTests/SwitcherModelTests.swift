@@ -27,7 +27,8 @@ final class SwitcherModelTests: XCTestCase {
             frame: .zero,
             axElement: nil,
             isOnCurrentSpace: onCurrentSpace,
-            spaceID: spaceID
+            spaceID: spaceID,
+            spaceIndex: 0
         )
     }
 

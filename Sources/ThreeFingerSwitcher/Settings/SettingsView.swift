@@ -31,6 +31,13 @@ struct SettingsView: View {
                 Toggle("Require exactly three fingers", isOn: $settings.requireExactlyThree)
             }
 
+            Section("Spaces") {
+                Toggle("Keep Spaces in a fixed order", isOn: $settings.manageSpacesRearrange)
+                Text("Turns off macOS “Automatically rearrange Spaces based on most recent use” so each Space keeps its position and the switcher's row order stays stable. Changes a system setting (Mission Control, everywhere) and briefly restarts the Dock; restored when you quit and reapplied on launch.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Reliability") {
                 Toggle("Self-heal focus after switching", isOn: $settings.focusWatchdogEnabled)
                 Text("Verifies the switched-to window actually receives focus and recovers automatically, so you never need Mission Control to escape a stuck state.")

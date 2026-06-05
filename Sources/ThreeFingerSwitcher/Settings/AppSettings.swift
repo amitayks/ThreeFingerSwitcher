@@ -46,6 +46,11 @@ final class AppSettings: ObservableObject {
     /// open Mission Control to escape a focus vacuum. Default ON; toggle off if it misbehaves.
     @Published var focusWatchdogEnabled: Bool { didSet { defaults.set(focusWatchdogEnabled, forKey: Keys.focusWatchdogEnabled) } }
 
+    /// Opt-in to managing the macOS "Automatically rearrange Spaces based on most recent use"
+    /// setting. When ON, the app disables it on launch and restores it on quit, so Mission Control
+    /// (and therefore the switcher) keeps a fixed Space order. Default OFF — set only via consent.
+    @Published var manageSpacesRearrange: Bool { didSet { defaults.set(manageSpacesRearrange, forKey: Keys.manageSpacesRearrange) } }
+
     /// Shared singleton uses the standard user defaults.
     private convenience init() {
         self.init(defaults: .standard)
@@ -66,6 +71,7 @@ final class AppSettings: ObservableObject {
         rowStepDistance = defaults.object(forKey: Keys.rowStepDistance) as? Double ?? Defaults.rowStepDistance
         reverseVerticalDirection = defaults.object(forKey: Keys.reverseVerticalDirection) as? Bool ?? Defaults.reverseVerticalDirection
         focusWatchdogEnabled = defaults.object(forKey: Keys.focusWatchdogEnabled) as? Bool ?? Defaults.focusWatchdogEnabled
+        manageSpacesRearrange = defaults.object(forKey: Keys.manageSpacesRearrange) as? Bool ?? Defaults.manageSpacesRearrange
     }
 
     func resetToDefaults() {
@@ -94,6 +100,7 @@ final class AppSettings: ObservableObject {
         static let rowStepDistance = 0.12       // ~2.4× the horizontal step; deliberate up/down
         static let reverseVerticalDirection = false
         static let focusWatchdogEnabled = true
+        static let manageSpacesRearrange = false   // opt-in; only enabled via explicit consent
     }
 
     private enum Keys {
@@ -108,5 +115,6 @@ final class AppSettings: ObservableObject {
         static let rowStepDistance = "rowStepDistance"
         static let reverseVerticalDirection = "reverseVerticalDirection"
         static let focusWatchdogEnabled = "focusWatchdogEnabled"
+        static let manageSpacesRearrange = "manageSpacesRearrange"
     }
 }

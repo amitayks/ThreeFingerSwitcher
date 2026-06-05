@@ -24,20 +24,21 @@ final class HarnessTests: XCTestCase {
         XCTAssertEqual(frame.centroid.x, 0.5, accuracy: 1e-9)
     }
 
-    /// Smoke test for the extracted Space-grouping logic.
-    func testSpaceGroupingPutsCurrentSpaceFirst() {
+    /// Smoke test for the extracted Space-grouping logic: rows follow Mission Control order
+    /// and the current Space is highlighted at its own position (not pulled to row 0).
+    func testSpaceGroupingOrdersByMissionControlIndex() {
         let other = WindowInfo(
             id: 1, pid: 1, appName: "A", title: "", appIcon: nil,
-            frame: .zero, axElement: nil, isOnCurrentSpace: false, spaceID: 9
+            frame: .zero, axElement: nil, isOnCurrentSpace: false, spaceID: 9, spaceIndex: 0
         )
         let current = WindowInfo(
             id: 2, pid: 2, appName: "B", title: "", appIcon: nil,
-            frame: .zero, axElement: nil, isOnCurrentSpace: true, spaceID: 3
+            frame: .zero, axElement: nil, isOnCurrentSpace: true, spaceID: 3, spaceIndex: 1
         )
         let grouped = SpaceGrouping.group([other, current])
         XCTAssertEqual(grouped.rows.count, 2)
-        XCTAssertEqual(grouped.startRow, 0)
-        XCTAssertTrue(grouped.rows[0].first?.isOnCurrentSpace ?? false)
+        XCTAssertEqual(grouped.startRow, 1, "Current Space (index 1) is highlighted in place")
+        XCTAssertTrue(grouped.rows[1].first?.isOnCurrentSpace ?? false)
         XCTAssertEqual(grouped.labels, ["1", "2"])
     }
 }

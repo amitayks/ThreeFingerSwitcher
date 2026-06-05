@@ -6,3 +6,5 @@ DerivedData/
 
 # Per-user Claude Code local settings (machine-specific; not shared)
 .claude/settings.local.json
+
+working-desk.md

@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import ServiceManagement
 import SwiftUI
 
@@ -16,6 +17,8 @@ final class AppCoordinator: GestureRecognizerDelegate {
     private let overlay = OverlayController()
     private let touchEngine = TouchEngine()
     private lazy var recognizer = GestureRecognizer(settings: settings)
+    let spacesRearrange = SpacesRearrangeConfig()
+    private var cancellables: Set<AnyCancellable> = []
 
     private var settingsWindow: NSWindow?
     private var onboardingWindow: NSWindow?
@@ -30,6 +33,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         touchEngine.onFrame = { [weak self] frame in self?.recognizer.feed(frame) }
         thumbnails.onThumbnail = { [weak self] id, image in self?.overlay.model.setThumbnail(image, for: id) }
         observeSleepWake()
+        observeSpacesRearrangeToggle()
     }
 
     deinit {
@@ -48,9 +52,15 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// whether the watchdog recovered, and whether secure input was the real culprit.
     func writeDiagnostics() {
         let path = "/tmp/tfs-cross-space-diag.txt"
-        let report = windowService.diagnosticReport() + "\n\n" + FocusLog.shared.dump()
-        try? report.write(toFile: path, atomically: true, encoding: .utf8)
-        infoAlert(title: "Diagnostics written", text: "Saved to \(path)")
+        let base = windowService.diagnosticReport() + "\n\n" + FocusLog.shared.dump()
+        // The ScreenCaptureKit frame probe is async; append it before writing so a single capture
+        // carries both the listing (ghost) data and the thumbnail (set-aside) data.
+        Task { @MainActor in
+            let scFrames = await thumbnails.diagnosticFrames()
+            let report = base + "\n\n" + scFrames
+            try? report.write(toFile: path, atomically: true, encoding: .utf8)
+            infoAlert(title: "Diagnostics written", text: "Saved to \(path)")
+        }
     }
 
     /// Put the focus log (ring buffer) on the pasteboard for quick sharing after a freeze.
@@ -71,6 +81,8 @@ final class AppCoordinator: GestureRecognizerDelegate {
         permissions.refresh()
         if settings.enabled { enable() }
         maybePromptNativeGestureSetup()
+        applySpacesRearrangeOnLaunchIfManaged()
+        maybePromptSpacesRearrange()
         if !permissions.allRequiredGranted { showOnboarding() }
     }
 
@@ -229,9 +241,9 @@ final class AppCoordinator: GestureRecognizerDelegate {
     }
 
     private func prefetchCurrentRow() {
-        let ids = overlay.model.currentRowIDs
-        thumbnails.seed(into: overlay.model, ids: ids)   // instant from cache (no icon-only flash)
-        thumbnails.prefetch(ids)                         // refresh to keep previews live
+        let windows = overlay.model.windows
+        thumbnails.seed(into: overlay.model, ids: windows.map(\.id))  // instant from cache (no icon-only flash)
+        thumbnails.prefetch(windows)                                  // refresh only cleanly-visible windows
     }
 
     func gestureDidCommit() {
@@ -317,6 +329,89 @@ final class AppCoordinator: GestureRecognizerDelegate {
         }
     }
 
+    // MARK: - Spaces auto-rearrange
+
+    private let didPromptSpacesKey = "didPromptSpacesRearrange"
+
+    /// React to the Settings toggle: enabling applies the setting, disabling restores it. The
+    /// initial persisted value is skipped (`dropFirst`); launch-apply is handled in `start()`.
+    private func observeSpacesRearrangeToggle() {
+        settings.$manageSpacesRearrange
+            .dropFirst()
+            .sink { [weak self] enabled in
+                MainActor.assumeIsolated { self?.handleSpacesRearrangeToggle(enabled) }
+            }
+            .store(in: &cancellables)
+    }
+
+    private func handleSpacesRearrangeToggle(_ enabled: Bool) {
+        if enabled {
+            applySpacesRearrange()
+        } else if spacesRearrange.hasBackup {
+            _ = spacesRearrange.restore()
+        }
+    }
+
+    private func applySpacesRearrangeOnLaunchIfManaged() {
+        guard settings.manageSpacesRearrange else { return }
+        applySpacesRearrange()
+    }
+
+    /// Disable Spaces auto-rearrange; surface a non-fatal warning if the write/Dock restart failed
+    /// (e.g. a managed preference). A no-op when the setting is already fixed.
+    private func applySpacesRearrange() {
+        guard !spacesRearrange.disableAutoRearrange() else { return }
+        infoAlert(
+            title: "Couldn't change the Spaces setting",
+            text: """
+            Turning off “Automatically rearrange Spaces based on most recent use” (or restarting \
+            the Dock) didn't succeed. If your Mac is managed (MDM), this setting may be locked. \
+            You can turn it off manually in System Settings ▸ Desktop & Dock ▸ Mission Control.
+            """
+        )
+    }
+
+    /// First-run consent, mirroring the native-gesture prompt: ask once, only when the setting is
+    /// actually on and the user hasn't already opted in.
+    private func maybePromptSpacesRearrange() {
+        let alreadyPrompted = UserDefaults.standard.bool(forKey: didPromptSpacesKey)
+        guard !alreadyPrompted, !settings.manageSpacesRearrange, spacesRearrange.isAutoRearrangeOn else { return }
+        UserDefaults.standard.set(true, forKey: didPromptSpacesKey)
+        promptSpacesRearrangeSetup()
+    }
+
+    func promptSpacesRearrangeSetup() {
+        guard spacesRearrange.isAutoRearrangeOn else {
+            infoAlert(title: "Already set",
+                      text: "Spaces are already kept in a fixed order — macOS isn't rearranging them by recent use.")
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Keep Spaces in a fixed order?"
+        alert.informativeText = """
+        macOS is set to “Automatically rearrange Spaces based on most recent use,” which reorders \
+        your Spaces as you move between them — so the switcher's row order keeps shifting.
+
+        Turn this off so each Space stays put. This changes a system setting (Mission Control, \
+        everywhere) and briefly restarts the Dock. The app restores your original setting when you \
+        quit and reapplies it on launch. You can change this anytime in Settings.
+        """
+        alert.addButton(withTitle: "Keep Spaces fixed")
+        alert.addButton(withTitle: "Not now")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            settings.manageSpacesRearrange = true   // observer applies the change and persists the opt-in
+            onStateChange?()
+        }
+    }
+
+    /// Called on quit: if we disabled auto-rearrange this session, restore the original value
+    /// (synchronously, so the Dock restart finishes before the app exits).
+    func restoreSpacesRearrangeOnQuit() {
+        guard spacesRearrange.changedThisSession else { return }
+        _ = spacesRearrange.restore()
+    }
+
     // MARK: - Windows
 
     func showSettings() {
@@ -338,7 +433,9 @@ final class AppCoordinator: GestureRecognizerDelegate {
                 permissions: permissions,
                 trackpadClaimed: trackpadConfig.isClaimed,
                 trackpadNeedsRelogin: trackpadConfig.needsReloginWarning,
+                spacesAutoRearrangeOn: spacesRearrange.isAutoRearrangeOn,
                 onSetupNativeGesture: { [weak self] in self?.promptNativeGestureSetup() },
+                onKeepSpacesFixed: { [weak self] in self?.promptSpacesRearrangeSetup() },
                 onRefresh: { [weak self] in self?.permissions.refresh() }
             )
             let host = NSHostingController(rootView: view)

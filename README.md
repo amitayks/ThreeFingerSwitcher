@@ -140,3 +140,4 @@ All in `AppSettings` (persisted, live-applied, editable in the Settings window):
 - Raw multitouch via **[OpenMultitouchSupport](https://github.com/Kyome22/OpenMultitouchSupport)** (Kyome, MIT), wrapping the private `MultitouchSupport.framework`.
 
 If you (Claude) end up extending this, keep the spec in `openspec/specs/` honest, keep the 117 tests green (`swift test`), and respect the landmines in **B3** — they each cost a real debugging session to learn.
+

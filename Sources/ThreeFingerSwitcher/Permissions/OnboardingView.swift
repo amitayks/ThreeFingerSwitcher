@@ -6,7 +6,9 @@ struct OnboardingView: View {
     @ObservedObject var permissions: PermissionsService
     let trackpadClaimed: Bool
     let trackpadNeedsRelogin: Bool
+    let spacesAutoRearrangeOn: Bool
     let onSetupNativeGesture: () -> Void
+    let onKeepSpacesFixed: () -> Void
     let onRefresh: () -> Void
 
     var body: some View {
@@ -55,6 +57,21 @@ struct OnboardingView: View {
                             .foregroundStyle(.orange)
                     } else {
                         Label("Horizontal three-finger swipe is free. Mission Control / App Exposé still work on up/down.", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(6)
+            }
+
+            GroupBox("Spaces") {
+                VStack(alignment: .leading, spacing: 8) {
+                    if spacesAutoRearrangeOn {
+                        Label("macOS rearranges Spaces by most recent use, so the switcher's row order keeps shifting.", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Button("Keep Spaces in a fixed order…", action: onKeepSpacesFixed)
+                    } else {
+                        Label("Spaces stay in a fixed order — the switcher's row order is stable.", systemImage: "checkmark.circle.fill")
                             .foregroundStyle(.green)
                     }
                 }

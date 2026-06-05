@@ -28,18 +28,13 @@ final class WindowService {
     private let watchdogDelay: TimeInterval = 0.180
     private let maxRecoveries = 2
 
-    /// Minimum width AND height (px) for an off-Space window with no resolvable AX element to be
-    /// listed from CGS metadata alone (Bug A). Clears real browser/app windows and Stage Manager
-    /// strip thumbnails (min dim ≥ ~150 in captures) while dropping sliver dividers and full-width
-    /// toolbars (min dim ≤ 106). Empirically chosen with margin from two cross-space diags.
-    private let minOffSpaceDimension: CGFloat = 130
-
     /// Persistent AX-element cache keyed by CGWindowID (Bug A raise — the AltTab/HyperSwitch strategy).
     /// A fresh `_AXUIElementCreateWithRemoteToken` brute force can't reach an off-Space Chromium window,
     /// but an element captured while the window WAS reachable stays valid across Spaces — so we can
     /// `kAXRaise` it (which switches Space) later. Populated from `snapshot()` and on app activation;
     /// pruned to live windows each snapshot.
     private var elementCache: [CGWindowID: AXUIElement] = [:]
+
     private var activationObserver: NSObjectProtocol?
 
     init(mru: MRUTracker, settings: AppSettings) {
@@ -74,6 +69,7 @@ final class WindowService {
         let alpha: Double
         let bounds: CGRect
         let name: String?
+        let isOnscreen: Bool
     }
 
     // MARK: - Diagnostics
@@ -115,9 +111,55 @@ final class WindowService {
 
         let final = snapshot()
         out.append("final snapshot().count: \(final.count)")
+        // Every listed window now has an Accessibility element (subrole shown). After the AX-required
+        // gate, snapshot() can no longer surface a metadata-only no-element row, so there is no ghost
+        // block here — the per-candidate dump below is where dropped no-element ghosts are observable.
         for w in final {
             let subrole = w.axElement.flatMap { axString($0, kAXSubroleAttribute as String) } ?? "no-element"
-            out.append("  • wid \(w.id) pid \(w.pid) space \(w.spaceID.map(String.init) ?? "-") cur=\(w.isOnCurrentSpace) subrole=\(subrole) '\(w.displayTitle)'")
+            // cg = CGWindowList displayed bounds (a Stage-Manager strip thumbnail reports the small
+            // scaled rect); ax = the Accessibility (real) size. cg << ax ⇒ strip proxy → skip capture.
+            out.append("  • wid \(w.id) pid \(w.pid) space \(w.spaceID.map(String.init) ?? "-") cur=\(w.isOnCurrentSpace) "
+                + "cg=\(Int(w.frame.width))x\(Int(w.frame.height)) ax=\(Int(w.realFrame.width))x\(Int(w.realFrame.height)) "
+                + "subrole=\(subrole) '\(w.displayTitle)'")
+        }
+
+        // Full candidate dump: EVERY layer-0 window owned by a regular app, with the metadata and
+        // the element-resolution that drives listing — including windows that were DROPPED. This is
+        // what reveals why a ghost with no AX element on any Space (e.g. ASUS GlideX) slips through
+        // the off-Space metadata gate, by showing its CGS profile next to genuine windows.
+        out.append("\n=== layer-0 candidate dump (regular apps; includes dropped) ===")
+        out.append("legend: live=brute/current AX element resolved · cached=elementCache hit · "
+            + "onscr=kCGWindowIsOnscreen · decision=what snapshot() does (AX-path requires live||cached)")
+        var bruteByPid: [pid_t: Set<CGWindowID>] = [:]
+        var currentByPid: [pid_t: Set<CGWindowID>] = [:]
+        let sortedCandidates = spaceForWindow.sorted {
+            $0.value.space != $1.value.space ? $0.value.space < $1.value.space : $0.key < $1.key
+        }
+        for (wid, placement) in sortedCandidates {
+            guard let m = meta[wid], appsByPid.contains(m.pid), m.layer == 0 else { continue }
+            let onCurrent = model.currentSpaceIDs.contains(placement.space)
+            if onCurrent, currentByPid[m.pid] == nil {
+                currentByPid[m.pid] = Set(currentSpaceElements(pid: m.pid).keys)
+            }
+            if !onCurrent, bruteByPid[m.pid] == nil {
+                bruteByPid[m.pid] = Set(bruteForceWindows(pid: m.pid).map(\.0))
+            }
+            let live = onCurrent ? (currentByPid[m.pid]?.contains(wid) ?? false)
+                                 : (bruteByPid[m.pid]?.contains(wid) ?? false)
+            let cached = (elementCache[wid]).map { axCopy($0, kAXRoleAttribute as String) != nil } ?? false
+            let b = m.bounds
+            // AX-presence is the ghost discriminator: a window with neither a live nor a cached element
+            // on any Space is a ghost and is dropped off-Space — every genuine window resolves one.
+            let decision: String
+            if live || cached { decision = "AX-path" }
+            else if !onCurrent { decision = "drop(off-space,no-element)" }
+            else { decision = "drop(current,no-element)" }
+            let appName = NSRunningApplication(processIdentifier: m.pid)?.localizedName ?? "?"
+            out.append("  wid \(wid) pid \(m.pid) sp \(placement.space) cur=\(onCurrent ? 1 : 0) "
+                + "live=\(live ? 1 : 0) cached=\(cached ? 1 : 0) "
+                + "alpha=\(m.alpha) onscr=\(m.isOnscreen ? 1 : 0) "
+                + "\(Int(b.width))x\(Int(b.height))@\(Int(b.origin.x)),\(Int(b.origin.y)) "
+                + "→ \(decision)  [\(appName)] '\(m.name ?? "")'")
         }
         return out.joined(separator: "\n")
     }
@@ -187,25 +229,18 @@ final class WindowService {
                 element = cached
             }
 
-            // Decide switchability. When an AX element resolved (current-Space via kAXWindowsAttribute,
-            // or off-Space via remote-token brute force), require a standard window subrole — AltTab's
-            // rule that filters the invisible/companion windows options=7 surfaces. When NO element
-            // resolves for an off-Space window (Chromium browsers expose none reachable by remote
-            // token, so they used to vanish — Bug A), fall back to CoreGraphicsServices metadata:
-            // layer 0 (already enforced) + non-zero alpha + a real minimum dimension. That lists real
-            // browser/app windows while still rejecting sliver dividers, full-width toolbars, and
-            // zero-alpha shadow companions. Confirmed against two cross-space diags.
-            let listable: Bool
-            if let el = element {
-                listable = isSwitchable(el)
-            } else if !onCurrent {
-                listable = m.alpha > 0 && min(m.bounds.width, m.bounds.height) >= minOffSpaceDimension
-            } else {
-                listable = false
-            }
-            guard listable else { continue }
+            // List a window only when an Accessibility element resolved — current-Space via
+            // kAXWindowsAttribute, off-Space via remote-token brute force, or from the persistent
+            // `elementCache` populated while the window was reachable. Requiring an element is
+            // AltTab's 100%-Accessibility model: it drops off-Space "ghosts" (closed-but-process-
+            // alive windows, dialog/sheets, background-agent surfaces) that expose no AX window on
+            // any Space and that the former CoreGraphicsServices-metadata fallback could not tell
+            // apart from a real window. Genuine off-Space windows — including Chromium reachable only
+            // via a cached element (Bug A) — keep listing via `elementCache`. `isSwitchable` still
+            // excludes minimized windows and non-standard subroles (dialogs/sheets).
+            guard let element, isSwitchable(element) else { continue }
 
-            let title = (element.flatMap { axString($0, kAXTitleAttribute as String) })
+            let title = axString(element, kAXTitleAttribute as String)
                 ?? m.name
                 ?? (app.localizedName ?? "")
 
@@ -216,14 +251,17 @@ final class WindowService {
                 title: title,
                 appIcon: app.icon,
                 frame: m.bounds,
+                realFrame: axFrame(element),
                 axElement: element,
                 isOnCurrentSpace: onCurrent,
-                spaceID: placement.space
+                spaceID: placement.space,
+                spaceIndex: model.indexBySpace[placement.space] ?? Int.max
             )
             rows.append((info, mru.rank(m.pid), onCurrent ? 0 : 1, model.indexBySpace[placement.space] ?? Int.max, placement.z))
         }
 
         // Evict cached elements for windows that no longer exist (keep only currently-enumerated ids).
+        // `elementCache` is now the sole Bug-A guard, so this prune must stay correct.
         elementCache = elementCache.filter { spaceForWindow[$0.key] != nil }
 
         rows.sort { a, b in
@@ -256,7 +294,7 @@ final class WindowService {
                     id: wid, pid: pid, appName: app.localizedName ?? "",
                     title: axString(axWin, kAXTitleAttribute as String) ?? "",
                     appIcon: app.icon, frame: axFrame(axWin),
-                    axElement: axWin, isOnCurrentSpace: true, spaceID: nil
+                    axElement: axWin, isOnCurrentSpace: true, spaceID: nil, spaceIndex: 0
                 )
                 result.append((info, appRank, zIndex))
             }
@@ -551,11 +589,12 @@ final class WindowService {
             let layer = (d[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0
             let alpha = (d[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
             let name = d[kCGWindowName as String] as? String
+            let isOnscreen = (d[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue ?? false
             var bounds = CGRect.zero
             if let b = d[kCGWindowBounds as String] as? NSDictionary {
                 bounds = CGRect(dictionaryRepresentation: b as CFDictionary) ?? .zero
             }
-            map[wid] = CGMeta(pid: pid, layer: layer, alpha: alpha, bounds: bounds, name: name)
+            map[wid] = CGMeta(pid: pid, layer: layer, alpha: alpha, bounds: bounds, name: name, isOnscreen: isOnscreen)
         }
         return map
     }
