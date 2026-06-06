@@ -51,6 +51,13 @@ final class AppSettings: ObservableObject {
     /// (and therefore the switcher) keeps a fixed Space order. Default OFF — set only via consent.
     @Published var manageSpacesRearrange: Bool { didSet { defaults.set(manageSpacesRearrange, forKey: Keys.manageSpacesRearrange) } }
 
+    /// Opt-in to Space-row switching. When ON, the app relocates the native three-finger vertical
+    /// gesture (Mission Control / App Exposé) to four fingers — on launch, restored on quit — and
+    /// the recognizer steps Space-rows on vertical motion. Binding both sides to this one flag is
+    /// what prevents the conflict where row stepping is live while the OS still owns three-finger
+    /// vertical. Default OFF — set only via consent (which moves Mission Control to four fingers).
+    @Published var manageVerticalGesture: Bool { didSet { defaults.set(manageVerticalGesture, forKey: Keys.manageVerticalGesture) } }
+
     /// Shared singleton uses the standard user defaults.
     private convenience init() {
         self.init(defaults: .standard)
@@ -72,6 +79,7 @@ final class AppSettings: ObservableObject {
         reverseVerticalDirection = defaults.object(forKey: Keys.reverseVerticalDirection) as? Bool ?? Defaults.reverseVerticalDirection
         focusWatchdogEnabled = defaults.object(forKey: Keys.focusWatchdogEnabled) as? Bool ?? Defaults.focusWatchdogEnabled
         manageSpacesRearrange = defaults.object(forKey: Keys.manageSpacesRearrange) as? Bool ?? Defaults.manageSpacesRearrange
+        manageVerticalGesture = defaults.object(forKey: Keys.manageVerticalGesture) as? Bool ?? Defaults.manageVerticalGesture
     }
 
     func resetToDefaults() {
@@ -101,6 +109,7 @@ final class AppSettings: ObservableObject {
         static let reverseVerticalDirection = false
         static let focusWatchdogEnabled = true
         static let manageSpacesRearrange = false   // opt-in; only enabled via explicit consent
+        static let manageVerticalGesture = false   // opt-in; relocates Mission Control to four fingers
     }
 
     private enum Keys {
@@ -116,5 +125,6 @@ final class AppSettings: ObservableObject {
         static let reverseVerticalDirection = "reverseVerticalDirection"
         static let focusWatchdogEnabled = "focusWatchdogEnabled"
         static let manageSpacesRearrange = "manageSpacesRearrange"
+        static let manageVerticalGesture = "manageVerticalGesture"
     }
 }

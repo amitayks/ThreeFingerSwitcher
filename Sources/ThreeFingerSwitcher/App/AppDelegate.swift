@@ -31,6 +31,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         coordinator?.restoreSpacesRearrangeOnQuit()
+        // NOTE: the vertical-gesture relocation is deliberately NOT restored on quit. It needs a
+        // re-login to take effect, and logout quits the app — restoring here would undo the change
+        // on the very logout that applies it, so the feature could never engage. The relocation
+        // persists while the opt-in is on and is reverted only when the user disables the opt-in
+        // or picks Restore from the menu (the same model as the horizontal gesture).
         coordinator?.offerRestoreOnQuit()
         return .terminateNow
     }

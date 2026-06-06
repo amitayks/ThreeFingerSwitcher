@@ -35,22 +35,22 @@ With consent, the system SHALL reassign the native three-finger vertical gesture
 - **THEN** the app does not rewrite the values
 
 ### Requirement: Manage the native vertical gesture across the app lifecycle
-When Space-row switching is enabled, the system SHALL apply the gesture relocation on launch, restore the original values on quit, and reapply on relaunch, so the OS setting is changed only while the opt-in is active.
+When Space-row switching is enabled, the system SHALL apply the gesture relocation on launch and reapply on relaunch, and SHALL keep it applied (persisted) while the opt-in is on — including across logout/restart — so the re-login that makes the change effective is not undone. The relocation SHALL be reverted only when the user disables the opt-in or explicitly chooses to restore, never automatically on quit.
 
 #### Scenario: Apply on launch
 - **WHEN** the app launches with Space-row switching enabled and the native vertical gesture is not already relocated
 - **THEN** it backs up the current values and relocates the three-finger vertical gesture to four fingers
 
-#### Scenario: Restore on quit
-- **WHEN** the app quits and it relocated the native vertical gesture during this session
-- **THEN** it restores the original values before exiting
+#### Scenario: Relocation persists across quit and logout
+- **WHEN** the app quits (including the logout/restart needed to make the change effective) while Space-row switching is still on
+- **THEN** the relocated value is left in place (not reverted), so the next login frees the three-finger vertical swipe
 
-#### Scenario: Reapply on relaunch
-- **WHEN** the app is launched again with Space-row switching still enabled
-- **THEN** it applies the relocation again
+#### Scenario: Reapply on relaunch is a no-op when already relocated
+- **WHEN** the app is launched again with Space-row switching still enabled and the value already reads relocated
+- **THEN** it makes no further write, so the change is not re-marked as "this session" and becomes effective
 
 #### Scenario: Restore on disabling the opt-in
-- **WHEN** the user turns Space-row switching off
+- **WHEN** the user turns Space-row switching off (or chooses Restore from the menu)
 - **THEN** the app restores the original vertical trackpad values
 
 ### Requirement: Preserve and restore the exact prior vertical-gesture values

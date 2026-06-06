@@ -7,8 +7,11 @@ struct OnboardingView: View {
     let trackpadClaimed: Bool
     let trackpadNeedsRelogin: Bool
     let spacesAutoRearrangeOn: Bool
+    let spaceRowSwitchingOn: Bool
+    let spaceRowNeedsRelogin: Bool
     let onSetupNativeGesture: () -> Void
     let onKeepSpacesFixed: () -> Void
+    let onEnableSpaceRowSwitching: () -> Void
     let onRefresh: () -> Void
 
     var body: some View {
@@ -72,6 +75,24 @@ struct OnboardingView: View {
                         Button("Keep Spaces in a fixed order…", action: onKeepSpacesFixed)
                     } else {
                         Label("Spaces stay in a fixed order — the switcher's row order is stable.", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(6)
+            }
+
+            GroupBox("Space-row switching (optional)") {
+                VStack(alignment: .leading, spacing: 8) {
+                    if !spaceRowSwitchingOn {
+                        Label("Slide three fingers up/down while the switcher is open to switch Spaces. This moves Mission Control / App Exposé to four fingers.", systemImage: "arrow.up.arrow.down.circle")
+                            .foregroundStyle(.secondary)
+                        Button("Enable Space-row switching…", action: onEnableSpaceRowSwitching)
+                    } else if spaceRowNeedsRelogin {
+                        Label("Enabled. Log out and back in (or restart) so macOS frees the three-finger up/down swipe.", systemImage: "arrow.clockwise.circle.fill")
+                            .foregroundStyle(.orange)
+                    } else {
+                        Label("Space-row switching is on. Mission Control / App Exposé are on four-finger up/down.", systemImage: "checkmark.circle.fill")
                             .foregroundStyle(.green)
                     }
                 }

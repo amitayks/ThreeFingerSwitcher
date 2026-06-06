@@ -82,6 +82,10 @@ if [ -n "${INSTALL_DIR:-}" ]; then
     DEST="$INSTALL_DIR/$APP"
     echo "▸ installing in place → $DEST (same path + signature: Open-at-Login stays registered)"
     if rm -rf "$DEST" 2>/dev/null && ditto "$APP" "$DEST" 2>/dev/null; then
+        # Remove the local working copy so it isn't indexed by Launch Services / Spotlight as a
+        # second "ThreeFingerSwitcher" alongside the canonical install. (Skipped for non-INSTALL
+        # builds below, where the local copy IS the deliverable.)
+        rm -rf "$APP"
         echo "✓ built + installed: $DEST  (run: open \"$DEST\")"
     else
         echo "✗ could not write to $INSTALL_DIR (permissions?). Run once with elevation:"

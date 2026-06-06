@@ -10,6 +10,7 @@ private final class MockDelegate: GestureRecognizerDelegate {
         case activate
         case step(Int)
         case stepRow(Int)
+        case missionControl(Bool)   // true = up (Mission Control), false = down (App Exposé)
         case commit
         case cancel
     }
@@ -21,11 +22,13 @@ private final class MockDelegate: GestureRecognizerDelegate {
     var cancelCount: Int { events.filter { $0 == .cancel }.count }
     var steps: [Int] { events.compactMap { if case let .step(d) = $0 { return d } else { return nil } } }
     var stepRows: [Int] { events.compactMap { if case let .stepRow(d) = $0 { return d } else { return nil } } }
+    var missionControls: [Bool] { events.compactMap { if case let .missionControl(up) = $0 { return up } else { return nil } } }
     var didActivate: Bool { activateCount > 0 }
 
     func gestureDidActivate() { events.append(.activate) }
     func gestureDidStep(_ direction: Int) { events.append(.step(direction)) }
     func gestureDidStepRow(_ direction: Int) { events.append(.stepRow(direction)) }
+    func gestureDidTriggerMissionControl(up: Bool) { events.append(.missionControl(up)) }
     func gestureDidCommit() { events.append(.commit) }
     func gestureDidCancel() { events.append(.cancel) }
 }
@@ -58,10 +61,13 @@ final class GestureRecognizerTests: XCTestCase {
         return settings
     }
 
-    private func makeRecognizer(_ settings: AppSettings) -> (GestureRecognizer, MockDelegate) {
+    private func makeRecognizer(_ settings: AppSettings, rowSwitching: Bool = false) -> (GestureRecognizer, MockDelegate) {
         let delegate = MockDelegate()
         let recognizer = GestureRecognizer(settings: settings)
         recognizer.delegate = delegate
+        // Vertical row stepping is gated: the coordinator only enables it when the Space-row
+        // switching opt-in is effective. Tests that exercise row steps must opt in explicitly.
+        recognizer.rowSwitchingEnabled = rowSwitching
         return (recognizer, delegate)
     }
 
@@ -233,7 +239,7 @@ final class GestureRecognizerTests: XCTestCase {
     func test_rowStep_onlyAfterActivation_verticalTravelPastRowStepDistance() {
         // Arrange: rowStepDistance 0.10.
         let settings = makeSettings(activationThreshold: 0.045, stepDistance: 0.05, rowStepDistance: 0.10)
-        let (rec, delegate) = makeRecognizer(settings)
+        let (rec, delegate) = makeRecognizer(settings, rowSwitching: true)
 
         // Act: activate horizontally, THEN move vertically past 2 * rowStepDistance.
         feed(rec, x: 0.20, y: 0.50)        // begin
@@ -266,7 +272,7 @@ final class GestureRecognizerTests: XCTestCase {
     func test_rowStepReversal_downAfterUp() {
         // Arrange
         let settings = makeSettings(activationThreshold: 0.045, rowStepDistance: 0.10)
-        let (rec, delegate) = makeRecognizer(settings)
+        let (rec, delegate) = makeRecognizer(settings, rowSwitching: true)
 
         // Act
         feed(rec, x: 0.20, y: 0.50)        // begin
@@ -282,7 +288,7 @@ final class GestureRecognizerTests: XCTestCase {
     func test_reverseVerticalDirection_flipsRowStepSign() {
         // Arrange
         let settings = makeSettings(activationThreshold: 0.045, rowStepDistance: 0.10, reverseVerticalDirection: true)
-        let (rec, delegate) = makeRecognizer(settings)
+        let (rec, delegate) = makeRecognizer(settings, rowSwitching: true)
 
         // Act: finger moves up (y increases) after activation.
         feed(rec, x: 0.20, y: 0.50)        // begin
@@ -296,7 +302,7 @@ final class GestureRecognizerTests: XCTestCase {
     func test_postActivation_combinedDiagonal_emitsBothWindowAndRowSteps() {
         // Arrange: after activation the recognizer is 2D; a diagonal move emits both kinds.
         let settings = makeSettings(activationThreshold: 0.045, stepDistance: 0.05, rowStepDistance: 0.10)
-        let (rec, delegate) = makeRecognizer(settings)
+        let (rec, delegate) = makeRecognizer(settings, rowSwitching: true)
 
         // Act
         feed(rec, x: 0.20, y: 0.50)        // begin
@@ -306,6 +312,145 @@ final class GestureRecognizerTests: XCTestCase {
         // Assert
         XCTAssertEqual(delegate.steps, [1, 1])
         XCTAssertEqual(delegate.stepRows, [1, 1])
+    }
+
+    // MARK: - (4b) Row stepping gated by the Space-row switching opt-in
+
+    func test_rowSwitchingDisabled_postActivationVertical_emitsNoRowSteps() {
+        // Arrange: opt-in OFF (default) — vertical must be left entirely to the OS, even after
+        // a horizontal activation, so the native Mission Control / App Exposé gesture isn't stolen.
+        let settings = makeSettings(activationThreshold: 0.045, stepDistance: 0.05, rowStepDistance: 0.10)
+        let (rec, delegate) = makeRecognizer(settings, rowSwitching: false)
+
+        // Act: activate horizontally, then move vertically well past 2 * rowStepDistance.
+        feed(rec, x: 0.20, y: 0.50)        // begin
+        feed(rec, x: 0.26, y: 0.50)        // activate
+        feed(rec, x: 0.26, y: 0.701)       // +~0.20 vertical -> would be 2 row steps if enabled
+
+        // Assert: activated, but zero row steps because the opt-in is off.
+        XCTAssertTrue(delegate.didActivate)
+        XCTAssertTrue(delegate.stepRows.isEmpty)
+    }
+
+    func test_rowSwitchingDisabled_diagonal_stillStepsWindowsButNoRows() {
+        // Arrange: opt-in OFF — horizontal window stepping must be unaffected by the gate.
+        let settings = makeSettings(activationThreshold: 0.045, stepDistance: 0.05, rowStepDistance: 0.10)
+        let (rec, delegate) = makeRecognizer(settings, rowSwitching: false)
+
+        // Act: activate, then a diagonal move (horizontal + vertical).
+        feed(rec, x: 0.20, y: 0.50)        // begin
+        feed(rec, x: 0.26, y: 0.50)        // activate (lastCentroid 0.26, 0.50)
+        feed(rec, x: 0.361, y: 0.701)      // +~0.10 x (2 steps), +~0.20 y (would be 2 rows)
+
+        // Assert: window steps still happen; row steps are suppressed.
+        XCTAssertEqual(delegate.steps, [1, 1])
+        XCTAssertTrue(delegate.stepRows.isEmpty)
+    }
+
+    func test_rowSwitchingDisabled_liftAfterActivation_stillCommits() {
+        // Arrange: the gate only affects vertical row stepping, not the commit lifecycle.
+        let settings = makeSettings(activationThreshold: 0.045)
+        let (rec, delegate) = makeRecognizer(settings, rowSwitching: false)
+
+        // Act
+        feed(rec, x: 0.40, y: 0.50, fingers: 3)   // begin
+        feed(rec, x: 0.46, y: 0.50, fingers: 3)   // activate
+        feed(rec, x: 0.46, y: 0.50, fingers: 0)   // lift
+
+        // Assert
+        XCTAssertEqual(delegate.commitCount, 1)
+        XCTAssertEqual(delegate.cancelCount, 0)
+    }
+
+    func test_rowSwitchingEnabled_freshVerticalUp_triggersMissionControlOnce() {
+        // Arrange: with the gate ON the app owns the vertical gesture — a fresh vertical-up swipe
+        // (no horizontal activation) triggers Mission Control ourselves, exactly once per gesture.
+        let settings = makeSettings()
+        let (rec, delegate) = makeRecognizer(settings, rowSwitching: true)
+
+        // Act: dominantly-vertical UP scrub past the Mission Control threshold (0.10).
+        feed(rec, x: 0.5, y: 0.5)          // begin
+        feed(rec, x: 0.5, y: 0.7)          // dy=+0.2 -> vertical lock, past threshold -> MC (up)
+        feed(rec, x: 0.5, y: 0.9)          // continue up -> must NOT re-fire
+
+        // Assert: Mission Control (up) exactly once; no activation, no row steps.
+        XCTAssertEqual(delegate.missionControls, [true])
+        XCTAssertFalse(delegate.didActivate)
+        XCTAssertTrue(delegate.stepRows.isEmpty)
+    }
+
+    func test_rowSwitchingEnabled_freshVerticalDown_triggersAppExpose() {
+        // Arrange
+        let settings = makeSettings()
+        let (rec, delegate) = makeRecognizer(settings, rowSwitching: true)
+
+        // Act: vertical DOWN past threshold -> App Exposé (up:false).
+        feed(rec, x: 0.5, y: 0.5)
+        feed(rec, x: 0.5, y: 0.3)          // dy=-0.2 down
+
+        // Assert
+        XCTAssertEqual(delegate.missionControls, [false])
+        XCTAssertFalse(delegate.didActivate)
+    }
+
+    func test_rowSwitchingDisabled_freshVertical_noMissionControl_yieldsToOS() {
+        // Arrange: gate OFF — vertical is left entirely to the OS, we never trigger MC ourselves.
+        let settings = makeSettings()
+        let (rec, delegate) = makeRecognizer(settings, rowSwitching: false)
+
+        // Act: a big fresh vertical scrub.
+        feed(rec, x: 0.5, y: 0.5)
+        feed(rec, x: 0.5, y: 0.8)
+
+        // Assert: nothing emitted at all (OS owns it).
+        XCTAssertTrue(delegate.missionControls.isEmpty)
+        XCTAssertTrue(delegate.events.isEmpty)
+    }
+
+    func test_rowSwitchingEnabled_smallVerticalBelowThreshold_noMissionControl() {
+        // Arrange: gate ON but the vertical travel stays under the 0.10 MC threshold.
+        let settings = makeSettings()
+        let (rec, delegate) = makeRecognizer(settings, rowSwitching: true)
+
+        // Act: small vertical wiggle.
+        feed(rec, x: 0.5, y: 0.5)
+        feed(rec, x: 0.5, y: 0.55)         // dy=+0.05 < 0.10
+
+        // Assert: no Mission Control yet.
+        XCTAssertTrue(delegate.missionControls.isEmpty)
+    }
+
+    func test_rowSwitchingEnabled_preActivationVertical_thenActivate_noBufferedRowSteps() {
+        // Arrange: gate ON, high activation threshold. Lock horizontal, do a large pre-activation
+        // vertical move, THEN cross activation — buffered vertical must NOT flush into row steps.
+        let settings = makeSettings(activationThreshold: 0.20, stepDistance: 0.05, rowStepDistance: 0.10)
+        let (rec, delegate) = makeRecognizer(settings, rowSwitching: true)
+
+        // Act
+        feed(rec, x: 0.40, y: 0.50)        // begin
+        feed(rec, x: 0.43, y: 0.50)        // dx=0.03 -> horizontal lock, below activation (0.20)
+        feed(rec, x: 0.43, y: 0.90)        // large pre-activation vertical (must not buffer)
+        feed(rec, x: 0.62, y: 0.90)        // dx=0.22 from start -> activates; accumulators reset
+
+        // Assert: activated, but no row steps leaked from the pre-activation vertical travel.
+        XCTAssertTrue(delegate.didActivate)
+        XCTAssertTrue(delegate.stepRows.isEmpty, "pre-activation vertical must not flush into row steps")
+    }
+
+    func test_rowSwitchingEnabled_horizontalScrubWithSmallVerticalWobble_noRowSteps() {
+        // Arrange: gate ON. Horizontal scrubbing with incidental vertical wobble below the
+        // row-step distance must produce window steps but no row flips.
+        let settings = makeSettings(activationThreshold: 0.045, stepDistance: 0.05, rowStepDistance: 0.10)
+        let (rec, delegate) = makeRecognizer(settings, rowSwitching: true)
+
+        // Act
+        feed(rec, x: 0.20, y: 0.50)        // begin
+        feed(rec, x: 0.26, y: 0.50)        // activate
+        feed(rec, x: 0.40, y: 0.52)        // +0.14 x (window steps), +0.02 y (< 0.10 row step)
+
+        // Assert
+        XCTAssertFalse(delegate.steps.isEmpty, "horizontal travel still steps windows")
+        XCTAssertTrue(delegate.stepRows.isEmpty, "small vertical wobble must not flip rows")
     }
 
     // MARK: - (5) Fourth finger cancels

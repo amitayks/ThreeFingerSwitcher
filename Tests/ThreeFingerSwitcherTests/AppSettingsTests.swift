@@ -59,6 +59,22 @@ final class AppSettingsTests: XCTestCase {
 
         // `enabled` has no entry in Defaults; its first-run value is hardcoded to true.
         XCTAssertTrue(settings.enabled)
+
+        // Space-row switching is opt-in: off by default (it relocates Mission Control).
+        XCTAssertEqual(settings.manageVerticalGesture, AppSettings.Defaults.manageVerticalGesture)
+        XCTAssertFalse(settings.manageVerticalGesture)
+    }
+
+    /// `manageVerticalGesture` is opt-in (default false) and persists across instances both ways.
+    func testManageVerticalGestureDefaultsFalseAndPersists() {
+        let writer = makeSettings()
+        XCTAssertFalse(writer.manageVerticalGesture, "default must be off (opt-in)")
+
+        writer.manageVerticalGesture = true
+        XCTAssertEqual(defaults.object(forKey: "manageVerticalGesture") as? Bool, true, "writes the documented key")
+
+        let reader = AppSettings(defaults: defaults)
+        XCTAssertTrue(reader.manageVerticalGesture, "persists across instances")
     }
 
     /// Spot-check the literal default values so a silent change to `Defaults` is caught.
@@ -240,6 +256,21 @@ final class AppSettingsTests: XCTestCase {
 
         // Assert: enabled is left untouched by reset.
         XCTAssertFalse(settings.enabled)
+    }
+
+    /// `resetToDefaults()` must NOT touch `manageVerticalGesture`: like `manageSpacesRearrange`, it
+    /// is a consent-gated opt-in with a system side effect (it relocates Mission Control), so a
+    /// tunables reset must never silently flip it and leave the trackpad change dangling.
+    func testResetToDefaultsDoesNotTouchManageVerticalGesture() {
+        // Arrange
+        let settings = makeSettings()
+        settings.manageVerticalGesture = true
+
+        // Act
+        settings.resetToDefaults()
+
+        // Assert: still on (reset doesn't manage system-side-effect opt-ins).
+        XCTAssertTrue(settings.manageVerticalGesture)
     }
 
     // MARK: - Stored-value loading

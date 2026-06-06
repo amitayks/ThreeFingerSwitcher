@@ -48,6 +48,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             menu.addItem(item("Restore native gesture setting…", #selector(restoreNativeGesture)))
         }
 
+        if coordinator.verticalGesture.hasBackup {
+            menu.addItem(item("Restore three-finger up/down (Mission Control)…", #selector(restoreVerticalGesture)))
+        }
+
         let loginItem = NSMenuItem(title: "Open at Login", action: #selector(toggleOpenAtLogin), keyEquivalent: "")
         loginItem.target = self
         loginItem.state = coordinator.isOpenAtLogin ? .on : .off
@@ -79,6 +83,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func toggleEnabled() { coordinator.toggleEnabled() }
     @objc private func setupNativeGesture() { coordinator.promptNativeGestureSetup() }
     @objc private func restoreNativeGesture() { coordinator.restoreNativeGestureSetting() }
+    @objc private func restoreVerticalGesture() { coordinator.restoreVerticalGestureSetting() }
     @objc private func toggleOpenAtLogin() { coordinator.toggleOpenAtLogin() }
     @objc private func showSettings() { coordinator.showSettings() }
     @objc private func showOnboarding() { coordinator.showOnboarding() }

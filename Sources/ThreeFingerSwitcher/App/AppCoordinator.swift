@@ -18,6 +18,8 @@ final class AppCoordinator: GestureRecognizerDelegate {
     private let touchEngine = TouchEngine()
     private lazy var recognizer = GestureRecognizer(settings: settings)
     let spacesRearrange = SpacesRearrangeConfig()
+    let verticalGesture = VerticalGestureConfig()
+    private let scrollTap = ScrollEventTap()
     private var cancellables: Set<AnyCancellable> = []
 
     private var settingsWindow: NSWindow?
@@ -28,12 +30,21 @@ final class AppCoordinator: GestureRecognizerDelegate {
 
     var onStateChange: (() -> Void)?
 
+    /// Live finger count from the most recent touch frame; drives the scroll tap's consume rule
+    /// (the switcher owns all three-finger scroll so it never leaks to the background).
+    private var currentFingerCount = 0
+
     init() {
         recognizer.delegate = self
-        touchEngine.onFrame = { [weak self] frame in self?.recognizer.feed(frame) }
+        touchEngine.onFrame = { [weak self] frame in
+            self?.currentFingerCount = frame.fingerCount
+            self?.recognizer.feed(frame)
+        }
+        scrollTap.consumePredicate = { [weak self] in (self?.currentFingerCount ?? 0) >= 3 }
         thumbnails.onThumbnail = { [weak self] id, image in self?.overlay.model.setThumbnail(image, for: id) }
         observeSleepWake()
         observeSpacesRearrangeToggle()
+        observeVerticalGestureToggle()
     }
 
     deinit {
@@ -79,10 +90,15 @@ final class AppCoordinator: GestureRecognizerDelegate {
             NSLog("[ThreeFingerSwitcher] off-Space window support disabled (private CGS symbols unavailable); using current-Space only.")
         }
         permissions.refresh()
+        // Reapply the vertical-gesture relocation before enabling so the recognizer's row-switching
+        // gate reflects the effective state from the first gesture.
+        applyVerticalGestureOnLaunchIfManaged()
         if settings.enabled { enable() }
+        refreshRowSwitchingGate()
         maybePromptNativeGestureSetup()
         applySpacesRearrangeOnLaunchIfManaged()
         maybePromptSpacesRearrange()
+        maybePromptVerticalGesture()
         if !permissions.allRequiredGranted { showOnboarding() }
     }
 
@@ -95,6 +111,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         touchEngine.start()
         isEnabled = touchEngine.isAvailable
         settings.enabled = true
+        refreshRowSwitchingGate()
         onStateChange?()
     }
 
@@ -102,6 +119,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         guard isEnabled else { return }
         recognizer.reset()
         touchEngine.stop()
+        scrollTap.stop()
         mru.stop()
         overlay.hide()
         isEnabled = false
@@ -238,6 +256,12 @@ final class AppCoordinator: GestureRecognizerDelegate {
         guard row != overlay.currentRow else { return }
         overlay.updateRow(row)
         prefetchCurrentRow()
+    }
+
+    func gestureDidTriggerMissionControl(up: Bool) {
+        // A fresh three-finger vertical swipe while we own the gesture: open the OS overview
+        // ourselves (the native gesture is disabled to a scroll, which the scroll tap consumes).
+        MissionControl.trigger(up: up)
     }
 
     private func prefetchCurrentRow() {
@@ -412,6 +436,126 @@ final class AppCoordinator: GestureRecognizerDelegate {
         _ = spacesRearrange.restore()
     }
 
+    // MARK: - Space-row switching (vertical gesture)
+
+    private let didPromptVerticalKey = "didPromptVerticalGesture"
+
+    /// Whether vertical Space-row switching is *effective*: the opt-in is on AND the native
+    /// three-finger vertical gesture has actually been relocated (freed) and that change has taken
+    /// effect at runtime (not merely written this session — the trackpad change needs a re-login).
+    var isSpaceRowSwitchingEffective: Bool {
+        settings.manageVerticalGesture && verticalGesture.isEffectivelyFree
+    }
+
+    /// Push the effective state into the recognizer so vertical motion only steps Space-rows (and a
+    /// fresh vertical swipe only triggers Mission Control ourselves) when the OS has genuinely
+    /// released the three-finger vertical swipe. Also runs the scroll tap exactly while the feature
+    /// is live, so the freed three-finger scroll is consumed instead of leaking to the background.
+    private func refreshRowSwitchingGate() {
+        let effective = isSpaceRowSwitchingEffective
+        recognizer.rowSwitchingEnabled = effective
+        if effective && isEnabled {
+            _ = scrollTap.start()
+        } else {
+            scrollTap.stop()
+        }
+    }
+
+    /// React to the Settings toggle: enabling relocates the native vertical gesture, disabling
+    /// restores it. The persisted initial value is skipped (`dropFirst`); launch-apply is handled
+    /// in `start()`. Mirrors `observeSpacesRearrangeToggle`.
+    private func observeVerticalGestureToggle() {
+        settings.$manageVerticalGesture
+            .dropFirst()
+            .sink { [weak self] enabled in
+                MainActor.assumeIsolated { self?.handleVerticalGestureToggle(enabled) }
+            }
+            .store(in: &cancellables)
+    }
+
+    private func handleVerticalGestureToggle(_ enabled: Bool) {
+        if enabled {
+            applyVerticalGesture()
+        } else if verticalGesture.hasBackup {
+            _ = verticalGesture.restore()
+        }
+        refreshRowSwitchingGate()
+    }
+
+    private func applyVerticalGestureOnLaunchIfManaged() {
+        guard settings.manageVerticalGesture else { return }
+        applyVerticalGesture()
+    }
+
+    /// Relocate the native three-finger vertical gesture to four fingers; surface a non-fatal
+    /// warning if the write failed (e.g. a managed preference). A no-op when already free.
+    private func applyVerticalGesture() {
+        guard !verticalGesture.relocateToFourFingers() else { return }
+        infoAlert(
+            title: "Couldn't change the trackpad setting",
+            text: """
+            Moving Mission Control / App Exposé to four fingers didn't succeed. If your Mac is \
+            managed (MDM), this setting may be locked. You can change it manually in System \
+            Settings ▸ Trackpad ▸ More Gestures (set Mission Control to “Swipe Up with Four Fingers”).
+            """
+        )
+    }
+
+    /// First-run consent, mirroring the spaces-rearrange prompt: ask once, only when the gesture is
+    /// actually on three fingers and the user hasn't already opted in.
+    private func maybePromptVerticalGesture() {
+        let alreadyPrompted = UserDefaults.standard.bool(forKey: didPromptVerticalKey)
+        guard !alreadyPrompted, !settings.manageVerticalGesture, verticalGesture.isClaimed else { return }
+        UserDefaults.standard.set(true, forKey: didPromptVerticalKey)
+        promptVerticalGestureSetup()
+    }
+
+    func promptVerticalGestureSetup() {
+        guard verticalGesture.isClaimed else {
+            infoAlert(title: "Already set up",
+                      text: "Three-finger up/down is already free for Space-row switching. Mission Control / App Exposé are on four fingers.")
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Enable Space-row switching?"
+        alert.informativeText = """
+        Switch between Spaces by sliding three fingers up/down while the switcher is open. To free \
+        that gesture, this app moves Mission Control and App Exposé to four fingers.
+
+        They keep working on four-finger up/down. Your previous setting is saved — turn Space-row \
+        switching off (or pick Restore from the menu) to put it back. A logout/restart is required \
+        for the change to take effect, and it stays applied across logins until you turn it off.
+        """
+        alert.addButton(withTitle: "Enable Space-row switching")
+        alert.addButton(withTitle: "Not now")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            settings.manageVerticalGesture = true   // observer applies the change and persists the opt-in
+            infoAlert(
+                title: "Almost there — restart to finish",
+                text: "Log out and back in (or restart) so macOS frees the three-finger vertical swipe. Space-row switching turns on automatically after that."
+            )
+            onStateChange?()
+        }
+    }
+
+    func restoreVerticalGestureSetting() {
+        guard verticalGesture.hasBackup else {
+            infoAlert(title: "Nothing to restore", text: "No saved trackpad setting was found.")
+            return
+        }
+        let ok = verticalGesture.restore()
+        settings.manageVerticalGesture = false
+        infoAlert(title: ok ? "Restored" : "Restore failed",
+                  text: ok ? "Mission Control / App Exposé were restored to three fingers. Log out and back in for it to take effect."
+                           : "Could not restore the setting. Adjust it manually in System Settings ▸ Trackpad.")
+        onStateChange?()
+    }
+
+    // The vertical-gesture relocation is intentionally not restored on quit (see AppDelegate):
+    // it needs a re-login to take effect, so reverting on logout would prevent it ever engaging.
+    // Restore happens only on explicit opt-out (`handleVerticalGestureToggle`) or the menu action.
+
     // MARK: - Windows
 
     func showSettings() {
@@ -434,8 +578,11 @@ final class AppCoordinator: GestureRecognizerDelegate {
                 trackpadClaimed: trackpadConfig.isClaimed,
                 trackpadNeedsRelogin: trackpadConfig.needsReloginWarning,
                 spacesAutoRearrangeOn: spacesRearrange.isAutoRearrangeOn,
+                spaceRowSwitchingOn: settings.manageVerticalGesture,
+                spaceRowNeedsRelogin: verticalGesture.needsReloginWarning,
                 onSetupNativeGesture: { [weak self] in self?.promptNativeGestureSetup() },
                 onKeepSpacesFixed: { [weak self] in self?.promptSpacesRearrangeSetup() },
+                onEnableSpaceRowSwitching: { [weak self] in self?.promptVerticalGestureSetup() },
                 onRefresh: { [weak self] in self?.permissions.refresh() }
             )
             let host = NSHostingController(rootView: view)

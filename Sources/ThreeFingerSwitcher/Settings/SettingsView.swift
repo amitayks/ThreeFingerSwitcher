@@ -16,6 +16,7 @@ struct SettingsView: View {
                 slider("Row-step distance (one Space per…)", value: $settings.rowStepDistance,
                        range: 0.05...0.30, format: "%.3f",
                        help: "Vertical finger travel needed to switch to the next Space's row. Keep this larger than the step distance so horizontal scrubbing doesn't flip rows.")
+                    .disabled(!settings.manageVerticalGesture)
                 slider("Axis-lock ratio", value: $settings.axisLockRatio,
                        range: 1.0...3.0, format: "%.2f",
                        help: "How strongly horizontal must dominate vertical to scrub instead of yielding to Mission Control.")
@@ -28,7 +29,15 @@ struct SettingsView: View {
                 Toggle("Wrap around at the ends of the list", isOn: $settings.wrapAtEnds)
                 Toggle("Reverse direction", isOn: $settings.reverseDirection)
                 Toggle("Reverse vertical (Space-row) direction", isOn: $settings.reverseVerticalDirection)
+                    .disabled(!settings.manageVerticalGesture)
                 Toggle("Require exactly three fingers", isOn: $settings.requireExactlyThree)
+            }
+
+            Section("Space-row switching") {
+                Toggle("Switch Spaces by sliding up/down", isOn: $settings.manageVerticalGesture)
+                Text("Slide three fingers up/down while the switcher is open to move between Spaces. To free that gesture, this moves Mission Control / App Exposé to four-finger up/down (they keep working there). Changes a system setting that stays applied until you turn this off; a logout/restart is required for it to take effect.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Spaces") {
