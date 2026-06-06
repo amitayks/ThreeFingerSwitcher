@@ -109,6 +109,9 @@ jobs:
           set -euo pipefail
           SIGN_ID="$SIGN_ID" NOTARIZE=1 ./scripts/build-app.sh
 
+      - name: Install create-dmg (styled DMG window)
+        run: brew install create-dmg
+
       - name: Package DMG
         id: dmg
         run: |
