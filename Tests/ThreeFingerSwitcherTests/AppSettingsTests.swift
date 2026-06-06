@@ -154,6 +154,7 @@ final class AppSettingsTests: XCTestCase {
         writer.reverseDirection = true          // default false -> true
         writer.requireExactlyThree = false      // default true -> false
         writer.reverseVerticalDirection = true  // default false -> true
+        writer.showDiagnostics = true           // default false -> true
 
         // Assert
         let reader = AppSettings(defaults: defaults)
@@ -162,6 +163,7 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertTrue(reader.reverseDirection)
         XCTAssertFalse(reader.requireExactlyThree)
         XCTAssertTrue(reader.reverseVerticalDirection)
+        XCTAssertTrue(reader.showDiagnostics)
     }
 
     /// Persistence writes through to the raw UserDefaults keys (verifies the actual key names),
@@ -209,6 +211,7 @@ final class AppSettingsTests: XCTestCase {
         settings.requireExactlyThree = false
         settings.rowStepDistance = 0.5
         settings.reverseVerticalDirection = true
+        settings.showDiagnostics = true
 
         // Act
         settings.resetToDefaults()
@@ -223,6 +226,8 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertEqual(settings.requireExactlyThree, AppSettings.Defaults.requireExactlyThree)
         XCTAssertEqual(settings.rowStepDistance, AppSettings.Defaults.rowStepDistance, accuracy: eps)
         XCTAssertEqual(settings.reverseVerticalDirection, AppSettings.Defaults.reverseVerticalDirection)
+        XCTAssertEqual(settings.showDiagnostics, AppSettings.Defaults.showDiagnostics)
+        XCTAssertFalse(settings.showDiagnostics, "diagnostics visibility resets to off")
     }
 
     /// `resetToDefaults()` also persists the restored values, so a fresh instance reads defaults.

@@ -4,7 +4,11 @@
 DerivedData/
 .DS_Store
 
+# Release packaging output (DMGs are built by CI / scripts/package-dmg.sh, never committed)
+dist/
+
 # Per-user Claude Code local settings (machine-specific; not shared)
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
 
 working-desk.md

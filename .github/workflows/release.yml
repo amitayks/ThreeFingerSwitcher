@@ -1,0 +1,149 @@
+name: Release
+
+# Tag-driven release: pushing a version tag builds, Developer-ID-signs, notarizes, staples,
+# packages a DMG, and publishes a GitHub Release. Branch pushes never release (see tags filter).
+#
+# Required repository secrets (Settings ▸ Secrets and variables ▸ Actions):
+#   DEVELOPER_ID_P12_BASE64   base64 of your "Developer ID Application" cert exported as .p12
+#   DEVELOPER_ID_P12_PASSWORD password used when exporting that .p12
+#   APPLE_TEAM_ID             your 10-char Team ID (e.g. ABCDE12345)
+#   ASC_API_KEY_BASE64        base64 of the App Store Connect API key .p8
+#   ASC_KEY_ID               the API key's Key ID
+#   ASC_ISSUER_ID            the API key's Issuer ID (UUID)
+# See docs/RELEASING.md for how to produce each value.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'      # stable, e.g. v0.1.0
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'    # pre-release, e.g. v0.1.0-rc1
+
+permissions:
+  contents: write   # create the GitHub Release + upload the DMG
+
+jobs:
+  release:
+    # NOTE: the package is swift-tools-version 6.2 — the runner's Xcode must ship Swift >= 6.2.
+    # Bump this image / the Xcode selection below if the toolchain gate (below) fails.
+    runs-on: macos-15
+    env:
+      PRODUCT: ThreeFingerSwitcher
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode and gate on toolchain (fail fast)
+        run: |
+          set -euo pipefail
+          # Prefer the newest installed Xcode; adjust if a specific one is needed.
+          sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)/Contents/Developer"
+          swift --version
+          SWIFT_VER="$(swift -version 2>&1 | sed -nE 's/.*version ([0-9]+\.[0-9]+).*/\1/p' | head -1)"
+          REQUIRED="6.2"
+          if [ "$(printf '%s\n%s\n' "$REQUIRED" "$SWIFT_VER" | sort -V | head -1)" != "$REQUIRED" ]; then
+            echo "::error::Swift $SWIFT_VER < required $REQUIRED. Bump runs-on / Xcode selection."
+            exit 1
+          fi
+
+      - name: Verify required secrets are present (fail closed)
+        env:
+          DEVELOPER_ID_P12_BASE64:   ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_TEAM_ID:             ${{ secrets.APPLE_TEAM_ID }}
+          ASC_API_KEY_BASE64:        ${{ secrets.ASC_API_KEY_BASE64 }}
+          ASC_KEY_ID:                ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID:             ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -uo pipefail
+          missing=()
+          for v in DEVELOPER_ID_P12_BASE64 DEVELOPER_ID_P12_PASSWORD APPLE_TEAM_ID \
+                   ASC_API_KEY_BASE64 ASC_KEY_ID ASC_ISSUER_ID; do
+            [ -n "${!v:-}" ] || missing+=("$v")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Cannot produce a notarized release — missing secrets: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Derive version from tag
+        id: ver
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"               # e.g. v0.2.0 or v0.2.0-rc1
+          echo "marketing=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "build=${GITHUB_RUN_NUMBER}"      >> "$GITHUB_OUTPUT"
+          if [[ "$TAG" == *-* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT";
+          else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Import Developer ID into an ephemeral keychain
+        env:
+          DEVELOPER_ID_P12_BASE64:   ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KPW="$(uuidgen)"
+          security create-keychain -p "$KPW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KPW" "$KEYCHAIN"
+          # Decode + import the cert (no secret echoed).
+          printf '%s' "$DEVELOPER_ID_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$DEVELOPER_ID_P12_PASSWORD" \
+            -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # Allow codesign to use the key without an interactive prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KPW" "$KEYCHAIN" >/dev/null
+          # Put our keychain first in the search list so codesign finds the identity.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed s/\"//g)
+          SIGN_ID="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | grep 'Developer ID Application' | head -1 | sed -E 's/.*"(.*)".*/\1/')"
+          if [ -z "$SIGN_ID" ]; then echo "::error::no Developer ID Application identity in keychain"; exit 1; fi
+          echo "SIGN_ID=$SIGN_ID"   >> "$GITHUB_ENV"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          echo "::add-mask::$SIGN_ID"
+
+      - name: Build + sign (Developer ID, hardened runtime, secure timestamp)
+        env:
+          MARKETING_VERSION: ${{ steps.ver.outputs.marketing }}
+          BUILD_VERSION:     ${{ steps.ver.outputs.build }}
+        run: |
+          set -euo pipefail
+          SIGN_ID="$SIGN_ID" NOTARIZE=1 ./scripts/build-app.sh
+
+      - name: Package DMG
+        id: dmg
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.marketing }}" ./scripts/package-dmg.sh
+          echo "path=dist/${PRODUCT}-${{ steps.ver.outputs.marketing }}.dmg" >> "$GITHUB_OUTPUT"
+
+      - name: Notarize + staple
+        env:
+          ASC_API_KEY_BASE64: ${{ secrets.ASC_API_KEY_BASE64 }}
+          ASC_KEY_ID:         ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID:      ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$ASC_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/asc.p8"
+          # Apple's notary service backlog can exceed 30 min on a slow day; give it real
+          # headroom (the job's own 6h cap still bounds it) so a slow-but-valid submission
+          # isn't failed by an impatient client timeout.
+          xcrun notarytool submit "${{ steps.dmg.outputs.path }}" \
+            --key "$RUNNER_TEMP/asc.p8" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
+            --wait --timeout 2h
+          rm -f "$RUNNER_TEMP/asc.p8"
+          xcrun stapler staple "${{ steps.dmg.outputs.path }}"
+          xcrun stapler validate "${{ steps.dmg.outputs.path }}"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.dmg.outputs.path }}
+          generate_release_notes: true
+          prerelease: ${{ steps.ver.outputs.prerelease }}
+          fail_on_unmatched_files: true
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          security delete-keychain "${KEYCHAIN:-}" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/asc.p8" 2>/dev/null || true

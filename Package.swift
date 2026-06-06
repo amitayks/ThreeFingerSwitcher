@@ -53,6 +53,15 @@ let package = Package(
                 .product(name: "OpenMultitouchSupport", package: "OpenMultitouchSupport")
             ],
             path: "Sources/TouchSpike"
+        ),
+        // Throwaway harness for the four-finger-launcher spikes (S-OQ1 haptics, S-OQ3 window move).
+        // Not bundled in the shipped app.
+        .executableTarget(
+            name: "LauncherSpike",
+            path: "Sources/LauncherSpike",
+            swiftSettings: [
+                .swiftLanguageMode(.v5)
+            ]
         )
     ]
 )

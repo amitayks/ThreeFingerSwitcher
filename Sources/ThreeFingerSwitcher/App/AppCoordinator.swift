@@ -19,11 +19,34 @@ final class AppCoordinator: GestureRecognizerDelegate {
     private lazy var recognizer = GestureRecognizer(settings: settings)
     let spacesRearrange = SpacesRearrangeConfig()
     let verticalGesture = VerticalGestureConfig()
+    let fourFingerGesture = FourFingerGestureConfig()
     private let scrollTap = ScrollEventTap()
     private var cancellables: Set<AnyCancellable> = []
 
+    // Four-finger launcher.
+    private let favoritesStore = FavoritesStore.shared
+    private let launcherOverlay = LauncherOverlayController()
+    private lazy var launchService = LaunchService(
+        favoritesProvider: { [weak self] in self?.favoritesStore.favorites ?? Favorites() },
+        mover: SpaceWindowMover(),
+        // A foreign single-window app can't be pulled to the current Space, so "go to it": reuse the
+        // switcher's robust off-Space raise (Space switch + Stage-Manager hold-guard + focus watchdog).
+        goToWindow: { [weak self] pid in
+            guard let self, let target = self.windowService.snapshot().first(where: { $0.pid == pid })
+            else { return false }
+            self.windowService.raise(target)
+            return true
+        },
+        // The window a "Close Front Window" action targets — captured when the launcher opened.
+        frontAppProvider: { [weak self] in self?.capturedFrontApp ?? NSWorkspace.shared.frontmostApplication }
+    )
+
+    /// Frontmost app captured at launcher-open time (target for `.action(.closeFrontWindow)`).
+    private var capturedFrontApp: NSRunningApplication?
+
     private var settingsWindow: NSWindow?
     private var onboardingWindow: NSWindow?
+    private var favoritesEditorWindow: NSWindow?
 
     private(set) var isEnabled = false
     var isTrackpadAvailable: Bool { touchEngine.isAvailable }
@@ -34,17 +57,31 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// (the switcher owns all three-finger scroll so it never leaks to the background).
     private var currentFingerCount = 0
 
+    /// Pure decision for the scroll tap: consume (swallow) scroll while three or more fingers are
+    /// down OR while the launcher overlay is open. The launcher-open clause captures the two-finger
+    /// movement that drives launcher navigation so it doesn't scroll the window underneath; with the
+    /// launcher closed it reverts to the `≥3`-fingers rule, leaving normal two-finger scroll alone.
+    static func shouldConsumeScroll(fingerCount: Int, launcherOpen: Bool) -> Bool {
+        fingerCount >= 3 || launcherOpen
+    }
+
     init() {
         recognizer.delegate = self
         touchEngine.onFrame = { [weak self] frame in
             self?.currentFingerCount = frame.fingerCount
             self?.recognizer.feed(frame)
         }
-        scrollTap.consumePredicate = { [weak self] in (self?.currentFingerCount ?? 0) >= 3 }
+        scrollTap.consumePredicate = { [weak self] in
+            guard let self else { return false }
+            return Self.shouldConsumeScroll(fingerCount: self.currentFingerCount,
+                                            launcherOpen: self.launcherOverlay.isVisible)
+        }
         thumbnails.onThumbnail = { [weak self] id, image in self?.overlay.model.setThumbnail(image, for: id) }
+        launcherOverlay.onFire = { [weak self] item, band in self?.launchService.fire(item, inBand: band) }
         observeSleepWake()
         observeSpacesRearrangeToggle()
         observeVerticalGestureToggle()
+        observeLauncherToggle()
     }
 
     deinit {
@@ -93,12 +130,14 @@ final class AppCoordinator: GestureRecognizerDelegate {
         // Reapply the vertical-gesture relocation before enabling so the recognizer's row-switching
         // gate reflects the effective state from the first gesture.
         applyVerticalGestureOnLaunchIfManaged()
+        applyLauncherGestureOnLaunchIfManaged()
         if settings.enabled { enable() }
         refreshRowSwitchingGate()
         maybePromptNativeGestureSetup()
         applySpacesRearrangeOnLaunchIfManaged()
         maybePromptSpacesRearrange()
         maybePromptVerticalGesture()
+        maybePromptLauncher()
         if !permissions.allRequiredGranted { showOnboarding() }
     }
 
@@ -122,6 +161,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         scrollTap.stop()
         mru.stop()
         overlay.hide()
+        launcherOverlay.cancel()
         isEnabled = false
         settings.enabled = false
         onStateChange?()
@@ -162,6 +202,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         guard isEnabled else { return }
         recognizer.reset()
         overlay.hide()
+        launcherOverlay.cancel()
     }
 
     /// Re-subscribe the multitouch listener after wake. Idempotent and guarded against
@@ -285,6 +326,42 @@ final class AppCoordinator: GestureRecognizerDelegate {
 
     func gestureDidCancel() {
         overlay.hide()
+    }
+
+    // MARK: - GestureRecognizerDelegate (four-finger launcher)
+
+    func launcherDidActivate() {
+        let fav = favoritesStore.favorites
+        guard !fav.bands.isEmpty else { return }
+        // Capture the app the user was looking at before the (non-activating) overlay appears, so a
+        // `.action(.closeFrontWindow)` item targets that window rather than whatever is front at fire.
+        let front = NSWorkspace.shared.frontmostApplication
+        capturedFrontApp = (front?.processIdentifier == getpid()) ? capturedFrontApp : front
+        launcherOverlay.show(bands: fav.bands,
+                             startBand: fav.homeBandIndex,
+                             startColumn: fav.resolvedHomeColumn,
+                             dwell: settings.dwellToArmDuration)
+    }
+
+    func launcherDidStepItem(_ direction: Int) {
+        guard launcherOverlay.isVisible else { return }
+        launcherOverlay.stepHorizontal(direction)   // grid cursor / batch switch (on the headers row)
+    }
+
+    func launcherDidStepContext(_ direction: Int) {
+        guard launcherOverlay.isVisible else { return }
+        launcherOverlay.stepVertical(direction)      // grid rows / rise onto the headers row
+    }
+
+    func launcherDidEnd() {
+        // Lift: the controller fires the armed item (or dismisses if nothing armed). Firing is
+        // heterogeneous (app/path/url/shortcut/script/preset); the AX-dependent paths degrade on
+        // their own if Accessibility isn't granted, so we don't gate the whole commit on it.
+        launcherOverlay.end()
+    }
+
+    func launcherDidCancel() {
+        launcherOverlay.cancel()
     }
 
     // MARK: - Native gesture consent
@@ -447,14 +524,25 @@ final class AppCoordinator: GestureRecognizerDelegate {
         settings.manageVerticalGesture && verticalGesture.isEffectivelyFree
     }
 
+    /// Whether the four-finger launcher is *effective*: the opt-in is on AND the native four-finger
+    /// swipes have actually been freed and that change has taken runtime effect (re-login), not
+    /// merely been written this session.
+    var isLauncherEffective: Bool {
+        settings.enableLauncher && fourFingerGesture.isEffectivelyFree
+    }
+
     /// Push the effective state into the recognizer so vertical motion only steps Space-rows (and a
     /// fresh vertical swipe only triggers Mission Control ourselves) when the OS has genuinely
-    /// released the three-finger vertical swipe. Also runs the scroll tap exactly while the feature
-    /// is live, so the freed three-finger scroll is consumed instead of leaking to the background.
+    /// released the three-finger vertical swipe, and so four fingers only drive the launcher once the
+    /// native four-finger swipes are freed. Also runs the scroll tap exactly while *either* feature
+    /// is live, so the freed three/four-finger scroll is consumed instead of leaking to the
+    /// background (the tap's `≥3` consume rule already covers four-finger contact on both axes).
     private func refreshRowSwitchingGate() {
-        let effective = isSpaceRowSwitchingEffective
-        recognizer.rowSwitchingEnabled = effective
-        if effective && isEnabled {
+        let rowEffective = isSpaceRowSwitchingEffective
+        let launcherEffective = isLauncherEffective
+        recognizer.rowSwitchingEnabled = rowEffective
+        recognizer.launcherEnabled = launcherEffective
+        if (rowEffective || launcherEffective) && isEnabled {
             _ = scrollTap.start()
         } else {
             scrollTap.stop()
@@ -556,11 +644,150 @@ final class AppCoordinator: GestureRecognizerDelegate {
     // it needs a re-login to take effect, so reverting on logout would prevent it ever engaging.
     // Restore happens only on explicit opt-out (`handleVerticalGestureToggle`) or the menu action.
 
+    // MARK: - Four-finger launcher opt-in
+
+    private let didPromptLauncherKey = "didPromptLauncher"
+
+    /// React to the Settings toggle: enabling frees the native four-finger swipes, disabling
+    /// restores them. The persisted initial value is skipped (`dropFirst`); launch-apply is handled
+    /// in `start()`. Mirrors `observeVerticalGestureToggle`.
+    private func observeLauncherToggle() {
+        settings.$enableLauncher
+            .dropFirst()
+            .sink { [weak self] enabled in
+                MainActor.assumeIsolated { self?.handleLauncherToggle(enabled) }
+            }
+            .store(in: &cancellables)
+    }
+
+    private func handleLauncherToggle(_ enabled: Bool) {
+        if enabled {
+            applyLauncherGesture()
+        } else if fourFingerGesture.hasBackup {
+            _ = fourFingerGesture.restore()
+        }
+        refreshRowSwitchingGate()
+    }
+
+    private func applyLauncherGestureOnLaunchIfManaged() {
+        guard settings.enableLauncher else { return }
+        applyLauncherGesture()
+    }
+
+    /// Free the native four-finger horizontal/vertical swipes; surface a non-fatal warning if the
+    /// write failed (e.g. a managed preference). A no-op when already free.
+    private func applyLauncherGesture() {
+        guard !fourFingerGesture.freeFourFingerSwipes() else { return }
+        infoAlert(
+            title: "Couldn't change the trackpad setting",
+            text: """
+            Freeing the four-finger swipes for the launcher didn't succeed. If your Mac is managed \
+            (MDM), this setting may be locked. You can change it manually in System Settings ▸ \
+            Trackpad ▸ More Gestures (turn off the four-finger swipe gestures).
+            """
+        )
+    }
+
+    /// First-run consent, mirroring the vertical-gesture prompt: ask once, only when the four-finger
+    /// gesture is still claimed by the OS and the user hasn't already opted in.
+    private func maybePromptLauncher() {
+        let alreadyPrompted = UserDefaults.standard.bool(forKey: didPromptLauncherKey)
+        guard !alreadyPrompted, !settings.enableLauncher, fourFingerGesture.isClaimed else { return }
+        UserDefaults.standard.set(true, forKey: didPromptLauncherKey)
+        promptLauncherSetup()
+    }
+
+    func promptLauncherSetup() {
+        // "Already set up" only when the launcher is on AND the relocation is effective. With the
+        // trackpad keys at their factory default (absent), the gesture still needs freeing, so we
+        // offer rather than reporting it as done.
+        if settings.enableLauncher && fourFingerGesture.isEffectivelyFree {
+            infoAlert(title: "Already set up",
+                      text: "Four-finger swipes are already free and the launcher is on.")
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Enable the four-finger launcher?"
+        alert.informativeText = """
+        Open a launcher of your favorite apps, scripts, and presets by sliding four fingers \
+        horizontally — then dwell on an item and lift to fire it. To free that gesture, this app \
+        turns off the native four-finger swipe gestures (full-screen-app swipe and four-finger \
+        Mission Control).
+
+        Mission Control / App Exposé still work via three-finger up/down. Your previous setting is \
+        saved — turn the launcher off (or pick Restore from the menu) to put it back. A \
+        logout/restart is required for the change to take effect, and it stays applied across \
+        logins until you turn it off.
+        """
+        alert.addButton(withTitle: "Enable the launcher")
+        alert.addButton(withTitle: "Not now")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            settings.enableLauncher = true   // observer applies the change and persists the opt-in
+            infoAlert(
+                title: "Almost there — restart to finish",
+                text: "Log out and back in (or restart) so macOS frees the four-finger swipes. The launcher turns on automatically after that."
+            )
+            onStateChange?()
+        }
+    }
+
+    func restoreLauncherGestureSetting() {
+        guard fourFingerGesture.hasBackup else {
+            infoAlert(title: "Nothing to restore", text: "No saved trackpad setting was found.")
+            return
+        }
+        let ok = fourFingerGesture.restore()
+        settings.enableLauncher = false
+        infoAlert(title: ok ? "Restored" : "Restore failed",
+                  text: ok ? "The native four-finger swipe gestures were restored. Log out and back in for it to take effect."
+                           : "Could not restore the setting. Adjust it manually in System Settings ▸ Trackpad.")
+        onStateChange?()
+    }
+
+    /// Open the favorites editor — the "small IDE" for arranging launcher bands and items.
+    func showFavoritesEditor() {
+        if favoritesEditorWindow == nil {
+            let host = NSHostingController(rootView: FavoritesEditorView(store: favoritesStore))
+            let window = NSWindow(contentViewController: host)
+            window.title = "Favorites"
+            window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+            window.isReleasedWhenClosed = false
+            favoritesEditorWindow = window
+        }
+        present(favoritesEditorWindow)
+    }
+
+    /// Menu-bar quick-add: append the frontmost app to a band without opening the editor (10.2).
+    func addFrontAppToBand(_ bandID: UUID) {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              let url = app.bundleURL else {
+            infoAlert(title: "No front app", text: "Couldn't determine the frontmost application.")
+            return
+        }
+        let title = app.localizedName ?? url.deletingPathExtension().lastPathComponent
+        favoritesStore.addItem(LaunchItem(title: title, icon: .appDefault,
+                                          kind: .app(bundleURL: url, strategy: nil)), toBand: bandID)
+    }
+
+    /// Bands for the status-menu quick-add submenu.
+    var favoriteBands: [ContextBand] { favoritesStore.favorites.bands }
+
     // MARK: - Windows
 
     func showSettings() {
-        if settingsWindow == nil {
-            let host = NSHostingController(rootView: SettingsView(settings: settings))
+        // Rebuild the root view on each open so the actions are wired and `showRestoreMissionControl`
+        // reflects the current backup state (Setup & Permissions and the MC restore live here now).
+        let view = SettingsView(
+            settings: settings,
+            onOpenSetup: { [weak self] in self?.showOnboarding() },
+            onRestoreMissionControl: { [weak self] in self?.restoreVerticalGestureSetting() },
+            showRestoreMissionControl: verticalGesture.hasBackup
+        )
+        if let settingsWindow {
+            (settingsWindow.contentViewController as? NSHostingController<SettingsView>)?.rootView = view
+        } else {
+            let host = NSHostingController(rootView: view)
             let window = NSWindow(contentViewController: host)
             window.title = "Settings"
             window.styleMask = [.titled, .closable, .miniaturizable]
@@ -580,9 +807,12 @@ final class AppCoordinator: GestureRecognizerDelegate {
                 spacesAutoRearrangeOn: spacesRearrange.isAutoRearrangeOn,
                 spaceRowSwitchingOn: settings.manageVerticalGesture,
                 spaceRowNeedsRelogin: verticalGesture.needsReloginWarning,
+                launcherOn: settings.enableLauncher,
+                launcherNeedsRelogin: fourFingerGesture.needsReloginWarning,
                 onSetupNativeGesture: { [weak self] in self?.promptNativeGestureSetup() },
                 onKeepSpacesFixed: { [weak self] in self?.promptSpacesRearrangeSetup() },
                 onEnableSpaceRowSwitching: { [weak self] in self?.promptVerticalGestureSetup() },
+                onEnableLauncher: { [weak self] in self?.promptLauncherSetup() },
                 onRefresh: { [weak self] in self?.permissions.refresh() }
             )
             let host = NSHostingController(rootView: view)

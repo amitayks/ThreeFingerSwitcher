@@ -9,9 +9,12 @@ struct OnboardingView: View {
     let spacesAutoRearrangeOn: Bool
     let spaceRowSwitchingOn: Bool
     let spaceRowNeedsRelogin: Bool
+    let launcherOn: Bool
+    let launcherNeedsRelogin: Bool
     let onSetupNativeGesture: () -> Void
     let onKeepSpacesFixed: () -> Void
     let onEnableSpaceRowSwitching: () -> Void
+    let onEnableLauncher: () -> Void
     let onRefresh: () -> Void
 
     var body: some View {
@@ -93,6 +96,24 @@ struct OnboardingView: View {
                             .foregroundStyle(.orange)
                     } else {
                         Label("Space-row switching is on. Mission Control / App Exposé are on four-finger up/down.", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(6)
+            }
+
+            GroupBox("Four-finger launcher (optional)") {
+                VStack(alignment: .leading, spacing: 8) {
+                    if !launcherOn {
+                        Label("Slide four fingers horizontally to open a launcher of your favorite apps, scripts, and presets. This frees the native four-finger swipe gestures (Mission Control / App Exposé stay on three-finger up/down).", systemImage: "square.grid.2x2")
+                            .foregroundStyle(.secondary)
+                        Button("Enable the four-finger launcher…", action: onEnableLauncher)
+                    } else if launcherNeedsRelogin {
+                        Label("Enabled. Log out and back in (or restart) so macOS frees the four-finger swipes.", systemImage: "arrow.clockwise.circle.fill")
+                            .foregroundStyle(.orange)
+                    } else {
+                        Label("The four-finger launcher is on. Open it by sliding four fingers horizontally.", systemImage: "checkmark.circle.fill")
                             .foregroundStyle(.green)
                     }
                 }

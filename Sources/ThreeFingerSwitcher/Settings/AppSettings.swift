@@ -58,6 +58,31 @@ final class AppSettings: ObservableObject {
     /// vertical. Default OFF — set only via consent (which moves Mission Control to four fingers).
     @Published var manageVerticalGesture: Bool { didSet { defaults.set(manageVerticalGesture, forKey: Keys.manageVerticalGesture) } }
 
+    /// Opt-in to the four-finger launcher. When ON, the recognizer emits four-finger launcher
+    /// intents AND the native four-finger horizontal/vertical swipe gestures are freed (one-time
+    /// re-login). Binding both sides to this one flag mirrors `manageVerticalGesture`: row stepping
+    /// must never be live while the OS still owns the gesture. Default OFF — set only via consent.
+    @Published var enableLauncher: Bool { didSet { defaults.set(enableLauncher, forKey: Keys.enableLauncher) } }
+
+    /// Normalized horizontal centroid travel required to show the launcher (four-finger).
+    @Published var launcherActivationThreshold: Double { didSet { persist(launcherActivationThreshold, Keys.launcherActivationThreshold) } }
+
+    /// Normalized horizontal travel that advances the launcher selection by one item.
+    @Published var launcherStepDistance: Double { didSet { persist(launcherStepDistance, Keys.launcherStepDistance) } }
+
+    /// Normalized vertical travel that switches one context band in the launcher. Larger than the
+    /// item step so horizontal scrubbing jitter doesn't flip bands.
+    @Published var launcherContextStepDistance: Double { didSet { persist(launcherContextStepDistance, Keys.launcherContextStepDistance) } }
+
+    /// Seconds the selection must rest on an item before it arms (then a lift fires it). Brief but
+    /// deliberate — a quick scrub-and-lift never fires.
+    @Published var dwellToArmDuration: Double { didSet { persist(dwellToArmDuration, Keys.dwellToArmDuration) } }
+
+    /// Show the diagnostic tools ("Write Diagnostics", "Copy Focus Log") in the status menu. Off by
+    /// default — these are troubleshooting affordances most users never need, so they're hidden
+    /// behind this toggle to keep the menu tidy.
+    @Published var showDiagnostics: Bool { didSet { defaults.set(showDiagnostics, forKey: Keys.showDiagnostics) } }
+
     /// Shared singleton uses the standard user defaults.
     private convenience init() {
         self.init(defaults: .standard)
@@ -80,6 +105,12 @@ final class AppSettings: ObservableObject {
         focusWatchdogEnabled = defaults.object(forKey: Keys.focusWatchdogEnabled) as? Bool ?? Defaults.focusWatchdogEnabled
         manageSpacesRearrange = defaults.object(forKey: Keys.manageSpacesRearrange) as? Bool ?? Defaults.manageSpacesRearrange
         manageVerticalGesture = defaults.object(forKey: Keys.manageVerticalGesture) as? Bool ?? Defaults.manageVerticalGesture
+        enableLauncher = defaults.object(forKey: Keys.enableLauncher) as? Bool ?? Defaults.enableLauncher
+        launcherActivationThreshold = defaults.object(forKey: Keys.launcherActivationThreshold) as? Double ?? Defaults.launcherActivationThreshold
+        launcherStepDistance = defaults.object(forKey: Keys.launcherStepDistance) as? Double ?? Defaults.launcherStepDistance
+        launcherContextStepDistance = defaults.object(forKey: Keys.launcherContextStepDistance) as? Double ?? Defaults.launcherContextStepDistance
+        dwellToArmDuration = defaults.object(forKey: Keys.dwellToArmDuration) as? Double ?? Defaults.dwellToArmDuration
+        showDiagnostics = defaults.object(forKey: Keys.showDiagnostics) as? Bool ?? Defaults.showDiagnostics
     }
 
     func resetToDefaults() {
@@ -93,6 +124,13 @@ final class AppSettings: ObservableObject {
         rowStepDistance = Defaults.rowStepDistance
         reverseVerticalDirection = Defaults.reverseVerticalDirection
         focusWatchdogEnabled = Defaults.focusWatchdogEnabled
+        // Launcher tunables reset too; `enableLauncher` is a consent-gated opt-in (system side
+        // effect) and is intentionally NOT reset, mirroring `manageVerticalGesture`.
+        launcherActivationThreshold = Defaults.launcherActivationThreshold
+        launcherStepDistance = Defaults.launcherStepDistance
+        launcherContextStepDistance = Defaults.launcherContextStepDistance
+        dwellToArmDuration = Defaults.dwellToArmDuration
+        showDiagnostics = Defaults.showDiagnostics
     }
 
     private func persist(_ value: Double, _ key: String) { defaults.set(value, forKey: key) }
@@ -110,6 +148,12 @@ final class AppSettings: ObservableObject {
         static let focusWatchdogEnabled = true
         static let manageSpacesRearrange = false   // opt-in; only enabled via explicit consent
         static let manageVerticalGesture = false   // opt-in; relocates Mission Control to four fingers
+        static let enableLauncher = false          // opt-in; frees four-finger native gestures
+        static let launcherActivationThreshold = 0.045  // same deliberate trigger as the horizontal switcher
+        static let launcherStepDistance = 0.07     // one item per ~7%; items are larger, fewer targets
+        static let launcherContextStepDistance = 0.12   // ~1.7× the item step; deliberate up/down between bands
+        static let dwellToArmDuration = 0.5        // brief but deliberate; not a full second
+        static let showDiagnostics = false         // troubleshooting tools hidden from the menu by default
     }
 
     private enum Keys {
@@ -126,5 +170,11 @@ final class AppSettings: ObservableObject {
         static let focusWatchdogEnabled = "focusWatchdogEnabled"
         static let manageSpacesRearrange = "manageSpacesRearrange"
         static let manageVerticalGesture = "manageVerticalGesture"
+        static let enableLauncher = "enableLauncher"
+        static let launcherActivationThreshold = "launcherActivationThreshold"
+        static let launcherStepDistance = "launcherStepDistance"
+        static let launcherContextStepDistance = "launcherContextStepDistance"
+        static let dwellToArmDuration = "dwellToArmDuration"
+        static let showDiagnostics = "showDiagnostics"
     }
 }

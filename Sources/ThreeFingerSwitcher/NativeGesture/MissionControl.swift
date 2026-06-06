@@ -41,6 +41,9 @@ enum MissionControl {
     /// Open App Exposé (the frontmost app's windows) — native three-finger-down action.
     static func showAppExpose() { send?("com.apple.expose.front.awake" as CFString, 0) }
 
+    /// Reveal the desktop (move all windows aside).
+    static func showDesktop() { send?("com.apple.showdesktop.awake" as CFString, 0) }
+
     /// Convenience for the recognizer's idle-vertical intent: up → Mission Control, down → App Exposé.
     static func trigger(up: Bool) { up ? showMissionControl() : showAppExpose() }
 }

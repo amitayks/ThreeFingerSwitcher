@@ -34,6 +34,8 @@ typealias FnPostEventRecordTo = @convention(c)
     (UnsafeMutablePointer<ProcessSerialNumber>, UnsafeMutablePointer<UInt8>) -> CGError
 typealias FnCreateWithRemoteToken = @convention(c) (CFData) -> Unmanaged<AXUIElement>?
 typealias FnGetProcessForPID = @convention(c) (pid_t, UnsafeMutablePointer<ProcessSerialNumber>) -> OSStatus
+typealias FnGetActiveSpace = @convention(c) (CGSConnectionID) -> CGSSpaceID
+typealias FnMoveWindowsToManagedSpace = @convention(c) (CGSConnectionID, CFArray, CGSSpaceID) -> Void
 
 /// Resolved-once private API surface. Use `cgs` to access it.
 struct CGSPrivate {
@@ -45,6 +47,10 @@ struct CGSPrivate {
     let postEventRecordTo: FnPostEventRecordTo?
     let createWithRemoteToken: FnCreateWithRemoteToken?
     let getProcessForPID: FnGetProcessForPID?
+    /// Active Space + move-windows-to-Space, for the launcher's "bring an existing window to me"
+    /// (no Space teleport). Resolved crash-safely; a missing symbol degrades to activate().
+    let getActiveSpace: FnGetActiveSpace?
+    let moveWindowsToManagedSpace: FnMoveWindowsToManagedSpace?
 
     /// Symbols required to ENUMERATE windows across all Spaces (and acquire off-Space AX
     /// elements). When false, snapshot() uses the legacy current-Space path.
@@ -71,6 +77,10 @@ struct CGSPrivate {
         postEventRecordTo = loadSymbol("SLPSPostEventRecordTo", FnPostEventRecordTo.self)
         createWithRemoteToken = loadSymbol("_AXUIElementCreateWithRemoteToken", FnCreateWithRemoteToken.self)
         getProcessForPID = loadSymbol("GetProcessForPID", FnGetProcessForPID.self)
+        getActiveSpace = loadSymbol("CGSGetActiveSpace", FnGetActiveSpace.self)
+            ?? loadSymbol("SLSGetActiveSpace", FnGetActiveSpace.self)
+        moveWindowsToManagedSpace = loadSymbol("SLSMoveWindowsToManagedSpace", FnMoveWindowsToManagedSpace.self)
+            ?? loadSymbol("CGSMoveWindowsToManagedSpace", FnMoveWindowsToManagedSpace.self)
     }
 }
 
