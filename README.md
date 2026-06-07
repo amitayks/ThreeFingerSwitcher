@@ -21,6 +21,7 @@ A lightweight **macOS menu-bar app** that recreates the **Windows Precision Touc
 - **Window switcher (core, always on).** Put **three fingers** on the trackpad and **slide left/right** → a live highlight scrubs across individual windows, one at a time. **Lift** to commit — the highlighted window is raised and focused. Works **across all Spaces**, including other desktops and full-screen apps.
 - **Space-row switching (optional).** With the switcher open, **slide up/down** → switch which **Space's** row of windows you're scrubbing (a 2D grid: horizontal = windows, vertical = Spaces). This is an **opt-in** (default off): turning it on moves Mission Control / App Exposé to four fingers, and the app then synthesizes them itself on idle three-finger up/down (see keystone).
 - **Four-finger launcher (optional).** Slide **four fingers** horizontally → a launcher overlay of your favorites (apps, folders, URLs, Shortcuts, scripts, and "preset" workspaces) organized into color-coded **context bands**. Scrub to an item, then **dwell** (≈500 ms, haptic tick + charge-ring) and **lift to fire**; a quick flick lifts off without firing. Once open you can **relax to two fingers** to navigate comfortably. Launching always **opens a window in the *current* Space** (or pulls a single-window app to you) instead of teleporting you away. Also an opt-in (default off).
+- **Clipboard history (optional, lives in the launcher).** A further opt-in (default off — it records copied content, so privacy-gated): when on, what you copy — text, images, files/folders, colors, links — is stored locally and shown as the **last band** in the launcher. Scrub the key list, see a live preview on the right (image / QuickLook file content / text / color), **lift to paste** it into the app you were in; **swipe right** on an entry to pin it, **left** to leave the band. Unlike the two gesture opt-ins it **relocates no gesture and needs no re-login or new permission**.
 - **Mission Control / App Exposé always available** — natively on three-finger up/down when the opt-ins are off, or app-synthesized when they're on. The app never blocks the OS (see the keystone below).
 - No keypresses, no clicks. Pure trackpad.
 
@@ -73,6 +74,8 @@ Both are opt-ins surfaced in **Setup & Permissions…** and **Settings**, each w
 
 Tell them: enabling either feature requires a re-login to take effect, and it stays applied across logins until they turn it off.
 
+**Clipboard history** is a third opt-in, but not a gesture one: it just records what they copy and shows it as the last band inside the launcher (so it needs the launcher on to be useful). It **relocates no gesture and needs no re-login or new permission** — flip it on under **Settings → Clipboard history**, where they can also set retention caps, exclude apps, pause, or clear. Off by default because it stores copied content locally.
+
 ### A4. Make it permanent (optional but recommended)
 
 - Menu → **Open at Login** (uses `SMAppService`) so it starts automatically.
@@ -89,9 +92,9 @@ Symptom: cursor still moves but **clicks/scroll/keyboard stop reaching any windo
 
 ### B0. Source of truth: read `openspec/specs/` first
 
-This project was built spec-first with **OpenSpec**. The **canonical behavior** lives in `openspec/specs/<capability>/spec.md` (**14 capabilities** — the switcher core: `gesture-recognition`, `switcher-overlay`, `window-enumeration-and-raising`, `touch-input`, `native-gesture-config`, `spaces-rearrange-config`, `tunable-settings`, `menubar-app-shell`, `permissions-onboarding`; the opt-in features: `runtime-gesture-ownership`, `launcher-overlay`, `launch-items`, `launch-actions`, `favorites-editor`). Every feature was a `change/` (proposal → design → spec delta → tasks), now in `openspec/changes/archive/`. **Before changing behavior, read the relevant spec; after changing behavior, update it.** The archived changes are an excellent design history:
+This project was built spec-first with **OpenSpec**. The **canonical behavior** lives in `openspec/specs/<capability>/spec.md` (**15 capabilities** — the switcher core: `gesture-recognition`, `switcher-overlay`, `window-enumeration-and-raising`, `touch-input`, `native-gesture-config`, `spaces-rearrange-config`, `tunable-settings`, `menubar-app-shell`, `permissions-onboarding`; the opt-in features: `runtime-gesture-ownership`, `launcher-overlay`, `launch-items`, `launch-actions`, `favorites-editor`, `clipboard-history`). Every feature was a `change/` (proposal → design → spec delta → tasks), now in `openspec/changes/archive/`. **Before changing behavior, read the relevant spec; after changing behavior, update it.** The archived changes are an excellent design history:
 - **Switcher / window-raising internals:** `cross-space-windows`, `fix-focus-vacuum-on-raise`, `space-grid-navigation`, `fix-off-space-listing-and-focus` — read their `design.md` for the hard-won private-API details.
-- **Optional features:** `optional-space-row-gesture` (runtime gesture ownership — the scroll tap + Mission Control synthesis substrate), `four-finger-launcher` (the launcher, favorites model, launch strategies, dwell-to-arm), and `launcher-two-finger-nav` (drop-to-two-finger navigation).
+- **Optional features:** `optional-space-row-gesture` (runtime gesture ownership — the scroll tap + Mission Control synthesis substrate), `four-finger-launcher` (the launcher, favorites model, launch strategies, dwell-to-arm), `launcher-two-finger-nav` (drop-to-two-finger navigation), and `clipboard-history` (the launcher's Clipboard band: a polled-`changeCount` recorder + on-disk store, paste-into-front, pin/edge-accel — its `design.md` covers the band-not-keyboard-picker decision).
 
 ### B1. Repo map
 
@@ -106,9 +109,12 @@ Sources/ThreeFingerSwitcher/          ── ThreeFingerSwitcherCore library (AL
                       Spaces, SpaceGrouping, StageManager, AXPrivate (_AXUIElementGetWindow + remote-token brute force),
                       WindowInfo, ThumbnailService, MRUTracker, FocusLog
   Overlay/            OverlayController (non-activating NSPanel), SwitcherView (SwiftUI strip + dots), SwitcherModel, SwitcherLayout,
-                      LauncherView / LauncherModel / LauncherOverlayController / LauncherGridLayout (the four-finger launcher HUD + dwell-arm/charge-ring/haptics)
-  Launcher/           LaunchItem (favorites data model: app/path/url/shortcut/script/preset + context bands), FavoritesStore (Codable persistence),
-                      LaunchService (dispatch + "new window here" strategy), SpaceWindowMover (SLSMoveWindowsToManagedSpace bring-here)
+                      LauncherView / LauncherModel / LauncherOverlayController / LauncherGridLayout (the four-finger launcher HUD + dwell-arm/charge-ring/haptics),
+                      ClipboardBandView (the Clipboard band's master-detail key-list + value preview; QuickLook for files)
+  Launcher/           LaunchItem (favorites data model: app/path/url/shortcut/script/preset + the synthetic clipboardEntry + context bands), FavoritesStore (Codable persistence),
+                      LaunchService (dispatch + "new window here" strategy + clipboard paste-into-front with text/image fallbacks), SpaceWindowMover (SLSMoveWindowsToManagedSpace bring-here)
+  Clipboard/          ClipboardEntry (AppKit-free model), ClipboardStore (on-disk index + blobs, de-dup/retention/pins), ClipboardMonitor (changeCount poll + capture),
+                      ClipboardCapture (pure classify + concealed/exclusion filter), ClipboardBandBuilder (store → synthetic last band) — the opt-in clipboard history
   NativeGesture/      TrackpadGestureConfig (horizontal three-finger), VerticalGestureConfig (three-finger vertical), FourFingerGestureConfig (four-finger swipes),
                       MissionControl (CoreDockSendNotification synthesis), SpacesRearrangeConfig — all defaults-based, absent-aware backup/restore
   Permissions/        PermissionsService, OnboardingView
@@ -116,7 +122,7 @@ Sources/ThreeFingerSwitcher/          ── ThreeFingerSwitcherCore library (AL
 Sources/ThreeFingerSwitcherApp/main.swift   thin executable: import Core; runThreeFingerSwitcher()
 Sources/TouchSpike/                   throwaway harness to print raw touch frames (swift run TouchSpike)
 Sources/LauncherSpike/                throwaway harness for the launcher spikes (haptics, window move) — not bundled
-Tests/ThreeFingerSwitcherTests/       238 XCTest unit tests (pure-logic core)
+Tests/ThreeFingerSwitcherTests/       308 XCTest unit tests (pure-logic core)
 scripts/                              build-app.sh, make-dev-cert.sh, allow-codesign-key.sh, install-launch-agent.sh
 openspec/                             specs (canonical) + changes/archive (history)
 ```
@@ -127,7 +133,7 @@ The Core/App split exists so the test target can `@testable import ThreeFingerSw
 
 ```bash
 swift build                                   # build the library + executable
-swift test                                    # 238 unit tests (gesture machine + launcher latching, models, grouping, layout, settings, native-gesture config, touch)
+swift test                                    # 308 unit tests (gesture machine + launcher latching, models, grouping, layout, settings, native-gesture config, touch)
 swift run TouchSpike                           # print live multitouch frames (touch the trackpad)
 swift run LauncherSpike                        # throwaway launcher spike harness (haptics / window move)
 ./scripts/build-app.sh                         # assemble + sign ThreeFingerSwitcher.app (repo root)
@@ -164,8 +170,9 @@ INSTALL=1 ./scripts/build-app.sh               # also install in place to /Appli
 All in `AppSettings` (persisted, live-applied, editable in the Settings window):
 
 - **Switcher:** activation threshold, axis-lock ratio, horizontal step distance, **row-step distance** (vertical, larger so scrubbing doesn't flip Spaces), wrap-vs-clamp, direction inversions (horizontal + vertical), velocity smoothing, exact-three-fingers, and the focus self-heal toggle.
-- **Opt-ins (each gates a native-gesture relocation + its feature):** `manageVerticalGesture` (Space-row switching), `enableLauncher` (four-finger launcher), plus `manageSpacesRearrange` (keep Spaces in a fixed order). Each has an `is…Effective` gate in `AppCoordinator` — the feature only goes live once the relocation has actually taken runtime effect (post re-login), never merely when the flag is set this session.
+- **Opt-ins (each gates a native-gesture relocation + its feature):** `manageVerticalGesture` (Space-row switching), `enableLauncher` (four-finger launcher), plus `manageSpacesRearrange` (keep Spaces in a fixed order). Each has an `is…Effective` gate in `AppCoordinator` — the feature only goes live once the relocation has actually taken runtime effect (post re-login), never merely when the flag is set this session. **Exception:** `keepClipboardHistory` is an opt-in with **no** gesture relocation and **no** `is…Effective` gate — it just starts/stops `ClipboardMonitor` (and gates injecting the Clipboard band), so it takes effect immediately with no re-login.
 - **Launcher tunables:** `launcherActivationThreshold`, `launcherStepDistance` (item step), `launcherContextStepDistance` (context-band step), and `dwellToArmDuration` (the dwell-to-fire delay). The launcher reuses the switcher's direction-inversion settings.
+- **Clipboard tunables:** `clipboardRecentWindow` (entries shown in the band), retention caps (`clipboardMaxCount` / `clipboardMaxBytes` / `clipboardMaxAgeDays`, pinned-exempt), `clipboardPollInterval`, `clipboardEdgeAcceleration` (edge auto-repeat ramp), `clipboardPinDistance` (deliberate pin/leave flick), `clipboardExcludedApps`, and `clipboardPaused`.
 
 ---
 
@@ -174,5 +181,5 @@ All in `AppSettings` (persisted, live-applied, editable in the Settings window):
 - **GPL-3.0** — see `LICENSE` and `NOTICE`. The window-raising/Space technique (the private `_AXUIElementGetWindow`, the remote-token brute force, the SkyLight front/key byte protocol, the CGS Space enumeration) is adapted from **[AltTab](https://github.com/lwouis/alt-tab-macos)** (GPL-3), which is why this project is GPL-3.
 - Raw multitouch via **[OpenMultitouchSupport](https://github.com/Kyome22/OpenMultitouchSupport)** (Kyome, MIT), wrapping the private `MultitouchSupport.framework`.
 
-If you (Claude) end up extending this, keep the spec in `openspec/specs/` honest, keep the 238 tests green (`swift test`), and respect the landmines in **B3** — they each cost a real debugging session to learn.
+If you (Claude) end up extending this, keep the spec in `openspec/specs/` honest, keep the 308 tests green (`swift test`), and respect the landmines in **B3** — they each cost a real debugging session to learn.
 
