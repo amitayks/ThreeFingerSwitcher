@@ -55,4 +55,4 @@
 ## 10. Build & spec sync
 
 - [x] 10.1 `swift build` and `swift test` green. Do NOT assemble/sign/install the `.app` from the agent shell (per CLAUDE.md); leave in-app + permission/paste verification to the user's own stable-signed build.
-- [ ] 10.2 After implementation, run `/opsx:sync` (or `openspec`) to fold the `clipboard-history`, `launcher-overlay`, and `tunable-settings` deltas into the main specs, then archive the change.
+- [x] 10.2 After implementation, run `/opsx:sync` (or `openspec`) to fold the `clipboard-history`, `launcher-overlay`, and `tunable-settings` deltas into the main specs, then archive the change.
