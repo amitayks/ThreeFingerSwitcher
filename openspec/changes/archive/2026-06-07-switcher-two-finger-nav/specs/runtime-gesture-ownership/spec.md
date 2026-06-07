@@ -1,9 +1,19 @@
-# runtime-gesture-ownership Specification
+## ADDED Requirements
 
-## Purpose
+### Requirement: Scroll tap covers two-finger switcher navigation
 
-Define how the app owns the freed three-finger vertical gesture at runtime when Space-row switching is effective. Freeing the OS three-finger vertical gesture turns it into a plain scroll, so the app consumes that scroll (it would otherwise leak to the background window) and synthesizes Mission Control / App Exposé itself (so idle three-finger up/down still works), using only the Accessibility permission it already holds — with no per-use re-login.
-## Requirements
+The session scroll event tap's consume rule SHALL additionally consume scroll **while the switcher overlay is open**, so that the **two-finger movement during switcher navigation** (after a three-finger trigger relaxes to two fingers) is captured and does not scroll the window underneath. The full consume rule SHALL therefore consume scroll while **three or more fingers are in contact, OR the launcher overlay is open, OR the switcher overlay is open**. When the switcher overlay is **closed**, the switcher clause does not apply, so normal two-finger scrolling passes through unchanged. This clause SHALL require only the Accessibility permission the app already holds (no Input Monitoring, no re-login).
+
+#### Scenario: Two-finger navigation is consumed while the switcher is open
+- **WHEN** the switcher overlay is open and the user navigates with two fingers
+- **THEN** the two-finger scroll is consumed and the window under the switcher does not scroll
+
+#### Scenario: Two-finger scroll passes through when the switcher is closed
+- **WHEN** the switcher overlay is not open (and no other consume condition holds) and two fingers scroll
+- **THEN** the scroll passes through and the window scrolls normally
+
+## MODIFIED Requirements
+
 ### Requirement: Consume the freed three-finger scroll at runtime
 When the Space-row switching opt-in is effective, the system SHALL run a session scroll event tap that consumes scroll-wheel events while three or more fingers are in contact, so the freed three-finger vertical gesture (which macOS turns into a plain scroll once its system assignment is removed) does not leak to the window under the cursor. Two-finger scrolling SHALL pass through untouched **except while a tap-owning overlay (launcher or switcher) is open**. The tap SHALL require only the Accessibility permission the app already holds for window raising (Input Monitoring SHALL NOT be required). The tap SHALL run **whenever the switcher is enabled** — two-finger switcher navigation depends on it, so it is no longer gated on the Space-row or launcher opt-ins being effective.
 
@@ -19,28 +29,6 @@ When the Space-row switching opt-in is effective, the system SHALL run a session
 - **WHEN** the switcher is enabled
 - **THEN** the session scroll tap is running (covering the three-finger, launcher, and two-finger-switcher consume cases); and **WHEN** the switcher is disabled
 - **THEN** the tap is stopped (the system handles scroll normally)
-
-### Requirement: Synthesize Mission Control / App Exposé for idle vertical swipes
-When the Space-row switching opt-in is effective, the system SHALL open Mission Control (three-finger up) or App Exposé (three-finger down) itself in response to the recognizer's fresh-vertical intent, so idle three-finger up/down keeps working even though the OS gesture is freed. The trigger SHALL use a private system call resolved crash-safely (a missing symbol degrades to a no-op, never a crash).
-
-#### Scenario: Idle three-finger up opens Mission Control
-- **WHEN** the feature is effective and a fresh three-finger up swipe is recognized
-- **THEN** Mission Control opens
-
-#### Scenario: Idle three-finger down opens App Exposé
-- **WHEN** the feature is effective and a fresh three-finger down swipe is recognized
-- **THEN** App Exposé opens
-
-#### Scenario: Native handling when the feature is off
-- **WHEN** the opt-in is off (the OS still owns the three-finger vertical gesture)
-- **THEN** the app does not synthesize the overview; macOS opens Mission Control / App Exposé natively
-
-### Requirement: Idle Mission Control survives across logins without per-use re-login
-The one-time logout/login that frees the OS gesture SHALL be the only re-login required; thereafter the runtime tap and the synthesized Mission Control / App Exposé SHALL provide idle three-finger up/down and suppress the background scroll with no further re-login, for as long as the opt-in stays on.
-
-#### Scenario: Works immediately after the one-time re-login
-- **WHEN** the user has enabled the opt-in and logged back in once
-- **THEN** idle three-finger up/down opens the overview and overlay row-switching does not scroll the background, on every subsequent launch, with no additional re-login
 
 ### Requirement: Scroll tap covers the launcher feature
 The session scroll event tap SHALL run while the launcher opt-in is effective, in addition to when the Space-row opt-in is effective, so that the freed four-finger swipes — which macOS turns into plain scroll once their system assignment is removed — do not leak to the window under the cursor. The tap's consume rule SHALL consume scroll while **three or more fingers are in contact OR while the launcher overlay is open OR while the switcher overlay is open**. The launcher-open clause ensures that **two-finger movement during launcher navigation** is captured and does not scroll the window underneath. When the launcher overlay is **closed**, the launcher clause reverts so normal two-finger scrolling passes through unchanged (unless another consume condition, such as the switcher overlay being open, holds).
@@ -64,16 +52,3 @@ The session scroll event tap SHALL run while the launcher opt-in is effective, i
 #### Scenario: Tap stops only when the switcher is disabled
 - **WHEN** the switcher is disabled
 - **THEN** the tap is stopped and the system handles scroll normally
-
-### Requirement: Scroll tap covers two-finger switcher navigation
-
-The session scroll event tap's consume rule SHALL additionally consume scroll **while the switcher overlay is open**, so that the **two-finger movement during switcher navigation** (after a three-finger trigger relaxes to two fingers) is captured and does not scroll the window underneath. The full consume rule SHALL therefore consume scroll while **three or more fingers are in contact, OR the launcher overlay is open, OR the switcher overlay is open**. When the switcher overlay is **closed**, the switcher clause does not apply, so normal two-finger scrolling passes through unchanged. This clause SHALL require only the Accessibility permission the app already holds (no Input Monitoring, no re-login).
-
-#### Scenario: Two-finger navigation is consumed while the switcher is open
-- **WHEN** the switcher overlay is open and the user navigates with two fingers
-- **THEN** the two-finger scroll is consumed and the window under the switcher does not scroll
-
-#### Scenario: Two-finger scroll passes through when the switcher is closed
-- **WHEN** the switcher overlay is not open (and no other consume condition holds) and two fingers scroll
-- **THEN** the scroll passes through and the window scrolls normally
-

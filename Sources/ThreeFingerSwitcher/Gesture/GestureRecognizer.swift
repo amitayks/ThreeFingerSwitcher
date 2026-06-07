@@ -98,6 +98,10 @@ final class GestureRecognizer {
     /// Live contact count of the latched launcher gesture, used to detect contact-count changes so
     /// the step origin can be re-baselined (the centroid shifts as fingers leave). Seeded at begin.
     private var launcherContacts = 0
+    /// Live contact count of the switcher gesture *after activation*, used the same way as
+    /// `launcherContacts`: once the overlay is up the user may relax three fingers to two, and the
+    /// centroid shifts as the finger leaves — so on a count change we re-baseline the step origin.
+    private var switcherContacts = 0
 
     private var startCentroid = CGPoint.zero
     private var lastCentroid = CGPoint.zero
@@ -149,26 +153,62 @@ final class GestureRecognizer {
         }
     }
 
-    // MARK: - Switcher (three-finger) — unchanged behavior
+    // MARK: - Switcher (three-finger; relaxes to two after activation)
 
     private func trackSwitcher(_ frame: TouchFrame) {
-        let target = settings.requireExactlyThree ? (frame.fingerCount == 3) : (frame.fingerCount >= 3)
-        let tooMany = settings.requireExactlyThree ? (frame.fingerCount > 3) : false
+        let count = frame.fingerCount
+        let tooMany = settings.requireExactlyThree ? (count > 3) : false
 
+        // A 4th finger cancels exactly as before (only meaningful under requireExactlyThree); this
+        // ceiling rule is unchanged in both phases — relaxation only ever lowers the floor to two.
         if tooMany {
             cancel()                      // a 4th finger landed
-        } else if target {
+            return
+        }
+
+        guard activated else {
+            // Pre-activation: unchanged three-finger trigger. The overlay isn't up yet, so the count
+            // requirement is the original one and dropping below it cancels (a two-finger contact can
+            // never trigger the switcher).
+            let target = settings.requireExactlyThree ? (count == 3) : (count >= 3)
+            if target {
+                belowTargetFrames = 0
+                update(frame)             // still scrubbing toward activation
+            } else {
+                // Below the required count: a real lift reports 0 fingers; an edge flicker dips
+                // to 1–2 for a frame or two. Only end on a true lift or a sustained drop, so
+                // swiping toward the trackpad edge doesn't prematurely commit/close.
+                belowTargetFrames += 1
+                if count == 0 || belowTargetFrames >= 2 {
+                    end()
+                }
+                // otherwise ignore this frame and wait for the 3rd finger to return
+            }
+            return
+        }
+
+        // Post-activation: the overlay is up, so the user may relax three fingers to two and keep
+        // navigating. The gesture lives while ≥2 contacts remain (the launcher's proven latch). On
+        // any contact-count change the centroid shifts as a finger leaves, so re-baseline the step
+        // origin and clear carry — only movement *after* the new baseline advances the selection.
+        if count >= 2 {
             belowTargetFrames = 0
-            update(frame)                 // still scrubbing
+            if count != switcherContacts {
+                switcherContacts = count
+                startCentroid = frame.centroid
+                lastCentroid = frame.centroid
+                stepAccumulator = 0
+                stepAccumulatorY = 0
+            }
+            update(frame)
         } else {
-            // Below the required count: a real lift reports 0 fingers; an edge flicker dips
-            // to 1–2 for a frame or two. Only end on a true lift or a sustained drop, so
-            // swiping toward the trackpad edge doesn't prematurely commit/close.
+            // Below two contacts ("lift"): a real lift reports 0 immediately; an edge flicker dips to
+            // 1 for a frame or two. End on a true lift or a sustained drop, then `end()` commits the
+            // highlighted window (activated is true here).
             belowTargetFrames += 1
-            if frame.fingerCount == 0 || belowTargetFrames >= 2 {
+            if count == 0 || belowTargetFrames >= 2 {
                 end()
             }
-            // otherwise ignore this frame and wait for the 3rd finger to return
         }
     }
 
@@ -182,6 +222,7 @@ final class GestureRecognizer {
         stepAccumulatorY = 0
         belowTargetFrames = 0
         triggeredMissionControl = false
+        switcherContacts = frame.fingerCount   // 3 at begin; tracked so a post-activation drop re-baselines
     }
 
     private func update(_ frame: TouchFrame) {

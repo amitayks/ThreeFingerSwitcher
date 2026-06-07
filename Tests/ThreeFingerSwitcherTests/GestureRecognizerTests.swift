@@ -502,23 +502,26 @@ final class GestureRecognizerTests: XCTestCase {
 
     // MARK: - (6) Edge-flicker debounce
 
-    func test_oneFrameDipToTwoFingers_thenBackToThree_doesNotEnd() {
-        // Arrange
+    func test_dipToTwoFingers_thenBackToThree_doesNotEnd() {
+        // Post-activation the gesture is alive at two fingers (the relaxation feature), so a dip to
+        // two and back to three never ends it. Each contact-count change re-baselines the step
+        // origin, so the change itself emits no step; travel after the new baseline still steps.
         let settings = makeSettings(activationThreshold: 0.045)
         let (rec, delegate) = makeRecognizer(settings)
 
-        // Act: activate, dip to 2 fingers for a single frame, then return to 3 and keep going.
+        // Act: activate, relax to 2 fingers, return to 3, then keep moving.
         feed(rec, x: 0.40, y: 0.50, fingers: 3)   // begin
         feed(rec, x: 0.46, y: 0.50, fingers: 3)   // activate
-        feed(rec, x: 0.46, y: 0.50, fingers: 2)   // 1-frame dip (belowTargetFrames == 1)
-        XCTAssertEqual(delegate.commitCount, 0, "A single sub-3 frame must not end the gesture.")
+        feed(rec, x: 0.46, y: 0.50, fingers: 2)   // relax to two — alive, re-baseline, no step
+        XCTAssertEqual(delegate.commitCount, 0, "two fingers keep the gesture alive post-activation")
         XCTAssertEqual(delegate.cancelCount, 0)
-        feed(rec, x: 0.56, y: 0.50, fingers: 3)   // 3rd finger returns; resets debounce, steps
-
-        // Assert: gesture survived the dip and continued stepping.
+        feed(rec, x: 0.56, y: 0.50, fingers: 3)   // back to three — re-baseline (count change), no step
         XCTAssertEqual(delegate.commitCount, 0)
         XCTAssertEqual(delegate.cancelCount, 0)
-        XCTAssertEqual(delegate.steps, [1, 1], "Travel after the flicker still produces steps.")
+        feed(rec, x: 0.711, y: 0.50, fingers: 3)  // +0.151 from the new baseline → 3 steps
+
+        // Assert: gesture survived the dip; travel after the re-baseline still steps.
+        XCTAssertEqual(delegate.steps, [1, 1, 1], "travel after the re-baseline still produces steps")
     }
 
     func test_zeroFingers_endsImmediately_committingAfterActivation() {
@@ -537,15 +540,17 @@ final class GestureRecognizerTests: XCTestCase {
         XCTAssertEqual(delegate.events.last, .commit)
     }
 
-    func test_twoConsecutiveSubThreeFrames_endsTheGesture() {
-        // Arrange
+    func test_twoConsecutiveSubTwoFrames_endsTheGesture() {
+        // Post-activation the end debounce moved to the below-TWO boundary (two fingers are now a
+        // live navigation count). A single sub-two frame is an edge flicker (no end); two
+        // consecutive sub-two frames end the gesture and commit.
         let settings = makeSettings(activationThreshold: 0.045)
         let (rec, delegate) = makeRecognizer(settings)
 
-        // Act: activate, then a sustained 2-frame drop to 2 fingers (belowTargetFrames reaches 2).
+        // Act: activate, then a sustained 2-frame drop below two fingers (belowTargetFrames reaches 2).
         feed(rec, x: 0.40, y: 0.50, fingers: 3)   // begin
         feed(rec, x: 0.46, y: 0.50, fingers: 3)   // activate
-        feed(rec, x: 0.46, y: 0.50, fingers: 2)   // belowTargetFrames == 1, no end
+        feed(rec, x: 0.46, y: 0.50, fingers: 1)   // belowTargetFrames == 1, no end
         XCTAssertEqual(delegate.commitCount, 0)
         feed(rec, x: 0.46, y: 0.50, fingers: 1)   // belowTargetFrames == 2 -> end (commit)
 
@@ -554,17 +559,18 @@ final class GestureRecognizerTests: XCTestCase {
         XCTAssertEqual(delegate.cancelCount, 0)
     }
 
-    func test_debounceCounterResetsAfterFingerReturns() {
-        // Arrange: a dip, a return, then another single dip must NOT end (counter reset).
+    func test_singleSubTwoFrame_thenBackToTwo_doesNotEnd() {
+        // A one-frame dip below two, then a return to two (or more), must NOT end: two contacts are
+        // alive post-activation, so returning to two clears the below-two debounce counter.
         let settings = makeSettings(activationThreshold: 0.045)
         let (rec, delegate) = makeRecognizer(settings)
 
         // Act
         feed(rec, x: 0.40, y: 0.50, fingers: 3)   // begin
         feed(rec, x: 0.46, y: 0.50, fingers: 3)   // activate
-        feed(rec, x: 0.46, y: 0.50, fingers: 2)   // belowTargetFrames -> 1
-        feed(rec, x: 0.46, y: 0.50, fingers: 3)   // resets belowTargetFrames -> 0
-        feed(rec, x: 0.46, y: 0.50, fingers: 2)   // belowTargetFrames -> 1 again, not 2
+        feed(rec, x: 0.46, y: 0.50, fingers: 1)   // belowTargetFrames -> 1
+        feed(rec, x: 0.46, y: 0.50, fingers: 2)   // alive again, resets belowTargetFrames -> 0
+        feed(rec, x: 0.46, y: 0.50, fingers: 1)   // belowTargetFrames -> 1 again, not 2
 
         // Assert: still alive.
         XCTAssertEqual(delegate.commitCount, 0)
@@ -689,5 +695,101 @@ final class GestureRecognizerTests: XCTestCase {
 
         // Assert
         XCTAssertTrue(delegate.didActivate)
+    }
+
+    // MARK: - (8) Two-finger relaxation after activation
+
+    func test_relaxToTwoFingers_keepsSteppingWindows() {
+        // After a three-finger activation, relaxing to two fingers must keep navigating the window
+        // grid: the count change re-baselines (no spurious step), then two-finger travel steps.
+        let settings = makeSettings(activationThreshold: 0.045, stepDistance: 0.05)
+        let (rec, delegate) = makeRecognizer(settings)
+
+        feed(rec, x: 0.20, y: 0.50, fingers: 3)   // begin
+        feed(rec, x: 0.26, y: 0.50, fingers: 3)   // activate (lastCentroid 0.26)
+        feed(rec, x: 0.26, y: 0.50, fingers: 2)   // relax to two — re-baseline, no step
+        XCTAssertTrue(delegate.steps.isEmpty, "the count change alone emits no step")
+        feed(rec, x: 0.411, y: 0.50, fingers: 2)  // +0.151 from the new baseline → 3 steps
+
+        XCTAssertEqual(delegate.steps, [1, 1, 1], "two-finger travel steps through windows")
+    }
+
+    func test_relaxToTwoFingers_centroidJump_emitsNoStep_thenStepsAfterBaseline() {
+        // A leaving finger shifts the centroid; without re-baselining that jump would fire spurious
+        // window/row steps. Assert zero from the count change, then normal steps from later travel.
+        let settings = makeSettings(activationThreshold: 0.045, stepDistance: 0.05, rowStepDistance: 0.10)
+        let (rec, delegate) = makeRecognizer(settings, rowSwitching: true)
+
+        feed(rec, x: 0.20, y: 0.50, fingers: 3)   // begin
+        feed(rec, x: 0.26, y: 0.50, fingers: 3)   // activate
+        feed(rec, x: 0.60, y: 0.80, fingers: 2)   // drop to two AND big centroid jump → no step
+        XCTAssertTrue(delegate.steps.isEmpty, "centroid jump from a finger leaving emits no window step")
+        XCTAssertTrue(delegate.stepRows.isEmpty, "centroid jump from a finger leaving emits no row step")
+        feed(rec, x: 0.751, y: 0.80, fingers: 2)  // +0.151 x from the new baseline → 3 steps
+        XCTAssertEqual(delegate.steps, [1, 1, 1])
+        XCTAssertTrue(delegate.stepRows.isEmpty)
+    }
+
+    func test_relaxToTwoFingers_verticalStillStepsRows() {
+        // Two-finger vertical travel after activation still steps Space-rows via the existing
+        // rowSwitchingEnabled path (the relaxation does not bypass the opt-in gate).
+        let settings = makeSettings(activationThreshold: 0.045, rowStepDistance: 0.10)
+        let (rec, delegate) = makeRecognizer(settings, rowSwitching: true)
+
+        feed(rec, x: 0.20, y: 0.50, fingers: 3)   // begin
+        feed(rec, x: 0.26, y: 0.50, fingers: 3)   // activate
+        feed(rec, x: 0.26, y: 0.50, fingers: 2)   // relax to two — re-baseline
+        feed(rec, x: 0.26, y: 0.701, fingers: 2)  // +~0.20 vertical → 2 row steps up
+
+        XCTAssertEqual(delegate.stepRows, [1, 1])
+    }
+
+    func test_twoContacts_keepAlive_thenLiftBelowTwo_commits() {
+        // Two contacts keep the gesture alive (no premature commit); only a lift below two commits.
+        let settings = makeSettings(activationThreshold: 0.045)
+        let (rec, delegate) = makeRecognizer(settings)
+
+        feed(rec, x: 0.40, y: 0.50, fingers: 3)   // begin
+        feed(rec, x: 0.46, y: 0.50, fingers: 3)   // activate
+        feed(rec, x: 0.46, y: 0.50, fingers: 2)   // relax to two — alive
+        feed(rec, x: 0.50, y: 0.50, fingers: 2)   // keep moving at two — still alive
+        XCTAssertEqual(delegate.commitCount, 0, "two contacts never commit")
+        XCTAssertEqual(delegate.cancelCount, 0)
+        feed(rec, x: 0.50, y: 0.50, fingers: 0)   // lift below two → commit
+
+        XCTAssertEqual(delegate.commitCount, 1)
+        XCTAssertEqual(delegate.cancelCount, 0)
+    }
+
+    // MARK: - (9) Trigger still requires three fingers (no pre-activation relaxation)
+
+    func test_twoFingerContact_neverActivatesTheSwitcher() {
+        // The trigger is unchanged: a gesture that never reaches three fingers must not begin or
+        // activate, even with a large horizontal move (otherwise ordinary two-finger scroll would
+        // trip the switcher).
+        let settings = makeSettings(activationThreshold: 0.045)
+        let (rec, delegate) = makeRecognizer(settings)
+
+        feed(rec, x: 0.30, y: 0.50, fingers: 2)   // idle — two fingers are not the target count
+        feed(rec, x: 0.60, y: 0.50, fingers: 2)   // big horizontal move, still never tracks
+
+        XCTAssertFalse(delegate.didActivate)
+        XCTAssertTrue(delegate.events.isEmpty)
+    }
+
+    func test_dropToTwoBeforeActivation_cancels_noRelaxation() {
+        // Relaxation is post-activation only: dropping to two fingers BEFORE the overlay is shown is
+        // a below-target lift (cancel after the debounce), not navigation.
+        let settings = makeSettings(activationThreshold: 0.045)
+        let (rec, delegate) = makeRecognizer(settings)
+
+        feed(rec, x: 0.50, y: 0.50, fingers: 3)   // begin (not activated — no horizontal travel yet)
+        feed(rec, x: 0.50, y: 0.50, fingers: 2)   // below target, belowTargetFrames -> 1
+        XCTAssertEqual(delegate.cancelCount, 0, "a single sub-three frame waits for the 3rd finger")
+        feed(rec, x: 0.50, y: 0.50, fingers: 2)   // belowTargetFrames -> 2 → cancel (never activated)
+
+        XCTAssertFalse(delegate.didActivate)
+        XCTAssertEqual(delegate.cancelCount, 1)
+        XCTAssertEqual(delegate.commitCount, 0)
     }
 }

@@ -65,11 +65,13 @@ final class AppCoordinator: GestureRecognizerDelegate {
     private var currentFingerCount = 0
 
     /// Pure decision for the scroll tap: consume (swallow) scroll while three or more fingers are
-    /// down OR while the launcher overlay is open. The launcher-open clause captures the two-finger
-    /// movement that drives launcher navigation so it doesn't scroll the window underneath; with the
-    /// launcher closed it reverts to the `≥3`-fingers rule, leaving normal two-finger scroll alone.
-    static func shouldConsumeScroll(fingerCount: Int, launcherOpen: Bool) -> Bool {
-        fingerCount >= 3 || launcherOpen
+    /// down OR while the launcher overlay is open OR while the switcher overlay is open. The
+    /// overlay-open clauses capture the two-finger movement that drives launcher / switcher
+    /// navigation (after a three- or four-finger trigger relaxes to two) so it doesn't scroll the
+    /// window underneath; with both overlays closed it reverts to the `≥3`-fingers rule, leaving
+    /// normal two-finger scroll alone.
+    static func shouldConsumeScroll(fingerCount: Int, launcherOpen: Bool, switcherOpen: Bool) -> Bool {
+        fingerCount >= 3 || launcherOpen || switcherOpen
     }
 
     init() {
@@ -81,7 +83,8 @@ final class AppCoordinator: GestureRecognizerDelegate {
         scrollTap.consumePredicate = { [weak self] in
             guard let self else { return false }
             return Self.shouldConsumeScroll(fingerCount: self.currentFingerCount,
-                                            launcherOpen: self.launcherOverlay.isVisible)
+                                            launcherOpen: self.launcherOverlay.isVisible,
+                                            switcherOpen: self.overlay.isVisible)
         }
         thumbnails.onThumbnail = { [weak self] id, image in self?.overlay.model.setThumbnail(image, for: id) }
         launcherOverlay.onFire = { [weak self] item, band in self?.launchService.fire(item, inBand: band) }
@@ -598,15 +601,16 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// Push the effective state into the recognizer so vertical motion only steps Space-rows (and a
     /// fresh vertical swipe only triggers Mission Control ourselves) when the OS has genuinely
     /// released the three-finger vertical swipe, and so four fingers only drive the launcher once the
-    /// native four-finger swipes are freed. Also runs the scroll tap exactly while *either* feature
-    /// is live, so the freed three/four-finger scroll is consumed instead of leaking to the
-    /// background (the tap's `≥3` consume rule already covers four-finger contact on both axes).
+    /// native four-finger swipes are freed. The scroll tap now runs whenever the switcher is *enabled*
+    /// — two-finger switcher navigation depends on it to consume the relaxed two-finger movement while
+    /// the overlay is open — which subsumes the row/launcher cases (both require the switcher enabled).
+    /// The tap consumes nothing outside its predicate (three-finger contact isn't a native scroll, and
+    /// the overlay-open clauses are only true mid-gesture), so an always-on-when-enabled tap is
+    /// observationally identical to a per-gesture one while being simpler and race-free.
     private func refreshRowSwitchingGate() {
-        let rowEffective = isSpaceRowSwitchingEffective
-        let launcherEffective = isLauncherEffective
-        recognizer.rowSwitchingEnabled = rowEffective
-        recognizer.launcherEnabled = launcherEffective
-        if (rowEffective || launcherEffective) && isEnabled {
+        recognizer.rowSwitchingEnabled = isSpaceRowSwitchingEffective
+        recognizer.launcherEnabled = isLauncherEffective
+        if isEnabled {
             _ = scrollTap.start()
         } else {
             scrollTap.stop()
