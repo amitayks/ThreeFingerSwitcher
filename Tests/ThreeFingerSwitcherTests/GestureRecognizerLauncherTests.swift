@@ -9,8 +9,12 @@ private final class LauncherMockDelegate: GestureRecognizerDelegate {
     enum Event: Equatable {
         case activate, step(Int), stepRow(Int), missionControl(Bool), commit, cancel
         case lActivate, lItem(Int), lContext(Int), lEnd, lCancel
+        case lEdge(Int, Int)
     }
     private(set) var events: [Event] = []
+    /// Simulates the launcher cursor sitting on the band-headers row, so horizontal travel is treated
+    /// as band switching (context-step) rather than in-grid item movement (item-step).
+    var onHeaders = false
 
     // Switcher
     func gestureDidActivate() { events.append(.activate) }
@@ -26,6 +30,12 @@ private final class LauncherMockDelegate: GestureRecognizerDelegate {
     func launcherDidStepContext(_ d: Int) { events.append(.lContext(d)) }
     func launcherDidEnd() { events.append(.lEnd) }
     func launcherDidCancel() { events.append(.lCancel) }
+    func launcherEdgeChanged(dx: Int, dy: Int) { events.append(.lEdge(dx, dy)) }
+    func launcherFocusIsOnHeaders() -> Bool { onHeaders }
+
+    /// The sequence of edge states emitted (dx, dy) per change.
+    var edges: [(Int, Int)] { events.compactMap { if case let .lEdge(x, y) = $0 { return (x, y) } else { return nil } } }
+    var lastEdge: (Int, Int)? { edges.last }
 
     var lActivateCount: Int { events.filter { $0 == .lActivate }.count }
     var lEndCount: Int { events.filter { $0 == .lEnd }.count }
@@ -96,13 +106,76 @@ final class GestureRecognizerLauncherTests: XCTestCase {
         XCTAssertEqual(d.lItems, [1, 1, 1])
     }
 
-    func test_contextStepping_verticalTravel() {
-        let (rec, d) = makeRecognizer(makeSettings(launcherContextStepDistance: 0.10), launcher: true)
+    func test_verticalStepping_usesItemStep() {
+        // Vertical travel (grid rows / rising to the headers) steps at the ITEM-step threshold — band
+        // switching is no longer the vertical axis, so the coarser band threshold does not apply here.
+        let (rec, d) = makeRecognizer(makeSettings(launcherStepDistance: 0.05,
+                                                   launcherContextStepDistance: 0.10), launcher: true)
         feed(rec, x: 0.20, y: 0.50, fingers: 4)   // begin
         feed(rec, x: 0.26, y: 0.50, fingers: 4)   // activate
-        feed(rec, x: 0.26, y: 0.701, fingers: 4)  // dy +0.201 → 2 context steps up
-        XCTAssertEqual(d.lContexts, [1, 1])
-        XCTAssertTrue(d.lItems.isEmpty, "pure vertical emits no item steps")
+        feed(rec, x: 0.26, y: 0.651, fingers: 4)  // dy +0.151 at the 0.05 item step → 3 vertical steps
+        XCTAssertEqual(d.lContexts, [1, 1, 1], "vertical steps at the item-step, not the band threshold")
+        XCTAssertTrue(d.lItems.isEmpty, "pure vertical emits no horizontal steps")
+    }
+
+    func test_bandSwitch_onHeaders_usesBandThreshold() {
+        // On the headers row, horizontal travel switches bands at the coarser context/band step, so the
+        // same travel yields fewer steps than in-grid item movement — the two thresholds are decoupled.
+        let (rec, d) = makeRecognizer(makeSettings(launcherStepDistance: 0.05,
+                                                   launcherContextStepDistance: 0.10), launcher: true)
+        d.onHeaders = true
+        feed(rec, x: 0.20, y: 0.50, fingers: 4)   // begin
+        feed(rec, x: 0.26, y: 0.50, fingers: 4)   // activate (dx 0.06 ≥ 0.045)
+        feed(rec, x: 0.461, y: 0.50, fingers: 4)  // dx +0.201 at the 0.10 band step → 2 steps
+        XCTAssertEqual(d.lItems, [1, 1], "band switching on the headers row steps at the band threshold")
+        // The same +0.201 travel in the grid (item step 0.05) would be 4 steps — see item-stepping test.
+    }
+
+    // MARK: - Edge-hold for auto-repeat (2D)
+
+    func test_bottomEdge_holdsDown_thenReleasesOnLeave() {
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
+        feed(rec, x: 0.50, y: 0.50, fingers: 4)   // begin
+        feed(rec, x: 0.56, y: 0.50, fingers: 4)   // activate
+        feed(rec, x: 0.56, y: 0.10, fingers: 2)   // centroid near the BOTTOM edge (y ≤ enter zone)
+        XCTAssertEqual(d.lastEdge.map { [$0.0, $0.1] }, [0, -1], "bottom edge: dy = −1, dx = 0")
+        feed(rec, x: 0.56, y: 0.50, fingers: 2)   // back to centre → no edge
+        XCTAssertEqual(d.lastEdge.map { [$0.0, $0.1] }, [0, 0])
+    }
+
+    func test_topEdge_holdsUp() {
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
+        feed(rec, x: 0.50, y: 0.50, fingers: 4)
+        feed(rec, x: 0.56, y: 0.50, fingers: 4)   // activate
+        feed(rec, x: 0.56, y: 0.90, fingers: 2)   // TOP edge (y ≥ 1 − enter zone)
+        XCTAssertEqual(d.lastEdge.map { [$0.0, $0.1] }, [0, 1], "top edge: dy = +1")
+    }
+
+    func test_rightEdge_holdsRight() {
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
+        feed(rec, x: 0.50, y: 0.50, fingers: 4)
+        feed(rec, x: 0.56, y: 0.50, fingers: 4)   // activate
+        feed(rec, x: 0.90, y: 0.50, fingers: 2)   // RIGHT edge (x ≥ 1 − enter zone)
+        XCTAssertEqual(d.lastEdge.map { [$0.0, $0.1] }, [1, 0], "right edge: dx = +1")
+    }
+
+    func test_corner_holdsBothAxes() {
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
+        feed(rec, x: 0.50, y: 0.50, fingers: 4)
+        feed(rec, x: 0.56, y: 0.50, fingers: 4)   // activate
+        feed(rec, x: 0.08, y: 0.92, fingers: 2)   // bottom-left… x low (−1), y high (+1)
+        XCTAssertEqual(d.lastEdge.map { [$0.0, $0.1] }, [-1, 1], "a corner reports both axes")
+    }
+
+    func test_edge_isEmittedOnce_whileHeld() {
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
+        feed(rec, x: 0.50, y: 0.50, fingers: 4)
+        feed(rec, x: 0.56, y: 0.50, fingers: 4)   // activate
+        feed(rec, x: 0.56, y: 0.10, fingers: 2)   // enter bottom edge → one emit
+        feed(rec, x: 0.56, y: 0.08, fingers: 2)   // still within exit zone → no re-emit
+        feed(rec, x: 0.56, y: 0.12, fingers: 2)   // still within exit zone → no re-emit
+        XCTAssertEqual(d.edges.count, 1, "edge state is emitted only when it changes")
+        XCTAssertEqual(d.edges.first.map { [$0.0, $0.1] }, [0, -1])
     }
 
     func test_liftAfterActivation_emitsEnd() {

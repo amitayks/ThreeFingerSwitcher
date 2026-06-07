@@ -56,11 +56,108 @@ final class LaunchService {
             runShortcut(named: name, title: item.title)
         case .script(let body):
             runScript(body, title: item.title)
-        case .action(let action, let adjustment):
-            perform(action, adjustment: adjustment)
+        case .action(let action, let adjustment, let toClipboard):
+            perform(action, adjustment: adjustment, toClipboard: toClipboard ?? false)
         case .preset:
             firePreset(item, inBand: band)
+        case .clipboardEntry(let entry):
+            pasteEntry(entry)
         }
+    }
+
+    // MARK: - Clipboard paste
+
+    /// Restore a clipboard entry's representations to the general pasteboard and paste into the app
+    /// that was frontmost when the launcher opened (the overlay is non-activating, so it still holds
+    /// focus). Uses only the already-held Accessibility permission (the synthesized ⌘V). The chosen
+    /// entry becomes the current clipboard. A stale file reference is harmless (it just won't paste).
+    private func pasteEntry(_ entry: ClipboardEntry) {
+        var writes = Self.pasteboardWrites(for: entry)
+        writes = Self.expandImageFormats(writes)         // offer both PNG + TIFF for broad image paste
+        Self.appendColorTextFallback(&writes, entry: entry)   // hex text for a copied color
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        if !writes.isEmpty {
+            let pbItem = NSPasteboardItem()
+            for write in writes {
+                pbItem.setData(write.data, forType: NSPasteboard.PasteboardType(write.uti))
+            }
+            pb.writeObjects([pbItem])
+        }
+        guard let app = frontApp() else { return }
+        // The non-activating overlay never took key focus, so the captured app is still frontmost;
+        // re-assert activation defensively, then synthesize ⌘V to its process.
+        app.activate(options: [])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self] in
+            self?.postKey(0x09, flags: .maskCommand, toPid: app.processIdentifier)   // ⌘V (V = 0x09)
+        }
+    }
+
+    /// Pure: the (UTI, bytes) representations to restore for `entry`, skipping any unmaterialized
+    /// (blob) payloads. Unit-testable without a pasteboard. Returns empty for an entry with no inline
+    /// bytes (a stale/empty entry), so the caller writes nothing harmful.
+    ///
+    /// A **plain-text fallback** is added when the entry has no plain text of its own, so it pastes
+    /// *something* into apps that don't accept the rich type — a file/folder's POSIX path, or a URL's
+    /// string. The rich representation (e.g. the file-url) is kept too, so Finder/IDEs still paste the
+    /// real file while a text field gets the path.
+    nonisolated static func pasteboardWrites(for entry: ClipboardEntry) -> [(uti: String, data: Data)] {
+        var writes: [(uti: String, data: Data)] = entry.representations.compactMap { uti, payload in
+            guard let data = payload.inlineData else { return nil }
+            return (uti, data)
+        }
+        let hasPlainText = writes.contains { $0.uti == ClipboardUTI.plainText }
+        if !hasPlainText, let fallback = plainTextFallback(for: entry), let data = fallback.data(using: .utf8) {
+            writes.append((ClipboardUTI.plainText, data))
+        }
+        return writes
+    }
+
+    /// Pure: a useful plain-text form for kinds that otherwise wouldn't paste into a text field. A
+    /// file/folder yields its POSIX path (decoded from the file-url); a URL yields its string. Image,
+    /// color, and already-textual kinds have no separate fallback (nil).
+    nonisolated static func plainTextFallback(for entry: ClipboardEntry) -> String? {
+        switch entry.kind {
+        case .file:
+            guard let data = entry.representations[ClipboardUTI.fileURL]?.inlineData,
+                  let str = String(data: data, encoding: .utf8),
+                  let url = URL(string: str) else { return nil }
+            return url.isFileURL ? url.path : str
+        case .url:
+            guard let data = entry.representations[ClipboardUTI.url]?.inlineData else { return nil }
+            return String(data: data, encoding: .utf8)
+        case .text, .richText, .image, .color:
+            return nil
+        }
+    }
+
+    /// Ensure an image on the pasteboard offers **both** PNG and TIFF, so apps that want one or the
+    /// other accept the paste (capture may have stored only one). AppKit conversion, kept out of the
+    /// pure `pasteboardWrites`. A no-op for non-image writes or undecodable data.
+    private static func expandImageFormats(_ writes: [(uti: String, data: Data)]) -> [(uti: String, data: Data)] {
+        var out = writes
+        let hasPNG = out.contains { $0.uti == ClipboardUTI.png }
+        let hasTIFF = out.contains { $0.uti == ClipboardUTI.tiff }
+        guard !(hasPNG && hasTIFF),
+              let data = out.first(where: { $0.uti == ClipboardUTI.png || $0.uti == ClipboardUTI.tiff })?.data,
+              let rep = NSBitmapImageRep(data: data) else { return out }
+        if !hasTIFF, let tiff = rep.tiffRepresentation { out.append((ClipboardUTI.tiff, tiff)) }
+        if !hasPNG, let png = rep.representation(using: .png, properties: [:]) { out.append((ClipboardUTI.png, png)) }
+        return out
+    }
+
+    /// Add a hex (`#RRGGBB`) plain-text fallback for a copied color, so it pastes into a text field.
+    private static func appendColorTextFallback(_ writes: inout [(uti: String, data: Data)], entry: ClipboardEntry) {
+        guard entry.kind == .color,
+              !writes.contains(where: { $0.uti == ClipboardUTI.plainText }),
+              let data = entry.representations[ClipboardUTI.color]?.inlineData,
+              let color = try? NSKeyedUnarchiver.unarchivedObject(ofClass: NSColor.self, from: data),
+              let rgb = color.usingColorSpace(.sRGB) else { return }
+        let hex = String(format: "#%02X%02X%02X",
+                         Int((rgb.redComponent * 255).rounded()),
+                         Int((rgb.greenComponent * 255).rounded()),
+                         Int((rgb.blueComponent * 255).rounded()))
+        if let hexData = hex.data(using: .utf8) { writes.append((ClipboardUTI.plainText, hexData)) }
     }
 
     // MARK: - Built-in actions
@@ -68,7 +165,7 @@ final class LaunchService {
     /// Perform a built-in `SystemAction` natively (AX / NSWorkspace / synthesized keys), no subprocess
     /// for the window/app paths and no new permission. Every "front" action targets the app captured
     /// when the launcher opened (`frontAppProvider`).
-    private func perform(_ action: SystemAction, adjustment: ValueAdjustment? = nil) {
+    private func perform(_ action: SystemAction, adjustment: ValueAdjustment? = nil, toClipboard: Bool = false) {
         switch action {
         // Window
         case .minimizeWindow:
@@ -110,9 +207,9 @@ final class LaunchService {
         case .screenSaver:         startScreenSaver()
         case .sleepDisplay:        runDetached("/usr/bin/pmset", ["displaysleepnow"])
         case .emptyTrash:          emptyTrash()
-        case .screenshotSelection: postKey(0x15, flags: [.maskShift, .maskCommand], toPid: nil) // ⇧⌘4
-        case .screenshotFullScreen:postKey(0x14, flags: [.maskShift, .maskCommand], toPid: nil) // ⇧⌘3
-        case .screenshotTools:     postKey(0x17, flags: [.maskShift, .maskCommand], toPid: nil) // ⇧⌘5
+        case .screenshotSelection, .screenshotFullScreen, .screenshotTools:
+            let shot = Self.screenshotShortcut(for: action, toClipboard: toClipboard)
+            postKey(shot.keyCode, flags: shot.flags, toPid: nil)
         // Media & display (system-defined keys)
         case .playPause:           postMediaKey(16)
         case .nextTrack:           postMediaKey(17)
@@ -670,6 +767,23 @@ final class LaunchService {
     /// numeric-pad + secondary-Fn) so macOS's default Space hotkey matches it; a partial flag set is
     /// silently ignored for arrow keys.
     nonisolated static let spaceSwitchFlags: CGEventFlags = [.maskControl, .maskNumericPad, .maskSecondaryFn]
+
+    /// The (keyCode, flags) for a screenshot action's native shortcut. Selection = ⇧⌘4, Full Screen =
+    /// ⇧⌘3, Tools = ⇧⌘5. macOS routes the same capture to the **clipboard** instead of a file when ⌃ is
+    /// added, so for Selection/Full Screen `toClipboard` ORs in `.maskControl` (→ ⌃⇧⌘4 / ⌃⇧⌘3). Tools
+    /// has no modifier equivalent (its toolbar owns the destination), so the flag is ignored for it.
+    nonisolated static func screenshotShortcut(for action: SystemAction,
+                                               toClipboard: Bool) -> (keyCode: CGKeyCode, flags: CGEventFlags) {
+        var flags: CGEventFlags = [.maskShift, .maskCommand]
+        let keyCode: CGKeyCode
+        switch action {
+        case .screenshotSelection:  keyCode = 0x15; if toClipboard { flags.insert(.maskControl) }   // ⇧⌘4
+        case .screenshotFullScreen: keyCode = 0x14; if toClipboard { flags.insert(.maskControl) }   // ⇧⌘3
+        case .screenshotTools:      keyCode = 0x17                                                   // ⇧⌘5
+        default:                    keyCode = 0x15
+        }
+        return (keyCode, flags)
+    }
 }
 
 /// Outcome of trying to bring an app's window(s) to the current Space — richer than a Bool so the

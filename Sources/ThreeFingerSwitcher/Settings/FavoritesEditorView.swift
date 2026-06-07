@@ -621,8 +621,13 @@ private struct ItemInspector: View {
                 Text(strategyHelp(strategy ?? band?.defaultAppStrategy ?? .smart))
                     .font(.caption).foregroundStyle(.secondary)
             }
-            if case let .action(action, adjustment) = item.kind, action.isValueAdjustable {
-                valueControl(action: action, adjustment: adjustment)
+            if case let .action(action, adjustment, toClipboard) = item.kind {
+                if action.isValueAdjustable {
+                    valueControl(action: action, adjustment: adjustment)
+                }
+                if action.supportsClipboardDestination {
+                    screenshotClipboardControl(action: action, adjustment: adjustment, toClipboard: toClipboard ?? false)
+                }
             }
         }
         .formStyle(.grouped)
@@ -631,7 +636,10 @@ private struct ItemInspector: View {
 
     private var inspectorHeight: CGFloat {
         if item.isAppKind { return 300 }
-        if case let .action(action, _) = item.kind, action.isValueAdjustable { return 270 }
+        if case let .action(action, _, _) = item.kind {
+            if action.isValueAdjustable { return 270 }
+            if action.supportsClipboardDestination { return 240 }
+        }
         return 190
     }
 
@@ -684,6 +692,25 @@ private struct ItemInspector: View {
                  : "Adds or subtracts this much from the current \(noun); Up adds, Down subtracts.")
                 .font(.caption).foregroundStyle(.secondary)
         }
+    }
+
+    /// Toggle for the Selection / Full-Screen screenshot actions: route the capture to the clipboard
+    /// (the native ⌃-modified shortcut) instead of writing a file. Preserves any (irrelevant here)
+    /// value adjustment when rewriting the kind.
+    @ViewBuilder
+    private func screenshotClipboardControl(action: SystemAction, adjustment: ValueAdjustment?,
+                                            toClipboard: Bool) -> some View {
+        Toggle("Save screenshot to clipboard", isOn: Binding(
+            get: { toClipboard },
+            set: { on in
+                store.updateItem(item.id, inBand: bandID) {
+                    // Store `nil` when off so the field encodes as absent — identical on disk to a
+                    // pre-feature item, and equal to a never-toggled one.
+                    $0.kind = .action(action, adjustment, screenshotToClipboard: on ? true : nil)
+                }
+            }))
+        Text("Captures to the clipboard only — no file is saved to the Desktop. Paste it anywhere (⌘V).")
+            .font(.caption).foregroundStyle(.secondary)
     }
 
     private var band: ContextBand? { store.favorites.bands.first { $0.id == bandID } }
@@ -749,7 +776,7 @@ private func naturalIcon(for kind: LaunchItemKind) -> ItemIcon? {
     switch kind {
     case .app: return .appDefault
     case .path: return .fileIcon
-    case .url, .shortcut, .script, .action, .preset: return nil
+    case .url, .shortcut, .script, .action, .preset, .clipboardEntry: return nil
     }
 }
 
@@ -983,6 +1010,7 @@ private func kindLabel(_ kind: LaunchItemKind) -> String {
     case .script: return "Script"
     case .action: return "Action"
     case .preset: return "Preset"
+    case .clipboardEntry: return "Clipboard"
     }
 }
 

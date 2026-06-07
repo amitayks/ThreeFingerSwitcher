@@ -24,7 +24,11 @@ struct LauncherView: View {
         VStack(spacing: 0) {
             tabs
             Divider().opacity(0.35)
-            grid
+            if model.currentBandIsClipboard {
+                ClipboardBandView(model: model)
+            } else {
+                grid
+            }
         }
         .padding(LauncherGridLayout.containerPadding)
         .frame(maxWidth: .infinity, maxHeight: .infinity)

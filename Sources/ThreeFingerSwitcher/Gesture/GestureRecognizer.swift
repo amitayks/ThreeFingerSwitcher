@@ -36,6 +36,15 @@ protocol GestureRecognizerDelegate: AnyObject {
     func launcherDidEnd()
     /// Launcher gesture aborted (extra finger / engine reset); dismiss without firing.
     func launcherDidCancel()
+    /// The controlling contact's held-edge state during launcher navigation, per axis: `dx`/`dy` are
+    /// each −1 / 0 / +1 (`dx +1` = right edge, `dy +1` = top edge). Emitted whenever the edge state
+    /// changes; `(0, 0)` means no edge. Drives edge-triggered auto-repeat of horizontal item/band
+    /// stepping and vertical row stepping.
+    func launcherEdgeChanged(dx: Int, dy: Int)
+    /// Whether the launcher cursor is on the band-headers row (where horizontal travel switches
+    /// bands). Lets the recognizer apply the coarser context-step to band switching and the finer
+    /// item-step to in-grid item movement — so the two can be tuned independently. Defaults to false.
+    func launcherFocusIsOnHeaders() -> Bool
 }
 
 extension GestureRecognizerDelegate {
@@ -44,6 +53,8 @@ extension GestureRecognizerDelegate {
     func launcherDidStepContext(_ direction: Int) {}
     func launcherDidEnd() {}
     func launcherDidCancel() {}
+    func launcherEdgeChanged(dx: Int, dy: Int) {}
+    func launcherFocusIsOnHeaders() -> Bool { false }
 }
 
 /// Multi-finger scrub state machine. The active finger count is **latched at gesture start**:
@@ -98,6 +109,15 @@ final class GestureRecognizer {
     /// Live contact count of the latched launcher gesture, used to detect contact-count changes so
     /// the step origin can be re-baselined (the centroid shifts as fingers leave). Seeded at begin.
     private var launcherContacts = 0
+    /// Edge-hold state for scroll acceleration, per axis (−1 / 0 / +1): `edgeDX +1` = right edge,
+    /// `edgeDY +1` = top edge. Emitted to the delegate when either changes.
+    private var edgeDX = 0
+    private var edgeDY = 0
+    /// Normalized distance from a trackpad edge within which a held contact triggers auto-repeat, with
+    /// hysteresis (enter < exit) so micro-jitter at the boundary doesn't flap the hold on/off. The
+    /// enter zone is generous because a multi-finger centroid can't physically reach the very edge.
+    private let edgeEnterZone: CGFloat = 0.16
+    private let edgeExitZone: CGFloat = 0.24
     /// Live contact count of the switcher gesture *after activation*, used the same way as
     /// `launcherContacts`: once the overlay is up the user may relax three fingers to two, and the
     /// centroid shifts as the finger leaves — so on a count change we re-baseline the step origin.
@@ -338,6 +358,7 @@ final class GestureRecognizer {
         belowTargetFrames = 0
         triggeredMissionControl = false
         launcherContacts = frame.fingerCount   // 4 at begin; tracked so a drop re-baselines the origin
+        edgeDX = 0; edgeDY = 0
     }
 
     private func trackLauncher(_ frame: TouchFrame) {
@@ -393,19 +414,53 @@ final class GestureRecognizer {
             return
         }
 
-        // Active: horizontal → item steps, vertical → context-band steps (both with carry). The
-        // launcher owns both axes; the freed four-finger scroll is consumed by the scroll tap.
+        // Active: horizontal moves the cursor / switches bands, vertical moves between grid rows and
+        // the headers (both with carry). The launcher owns both axes; the freed four-finger scroll is
+        // consumed by the scroll tap. The threshold tracks the *action*, not the axis: switching bands
+        // (horizontal on the headers row) uses the coarser context-step so it can be made deliberate
+        // independently; all item movement — horizontal in the grid and every vertical step — uses the
+        // finer item-step. So raising the context-step slows band switching without touching items.
         stepAccumulator += (c.x - lastCentroid.x)
         stepAccumulatorY += (c.y - lastCentroid.y)
         lastCentroid = c
 
         let itemStep = CGFloat(max(settings.launcherStepDistance, 0.005))
-        while stepAccumulator >= itemStep { stepAccumulator -= itemStep; emitItemStep(forward: true) }
-        while stepAccumulator <= -itemStep { stepAccumulator += itemStep; emitItemStep(forward: false) }
+        let onHeaders = delegate?.launcherFocusIsOnHeaders() ?? false
+        let horizStep = onHeaders ? CGFloat(max(settings.launcherContextStepDistance, 0.02)) : itemStep
+        while stepAccumulator >= horizStep { stepAccumulator -= horizStep; emitItemStep(forward: true) }
+        while stepAccumulator <= -horizStep { stepAccumulator += horizStep; emitItemStep(forward: false) }
 
-        let ctxStep = CGFloat(max(settings.launcherContextStepDistance, 0.02))
-        while stepAccumulatorY >= ctxStep { stepAccumulatorY -= ctxStep; emitContextStep(up: true) }
-        while stepAccumulatorY <= -ctxStep { stepAccumulatorY += ctxStep; emitContextStep(up: false) }
+        while stepAccumulatorY >= itemStep { stepAccumulatorY -= itemStep; emitContextStep(up: true) }
+        while stepAccumulatorY <= -itemStep { stepAccumulatorY += itemStep; emitContextStep(up: false) }
+
+        updateEdges(c)
+    }
+
+    /// Track whether the controlling contact is held at a trackpad edge on each axis (with hysteresis),
+    /// emitting `launcherEdgeChanged` only when the per-axis state changes. The controller decides what
+    /// to auto-repeat (and clamps when there's nowhere to go).
+    private func updateEdges(_ c: CGPoint) {
+        let dx = edgeAxis(c.x, current: edgeDX)
+        let dy = edgeAxis(c.y, current: edgeDY)
+        guard dx != edgeDX || dy != edgeDY else { return }
+        edgeDX = dx; edgeDY = dy
+        delegate?.launcherEdgeChanged(dx: dx, dy: dy)
+    }
+
+    /// Per-axis edge direction with hysteresis: enter an edge at `edgeEnterZone`, leave it only past
+    /// `edgeExitZone`, so jitter at the boundary doesn't flap. `+1` = high edge, `-1` = low edge.
+    private func edgeAxis(_ v: CGFloat, current: Int) -> Int {
+        if current > 0 { return v >= 1 - edgeExitZone ? 1 : (v <= edgeEnterZone ? -1 : 0) }
+        if current < 0 { return v <= edgeExitZone ? -1 : (v >= 1 - edgeEnterZone ? 1 : 0) }
+        if v >= 1 - edgeEnterZone { return 1 }
+        if v <= edgeEnterZone { return -1 }
+        return 0
+    }
+
+    private func clearEdges() {
+        guard edgeDX != 0 || edgeDY != 0 else { return }
+        edgeDX = 0; edgeDY = 0
+        delegate?.launcherEdgeChanged(dx: 0, dy: 0)
     }
 
     private func emitItemStep(forward: Bool) {
@@ -422,6 +477,7 @@ final class GestureRecognizer {
 
     private func endLauncher() {
         let didActivate = activated
+        clearEdges()
         state = .idle
         axis = .undetermined
         activated = false
@@ -432,6 +488,7 @@ final class GestureRecognizer {
 
     private func cancelLauncher() {
         let wasActivated = activated
+        clearEdges()
         state = .idle
         axis = .undetermined
         activated = false

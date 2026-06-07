@@ -36,3 +36,18 @@ enum LauncherGridLayout {
         return tabsHeight + gridHeight + 2 * containerPadding
     }
 }
+
+/// Metrics for the Clipboard band's master-detail layout (key list + value preview). Sized large
+/// enough to show several keys and a sizeable value preview at once — deliberately independent of the
+/// icon-grid `LauncherGridLayout`.
+enum ClipboardBandLayout {
+    static let containerWidth: CGFloat = 940
+    static let containerHeight: CGFloat = 580
+    /// Width of the left key column; the rest is the value preview.
+    static let keyColumnWidth: CGFloat = 340
+    static let keyRowHeight: CGFloat = 40
+    /// Visible key rows before the list scrolls.
+    static let maxVisibleKeyRows = 11
+    static let tabsHeight = LauncherGridLayout.tabsHeight
+    static let padding = LauncherGridLayout.containerPadding
+}

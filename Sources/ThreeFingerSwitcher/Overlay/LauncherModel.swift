@@ -32,17 +32,48 @@ final class LauncherModel: ObservableObject {
     @Published private(set) var armingToken: Int = 0
     @Published var dwell: Double = 0.5
 
-    var bandCount: Int { bands.count }
-    private var columns: Int { LauncherGridLayout.columns }
+    /// Index of the synthetic Clipboard band, when present (always the last band). It navigates as a
+    /// single-column master-detail list and repurposes horizontal travel (see `stepHorizontal`).
+    @Published private(set) var clipboardBandIndex: Int?
+    /// Session-only set of clipboard entry ids whose pin was toggled this session — drives the pin
+    /// marker without reordering the live list (the reorder is deferred to the next band build).
+    @Published private(set) var sessionPinToggles: Set<UUID> = []
+    /// Called when a RIGHT step pins/unpins the selected clipboard entry (wired to the store).
+    var onPinToggle: ((LaunchItem) -> Void)?
 
-    func setBands(_ bands: [[LaunchItem]], names: [String], colors: [ItemColor], startBand: Int, column: Int) {
+    /// How many fine horizontal steps must accumulate before a clipboard pin / previous-band action
+    /// fires — so pinning needs a *deliberate* horizontal excursion, not the fine item step. Set from
+    /// settings on `show`; defaults to a deliberate few.
+    var clipboardPinStepThreshold: Int = 3
+    /// Signed accumulator of fine horizontal steps within the current clipboard excursion.
+    private var clipHorizAccum = 0
+    /// True once an action fired this excursion; cleared only when the accumulator returns to centre,
+    /// so one horizontal flick = one action (no rapid re-toggling while the fingers stay offset).
+    private var clipHorizLatched = false
+
+    var bandCount: Int { bands.count }
+    /// Whether the current band is the Clipboard band (single column, repurposed horizontal).
+    var currentBandIsClipboard: Bool { clipboardBandIndex == currentBand }
+    /// Columns for the current band: the Clipboard band is a single-column list; others use the grid.
+    private var currentColumns: Int { currentBandIsClipboard ? 1 : LauncherGridLayout.columns }
+
+    func setBands(_ bands: [[LaunchItem]], names: [String], colors: [ItemColor],
+                  startBand: Int, column: Int, clipboardBandIndex: Int? = nil) {
         self.bands = bands
         self.bandNames = names
         self.bandColors = colors
+        self.clipboardBandIndex = clipboardBandIndex
+        self.sessionPinToggles = []
         self.currentBand = clamp(startBand, 0, max(bands.count - 1, 0))
         self.focus = .grid                         // first trigger: first app of the first header
         applyCurrentBand(column: column)
         disarm()
+    }
+
+    /// Visual pin state for a clipboard item: the entry's stored pin XOR a session toggle.
+    func isPinned(_ item: LaunchItem) -> Bool {
+        guard case let .clipboardEntry(entry) = item.kind else { return false }
+        return entry.pinned != sessionPinToggles.contains(item.id)
     }
 
     // MARK: - Navigation (pure)
@@ -59,21 +90,56 @@ final class LauncherModel: ObservableObject {
             currentBand = target
             applyCurrentBand(column: 0)
         case .grid:
+            // The Clipboard band has no horizontal cursor (single column): RIGHT pins the selected
+            // entry (no move, deferred reorder), LEFT leaves to the previous band.
+            if currentBandIsClipboard {
+                stepClipboardHorizontal(dir)
+                return
+            }
             guard !items.isEmpty else { return }
-            let col = selectedIndex % columns
-            let row = selectedIndex / columns
-            let itemsInRow = min(columns, items.count - row * columns)
+            let cols = currentColumns
+            let col = selectedIndex % cols
+            let row = selectedIndex / cols
+            let itemsInRow = min(cols, items.count - row * cols)
             let newCol = col + dir
             if newCol >= 0 && newCol < itemsInRow {
-                selectedIndex = row * columns + newCol
+                selectedIndex = row * cols + newCol
             }
         }
+    }
+
+    /// Clipboard-band horizontal: a *deliberate* excursion (≥ `clipboardPinStepThreshold` fine steps)
+    /// fires once — RIGHT toggles the selected entry's pin (selection stays put), LEFT switches to the
+    /// previous band (the Clipboard band is last). The action is latched until the accumulator returns
+    /// to centre, so one flick = one action (no rapid re-toggling within a small movement).
+    private func stepClipboardHorizontal(_ dir: Int) {
+        clipHorizAccum += dir
+        if clipHorizAccum == 0 { clipHorizLatched = false }   // returned to centre: ready for the next flick
+        guard !clipHorizLatched, abs(clipHorizAccum) >= max(1, clipboardPinStepThreshold) else { return }
+        clipHorizLatched = true
+        if clipHorizAccum > 0 {
+            guard let item = selectedItem else { return }
+            sessionPinToggles.formSymmetricDifference([item.id])   // toggle (next flick = back to original)
+            onPinToggle?(item)
+        } else if currentBand > 0 {
+            lastBandDirection = -1
+            currentBand -= 1
+            applyCurrentBand(column: 0)
+        }
+    }
+
+    /// Reset the clipboard horizontal excursion state (on band entry / vertical scrub) so partial
+    /// horizontal travel never lingers across a different action.
+    private func resetClipboardHoriz() {
+        clipHorizAccum = 0
+        clipHorizLatched = false
     }
 
     /// Vertical step (`dir > 0` = up, toward the headers; `dir < 0` = down, into the grid). Up from
     /// the first app row lands on the headers; down from the headers enters the grid.
     func stepVertical(_ dir: Int) {
         guard dir != 0 else { return }
+        if currentBandIsClipboard { resetClipboardHoriz() }   // vertical scrub clears horizontal intent
         switch focus {
         case .headers:
             if dir < 0, !items.isEmpty {           // down → enter the grid at the first app
@@ -82,18 +148,19 @@ final class LauncherModel: ObservableObject {
             }
             // up → already at the top; nothing
         case .grid:
-            let col = selectedIndex % columns
-            let row = selectedIndex / columns
+            let cols = currentColumns
+            let col = selectedIndex % cols
+            let row = selectedIndex / cols
             if dir > 0 {                            // up
                 if row == 0 {
                     focus = .headers                // rise out of the grid onto the headers
                 } else {
-                    selectedIndex = (row - 1) * columns + col
+                    selectedIndex = (row - 1) * cols + col
                 }
             } else {                                // down
-                let lastRow = max(0, (items.count - 1) / columns)
+                let lastRow = max(0, (items.count - 1) / cols)
                 if row < lastRow {
-                    selectedIndex = min((row + 1) * columns + col, items.count - 1)
+                    selectedIndex = min((row + 1) * cols + col, items.count - 1)
                 }
             }
         }
@@ -117,6 +184,7 @@ final class LauncherModel: ObservableObject {
     private func applyCurrentBand(column: Int) {
         items = bands.indices.contains(currentBand) ? bands[currentBand] : []
         selectedIndex = clamp(column, 0, max(items.count - 1, 0))
+        resetClipboardHoriz()
     }
 
     private func clamp(_ v: Int, _ lo: Int, _ hi: Int) -> Int { min(max(v, lo), hi) }

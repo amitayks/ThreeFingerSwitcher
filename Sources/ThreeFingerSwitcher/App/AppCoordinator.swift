@@ -47,6 +47,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// Frontmost app captured at launcher-open time (target for `.action(.closeFrontWindow)`).
     private var capturedFrontApp: NSRunningApplication?
 
+    // Clipboard history (opt-in; the synthetic Clipboard band + the background recorder).
+    private let clipboardStore = ClipboardStore.shared
+    private lazy var clipboardMonitor = ClipboardMonitor(store: clipboardStore)
+
     /// Whether the app currently has Mission Control open (it triggers MC itself via the vertical
     /// gesture). Lets the switcher float above MC and a commit dismiss it before raising.
     private var missionControlOpen = false
@@ -88,10 +92,15 @@ final class AppCoordinator: GestureRecognizerDelegate {
         }
         thumbnails.onThumbnail = { [weak self] id, image in self?.overlay.model.setThumbnail(image, for: id) }
         launcherOverlay.onFire = { [weak self] item, band in self?.launchService.fire(item, inBand: band) }
+        launcherOverlay.onTogglePin = { [weak self] item in
+            guard case let .clipboardEntry(entry) = item.kind else { return }
+            self?.clipboardStore.togglePin(id: entry.id)
+        }
         observeSleepWake()
         observeSpacesRearrangeToggle()
         observeVerticalGestureToggle()
         observeLauncherToggle()
+        observeClipboardToggle()
     }
 
     deinit {
@@ -143,6 +152,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         applyLauncherGestureOnLaunchIfManaged()
         if settings.enabled { enable() }
         refreshRowSwitchingGate()
+        refreshClipboardMonitor()
         maybePromptNativeGestureSetup()
         applySpacesRearrangeOnLaunchIfManaged()
         maybePromptSpacesRearrange()
@@ -161,6 +171,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         isEnabled = touchEngine.isAvailable
         settings.enabled = true
         refreshRowSwitchingGate()
+        refreshClipboardMonitor()
         onStateChange?()
     }
 
@@ -172,6 +183,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         mru.stop()
         overlay.hide()
         launcherOverlay.cancel()
+        clipboardMonitor.stop()
         isEnabled = false
         settings.enabled = false
         onStateChange?()
@@ -359,15 +371,29 @@ final class AppCoordinator: GestureRecognizerDelegate {
 
     func launcherDidActivate() {
         let fav = favoritesStore.favorites
-        guard !fav.bands.isEmpty else { return }
+        // When clipboard history is on, append the synthetic Clipboard band as the LAST band, built
+        // fresh from the store (recent slice, pinned-first). It is never persisted and never the home.
+        var bands = fav.bands
+        var clipboardBandIndex: Int?
+        if settings.keepClipboardHistory {
+            let entries = clipboardStore.recentWindow(limit: settings.clipboardRecentWindow)
+            bands.append(ClipboardBandBuilder.build(from: entries))
+            clipboardBandIndex = bands.count - 1
+        }
+        guard !bands.isEmpty else { return }
         // Capture the app the user was looking at before the (non-activating) overlay appears, so a
-        // `.action(.closeFrontWindow)` item targets that window rather than whatever is front at fire.
+        // `.action(.closeFrontWindow)` item — and a clipboard paste — targets that window.
         let front = NSWorkspace.shared.frontmostApplication
         capturedFrontApp = (front?.processIdentifier == getpid()) ? capturedFrontApp : front
-        launcherOverlay.show(bands: fav.bands,
+        launcherOverlay.edgeAcceleration = settings.clipboardEdgeAcceleration
+        // Convert the deliberate pin-flick distance into a count of fine horizontal steps.
+        launcherOverlay.clipboardPinSteps =
+            max(2, Int((settings.clipboardPinDistance / max(settings.launcherStepDistance, 0.01)).rounded()))
+        launcherOverlay.show(bands: bands,
                              startBand: fav.homeBandIndex,
                              startColumn: fav.resolvedHomeColumn,
-                             dwell: settings.dwellToArmDuration)
+                             dwell: settings.dwellToArmDuration,
+                             clipboardBandIndex: clipboardBandIndex)
     }
 
     func launcherDidStepItem(_ direction: Int) {
@@ -380,6 +406,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
         launcherOverlay.stepVertical(direction)      // grid rows / rise onto the headers row
     }
 
+    func launcherFocusIsOnHeaders() -> Bool {
+        launcherOverlay.isVisible && launcherOverlay.focusIsOnHeaders
+    }
+
     func launcherDidEnd() {
         // Lift: the controller fires the armed item (or dismisses if nothing armed). Firing is
         // heterogeneous (app/path/url/shortcut/script/preset); the AX-dependent paths degrade on
@@ -389,6 +419,61 @@ final class AppCoordinator: GestureRecognizerDelegate {
 
     func launcherDidCancel() {
         launcherOverlay.cancel()
+    }
+
+    func launcherEdgeChanged(dx: Int, dy: Int) {
+        guard launcherOverlay.isVisible else { return }
+        var h = dx, v = dy
+        if settings.reverseDirection { h = -h }            // match manual horizontal stepping
+        if settings.reverseVerticalDirection { v = -v }    // match manual vertical stepping
+        launcherOverlay.setEdgeAutoScroll(dx: h, dy: v)
+    }
+
+    // MARK: - Clipboard history monitor lifecycle
+
+    /// React to the "Keep clipboard history" toggle: start/stop the recorder. The pause toggle just
+    /// updates the monitor's pause flag (it early-returns while paused, keeping the band intact).
+    /// Both sinks use the **emitted** value, not a re-read of the property: `@Published` fires in
+    /// `willSet`, so `settings.keepClipboardHistory` would still report the OLD value here (the same
+    /// reason the gesture toggles pass `enabled` through).
+    private func observeClipboardToggle() {
+        settings.$keepClipboardHistory
+            .dropFirst()
+            .sink { [weak self] on in MainActor.assumeIsolated { self?.setClipboardRecording(on) } }
+            .store(in: &cancellables)
+        settings.$clipboardPaused
+            .dropFirst()
+            .sink { [weak self] paused in MainActor.assumeIsolated { self?.clipboardMonitor.isPaused = paused } }
+            .store(in: &cancellables)
+    }
+
+    /// Push the tunables (retention, poll interval, exclusions) into the store/monitor. Does NOT read
+    /// the start/stop or pause toggles (those are driven by their emitted values to avoid the
+    /// `@Published` willSet staleness).
+    private func applyClipboardTunables() {
+        clipboardStore.retention = ClipboardStore.Retention(
+            maxCount: settings.clipboardMaxCount,
+            maxBytes: settings.clipboardMaxBytes,
+            maxAge: settings.clipboardMaxAgeDays * 86_400)
+        clipboardMonitor.pollInterval = settings.clipboardPollInterval
+        clipboardMonitor.excludedBundleIDs = Set(settings.clipboardExcludedApps)
+    }
+
+    /// Start the recorder when recording is on AND the app is enabled; otherwise stop it. `on` is the
+    /// authoritative recording state (the toggle's emitted value, or a stable read at launch/enable).
+    private func setClipboardRecording(_ on: Bool) {
+        applyClipboardTunables()
+        clipboardMonitor.isPaused = settings.clipboardPaused
+        if on && isEnabled {
+            clipboardMonitor.start()
+        } else {
+            clipboardMonitor.stop()
+        }
+    }
+
+    /// Launch/enable/disable refresh: the opt-in value is stable at these call sites, so reading it is safe.
+    private func refreshClipboardMonitor() {
+        setClipboardRecording(settings.keepClipboardHistory)
     }
 
     // MARK: - Post-Space-switch cleanup & focus
@@ -855,7 +940,8 @@ final class AppCoordinator: GestureRecognizerDelegate {
             settings: settings,
             onOpenSetup: { [weak self] in self?.showOnboarding() },
             onRestoreMissionControl: { [weak self] in self?.restoreVerticalGestureSetting() },
-            showRestoreMissionControl: verticalGesture.hasBackup
+            showRestoreMissionControl: verticalGesture.hasBackup,
+            onClearClipboard: { [weak self] includingPinned in self?.clipboardStore.clear(includingPinned: includingPinned) }
         )
         if let settingsWindow {
             (settingsWindow.contentViewController as? NSHostingController<SettingsView>)?.rootView = view

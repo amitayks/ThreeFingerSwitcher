@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// Settings window for the gesture tunables.
 struct SettingsView: View {
@@ -10,6 +11,8 @@ struct SettingsView: View {
     var onRestoreMissionControl: () -> Void = {}
     /// Whether a Mission-Control backup exists to restore (drives the restore button's visibility).
     var showRestoreMissionControl: Bool = false
+    /// Clears the stored clipboard history. Wired by the coordinator to `ClipboardStore`.
+    var onClearClipboard: (_ includingPinned: Bool) -> Void = { _ in }
 
     var body: some View {
         Form {
@@ -63,16 +66,60 @@ struct SettingsView: View {
                     .disabled(!settings.enableLauncher)
                 slider("Item-step distance (one item per…)", value: $settings.launcherStepDistance,
                        range: 0.02...0.20, format: "%.3f",
-                       help: "Finger travel needed to move the selection by one item.")
+                       help: "Finger travel to move the selection by one item — horizontally between items in a band, and vertically between grid rows and the band headers.")
                     .disabled(!settings.enableLauncher)
-                slider("Context-step distance (one band per…)", value: $settings.launcherContextStepDistance,
+                slider("Band-switch distance (one band per…)", value: $settings.launcherContextStepDistance,
                        range: 0.05...0.30, format: "%.3f",
-                       help: "Vertical finger travel needed to switch context bands. Keep larger than the item step so horizontal scrubbing doesn't flip bands.")
+                       help: "Horizontal finger travel on the band-headers row needed to switch to the next band. Independent of the item step — raise it to make band switching more deliberate without slowing item movement.")
                     .disabled(!settings.enableLauncher)
                 slider("Dwell-to-arm (seconds)", value: $settings.dwellToArmDuration,
                        range: 0.2...1.5, format: "%.2f",
                        help: "How long to rest on an item before it arms; then lift to fire. A quick scrub-and-lift never fires.")
                     .disabled(!settings.enableLauncher)
+            }
+
+            Section("Clipboard history") {
+                Toggle("Keep clipboard history", isOn: $settings.keepClipboardHistory)
+                Text("Records what you copy — text, images, files, colors, links — into a Clipboard band shown as the last band in the four-finger launcher. Scrub to an entry and lift to paste it where you were. Stored only on this Mac; password-manager copies and excluded apps are never recorded. No new permission or logout needed. Off by default.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Toggle("Pause recording", isOn: $settings.clipboardPaused)
+                    .disabled(!settings.keepClipboardHistory)
+                intSlider("Entries shown in the band", value: $settings.clipboardRecentWindow,
+                          range: 5...100,
+                          help: "How many recent entries the Clipboard band shows. Pinned entries always float to the top.")
+                    .disabled(!settings.keepClipboardHistory)
+                intSlider("Maximum stored entries", value: $settings.clipboardMaxCount,
+                          range: 20...1000,
+                          help: "Oldest non-pinned entries are removed past this. Pinned entries are exempt.")
+                    .disabled(!settings.keepClipboardHistory)
+                slider("Maximum storage (MB)", value: maxBytesMB,
+                       range: 16...2048, format: "%.0f",
+                       help: "Total size of stored payloads (mostly images). Oldest non-pinned entries are removed past this.")
+                    .disabled(!settings.keepClipboardHistory)
+                slider("Maximum age (days, 0 = no limit)", value: $settings.clipboardMaxAgeDays,
+                       range: 0...90, format: "%.0f",
+                       help: "Non-pinned entries older than this are removed. 0 disables the age limit.")
+                    .disabled(!settings.keepClipboardHistory)
+                slider("Poll interval (seconds)", value: $settings.clipboardPollInterval,
+                       range: 0.2...2.0, format: "%.2f",
+                       help: "How often the clipboard is checked for new copies.")
+                    .disabled(!settings.keepClipboardHistory)
+                slider("Edge-scroll acceleration", value: $settings.clipboardEdgeAcceleration,
+                       range: 0.5...3.0, format: "%.2f",
+                       help: "How quickly the list speeds up when you hold a finger at the trackpad edge to scroll a long history.")
+                    .disabled(!settings.keepClipboardHistory)
+                slider("Pin flick distance", value: $settings.clipboardPinDistance,
+                       range: 0.10...0.45, format: "%.3f",
+                       help: "How far you swipe sideways on an entry to pin it (right) or jump to the previous band (left). Larger = more deliberate; one flick pins once.")
+                    .disabled(!settings.keepClipboardHistory)
+                ExcludedAppsEditor(excluded: $settings.clipboardExcludedApps)
+                    .disabled(!settings.keepClipboardHistory)
+                HStack {
+                    Button("Clear history") { onClearClipboard(false) }
+                    Button("Clear history (incl. pinned)") { onClearClipboard(true) }
+                }
+                .disabled(!settings.keepClipboardHistory)
             }
 
             Section("Reliability") {
@@ -104,6 +151,28 @@ struct SettingsView: View {
         .frame(width: 460, height: 460)
     }
 
+    /// The byte cap surfaced as megabytes for the slider.
+    private var maxBytesMB: Binding<Double> {
+        Binding(get: { Double(settings.clipboardMaxBytes) / (1024 * 1024) },
+                set: { settings.clipboardMaxBytes = Int($0 * 1024 * 1024) })
+    }
+
+    @ViewBuilder
+    private func intSlider(_ title: String, value: Binding<Int>, range: ClosedRange<Int>, help: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(title)
+                Spacer()
+                Text("\(value.wrappedValue)").foregroundStyle(.secondary).monospacedDigit()
+            }
+            Slider(value: Binding(get: { Double(value.wrappedValue) },
+                                  set: { value.wrappedValue = Int($0.rounded()) }),
+                   in: Double(range.lowerBound)...Double(range.upperBound))
+            Text(help).font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 2)
+    }
+
     @ViewBuilder
     private func slider(_ title: String, value: Binding<Double>, range: ClosedRange<Double>, format: String, help: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -118,5 +187,52 @@ struct SettingsView: View {
             Text(help).font(.caption).foregroundStyle(.secondary)
         }
         .padding(.vertical, 2)
+    }
+}
+
+/// Manages the clipboard-history app-exclusion list: shows current entries with a remove control and
+/// an "Add app…" menu of currently-running regular applications.
+private struct ExcludedAppsEditor: View {
+    @Binding var excluded: [String]
+
+    var body: some View {
+        DisclosureGroup("Excluded apps (\(excluded.count))") {
+            if excluded.isEmpty {
+                Text("Copies from apps you add here are never recorded.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(excluded, id: \.self) { bundleID in
+                HStack {
+                    Text(displayName(bundleID)).font(.caption)
+                    Spacer()
+                    Button { excluded.removeAll { $0 == bundleID } } label: {
+                        Image(systemName: "minus.circle.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                }
+            }
+            Menu("Add app…") {
+                ForEach(runningApps(), id: \.bundleID) { app in
+                    Button(app.name) {
+                        if !excluded.contains(app.bundleID) { excluded.append(app.bundleID) }
+                    }
+                }
+            }
+        }
+    }
+
+    private func displayName(_ bundleID: String) -> String {
+        NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first?.localizedName ?? bundleID
+    }
+
+    private func runningApps() -> [(bundleID: String, name: String)] {
+        NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular }
+            .compactMap { app in
+                guard let id = app.bundleIdentifier else { return nil }
+                return (id, app.localizedName ?? id)
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 }

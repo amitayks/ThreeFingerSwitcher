@@ -73,9 +73,10 @@ final class OverlayController {
 
     var isVisible: Bool { panel?.isVisible ?? false }
 
-    /// Size the panel to the card content and centre it horizontally on the active screen.
-    /// When the content fits, the panel hugs the cards (so the rounded container wraps them and
-    /// appears centred); when it overflows, the panel clamps to the available width and scrolls.
+    /// Size the panel to the card content and place it centred on the active screen — horizontally
+    /// centred and vertically a little above centre, matching the launcher overlay so the two land in
+    /// the same spot. When the content fits, the panel hugs the cards (so the rounded container wraps
+    /// them and appears centred); when it overflows, the panel clamps to the available width and scrolls.
     private func layout(_ panel: NSPanel, animated: Bool = false) {
         let screen = screenUnderMouse() ?? NSScreen.main ?? NSScreen.screens.first
         guard let frame = screen?.visibleFrame else { return }
@@ -87,7 +88,7 @@ final class OverlayController {
 
         let height = SwitcherLayout.panelHeight
         let x = frame.minX + (frame.width - width) / 2
-        let y = frame.minY + frame.height * 0.18
+        let y = frame.minY + (frame.height - height) * 0.62   // match the launcher's vertical placement
         let rect = NSRect(x: x, y: y, width: width, height: height)
 
         if animated {

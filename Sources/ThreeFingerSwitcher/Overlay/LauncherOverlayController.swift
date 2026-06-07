@@ -11,29 +11,51 @@ final class LauncherOverlayController {
 
     /// Called when an armed item is fired on lift. Wired by the coordinator to `LaunchService`.
     var onFire: ((LaunchItem, ContextBand) -> Void)?
+    /// Called when a RIGHT step pins/unpins the selected clipboard entry. Wired to `ClipboardStore`.
+    var onTogglePin: ((LaunchItem) -> Void)?
 
     private var panel: SwitcherPanel?
     private var bands: [ContextBand] = []
     private var dwell: Double = 0.5
     private var armWork: DispatchWorkItem?
 
+    // Edge-triggered auto-repeat state (per axis: −1 / 0 / +1; horizontal steps items/bands, vertical
+    // steps rows). A single timer advances both axes each tick.
+    private var edgeTimer: DispatchSourceTimer?
+    private var edgeDX = 0
+    private var edgeDY = 0
+    private var edgeTicks = 0
+    /// Acceleration sensitivity (≥1); higher accelerates faster. Set from settings on `show`.
+    var edgeAcceleration: Double = 1.0
+    /// Deliberate horizontal steps required before a clipboard pin / previous-band action fires. Set
+    /// from settings on `show`; pushed into the model so pinning isn't twitchy.
+    var clipboardPinSteps: Int = 3
+
     // MARK: - Show / navigate
 
-    func show(bands: [ContextBand], startBand: Int, startColumn: Int, dwell: Double) {
+    func show(bands: [ContextBand], startBand: Int, startColumn: Int, dwell: Double,
+              clipboardBandIndex: Int? = nil) {
         self.bands = bands
         self.dwell = dwell
         model.dwell = dwell
+        model.onPinToggle = onTogglePin
+        model.clipboardPinStepThreshold = clipboardPinSteps
         model.setBands(bands.map(\.items),
                        names: bands.map(\.name),
                        colors: bands.map(\.color),
                        startBand: startBand,
-                       column: startColumn)
+                       column: startColumn,
+                       clipboardBandIndex: clipboardBandIndex)
         let panel = self.panel ?? makePanel()
         self.panel = panel
         layout(panel)
         panel.orderFrontRegardless()
         manageDwell()
     }
+
+    /// Whether the cursor is on the band-headers row (where horizontal travel switches bands). Lets the
+    /// gesture recognizer apply the coarser context-step to band switching, finer item-step elsewhere.
+    var focusIsOnHeaders: Bool { model.focus == .headers }
 
     /// Horizontal swipe step: switch batch on the headers row, else move the grid cursor.
     func stepHorizontal(_ dir: Int) {
@@ -73,6 +95,7 @@ final class LauncherOverlayController {
 
     func hide() {
         armWork?.cancel(); armWork = nil
+        endEdgeAutoScroll()
         model.disarm()
         // Destroy the panel, don't just orderOut. The panel is `.canJoinAllSpaces`, and an orderOut'd
         // all-Spaces panel leaves a rendered GHOST on the Space you switch to (verified: a Space-switch
@@ -87,6 +110,65 @@ final class LauncherOverlayController {
     var isVisible: Bool { panel?.isVisible ?? false }
     var currentBand: Int { model.currentBand }
     var bandCount: Int { model.bandCount }
+
+    // MARK: - Edge-triggered auto-repeat
+
+    /// Pure: the auto-repeat interval for a given tick — ramps from ~0.18s down toward a 0.03s floor
+    /// as ticks accumulate (faster with higher `acceleration`), so stepping speeds up at the edge.
+    nonisolated static func edgeInterval(tick: Int, acceleration: Double) -> Double {
+        let base = 0.18, minInterval = 0.03
+        let ramp = Double(tick) * 0.06 * max(0.5, acceleration)
+        return max(minInterval, base / (1 + ramp))
+    }
+
+    /// Auto-repeat stepping while a contact is held at a trackpad edge. `dx`/`dy` are −1 / 0 / +1 per
+    /// axis (horizontal steps items / switches bands on the headers row; vertical steps grid rows).
+    /// Horizontal is suppressed in the Clipboard band (there horizontal is pin / previous-band). When
+    /// both axes are zero the timer stops. A step that doesn't move the selection (clamped at an end)
+    /// does NOT reset the dwell, so holding at a dead edge still lets the current item arm and fire.
+    func setEdgeAutoScroll(dx: Int, dy: Int) {
+        let hx = model.currentBandIsClipboard ? 0 : dx
+        guard hx != edgeDX || dy != edgeDY else { return }
+        edgeDX = hx
+        edgeDY = dy
+        edgeTicks = 0   // restart the acceleration ramp when the edge direction changes
+        if edgeDX == 0, edgeDY == 0 {
+            endEdgeAutoScroll()
+        } else if edgeTimer == nil {
+            let timer = DispatchSource.makeTimerSource(queue: .main)
+            timer.setEventHandler { [weak self] in self?.edgeTick() }
+            edgeTimer = timer
+            rescheduleEdge()
+            timer.resume()
+        }
+    }
+
+    /// Stop auto-repeat (contact left every edge, or lifted).
+    func endEdgeAutoScroll() {
+        edgeTimer?.cancel()
+        edgeTimer = nil
+        edgeDX = 0
+        edgeDY = 0
+        edgeTicks = 0
+    }
+
+    private func edgeTick() {
+        let beforeBand = model.currentBand, beforeIndex = model.selectedIndex, beforeFocus = model.focus
+        if edgeDX != 0 { model.stepHorizontal(edgeDX) }
+        if edgeDY != 0 { model.stepVertical(edgeDY) }
+        let moved = model.currentBand != beforeBand || model.selectedIndex != beforeIndex || model.focus != beforeFocus
+        if moved {
+            if model.currentBand != beforeBand, let panel { layout(panel, animated: true) }
+            manageDwell()   // a real move resets the dwell (so auto-repeat never arms mid-scroll)
+        }
+        edgeTicks += 1
+        rescheduleEdge()
+    }
+
+    private func rescheduleEdge() {
+        guard let timer = edgeTimer else { return }
+        timer.schedule(deadline: .now() + Self.edgeInterval(tick: edgeTicks, acceleration: edgeAcceleration))
+    }
 
     /// After any navigation step: arm the selected app (restart dwell) when the cursor is on a grid
     /// item; disarm when it's on the headers row (headers don't fire).
@@ -150,10 +232,18 @@ final class LauncherOverlayController {
         guard let frame = screen?.visibleFrame else { return }
 
         // Constant-width "Applications"-style container; height grows with the band's item count
-        // up to a few rows, then the grid scrolls. Both axes are clamped to the screen.
-        let width = min(LauncherGridLayout.containerWidth, frame.width - SwitcherLayout.sideMargin * 2)
-        let wanted = LauncherGridLayout.containerHeight(forItemCount: model.items.count)
-        let height = min(wanted, frame.height - 100)
+        // up to a few rows, then the grid scrolls. The Clipboard band uses its own (larger)
+        // master-detail metrics. Both axes are clamped to the screen.
+        let width: CGFloat
+        let height: CGFloat
+        if model.currentBandIsClipboard {
+            width = min(ClipboardBandLayout.containerWidth, frame.width - SwitcherLayout.sideMargin * 2)
+            height = min(ClipboardBandLayout.containerHeight, frame.height - 100)
+        } else {
+            width = min(LauncherGridLayout.containerWidth, frame.width - SwitcherLayout.sideMargin * 2)
+            let wanted = LauncherGridLayout.containerHeight(forItemCount: model.items.count)
+            height = min(wanted, frame.height - 100)
+        }
 
         let x = frame.minX + (frame.width - width) / 2
         let y = frame.minY + (frame.height - height) * 0.62   // a little above centre

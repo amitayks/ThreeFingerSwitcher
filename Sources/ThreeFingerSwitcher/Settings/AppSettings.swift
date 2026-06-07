@@ -67,11 +67,14 @@ final class AppSettings: ObservableObject {
     /// Normalized horizontal centroid travel required to show the launcher (four-finger).
     @Published var launcherActivationThreshold: Double { didSet { persist(launcherActivationThreshold, Keys.launcherActivationThreshold) } }
 
-    /// Normalized horizontal travel that advances the launcher selection by one item.
+    /// Normalized travel that advances the launcher selection by one item — horizontal between items
+    /// in a band, and vertical between grid rows and the band-headers row. (Band switching uses the
+    /// separate `launcherContextStepDistance`.)
     @Published var launcherStepDistance: Double { didSet { persist(launcherStepDistance, Keys.launcherStepDistance) } }
 
-    /// Normalized vertical travel that switches one context band in the launcher. Larger than the
-    /// item step so horizontal scrubbing jitter doesn't flip bands.
+    /// Normalized horizontal travel on the band-headers row that switches one band. Independent of the
+    /// item step so band switching can be made deliberate without slowing item movement; defaults
+    /// larger than the item step.
     @Published var launcherContextStepDistance: Double { didSet { persist(launcherContextStepDistance, Keys.launcherContextStepDistance) } }
 
     /// Seconds the selection must rest on an item before it arms (then a lift fires it). Brief but
@@ -82,6 +85,41 @@ final class AppSettings: ObservableObject {
     /// default — these are troubleshooting affordances most users never need, so they're hidden
     /// behind this toggle to keep the menu tidy.
     @Published var showDiagnostics: Bool { didSet { defaults.set(showDiagnostics, forKey: Keys.showDiagnostics) } }
+
+    // MARK: - Clipboard history (opt-in; default OFF)
+
+    /// Opt-in to recording clipboard history and showing the launcher's Clipboard band. Unlike the
+    /// gesture opt-ins this relocates no native gesture, needs no re-login, and requests no new
+    /// permission — it only enables local recording + the synthetic band. Default OFF (privacy).
+    @Published var keepClipboardHistory: Bool { didSet { defaults.set(keepClipboardHistory, forKey: Keys.keepClipboardHistory) } }
+
+    /// Temporarily stop recording without disabling the feature (the band still shows what's stored).
+    @Published var clipboardPaused: Bool { didSet { defaults.set(clipboardPaused, forKey: Keys.clipboardPaused) } }
+
+    /// How many most-recent entries the Clipboard band shows (pinned entries float to the top).
+    @Published var clipboardRecentWindow: Int { didSet { defaults.set(clipboardRecentWindow, forKey: Keys.clipboardRecentWindow) } }
+
+    /// Retention cap: maximum stored entries (pinned exempt).
+    @Published var clipboardMaxCount: Int { didSet { defaults.set(clipboardMaxCount, forKey: Keys.clipboardMaxCount) } }
+
+    /// Retention cap: maximum total bytes of stored payloads (pinned exempt).
+    @Published var clipboardMaxBytes: Int { didSet { defaults.set(clipboardMaxBytes, forKey: Keys.clipboardMaxBytes) } }
+
+    /// Retention cap: maximum age in days for non-pinned entries; 0 disables the age cap.
+    @Published var clipboardMaxAgeDays: Double { didSet { persist(clipboardMaxAgeDays, Keys.clipboardMaxAgeDays) } }
+
+    /// Seconds between change-counter polls.
+    @Published var clipboardPollInterval: Double { didSet { persist(clipboardPollInterval, Keys.clipboardPollInterval) } }
+
+    /// Edge-scroll acceleration sensitivity for long lists (≥1; higher accelerates faster at the edge).
+    @Published var clipboardEdgeAcceleration: Double { didSet { persist(clipboardEdgeAcceleration, Keys.clipboardEdgeAcceleration) } }
+
+    /// Normalized horizontal travel required for a deliberate clipboard pin / previous-band flick.
+    /// Larger than the item step so pinning isn't twitchy; one flick = one action.
+    @Published var clipboardPinDistance: Double { didSet { persist(clipboardPinDistance, Keys.clipboardPinDistance) } }
+
+    /// Bundle ids whose copies are never recorded (e.g. password managers the user wants excluded).
+    @Published var clipboardExcludedApps: [String] { didSet { defaults.set(clipboardExcludedApps, forKey: Keys.clipboardExcludedApps) } }
 
     /// Shared singleton uses the standard user defaults.
     private convenience init() {
@@ -111,6 +149,16 @@ final class AppSettings: ObservableObject {
         launcherContextStepDistance = defaults.object(forKey: Keys.launcherContextStepDistance) as? Double ?? Defaults.launcherContextStepDistance
         dwellToArmDuration = defaults.object(forKey: Keys.dwellToArmDuration) as? Double ?? Defaults.dwellToArmDuration
         showDiagnostics = defaults.object(forKey: Keys.showDiagnostics) as? Bool ?? Defaults.showDiagnostics
+        keepClipboardHistory = defaults.object(forKey: Keys.keepClipboardHistory) as? Bool ?? Defaults.keepClipboardHistory
+        clipboardPaused = defaults.object(forKey: Keys.clipboardPaused) as? Bool ?? Defaults.clipboardPaused
+        clipboardRecentWindow = defaults.object(forKey: Keys.clipboardRecentWindow) as? Int ?? Defaults.clipboardRecentWindow
+        clipboardMaxCount = defaults.object(forKey: Keys.clipboardMaxCount) as? Int ?? Defaults.clipboardMaxCount
+        clipboardMaxBytes = defaults.object(forKey: Keys.clipboardMaxBytes) as? Int ?? Defaults.clipboardMaxBytes
+        clipboardMaxAgeDays = defaults.object(forKey: Keys.clipboardMaxAgeDays) as? Double ?? Defaults.clipboardMaxAgeDays
+        clipboardPollInterval = defaults.object(forKey: Keys.clipboardPollInterval) as? Double ?? Defaults.clipboardPollInterval
+        clipboardEdgeAcceleration = defaults.object(forKey: Keys.clipboardEdgeAcceleration) as? Double ?? Defaults.clipboardEdgeAcceleration
+        clipboardPinDistance = defaults.object(forKey: Keys.clipboardPinDistance) as? Double ?? Defaults.clipboardPinDistance
+        clipboardExcludedApps = defaults.object(forKey: Keys.clipboardExcludedApps) as? [String] ?? Defaults.clipboardExcludedApps
     }
 
     func resetToDefaults() {
@@ -131,6 +179,15 @@ final class AppSettings: ObservableObject {
         launcherContextStepDistance = Defaults.launcherContextStepDistance
         dwellToArmDuration = Defaults.dwellToArmDuration
         showDiagnostics = Defaults.showDiagnostics
+        // Clipboard tunables reset; `keepClipboardHistory`, the exclusion list, and the stored history
+        // itself are a privacy choice and are intentionally NOT reset (mirrors the opt-in handling).
+        clipboardRecentWindow = Defaults.clipboardRecentWindow
+        clipboardMaxCount = Defaults.clipboardMaxCount
+        clipboardMaxBytes = Defaults.clipboardMaxBytes
+        clipboardMaxAgeDays = Defaults.clipboardMaxAgeDays
+        clipboardPollInterval = Defaults.clipboardPollInterval
+        clipboardEdgeAcceleration = Defaults.clipboardEdgeAcceleration
+        clipboardPinDistance = Defaults.clipboardPinDistance
     }
 
     private func persist(_ value: Double, _ key: String) { defaults.set(value, forKey: key) }
@@ -151,9 +208,19 @@ final class AppSettings: ObservableObject {
         static let enableLauncher = false          // opt-in; frees four-finger native gestures
         static let launcherActivationThreshold = 0.045  // same deliberate trigger as the horizontal switcher
         static let launcherStepDistance = 0.07     // one item per ~7%; items are larger, fewer targets
-        static let launcherContextStepDistance = 0.12   // ~1.7× the item step; deliberate up/down between bands
+        static let launcherContextStepDistance = 0.12   // ~1.7× the item step; deliberate horizontal band switching
         static let dwellToArmDuration = 0.5        // brief but deliberate; not a full second
         static let showDiagnostics = false         // troubleshooting tools hidden from the menu by default
+        static let keepClipboardHistory = false    // opt-in; records copied content locally (privacy)
+        static let clipboardPaused = false
+        static let clipboardRecentWindow = 30      // entries shown in the band (pinned float to top)
+        static let clipboardMaxCount = 200         // stored-entry cap (pinned exempt)
+        static let clipboardMaxBytes = 256 * 1024 * 1024   // 256 MB of payloads (pinned exempt)
+        static let clipboardMaxAgeDays = 0.0       // 0 = no age cap
+        static let clipboardPollInterval = 0.5     // change-counter poll cadence (seconds)
+        static let clipboardEdgeAcceleration = 1.0 // edge-scroll acceleration sensitivity
+        static let clipboardPinDistance = 0.22     // deliberate horizontal flick to pin / leave (≈3 item steps)
+        static let clipboardExcludedApps: [String] = []
     }
 
     private enum Keys {
@@ -176,5 +243,15 @@ final class AppSettings: ObservableObject {
         static let launcherContextStepDistance = "launcherContextStepDistance"
         static let dwellToArmDuration = "dwellToArmDuration"
         static let showDiagnostics = "showDiagnostics"
+        static let keepClipboardHistory = "keepClipboardHistory"
+        static let clipboardPaused = "clipboardPaused"
+        static let clipboardRecentWindow = "clipboardRecentWindow"
+        static let clipboardMaxCount = "clipboardMaxCount"
+        static let clipboardMaxBytes = "clipboardMaxBytes"
+        static let clipboardMaxAgeDays = "clipboardMaxAgeDays"
+        static let clipboardPollInterval = "clipboardPollInterval"
+        static let clipboardEdgeAcceleration = "clipboardEdgeAcceleration"
+        static let clipboardPinDistance = "clipboardPinDistance"
+        static let clipboardExcludedApps = "clipboardExcludedApps"
     }
 }

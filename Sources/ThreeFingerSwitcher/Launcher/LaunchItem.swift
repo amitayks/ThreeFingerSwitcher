@@ -96,6 +96,15 @@ enum SystemAction: String, Codable, Equatable, CaseIterable, Identifiable {
     /// Whether a value action targets volume (vs. brightness).
     var controlsVolume: Bool { self == .volumeUp || self == .volumeDown }
 
+    /// Screenshot actions that can route the capture to the clipboard (via the native ⌃-modified
+    /// shortcut) instead of writing a file. Tools is excluded — its toolbar owns its own destination.
+    var supportsClipboardDestination: Bool {
+        switch self {
+        case .screenshotSelection, .screenshotFullScreen: return true
+        default: return false
+        }
+    }
+
     private var meta: (title: String, symbol: String, detail: String, category: Category) {
         switch self {
         case .minimizeWindow:      return ("Minimize Window", "minus.circle", "Minimize the front window to the Dock.", .window)
@@ -166,10 +175,18 @@ enum LaunchItemKind: Codable, Equatable {
     case script(ScriptBody)
     /// A built-in system action performed via Accessibility (e.g. close the front window). The
     /// optional `ValueAdjustment` applies only to the value actions (volume/brightness); `nil` keeps
-    /// the native step behavior.
-    case action(SystemAction, ValueAdjustment? = nil)
+    /// the native step behavior. `screenshotToClipboard` applies only to the Selection/Full-Screen
+    /// screenshot actions (see `supportsClipboardDestination`); `true` routes the capture to the
+    /// clipboard (native ⌃-modified shortcut) instead of a file, `nil`/`false` keeps the file behavior.
+    /// It is **Optional** (like `ValueAdjustment?`) so the synthesized decoder uses `decodeIfPresent`
+    /// and pre-feature `.action` items — which have no third value — still decode (to `nil`).
+    case action(SystemAction, ValueAdjustment? = nil, screenshotToClipboard: Bool? = nil)
     /// An ordered composite that fires other items (referenced by id). "Work mode" / "Home mode".
     case preset(itemIDs: [UUID])
+    /// A clipboard-history entry shown in the synthetic Clipboard band. **Synthetic and ephemeral**:
+    /// built at launcher-open from `ClipboardStore`, never created in the editor and never written
+    /// into the persisted `Favorites` record. Firing it pastes the entry into the captured front app.
+    case clipboardEntry(ClipboardEntry)
 }
 
 /// A single launcher entry: stable identity + presentation + what it does.
@@ -188,7 +205,7 @@ struct LaunchItem: Codable, Equatable, Identifiable {
     var isConsequential: Bool {
         switch kind {
         case .script, .preset: return true
-        case .app, .path, .url, .shortcut, .action: return false
+        case .app, .path, .url, .shortcut, .action, .clipboardEntry: return false
         }
     }
 }
