@@ -1,5 +1,7 @@
 import AppKit
 import ApplicationServices
+import CoreAudio
+import AudioToolbox
 
 /// Executes a fired `LaunchItem`. Dispatch is split so the *decision* logic (strategy resolution,
 /// preset flattening, the new-window menu-title candidates) is pure and unit-testable, while the
@@ -22,15 +24,21 @@ final class LaunchService {
     /// The app whose window a `.action(.closeFrontWindow)` targets — captured when the launcher opens
     /// (the overlay is non-activating, so this is the app the user was actually looking at).
     private let frontAppProvider: () -> NSRunningApplication?
+    /// Called right after a Space-switch shortcut (⌃→ / ⌃←) is synthesized. Wired to focus the front
+    /// window of the destination Space once the switch settles — macOS leaves it visually front but
+    /// not key, exactly like the native shortcut. No-op by default / in tests.
+    private let onSpaceSwitch: () -> Void
 
     init(favoritesProvider: @escaping () -> Favorites,
          mover: WindowRelocating? = nil,
          goToWindow: @escaping (pid_t) -> Bool = { _ in false },
-         frontAppProvider: @escaping () -> NSRunningApplication? = { NSWorkspace.shared.frontmostApplication }) {
+         frontAppProvider: @escaping () -> NSRunningApplication? = { NSWorkspace.shared.frontmostApplication },
+         onSpaceSwitch: @escaping () -> Void = {}) {
         self.favoritesProvider = favoritesProvider
         self.mover = mover ?? NullWindowMover()
         self.goToWindow = goToWindow
         self.frontAppProvider = frontAppProvider
+        self.onSpaceSwitch = onSpaceSwitch
     }
 
     // MARK: - Fire
@@ -48,8 +56,8 @@ final class LaunchService {
             runShortcut(named: name, title: item.title)
         case .script(let body):
             runScript(body, title: item.title)
-        case .action(let action):
-            perform(action)
+        case .action(let action, let adjustment):
+            perform(action, adjustment: adjustment)
         case .preset:
             firePreset(item, inBand: band)
         }
@@ -60,7 +68,7 @@ final class LaunchService {
     /// Perform a built-in `SystemAction` natively (AX / NSWorkspace / synthesized keys), no subprocess
     /// for the window/app paths and no new permission. Every "front" action targets the app captured
     /// when the launcher opened (`frontAppProvider`).
-    private func perform(_ action: SystemAction) {
+    private func perform(_ action: SystemAction, adjustment: ValueAdjustment? = nil) {
         switch action {
         // Window
         case .minimizeWindow:
@@ -90,8 +98,14 @@ final class LaunchService {
         case .missionControl:      MissionControl.showMissionControl()
         case .appExpose:           MissionControl.showAppExpose()
         case .showDesktop:         MissionControl.showDesktop()
-        case .nextSpace:           postKey(0x7C, flags: .maskControl, toPid: nil)            // Ctrl-→
-        case .previousSpace:       postKey(0x7B, flags: .maskControl, toPid: nil)            // Ctrl-←
+        // Arrow-key system shortcuts must mimic a REAL arrow press to match macOS's default
+        // Move-left/right-a-space hotkey. On macOS the arrow keys are function keys, so a genuine
+        // arrow event carries BOTH the numeric-pad flag and the secondary-Fn flag in addition to the
+        // modifier. A synthetic arrow missing either is dropped silently (verified: ⌃-only and
+        // ⌃+numpad both did nothing) — unlike non-arrow shortcuts (e.g. the screenshots above), which
+        // need none of this. Keep them in sync via `spaceSwitchFlags`.
+        case .nextSpace:           postKey(0x7C, flags: Self.spaceSwitchFlags, toPid: nil); onSpaceSwitch()   // ⌃→
+        case .previousSpace:       postKey(0x7B, flags: Self.spaceSwitchFlags, toPid: nil); onSpaceSwitch()   // ⌃←
         case .lockScreen:          postKey(0x0C, flags: [.maskControl, .maskCommand], toPid: nil) // Ctrl-⌘-Q
         case .screenSaver:         startScreenSaver()
         case .sleepDisplay:        runDetached("/usr/bin/pmset", ["displaysleepnow"])
@@ -103,11 +117,11 @@ final class LaunchService {
         case .playPause:           postMediaKey(16)
         case .nextTrack:           postMediaKey(17)
         case .previousTrack:       postMediaKey(18)
-        case .volumeUp:            postMediaKey(0)
-        case .volumeDown:          postMediaKey(1)
+        case .volumeUp:            adjustVolume(up: true, adjustment)
+        case .volumeDown:          adjustVolume(up: false, adjustment)
         case .mute:                postMediaKey(7)
-        case .brightnessUp:        postMediaKey(2)
-        case .brightnessDown:      postMediaKey(3)
+        case .brightnessUp:        adjustBrightness(up: true, adjustment)
+        case .brightnessDown:      adjustBrightness(up: false, adjustment)
         }
     }
 
@@ -261,6 +275,89 @@ final class LaunchService {
         }
     }
 
+    // MARK: - Volume / brightness level control (no new permission)
+
+    /// Pure target-level math (unit-tested): `current` and `amount` are 0…1; the result is clamped to
+    /// 0…1. Absolute sets the level outright (direction ignored); relative steps by ±amount.
+    nonisolated static func targetLevel(current: Double, up: Bool,
+                                        mode: ValueAdjustment.Mode, amount: Double) -> Double {
+        let a = min(max(amount, 0), 1)
+        switch mode {
+        case .absolute: return a
+        case .relative: return min(max(current + (up ? a : -a), 0), 1)
+        }
+    }
+
+    /// Number of native key presses that approximate a percentage change (the OS step is ~6.25%).
+    /// Used only as the fallback when a level can't be read/set.
+    nonisolated static func stepCount(forPercent percent: Double) -> Int {
+        max(1, Int((percent / 6.25).rounded()))
+    }
+
+    /// Volume: with no adjustment, the native step (today's behavior). Otherwise set an absolute /
+    /// relative level via CoreAudio; if the level can't be read, fall back to native stepping.
+    private func adjustVolume(up: Bool, _ adjustment: ValueAdjustment?) {
+        guard let adj = adjustment else { postMediaKey(up ? 0 : 1); return }
+        guard let device = Self.defaultOutputDevice(), let current = Self.deviceVolume(device) else {
+            stepKey(up ? 0 : 1, times: Self.stepCount(forPercent: adj.percent)); return
+        }
+        let target = Self.targetLevel(current: Double(current), up: up, mode: adj.mode, amount: adj.percent / 100)
+        Self.setDeviceVolume(device, Float(target))
+    }
+
+    /// Brightness: with no adjustment, the native step. Otherwise set an absolute / relative level via
+    /// the private DisplayServices on the main display; fall back to native stepping if it's unavailable.
+    private func adjustBrightness(up: Bool, _ adjustment: ValueAdjustment?) {
+        guard let adj = adjustment else { postMediaKey(up ? 2 : 3); return }
+        let display = CGMainDisplayID()
+        guard let current = DisplayBrightness.get(display) else {
+            stepKey(up ? 2 : 3, times: Self.stepCount(forPercent: adj.percent)); return
+        }
+        let target = Self.targetLevel(current: Double(current), up: up, mode: adj.mode, amount: adj.percent / 100)
+        if !DisplayBrightness.set(display, Float(target)) {
+            stepKey(up ? 2 : 3, times: Self.stepCount(forPercent: adj.percent))
+        }
+    }
+
+    private func stepKey(_ key: Int32, times: Int) {
+        for _ in 0..<max(1, times) { postMediaKey(key) }
+    }
+
+    // MARK: CoreAudio (default output device volume)
+
+    private static func defaultOutputDevice() -> AudioObjectID? {
+        var id = AudioObjectID(0)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                              mScope: kAudioObjectPropertyScopeGlobal,
+                                              mElement: kAudioObjectPropertyElementMain)
+        let err = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id)
+        return (err == noErr && id != 0) ? id : nil
+    }
+
+    private static func volumeAddress() -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+                                   mScope: kAudioObjectPropertyScopeOutput,
+                                   mElement: kAudioObjectPropertyElementMain)
+    }
+
+    private static func deviceVolume(_ device: AudioObjectID) -> Float? {
+        var vol = Float32(0)
+        var size = UInt32(MemoryLayout<Float32>.size)
+        var addr = volumeAddress()
+        guard AudioObjectHasProperty(device, &addr) else { return nil }
+        return AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &vol) == noErr ? vol : nil
+    }
+
+    private static func setDeviceVolume(_ device: AudioObjectID, _ value: Float) {
+        var v = min(max(value, 0), 1)
+        var addr = volumeAddress()
+        var settable: DarwinBoolean = false
+        guard AudioObjectHasProperty(device, &addr),
+              AudioObjectIsPropertySettable(device, &addr, &settable) == noErr, settable.boolValue else { return }
+        AudioObjectSetPropertyData(device, &addr, 0, nil, UInt32(MemoryLayout<Float32>.size), &v)
+    }
+
     /// Fire each leaf item of a preset in order, re-dispatching through `fire` so nested kinds use
     /// the same paths. Reports overall success/failure via a notification.
     private func firePreset(_ preset: LaunchItem, inBand band: ContextBand) {
@@ -291,14 +388,14 @@ final class LaunchService {
         case .alwaysNewWindow:
             makeNewWindow(for: app)
         case .bringExistingHere:
-            bringExistingHere(app)
+            bringExistingHere(app, bundleURL: bundleURL)
         case .quitAndReopenHere:
             quitAndReopenHere(app, bundleURL: bundleURL)
         case .smart:
             if hasNewWindowMenuItem(pid: app.processIdentifier) {
                 makeNewWindow(for: app)
             } else {
-                bringExistingHere(app)
+                bringExistingHere(app, bundleURL: bundleURL)
             }
         }
     }
@@ -323,25 +420,53 @@ final class LaunchService {
     }
 
     /// Focus a single-window app's existing window. If a window is already on the current Space we
-    /// focus it locally (no teleport). Otherwise the window lives only off-Space and macOS won't let
-    /// an unprivileged app move it here, so we deliberately *go to it* — switch to its Space and focus
-    /// it, exactly like the window switcher. (A per-item `.quitAndReopenHere` is the opt-in for users
-    /// who'd rather reopen a fresh window on the current Space instead of switching.)
-    private func bringExistingHere(_ app: NSRunningApplication) {
+    /// focus it locally (no teleport). If it lives only off-Space, macOS won't let an unprivileged app
+    /// move it here, so we deliberately *go to it* — switch to its Space and focus it, exactly like the
+    /// window switcher. If the running app has no windows anywhere, we reopen it (same as the not-running
+    /// path) so a fresh window appears on the current Space. (A per-item `.quitAndReopenHere` is the
+    /// opt-in for users who'd rather reopen a fresh window on the current Space instead of switching.)
+    private func bringExistingHere(_ app: NSRunningApplication, bundleURL: URL) {
         let pid = app.processIdentifier
         switch mover.relocate(pid: pid) {
         case .broughtHere:
             app.activate(options: [])
             raiseFrontWindow(pid: pid)
         case .noWindows:
-            // No window anywhere — activating reopens one on the current Space (no teleport).
-            app.activate(options: [])
+            // Running but windowless. `activate()` only fronts the process — it does NOT recreate a
+            // window; only NSWorkspace.openApplication / a Dock click sends the reopen event. Most apps
+            // make a window from reopen, but some (notably Mac Catalyst apps like Shortcuts) ignore it
+            // while fully windowless, so escalate non-destructively. No off-Space window ⇒ no teleport.
+            reopenWindowlessApp(app, bundleURL: bundleURL)
         case .failed:
             // Window exists only off-Space; moving a foreign window across Spaces is blocked by macOS.
             // Go to the window (deliberate Space switch + focus). Last resort if it can't be resolved:
             // a plain activate.
             if !goToWindow(pid) { app.activate(options: []) }
         }
+    }
+
+    /// Give a running-but-windowless app a window on the current Space without destroying its state.
+    /// 1) Reopen via the workspace (Dock-click equivalent) so the app's reopen handler makes a window —
+    ///    this is enough for most apps (Xcode, Safari, Finder, Preview…). 2) Some apps (e.g. Mac
+    /// Catalyst apps like Shortcuts) ignore reopen while fully windowless, so if no window has appeared
+    /// shortly after, escalate to the app's own new-window command (File ▸ New Window, else ⌘N). The
+    /// delay both lets a working reopen land first (so we don't double-open) and gives the menu time to
+    /// become the active one after the reopen activates the app. An app that responds to neither needs
+    /// the explicit `.quitAndReopenHere` strategy.
+    private func reopenWindowlessApp(_ app: NSRunningApplication, bundleURL: URL) {
+        launch(bundleURL: bundleURL, newInstance: false)
+        let pid = app.processIdentifier
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, self.windowCount(pid: pid) == 0 else { return }
+            self.makeNewWindow(for: app)
+        }
+    }
+
+    /// Number of the app's AX windows (across all Spaces) — used to tell whether a reopen actually
+    /// produced a window before escalating to a new-window command.
+    private func windowCount(pid: pid_t) -> Int {
+        let appEl = AXUIElementCreateApplication(pid)
+        return (axCopy(appEl, kAXWindowsAttribute as String) as? [AXUIElement])?.count ?? 0
     }
 
     /// Quit the app and relaunch it so a fresh window opens on the CURRENT Space. Destructive (loses
@@ -540,6 +665,11 @@ final class LaunchService {
 
     /// Ordered candidate titles for the app's "new window" menu item (first match wins).
     nonisolated static let newWindowMenuTitles = ["New Window", "New OS Window", "New", "New Document"]
+
+    /// Flags for the synthesized ⌃→ / ⌃← Space-switch shortcut. Mimics a real arrow press (control +
+    /// numeric-pad + secondary-Fn) so macOS's default Space hotkey matches it; a partial flag set is
+    /// silently ignored for arrow keys.
+    nonisolated static let spaceSwitchFlags: CGEventFlags = [.maskControl, .maskNumericPad, .maskSecondaryFn]
 }
 
 /// Outcome of trying to bring an app's window(s) to the current Space — richer than a Bool so the

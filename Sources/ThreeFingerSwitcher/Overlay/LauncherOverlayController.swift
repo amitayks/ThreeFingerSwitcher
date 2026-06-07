@@ -53,12 +53,16 @@ final class LauncherOverlayController {
     @discardableResult
     func end() -> Bool {
         armWork?.cancel(); armWork = nil
-        defer { hide() }
         guard model.armed,
               bands.indices.contains(model.currentBand),
-              bands[model.currentBand].items.indices.contains(model.selectedIndex) else { return false }
+              bands[model.currentBand].items.indices.contains(model.selectedIndex) else { hide(); return false }
         let band = bands[model.currentBand]
-        onFire?(band.items[model.selectedIndex], band)
+        let item = band.items[model.selectedIndex]
+        // Dismiss the panel BEFORE firing. The panel is `.canJoinAllSpaces`, so a Space-switching
+        // action (Next/Previous Space) fired first would carry the still-visible panel onto the
+        // destination Space; ordering it out first lets the WindowServer drop it before the switch.
+        hide()
+        onFire?(item, band)
         return true
     }
 
@@ -70,7 +74,14 @@ final class LauncherOverlayController {
     func hide() {
         armWork?.cancel(); armWork = nil
         model.disarm()
+        // Destroy the panel, don't just orderOut. The panel is `.canJoinAllSpaces`, and an orderOut'd
+        // all-Spaces panel leaves a rendered GHOST on the Space you switch to (verified: a Space-switch
+        // action left the launcher visible on the destination even though isVisible was already false).
+        // Closing the window removes it from the WindowServer entirely; `show()` recreates it fresh on
+        // the current Space.
         panel?.orderOut(nil)
+        panel?.close()
+        panel = nil
     }
 
     var isVisible: Bool { panel?.isVisible ?? false }
@@ -117,12 +128,17 @@ final class LauncherOverlayController {
             backing: .buffered,
             defer: false
         )
+        panel.isReleasedWhenClosed = false   // ARC owns it; close() must not also release (we nil it)
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = false
         panel.level = .popUpMenu
         panel.ignoresMouseEvents = true
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        // NOT `.canJoinAllSpaces`: an all-Spaces panel leaves a ghost on the Space a Next-Space action
+        // switches to (and `close()` doesn't flush before the ⌃→ is processed). The panel is recreated
+        // fresh on every `show()` (see `hide()`), so it is created on — and stays bound to — only the
+        // current Space, which makes it impossible for it to appear on the destination Space.
+        panel.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle]
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
         panel.contentView = NSHostingView(rootView: LauncherView(model: model))

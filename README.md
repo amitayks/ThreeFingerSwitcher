@@ -116,7 +116,7 @@ Sources/ThreeFingerSwitcher/          ── ThreeFingerSwitcherCore library (AL
 Sources/ThreeFingerSwitcherApp/main.swift   thin executable: import Core; runThreeFingerSwitcher()
 Sources/TouchSpike/                   throwaway harness to print raw touch frames (swift run TouchSpike)
 Sources/LauncherSpike/                throwaway harness for the launcher spikes (haptics, window move) — not bundled
-Tests/ThreeFingerSwitcherTests/       230 XCTest unit tests (pure-logic core)
+Tests/ThreeFingerSwitcherTests/       238 XCTest unit tests (pure-logic core)
 scripts/                              build-app.sh, make-dev-cert.sh, allow-codesign-key.sh, install-launch-agent.sh
 openspec/                             specs (canonical) + changes/archive (history)
 ```
@@ -127,7 +127,7 @@ The Core/App split exists so the test target can `@testable import ThreeFingerSw
 
 ```bash
 swift build                                   # build the library + executable
-swift test                                    # 230 unit tests (gesture machine + launcher latching, models, grouping, layout, settings, native-gesture config, touch)
+swift test                                    # 238 unit tests (gesture machine + launcher latching, models, grouping, layout, settings, native-gesture config, touch)
 swift run TouchSpike                           # print live multitouch frames (touch the trackpad)
 swift run LauncherSpike                        # throwaway launcher spike harness (haptics / window move)
 ./scripts/build-app.sh                         # assemble + sign ThreeFingerSwitcher.app (repo root)
@@ -151,7 +151,7 @@ INSTALL=1 ./scripts/build-app.sh               # also install in place to /Appli
 - **Under Stage Manager, the current-Space AX focus *singletons* start a focus war.** With Stage Manager's "show windows from an application all at once" grouping, two windows of one app share the center stage. Setting `kAXMainAttribute` + the app's `kAXFocusedWindowAttribute` toward *one* of them hands the `WindowManager` daemon a self-contradicting target and it ping-pongs focus between the two ~12×/sec — a self-sustaining loop that **survives the app quitting** (the state lives in `WindowManager`, not us; only switching to another app or restarting `WindowManager` clears it). So `focusSequence` skips those two singleton writes when `StageManager.isEnabled` (current-Space only), raising with `kAXRaiseAction` + `activate()` alone — the pre-vacuum-fix behavior, which never oscillated; the watchdog still covers the vacuum. AltTab/yabai never write these singletons either. Don't re-add them unconditionally. (This was a real regression from `fix-focus-vacuum-on-raise`.)
 - **Off-Space Chromium windows (Chrome, Chrome Remote Desktop) have no remote-token AX element.** A fresh `_AXUIElementCreateWithRemoteToken` brute force returns nothing for them, so they used to vanish from the list *and* couldn't be raised. Two pieces fix this, both in `WindowService`: (1) **listing** falls back to a CGS-metadata heuristic (`alpha > 0 && min(width,height) ≥ 130`) when no element resolves — empirically separates real windows (incl. Stage-Manager strip thumbnails, min-dim ≥ 150) from sliver/toolbar/zero-alpha junk; (2) **raising** uses a persistent **`elementCache`** keyed by `CGWindowID`, seeded when an app activates (its windows are then on the current Space and resolvable via `kAXWindowsAttribute`) and during snapshots — a cached element stays valid across Spaces, so `kAXRaiseAction` on it *navigates* to the window. Limit: a Chromium window off-Space since before launch and never focused has no cached element and can't be navigated to (the AltTab/HyperSwitch limit). **Do NOT** try to switch Spaces with `CGSManagedDisplaySetCurrentSpace` — the WindowServer gates Space switching to Dock.app's privileged connection; the symbol resolves but no-ops for an unentitled, SIP-on process (it's why yabai needs SIP off). We tried it; it's removed.
 - **Off-Space focus is stolen by `WindowManager` ~300 ms after the Space switch** — a *different* mechanism from the current-Space singleton oscillation above. The +180 ms watchdog checks too early to see it, so `raise()` arms a bounded **polling hold-guard** (`offSpaceHoldTick`, off-Space + Stage-Manager only): poll every ~60 ms and re-front the target the instant the steal is detected (≈ one-frame flash), bounded to a few re-fronts so a daemon that fights back can't make it thrash. Don't turn it back into a fixed-delay re-assert (slower, visible flash) or drop the bound.
-- **The overlay panel is `.popUpMenu` level, non-activating, `ignoresMouseEvents`, and must NOT use `.stationary`** (Exposé-exempt → perturbs focus arbitration). It must never become key/main and must always be ordered out on gesture end.
+- **The overlay panel is non-activating, `ignoresMouseEvents`, must never become key/main, and is always ordered out on gesture end.** On the common path it sits at `.popUpMenu` with **no `.stationary`** (a higher band / `.stationary` are Exposé-exempt and perturb focus/Space arbitration). The **one scoped exception:** while **Mission Control is open**, `OverlayController.show(aboveMissionControl:)` raises it to `.screenSaver` + `.stationary` so the switcher floats *above* MC instead of behind it — applied per-show only in that case, and a commit then dismisses MC (synthesized Escape, never a re-toggle) before re-raising the window from a clean state. Don't widen that elevated config to the normal path.
 
 ### B4. How a gesture flows (mental model)
 
@@ -174,5 +174,5 @@ All in `AppSettings` (persisted, live-applied, editable in the Settings window):
 - **GPL-3.0** — see `LICENSE` and `NOTICE`. The window-raising/Space technique (the private `_AXUIElementGetWindow`, the remote-token brute force, the SkyLight front/key byte protocol, the CGS Space enumeration) is adapted from **[AltTab](https://github.com/lwouis/alt-tab-macos)** (GPL-3), which is why this project is GPL-3.
 - Raw multitouch via **[OpenMultitouchSupport](https://github.com/Kyome22/OpenMultitouchSupport)** (Kyome, MIT), wrapping the private `MultitouchSupport.framework`.
 
-If you (Claude) end up extending this, keep the spec in `openspec/specs/` honest, keep the 230 tests green (`swift test`), and respect the landmines in **B3** — they each cost a real debugging session to learn.
+If you (Claude) end up extending this, keep the spec in `openspec/specs/` honest, keep the 238 tests green (`swift test`), and respect the landmines in **B3** — they each cost a real debugging session to learn.
 

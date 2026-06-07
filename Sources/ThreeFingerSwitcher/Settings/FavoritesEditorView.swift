@@ -621,9 +621,69 @@ private struct ItemInspector: View {
                 Text(strategyHelp(strategy ?? band?.defaultAppStrategy ?? .smart))
                     .font(.caption).foregroundStyle(.secondary)
             }
+            if case let .action(action, adjustment) = item.kind, action.isValueAdjustable {
+                valueControl(action: action, adjustment: adjustment)
+            }
         }
         .formStyle(.grouped)
-        .frame(height: item.isAppKind ? 300 : 190)
+        .frame(height: inspectorHeight)
+    }
+
+    private var inspectorHeight: CGFloat {
+        if item.isAppKind { return 300 }
+        if case let .action(action, _) = item.kind, action.isValueAdjustable { return 270 }
+        return 190
+    }
+
+    /// Optional value control for the volume/brightness actions: native step (default), set to a
+    /// percentage, or change by a percentage.
+    private enum ValueChoice: Hashable { case step, set, change }
+
+    @ViewBuilder
+    private func valueControl(action: SystemAction, adjustment: ValueAdjustment?) -> some View {
+        let noun = action.controlsVolume ? "volume" : "brightness"
+        Picker("Value", selection: Binding(
+            get: {
+                switch adjustment?.mode {
+                case .none: return ValueChoice.step
+                case .absolute: return .set
+                case .relative: return .change
+                }
+            },
+            set: { choice in
+                let pct = adjustment?.percent ?? 50
+                let newAdj: ValueAdjustment?
+                switch choice {
+                case .step:   newAdj = nil
+                case .set:    newAdj = ValueAdjustment(mode: .absolute, percent: pct)
+                case .change: newAdj = ValueAdjustment(mode: .relative, percent: pct)
+                }
+                store.updateItem(item.id, inBand: bandID) { $0.kind = .action(action, newAdj) }
+            })) {
+            Text("Step (system default)").tag(ValueChoice.step)
+            Text("Set \(noun) to…").tag(ValueChoice.set)
+            Text("Change by…").tag(ValueChoice.change)
+        }
+        if let adjustment {
+            let label = adjustment.mode == .absolute
+                ? "Set to \(Int(adjustment.percent))%"
+                : "\(action.increasesValue ? "Increase" : "Decrease") by \(Int(adjustment.percent))%"
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                Slider(value: Binding(
+                    get: { adjustment.percent },
+                    set: { p in
+                        let clamped = max(0, min(100, p.rounded()))
+                        store.updateItem(item.id, inBand: bandID) {
+                            $0.kind = .action(action, ValueAdjustment(mode: adjustment.mode, percent: clamped))
+                        }
+                    }), in: 0...100, step: 5)
+            }
+            Text(adjustment.mode == .absolute
+                 ? "Sets \(noun) directly to this level (the up/down direction is ignored)."
+                 : "Adds or subtracts this much from the current \(noun); Up adds, Down subtracts.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
     }
 
     private var band: ContextBand? { store.favorites.bands.first { $0.id == bandID } }

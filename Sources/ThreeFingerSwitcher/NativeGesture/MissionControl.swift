@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 /// Triggers Mission Control / App Exposé programmatically via the private `CoreDockSendNotification`.
 ///
@@ -46,4 +47,14 @@ enum MissionControl {
 
     /// Convenience for the recognizer's idle-vertical intent: up → Mission Control, down → App Exposé.
     static func trigger(up: Bool) { up ? showMissionControl() : showAppExpose() }
+
+    /// Close Mission Control by synthesizing Escape. Unlike re-sending the `…expose.awake` toggle,
+    /// Escape can only *close* the overview — if it's already closed (stale caller state) this is a
+    /// harmless stray Escape, never a spurious re-open.
+    static func dismiss() {
+        let src = CGEventSource(stateID: .hidSystemState)
+        let escape: CGKeyCode = 0x35
+        CGEvent(keyboardEventSource: src, virtualKey: escape, keyDown: true)?.post(tap: .cghidEventTap)
+        CGEvent(keyboardEventSource: src, virtualKey: escape, keyDown: false)?.post(tap: .cghidEventTap)
+    }
 }

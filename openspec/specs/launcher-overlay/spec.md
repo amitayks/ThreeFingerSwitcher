@@ -3,9 +3,7 @@
 ## Purpose
 
 Define the four-finger launcher overlay: activation on the home cell, item/context stepping, deterministic home-cell entry, dwell-to-arm with haptic and charge-ring feedback, lift-fires-only-when-armed semantics, and the context-band visual encoding.
-
 ## Requirements
-
 ### Requirement: Four-finger launcher activation
 When the launcher opt-in is effective, a four-finger gesture whose horizontal travel crosses the four-finger activation threshold SHALL show the launcher overlay and place the selection on the deterministic home cell (the home band, home column). The overlay SHALL be a non-activating panel that never becomes key or steals focus, visible across all Spaces, consistent with the window switcher's overlay.
 
@@ -59,7 +57,7 @@ Landing the selection on an item and holding it (no further stepping) for at lea
 - **THEN** the previous item disarms, its ring empties, and the new item begins its own dwell
 
 ### Requirement: Lift fires only when armed
-Lifting the fingers SHALL fire the currently armed item; if no item is armed, lifting SHALL dismiss the overlay without firing anything. A quick scrub-and-lift (no dwell) SHALL therefore never fire an item.
+Lifting the fingers SHALL fire the currently armed item; if no item is armed, lifting SHALL dismiss the overlay without firing anything. A quick scrub-and-lift (no dwell) SHALL therefore never fire an item. The overlay SHALL be ordered out **before** the armed item is fired, so an action that switches Spaces (e.g. Next/Previous Space) does not carry the still-visible overlay onto the destination Space (the panel can join all Spaces, so firing first would leave it lingering there).
 
 #### Scenario: Armed lift fires
 - **WHEN** an item is armed and the fingers lift
@@ -73,6 +71,10 @@ Lifting the fingers SHALL fire the currently armed item; if no item is armed, li
 - **WHEN** an item is armed and the user keeps swiping off it, then lifts
 - **THEN** nothing is fired and the overlay hides
 
+#### Scenario: Space-switch action does not drag the overlay along
+- **WHEN** an armed Next/Previous Space item is fired on lift
+- **THEN** the overlay is dismissed before the Space switch, and it does not appear on the destination Space
+
 ### Requirement: Context-band visual encoding
 The launcher SHALL render each item as an icon plus a short label tinted/accented by its context band color, SHALL visually distinguish item kinds (e.g. a badge for presets, a marker for scripts), and SHALL show a band indicator (reusing the switcher's row-indicator gutter) colored per band.
 
@@ -83,3 +85,4 @@ The launcher SHALL render each item as an icon plus a short label tinted/accente
 #### Scenario: Presets are distinguishable
 - **WHEN** an item is a preset
 - **THEN** it is rendered with a badge that distinguishes it from single-action items
+

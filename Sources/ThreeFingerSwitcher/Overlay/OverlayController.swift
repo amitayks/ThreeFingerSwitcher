@@ -19,21 +19,35 @@ final class OverlayController {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = false
-        // .popUpMenu (above normal windows + menu bar) rather than the screen-saver band, and no
-        // .stationary (Exposé-exempt) — both perturb the WindowServer's focus/Space arbitration.
-        panel.level = .popUpMenu
         panel.ignoresMouseEvents = true
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
         panel.contentView = NSHostingView(rootView: SwitcherView(model: model))
         return panel
     }
 
-    func show(rows: [[WindowInfo]], labels: [String], startRow: Int, column: Int) {
+    /// Set the panel's stacking per show. Default: `.popUpMenu` (above normal windows + menu bar) and
+    /// NO `.stationary` — both a higher band and `.stationary` perturb the WindowServer's focus/Space
+    /// arbitration, so they're avoided on the common path. While Mission Control is open we must float
+    /// ABOVE it, so we raise to the screen-saver band and add `.stationary` (Exposé-exempt) so MC
+    /// doesn't pull the panel into the overview; this is short-lived — the commit dismisses MC and
+    /// re-raises the window from a clean state.
+    private func configure(_ panel: SwitcherPanel, aboveMissionControl: Bool) {
+        if aboveMissionControl {
+            panel.level = .screenSaver
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .stationary]
+        } else {
+            panel.level = .popUpMenu
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        }
+    }
+
+    func show(rows: [[WindowInfo]], labels: [String], startRow: Int, column: Int,
+              aboveMissionControl: Bool = false) {
         model.setRows(rows, labels: labels, startRow: startRow, column: column)
         let panel = self.panel ?? makePanel()
         self.panel = panel
+        configure(panel, aboveMissionControl: aboveMissionControl)
         layout(panel)
         panel.orderFrontRegardless()
     }

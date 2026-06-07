@@ -38,11 +38,18 @@ final class AppCoordinator: GestureRecognizerDelegate {
             return true
         },
         // The window a "Close Front Window" action targets — captured when the launcher opened.
-        frontAppProvider: { [weak self] in self?.capturedFrontApp ?? NSWorkspace.shared.frontmostApplication }
+        frontAppProvider: { [weak self] in self?.capturedFrontApp ?? NSWorkspace.shared.frontmostApplication },
+        // After a Next/Previous Space shortcut, focus the destination Space's front window once the
+        // switch settles (the OS leaves it visually front but not key — same as the native shortcut).
+        onSpaceSwitch: { [weak self] in self?.focusFrontWindowAfterSpaceSwitch() }
     )
 
     /// Frontmost app captured at launcher-open time (target for `.action(.closeFrontWindow)`).
     private var capturedFrontApp: NSRunningApplication?
+
+    /// Whether the app currently has Mission Control open (it triggers MC itself via the vertical
+    /// gesture). Lets the switcher float above MC and a commit dismiss it before raising.
+    private var missionControlOpen = false
 
     private var settingsWindow: NSWindow?
     private var onboardingWindow: NSWindow?
@@ -267,7 +274,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
         let windows = windowService.snapshot()
         guard !windows.isEmpty else { return }
         let grid = SpaceGrouping.group(windows)
-        overlay.show(rows: grid.rows, labels: grid.labels, startRow: grid.startRow, column: 0)
+        // When the app has Mission Control open, float the overlay above it (otherwise it renders
+        // behind the MC windows). The elevated config is scoped to this case in `OverlayController`.
+        overlay.show(rows: grid.rows, labels: grid.labels, startRow: grid.startRow, column: 0,
+                     aboveMissionControl: missionControlOpen)
         prefetchCurrentRow()
     }
 
@@ -303,6 +313,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
         // A fresh three-finger vertical swipe while we own the gesture: open the OS overview
         // ourselves (the native gesture is disabled to a scroll, which the scroll tap consumes).
         MissionControl.trigger(up: up)
+        // Track Mission Control's open state so a following switcher can float above it and a commit
+        // can dismiss it. `up` toggles MC; App Exposé (down) is a different overview, so MC is no
+        // longer considered open.
+        missionControlOpen = up ? !missionControlOpen : false
     }
 
     private func prefetchCurrentRow() {
@@ -321,7 +335,17 @@ final class AppCoordinator: GestureRecognizerDelegate {
             permissions.requestAccessibility()
             return
         }
-        windowService.raise(window)
+        // If Mission Control is open, close it first (so the raise lands on the live desktop, not the
+        // overview), then raise once its close animation has settled. Otherwise raise immediately.
+        if missionControlOpen {
+            missionControlOpen = false
+            MissionControl.dismiss()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.windowService.raise(window)
+            }
+        } else {
+            windowService.raise(window)
+        }
     }
 
     func gestureDidCancel() {
@@ -362,6 +386,46 @@ final class AppCoordinator: GestureRecognizerDelegate {
 
     func launcherDidCancel() {
         launcherOverlay.cancel()
+    }
+
+    // MARK: - Post-Space-switch cleanup & focus
+
+    /// A Next/Previous Space action only synthesizes the OS shortcut; once the switch lands the
+    /// destination's front window is visually front but *not key* (same as the native shortcut), so the
+    /// user would have to click before typing. Poll until the active Space actually flips, then focus
+    /// the window the user last had front there.
+    private func focusFrontWindowAfterSpaceSwitch() {
+        let before = SpaceService.currentModel()?.currentSpaceIDs ?? []
+        afterSpaceSettles(before: before, attempt: 0)
+    }
+
+    /// Poll until the active Space flips, then wait for the WindowServer transition (and the
+    /// Stage-Manager front-steal ~300ms post-switch) to finish before focusing — acting on the flip
+    /// instant gets steamrolled by the rest of the transition.
+    private func afterSpaceSettles(before: Set<CGSSpaceID>, attempt: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+            guard let self else { return }
+            let now = SpaceService.currentModel()?.currentSpaceIDs ?? []
+            if !now.isEmpty, now != before {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+                    self?.focusFrontWindowOnCurrentSpace()
+                }
+                return
+            }
+            // A ⌃→ with no neighbour Space never flips — bail after ~1.9s rather than poll forever.
+            if attempt < 30 { afterSpaceSettles(before: before, attempt: attempt + 1) }
+        }
+    }
+
+    /// Focus the window the user last had front on the new current Space — the MRU-top window in the
+    /// app's own snapshot. We do NOT use `NSWorkspace.frontmostApplication`: under Stage Manager, when
+    /// the destination Space has multiple windows it stays `WindowManager` indefinitely and never
+    /// yields to the real app (because that app's window isn't key — the very bug we're fixing). The
+    /// MRU-ranked snapshot is independent of that limbo and matches what the OS keeps visually front.
+    private func focusFrontWindowOnCurrentSpace() {
+        launcherOverlay.hide()   // belt-and-suspenders; panel is normally already gone
+        guard let w = windowService.snapshot().first(where: { $0.isOnCurrentSpace }) else { return }
+        windowService.raise(w)
     }
 
     // MARK: - Native gesture consent
@@ -753,6 +817,11 @@ final class AppCoordinator: GestureRecognizerDelegate {
             window.title = "Favorites"
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             window.isReleasedWhenClosed = false
+            // Persist position + size across launches/builds (stored in UserDefaults by the autosave
+            // name). Restore any saved frame; only center on the very first run.
+            let restored = window.setFrameUsingName("FavoritesEditorWindow")
+            window.setFrameAutosaveName("FavoritesEditorWindow")
+            if !restored { window.center() }
             favoritesEditorWindow = window
         }
         present(favoritesEditorWindow)
@@ -828,7 +897,9 @@ final class AppCoordinator: GestureRecognizerDelegate {
     private func present(_ window: NSWindow?) {
         guard let window else { return }
         NSApp.activate(ignoringOtherApps: true)
-        window.center()
+        // Windows that persist their own frame (a non-empty autosave name) keep their saved position;
+        // only center the transient ones (Settings / Setup).
+        if window.frameAutosaveName.isEmpty { window.center() }
         window.makeKeyAndOrderFront(nil)
     }
 

@@ -34,6 +34,19 @@ enum ScriptBody: Codable, Equatable {
     case file(URL)             // a path to an executable script / .scpt
 }
 
+/// Optional per-item value control for the volume/brightness actions. `nil` (the default) keeps the
+/// native OS-step behavior; otherwise the action sets an absolute level or changes it by an amount.
+struct ValueAdjustment: Codable, Equatable {
+    enum Mode: String, Codable, CaseIterable, Identifiable {
+        case absolute   // set the level directly to `percent`
+        case relative   // change by `percent` points; sign comes from the action's up/down
+        var id: String { rawValue }
+    }
+    var mode: Mode
+    /// 0…100. For `.absolute` the target level; for `.relative` the magnitude of the change.
+    var percent: Double
+}
+
 /// A built-in action performed natively (Accessibility / NSWorkspace / synthesized keys) without a
 /// subprocess or any new permission. Extensible — add a case here + a branch in `LaunchService.perform`.
 /// Every action targets the app that was frontmost when the launcher opened (captured at open time).
@@ -63,6 +76,25 @@ enum SystemAction: String, Codable, Equatable, CaseIterable, Identifiable {
     var title: String { meta.title }
     var symbol: String { meta.symbol }
     var detail: String { meta.detail }
+
+    /// Actions that control a continuous 0–100% level and so accept a `ValueAdjustment`.
+    var isValueAdjustable: Bool {
+        switch self {
+        case .volumeUp, .volumeDown, .brightnessUp, .brightnessDown: return true
+        default: return false
+        }
+    }
+
+    /// For value actions: whether this is the "increase" direction (drives a relative change's sign).
+    var increasesValue: Bool {
+        switch self {
+        case .volumeUp, .brightnessUp: return true
+        default: return false
+        }
+    }
+
+    /// Whether a value action targets volume (vs. brightness).
+    var controlsVolume: Bool { self == .volumeUp || self == .volumeDown }
 
     private var meta: (title: String, symbol: String, detail: String, category: Category) {
         switch self {
@@ -132,8 +164,10 @@ enum LaunchItemKind: Codable, Equatable {
     case shortcut(name: String)
     /// A script (shell / AppleScript / file).
     case script(ScriptBody)
-    /// A built-in system action performed via Accessibility (e.g. close the front window).
-    case action(SystemAction)
+    /// A built-in system action performed via Accessibility (e.g. close the front window). The
+    /// optional `ValueAdjustment` applies only to the value actions (volume/brightness); `nil` keeps
+    /// the native step behavior.
+    case action(SystemAction, ValueAdjustment? = nil)
     /// An ordered composite that fires other items (referenced by id). "Work mode" / "Home mode".
     case preset(itemIDs: [UUID])
 }
