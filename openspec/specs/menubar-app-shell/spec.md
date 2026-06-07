@@ -3,20 +3,22 @@
 ## Purpose
 
 Define the `LSUIElement` app lifecycle, the status-item menu, the sandbox-off packaging/distribution posture, and the app-wide wiring of the touch engine, gesture recognizer, window service, overlay, and settings.
-
 ## Requirements
-
 ### Requirement: Background menu-bar presence
-The app SHALL run as a background agent (`LSUIElement = true`) with no Dock icon and no main window, presenting only a status-bar item.
+The app SHALL run as a background agent (`LSUIElement = true`) with no Dock icon and no main window, presenting only a status-bar item. The status-bar item SHALL display the app's **brand mark** (a template image derived from the project logo) rather than a generic system symbol.
 
 #### Scenario: Launch shows no Dock icon
 - **WHEN** the app launches
 - **THEN** no Dock icon and no application window appear
 - **AND** a status-bar item is shown in the menu bar
 
+#### Scenario: Status item shows the brand mark
+- **WHEN** the status-bar item is shown
+- **THEN** it displays the app's brand mark as a template image (auto-adapting to light/dark menu bar), not a stock SF Symbol
+
 #### Scenario: Status menu actions
 - **WHEN** the user clicks the status-bar item
-- **THEN** a menu is shown offering at least: enable/disable the switcher, open Settings, and Quit
+- **THEN** a menu is shown offering at least: enable/disable the switcher, open Settings, open Permissions/Onboarding, and Quit
 
 ### Requirement: Status menu organization and diagnostics visibility
 The status menu SHALL be organized into logical groups separated by dividers: a state group containing the switcher enable, the launcher enable/status, and Open at Login together; followed by contextual setup and launcher actions; followed by app entries (Settings and, when enabled, the diagnostic actions); ending with Quit. Setup & Permissions and restoring the native three-finger up/down (Mission Control) gesture SHALL be reachable from the Settings window rather than the status menu. The diagnostic actions (write diagnostics, copy focus log) SHALL appear in the status menu only when the show-diagnostics preference is enabled; otherwise they SHALL be hidden.
@@ -38,11 +40,15 @@ The status menu SHALL be organized into logical groups separated by dividers: a 
 - **THEN** it offers a Setup & Permissions entry, and — when a Mission Control backup exists — an entry to restore the native three-finger up/down gesture
 
 ### Requirement: Sandbox-off distribution posture
-The app SHALL be built with App Sandbox disabled (required to load the private MultitouchSupport framework) and SHALL be distributable as a direct, notarized download rather than via the Mac App Store.
+The app SHALL be built with App Sandbox disabled (required to load the private MultitouchSupport framework) and SHALL be distributable as a direct, notarized download rather than via the Mac App Store. This posture SHALL be **realized** by a Developer-ID-signed, notarized, stapled DMG published to GitHub Releases (see the `release-pipeline` capability).
 
 #### Scenario: Sandbox disabled in build
 - **WHEN** the app's entitlements are inspected
 - **THEN** App Sandbox is not enabled
+
+#### Scenario: Distribution is a notarized direct download
+- **WHEN** a published release artifact is examined
+- **THEN** it is a Developer-ID-signed, notarized, stapled DMG offered as a direct download (not a Mac App Store listing)
 
 ### Requirement: Engine lifecycle wiring
 The app SHALL own and wire together the touch engine, gesture recognizer, window service, overlay, and settings, starting touch listening when enabled and stopping it when disabled or quitting.
@@ -77,3 +83,4 @@ The status menu SHALL offer an entry that opens the favorites editor, and an ent
 #### Scenario: Quick-add adds the front app
 - **WHEN** the user chooses to add the frontmost app to a context band from the status menu
 - **THEN** that app is added as an item to the chosen band and appears in the launcher on next activation
+
