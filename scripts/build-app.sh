@@ -39,6 +39,12 @@ fi
 # xcodebuild builds WITHOUT signing (CODE_SIGNING_ALLOWED=NO), then the codesign block below applies
 # the stable "ThreeFingerSwitcher Dev" identity, so TCC grants survive across rebuilds.
 echo "▸ xcodebuild build -scheme $PRODUCT -configuration $CONFIG (no xcodebuild signing; stable codesign below)"
+# `-onlyUsePackageVersionsFromResolvedFile`: build EXACTLY the versions in the committed
+# Package.resolved and never re-resolve. Some dependencies (gemma-4-swift-mlx, and its transitive
+# mlx-swift-lm) track `branch: main`, whose upstream HEAD drifts and has shipped commits that fail to
+# compile — without this flag a clean CI checkout re-resolves those branches to a broken newer HEAD
+# and fails the release build even though the lockfile pins known-good commits. The lockfile is the
+# source of truth; bump deliberately via `swift package update` + a verified `xcodebuild`.
 xcodebuild build \
     -scheme "$PRODUCT" \
     -destination 'platform=macOS' \
@@ -46,6 +52,7 @@ xcodebuild build \
     -derivedDataPath "$DERIVED" \
     -skipMacroValidation \
     -skipPackagePluginValidation \
+    -onlyUsePackageVersionsFromResolvedFile \
     CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
 
 BIN_PATH="$DERIVED/Build/Products/$CONFIG"
