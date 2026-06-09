@@ -150,6 +150,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         observeLauncherToggle()
         observeClipboardToggle()
         observeAICommandsToggle()
+        reconcileAIModelAtLaunch()
     }
 
     deinit {
@@ -571,8 +572,25 @@ final class AppCoordinator: GestureRecognizerDelegate {
     private func observeAICommandsToggle() {
         settings.$aiCommandsEnabled
             .dropFirst()
-            .sink { [weak self] on in MainActor.assumeIsolated { self?.modelManager.setOptedIn(on) } }
+            .sink { [weak self] on in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.modelManager.setOptedIn(on)
+                    // Re-enabling rediscovers an already-downloaded model (→ .ready) so the user isn't
+                    // asked to "Download" again; the heavy load stays lazy (first command).
+                    if on { self.modelManager.reconcileWithDisk() }
+                }
+            }
             .store(in: &cancellables)
+    }
+
+    /// At launch, if AI commands are already opted in, rediscover a previously-downloaded model so its
+    /// status shows "Downloaded" (and a command can lazy-load it) instead of resetting to "Not
+    /// downloaded" and forcing the user to click Download again every relaunch. Pure disk probe — no
+    /// network, no heavy load (that happens on first command). No-op if nothing is on disk.
+    private func reconcileAIModelAtLaunch() {
+        guard settings.aiCommandsEnabled else { return }
+        modelManager.reconcileWithDisk()
     }
 
     /// Begin (or retry) the on-device model download from Settings. Gated on the opt-in by the manager

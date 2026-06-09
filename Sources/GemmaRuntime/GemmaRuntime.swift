@@ -36,8 +36,43 @@ public enum GemmaRuntime {
                 let runtime = GemmaMLXRuntime()
                 try await runtime.prepare(model: model, progress: progress)
                 return runtime
+            },
+            // Network-free disk probe so the manager rediscovers an already-downloaded model on launch
+            // (→ `.ready`) and lazy-loads it on first use, instead of asking the user to "Download"
+            // again. Deliberately stricter than `Gemma4ModelCache.isDownloaded` (see `isFullyDownloaded`).
+            provisionedOnDisk: { descriptor in
+                isFullyDownloaded(pipelineModel(for: descriptor))
             }
         )
+    }
+
+    /// Whether `model`'s weights are COMPLETELY present in the EXACT directory the app loads from —
+    /// the resumable downloader's cache dir (`Gemma4ModelCache.modelsDirectory/<org>/<model>`, the same
+    /// path `GemmaMLXRuntime.prepare` builds). A model is "fully downloaded" only when it has a
+    /// `config.json` + at least one `*.safetensors` AND no leftover `*.part` shard from an interrupted
+    /// download.
+    ///
+    /// This is intentionally STRICTER than `Gemma4ModelCache.isDownloaded`, which (a) also accepts the
+    /// HuggingFace cache (`~/.cache/huggingface/...`) that the app's `ensureModel` does NOT load from —
+    /// so a HF-only copy would re-download — and (b) ignores `.part` files, so a half-finished
+    /// multi-shard download would read as present and then fail to load. Matching the app's real load
+    /// location makes the rediscovery `.ready` mean exactly "loadable without any network."
+    static func isFullyDownloaded(_ model: Gemma4Pipeline.Model) -> Bool {
+        var dir = Gemma4ModelCache.modelsDirectory
+        for part in model.rawValue.split(separator: "/") {
+            dir.appendPathComponent(String(part))
+        }
+        let fm = FileManager.default
+        // Walk the model dir (shallow + any subdirs) so a `.part` shard anywhere disqualifies it.
+        guard let enumerator = fm.enumerator(at: dir, includingPropertiesForKeys: nil) else { return false }
+        var hasConfig = false, hasWeights = false
+        for case let url as URL in enumerator {
+            let name = url.lastPathComponent
+            if name.hasSuffix(".part") { return false }       // an interrupted download is NOT ready
+            if name == "config.json" { hasConfig = true }
+            if name.hasSuffix(".safetensors") { hasWeights = true }
+        }
+        return hasConfig && hasWeights
     }
 
     /// Map a Core `ModelDescriptor` (selected from `ModelRegistry.standard`) to a concrete

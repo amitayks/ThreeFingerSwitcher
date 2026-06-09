@@ -87,6 +87,13 @@ public final class ModelManager: ObservableObject {
     /// When set, the real-runtime path: download+load are delegated to this (see `ModelProvisioner`),
     /// and the byte-SHA + `runtimeFactory` path is bypassed. nil → the existing dev-stub path.
     private let provisioner: ModelProvisioner?
+    /// Whether a descriptor's weights are ALREADY present on disk for the provisioner (real-runtime)
+    /// path — a pure, network-free filesystem probe. Injected by the backend (e.g. `GemmaRuntime`
+    /// checks `Gemma4ModelCache`), since Core doesn't know a backend's on-disk cache layout. Lets the
+    /// manager rediscover a previously-downloaded model on launch (`reconcileWithDisk`) and lazy-LOAD
+    /// it on first use WITHOUT a re-download. Default: `false` (the dev-stub/byte path proves presence
+    /// via `verifiedBytes`, not this probe).
+    private let provisionedOnDisk: @Sendable (ModelDescriptor) -> Bool
 
     private let storageRoot: URL
 
@@ -104,6 +111,7 @@ public final class ModelManager: ObservableObject {
                 storageRoot: URL? = nil,
                 hardwareSupports: @escaping @Sendable (ModelDescriptor) -> Bool = { _ in true },
                 provisioner: ModelProvisioner? = nil,
+                provisionedOnDisk: @escaping @Sendable (ModelDescriptor) -> Bool = { _ in false },
                 runtimeFactory: @escaping @Sendable (ModelDescriptor) throws -> LLMRuntime = { descriptor in
                     StubLLMRuntime(capabilities: descriptor.capabilities)
                 }) {
@@ -113,6 +121,7 @@ public final class ModelManager: ObservableObject {
         self.storageRoot = storageRoot ?? Self.defaultStorageRoot()
         self.hardwareSupports = hardwareSupports
         self.provisioner = provisioner
+        self.provisionedOnDisk = provisionedOnDisk
         self.runtimeFactory = runtimeFactory
     }
 
@@ -129,6 +138,33 @@ public final class ModelManager: ObservableObject {
     /// Set the opt-in. Turning it OFF evicts and resets state (privacy + frees weights from residency).
     public func setOptedIn(_ value: Bool) {
         optedIn = value
+    }
+
+    // MARK: - On-disk rediscovery
+
+    /// Rediscover a model whose weights are already present on disk (provisioner/real-runtime path) and
+    /// settle to `.ready` — "downloaded, not yet loaded" — so a relaunch (or re-enabling the opt-in)
+    /// does NOT ask the user to "Download" again. The heavy MLX load still happens lazily on first use
+    /// (`runtime(requiring:)`/`loadIfNeeded`), so this never fetches bytes or loads weights — it is a
+    /// pure disk probe + a state settle, safe to call at launch.
+    ///
+    /// No-op when: not opted in, no provisioner (dev/byte path), a runtime is already resident, a
+    /// download/verify/load is in flight, or nothing matching is on disk.
+    public func reconcileWithDisk() {
+        guard optedIn, provisioner != nil, residentRuntime == nil else { return }
+        switch state {
+        // Don't disturb an in-flight or already-resolved lifecycle.
+        case .downloading, .verifying, .loading, .loaded: return
+        case .notDownloaded, .ready, .failed: break
+        }
+        // Settle the DEFAULT descriptor for the UI's single status row. If a later command needs a
+        // different-capability model, `runtime(requiring:)` re-probes the selected descriptor and
+        // adopts it (loading it if it too is on disk), so this default is only the resting display.
+        guard let descriptor = registry.defaultDescriptor ?? registry.models.first,
+              provisionedOnDisk(descriptor) else { return }
+        activeDescriptor = descriptor
+        verifiedBytes = nil   // the pipeline owns the on-disk weights on this path
+        state = .ready
     }
 
     // MARK: - Download + verify
@@ -151,31 +187,7 @@ public final class ModelManager: ObservableObject {
         // load. We drive `.downloading(progress:)` from its callback, then store the ready runtime and
         // settle `.loaded` — the bytes + SHA + `runtimeFactory` path is bypassed (the Hub verifies).
         if let provisioner {
-            state = .downloading(progress: 0)
-            // Keep the system awake for the duration of the multi-gigabyte download. Idle system sleep
-            // mid-download would both interrupt the long fetch AND (on wake) tear down the trackpad
-            // listener and crash. The display may still sleep — we only block *system* sleep.
-            let activity = ProcessInfo.processInfo.beginActivity(
-                options: [.idleSystemSleepDisabled], reason: "Downloading on-device AI model")
-            defer { ProcessInfo.processInfo.endActivity(activity) }
-            do {
-                let runtime = try await provisioner(descriptor) { [weak self] p in
-                    Task { @MainActor in self?.state = .downloading(progress: min(max(p, 0), 1)) }
-                }
-                residentRuntime = runtime
-                activeDescriptor = descriptor
-                verifiedBytes = nil // the pipeline owns the on-disk weights; no in-memory copy here
-                state = .loaded
-            } catch is CancellationError {
-                state = .notDownloaded
-                throw RuntimeError.cancelled
-            } catch {
-                // De-leak: route the (already-boundary-mapped `RuntimeError`, or any error) through the
-                // single translator — a clean headline into `.failed`, raw text only as opt-in details.
-                let presented = AIError.message(for: error)
-                state = .failed(reason: presented.headline, details: presented.details)
-                throw error
-            }
+            try await runProvisioner(descriptor, provisioner: provisioner, mode: .download)
             return
         }
 
@@ -213,6 +225,53 @@ public final class ModelManager: ObservableObject {
         state = .ready
     }
 
+    /// Whether the provisioner is being used to DOWNLOAD-then-load (first acquisition) or to LOAD an
+    /// already-on-disk model (rediscovery). The difference is purely how state is surfaced: a download
+    /// drives `.downloading(progress:)`; a load shows `.loading` and ignores the (no-op) download
+    /// progress, because the resumable downloader skips the complete files — no bytes are fetched.
+    private enum ProvisionMode { case download, load }
+
+    /// Run the real-runtime provisioner (download+load, or load-only when already on disk), storing the
+    /// returned runtime resident and settling `.loaded`. Shared by `downloadAndVerify` (download mode)
+    /// and the lazy-rediscovery path in `loadIfNeeded` (load mode). Cancellation rewinds to the right
+    /// resting state; any other failure routes through the central translator into `.failed`.
+    private func runProvisioner(_ descriptor: ModelDescriptor,
+                                provisioner: ModelProvisioner,
+                                mode: ProvisionMode) async throws {
+        state = (mode == .download) ? .downloading(progress: 0) : .loading
+        // Keep the system awake for the duration. Idle system sleep mid-download would both interrupt
+        // the long fetch AND (on wake) tear down the trackpad listener and crash; a multi-gigabyte
+        // load is also worth protecting. The display may still sleep — we only block *system* sleep.
+        let activity = ProcessInfo.processInfo.beginActivity(
+            options: [.idleSystemSleepDisabled],
+            reason: mode == .download ? "Downloading on-device AI model" : "Loading on-device AI model")
+        defer { ProcessInfo.processInfo.endActivity(activity) }
+        do {
+            let runtime = try await provisioner(descriptor) { [weak self] p in
+                // In load mode the weights are already present (the downloader skips them), so the
+                // callback would only flash a misleading "Downloading…" bar over the heavy load — keep
+                // `.loading` instead.
+                guard mode == .download else { return }
+                Task { @MainActor in self?.state = .downloading(progress: min(max(p, 0), 1)) }
+            }
+            residentRuntime = runtime
+            activeDescriptor = descriptor
+            verifiedBytes = nil // the pipeline owns the on-disk weights; no in-memory copy here
+            state = .loaded
+        } catch is CancellationError {
+            // A cancelled LOAD keeps the on-disk weights (rewind to .ready); a cancelled DOWNLOAD has
+            // nothing usable yet (rewind to .notDownloaded).
+            state = (mode == .load) ? .ready : .notDownloaded
+            throw RuntimeError.cancelled
+        } catch {
+            // De-leak: route the (already-boundary-mapped `RuntimeError`, or any error) through the
+            // single translator — a clean headline into `.failed`, raw text only as opt-in details.
+            let presented = AIError.message(for: error)
+            state = .failed(reason: presented.headline, details: presented.details)
+            throw error
+        }
+    }
+
     // MARK: - Load / residency / evict
 
     /// Lazy-load the verified weights into a resident runtime. Idempotent: if already loaded for the
@@ -229,6 +288,25 @@ public final class ModelManager: ObservableObject {
             state = .loaded
             return runtime
         }
+
+        // Provisioner (real-runtime) path: weights live with the pipeline on disk, not as
+        // `verifiedBytes`. If they're present on disk (e.g. rediscovered after a relaunch), LOAD them
+        // resident now — the resumable downloader skips the complete files, so this re-loads without
+        // re-downloading. Otherwise the model is genuinely missing.
+        if let provisioner {
+            guard let descriptor = activeDescriptor ?? (registry.defaultDescriptor ?? registry.models.first),
+                  provisionedOnDisk(descriptor) else {
+                throw RuntimeError.modelMissing
+            }
+            guard hardwareSupports(descriptor) else {
+                state = .failed(reason: "This Mac cannot run \(descriptor.displayName)")
+                throw RuntimeError.unavailable(reason: "Unsupported hardware for \(descriptor.id)")
+            }
+            try await runProvisioner(descriptor, provisioner: provisioner, mode: .load)
+            guard let runtime = residentRuntime else { throw RuntimeError.modelMissing }
+            return runtime
+        }
+
         guard let descriptor = activeDescriptor, verifiedBytes != nil else {
             throw RuntimeError.modelMissing
         }
@@ -255,20 +333,26 @@ public final class ModelManager: ObservableObject {
     /// it is downloaded+verified+loaded, and return the resident runtime. The single entry point the
     /// executor uses; feature code never sees a concrete model.
     ///
-    /// This does NOT auto-download (download is an explicit, opt-in, user-visible action). If the
-    /// selected model is not the verified one, it reports `modelMissing` so the UI can prompt a
-    /// download rather than silently fetching gigabytes.
+    /// This does NOT auto-download (download is an explicit, opt-in, user-visible action). It WILL,
+    /// however, lazy-LOAD a model whose weights are already on disk (e.g. rediscovered after a relaunch)
+    /// — loading present weights is not a download. If nothing usable is present it reports
+    /// `modelMissing` so the UI can prompt a download rather than silently fetching gigabytes.
     public func runtime(requiring required: Set<Modality>) async throws -> LLMRuntime {
         guard optedIn else {
             throw RuntimeError.unavailable(reason: "AI commands opt-in is off")
         }
         let descriptor = try registry.selectModel(requiring: required)
         // On the provisioner (real-runtime) path the weights live with the pipeline, not as
-        // `verifiedBytes`; residency is proven by a resident runtime for the selected descriptor.
+        // `verifiedBytes`. Resolve from a resident runtime (warm) OR from weights already on disk
+        // (cold rediscovery → lazy load via `loadIfNeeded`, no re-download).
         if provisioner != nil {
-            guard let active = activeDescriptor, active.id == descriptor.id, residentRuntime != nil else {
-                throw RuntimeError.modelMissing
+            if let active = activeDescriptor, active.id == descriptor.id, residentRuntime != nil {
+                return try await loadIfNeeded()   // warm hit
             }
+            guard provisionedOnDisk(descriptor) else {
+                throw RuntimeError.modelMissing   // nothing on disk → genuinely needs a download
+            }
+            activeDescriptor = descriptor          // adopt the selected descriptor and load it resident
             return try await loadIfNeeded()
         }
         guard let active = activeDescriptor, active.id == descriptor.id, verifiedBytes != nil else {
@@ -280,14 +364,21 @@ public final class ModelManager: ObservableObject {
     /// The currently resident runtime, if loaded (nil otherwise). Exposed for tests / introspection.
     public var currentRuntime: LLMRuntime? { residentRuntime }
 
-    /// Evict the resident runtime (memory pressure, or opt-in off). The verified weights stay on disk
-    /// (state falls back to `.ready` if they were verified), so a re-load is warm, not a re-download.
+    /// Evict the resident runtime (memory pressure, or opt-in off). The weights stay on disk, so the
+    /// state falls back to `.ready` (a warm re-load, never a re-download) whenever they're still
+    /// present — on the byte path via `verifiedBytes`, and on the provisioner path via the on-disk
+    /// probe (where `verifiedBytes` is always nil because the pipeline owns the weights). Without the
+    /// provisioner branch, "Evict from memory" would leave the row stuck showing "Loaded" while nothing
+    /// is resident.
     public func evict() {
         residentRuntime = nil
-        if verifiedBytes != nil, activeDescriptor != nil {
-            // Weights remain verified on disk; just no longer resident.
-            if case .loaded = state { state = .ready }
-        }
+        guard case .loaded = state, let descriptor = activeDescriptor else { return }
+        // On the byte path, `verifiedBytes` proves on-disk presence; on the provisioner path it is
+        // always nil (the pipeline owns the weights), so the disk probe is what proves presence. If the
+        // weights are still there, fall back to `.ready` (warm reload); if they vanished underneath us,
+        // be honest and reset to `.notDownloaded` rather than leaving a stale `.loaded`.
+        let stillOnDisk = verifiedBytes != nil || (provisioner != nil && provisionedOnDisk(descriptor))
+        state = stillOnDisk ? .ready : .notDownloaded
     }
 
     /// Whether a model is currently resident in memory.

@@ -338,4 +338,149 @@ final class ModelManagerTests: XCTestCase {
         XCTAssertEqual(manager.state, .notDownloaded,
                        "cancellation returns to the resting state, never .failed")
     }
+
+    // MARK: - Provisioner path: rediscover an already-downloaded model (no re-download)
+
+    /// Thread-safe call counter for the fake provisioner (it may be touched off the main actor).
+    private final class ProvisionCounter: @unchecked Sendable {
+        private let lock = NSLock(); private var n = 0
+        func bump() { lock.lock(); n += 1; lock.unlock() }
+        var count: Int { lock.lock(); defer { lock.unlock() }; return n }
+    }
+
+    /// A provisioner-backed manager (the real-runtime shape) whose disk-probe reports `onDisk` and whose
+    /// provisioner returns a stub (counting invocations) — so rediscovery + lazy-load are testable with
+    /// no network and no real MLX.
+    private func provisionerManager(onDisk: Bool,
+                                    counter: ProvisionCounter,
+                                    optedIn: Bool = true) -> ModelManager {
+        let payload = Data("w".utf8)
+        return ModelManager(
+            registry: registry(matching: payload),
+            downloader: FakeDownloader(payload: payload),
+            optedIn: optedIn,
+            storageRoot: tempRoot(),
+            provisioner: { descriptor, progress in
+                counter.bump()
+                progress(1.0)
+                return StubLLMRuntime(capabilities: descriptor.capabilities)
+            },
+            provisionedOnDisk: { _ in onDisk }
+        )
+    }
+
+    func testReconcileDiscoversOnDiskModelAsReady() {
+        let counter = ProvisionCounter()
+        let manager = provisionerManager(onDisk: true, counter: counter)
+        XCTAssertEqual(manager.state, .notDownloaded, "fresh manager starts not-downloaded")
+        manager.reconcileWithDisk()
+        XCTAssertEqual(manager.state, .ready,
+                       "an already-downloaded model is rediscovered as .ready (no Download click needed)")
+        XCTAssertFalse(manager.isResident, "rediscovery does NOT eagerly load (load stays lazy)")
+        XCTAssertEqual(counter.count, 0, "rediscovery is a pure disk probe — the provisioner never runs")
+    }
+
+    func testReconcileIsNoOpWhenNothingOnDisk() {
+        let counter = ProvisionCounter()
+        let manager = provisionerManager(onDisk: false, counter: counter)
+        manager.reconcileWithDisk()
+        XCTAssertEqual(manager.state, .notDownloaded, "nothing on disk → stays not-downloaded")
+    }
+
+    func testReconcileIsNoOpWhenNotOptedIn() {
+        let counter = ProvisionCounter()
+        let manager = provisionerManager(onDisk: true, counter: counter, optedIn: false)
+        manager.reconcileWithDisk()
+        XCTAssertEqual(manager.state, .notDownloaded, "no rediscovery while opted out")
+    }
+
+    /// The real AppCoordinator flow when a user enables AI commands: opt-in flips on, THEN reconcile
+    /// runs — an already-downloaded model must surface as .ready without a Download click.
+    func testReconcileAfterOptingInRediscoversOnDiskModel() {
+        let counter = ProvisionCounter()
+        let manager = provisionerManager(onDisk: true, counter: counter, optedIn: false)
+        manager.reconcileWithDisk()
+        XCTAssertEqual(manager.state, .notDownloaded, "no rediscovery while still opted out")
+
+        manager.setOptedIn(true)
+        manager.reconcileWithDisk()   // mirrors observeAICommandsToggle's on-enable reconcile
+        XCTAssertEqual(manager.state, .ready, "enabling AI commands rediscovers the on-disk model as .ready")
+        XCTAssertEqual(counter.count, 0, "rediscovery still never downloads/loads")
+    }
+
+    func testReconcileNeverRegressesAResolvedState() async throws {
+        // Guard: reconcile must not clobber an already-resolved lifecycle. Once loaded, a stray
+        // reconcile (e.g. a second opt-in toggle) must leave .loaded untouched — not drop to .ready.
+        let counter = ProvisionCounter()
+        let manager = provisionerManager(onDisk: true, counter: counter)
+        _ = try await manager.runtime(requiring: [.text])
+        XCTAssertEqual(manager.state, .loaded)
+
+        manager.reconcileWithDisk()
+        XCTAssertEqual(manager.state, .loaded, "reconcile is a no-op on .loaded (never regresses it)")
+        XCTAssertEqual(counter.count, 1, "the stray reconcile triggered no extra provision")
+    }
+
+    func testRediscoveredModelLazyLoadsAsLoadingNotDownloading() async throws {
+        let counter = ProvisionCounter()
+        let manager = provisionerManager(onDisk: true, counter: counter)
+        manager.reconcileWithDisk()
+        XCTAssertEqual(manager.state, .ready)
+
+        var observed: [ModelLifecycleState] = []
+        let c = manager.$state.sink { observed.append($0) }
+        defer { c.cancel() }
+
+        let runtime = try await manager.runtime(requiring: [.text])
+        XCTAssertTrue(runtime.capabilities.contains(.text))
+        XCTAssertTrue(manager.isResident, "first use lazy-loads the rediscovered model resident")
+        XCTAssertEqual(manager.state, .loaded)
+        XCTAssertEqual(counter.count, 1, "the provisioner ran exactly once — to LOAD, not re-download")
+        XCTAssertTrue(observed.contains(.loading), "a rediscovered load surfaces as .loading")
+        XCTAssertFalse(observed.contains(where: { if case .downloading = $0 { return true }; return false }),
+                       "loading an already-present model never shows a (misleading) download bar")
+    }
+
+    func testRuntimeRequestLoadsOnDiskModelWithoutPriorReconcileOrDownload() async throws {
+        let counter = ProvisionCounter()
+        let manager = provisionerManager(onDisk: true, counter: counter)
+        // Straight to a command's runtime request — no reconcile, no downloadAndVerify.
+        let runtime = try await manager.runtime(requiring: [.text])
+        XCTAssertTrue(manager.isResident)
+        XCTAssertEqual(manager.state, .loaded)
+        XCTAssertEqual(counter.count, 1, "the on-disk model is loaded on demand, not re-downloaded")
+    }
+
+    func testRuntimeRequestReportsMissingWhenNothingOnDisk() async {
+        let counter = ProvisionCounter()
+        let manager = provisionerManager(onDisk: false, counter: counter)
+        do {
+            _ = try await manager.runtime(requiring: [.text])
+            XCTFail("nothing on disk must report missing, not silently load")
+        } catch let e as RuntimeError {
+            XCTAssertEqual(e, .modelMissing)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        XCTAssertEqual(counter.count, 0, "no provisioner call when nothing is on disk")
+    }
+
+    func testProvisionerEvictFallsBackToReadyAndReloadsWarm() async throws {
+        let counter = ProvisionCounter()
+        let manager = provisionerManager(onDisk: true, counter: counter)
+        _ = try await manager.runtime(requiring: [.text])   // load resident
+        XCTAssertEqual(manager.state, .loaded)
+        XCTAssertEqual(counter.count, 1)
+
+        manager.evict()
+        XCTAssertFalse(manager.isResident, "evict unloads the resident runtime")
+        XCTAssertEqual(manager.state, .ready,
+                       "provisioner-path evict falls back to .ready (weights remain on disk), not stuck .loaded")
+
+        // A subsequent request reloads from disk (no re-download): the provisioner runs again to LOAD.
+        _ = try await manager.runtime(requiring: [.text])
+        XCTAssertTrue(manager.isResident)
+        XCTAssertEqual(manager.state, .loaded)
+        XCTAssertEqual(counter.count, 2, "the warm reload re-runs the provisioner (load), still no byte fetch path")
+    }
 }
