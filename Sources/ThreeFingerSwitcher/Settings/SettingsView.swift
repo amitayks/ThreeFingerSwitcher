@@ -14,6 +14,19 @@ struct SettingsView: View {
     /// Clears the stored clipboard history. Wired by the coordinator to `ClipboardStore`.
     var onClearClipboard: (_ includingPinned: Bool) -> Void = { _ in }
 
+    /// The AI command store backing the authoring editor. OPTIONAL so the existing construction site
+    /// doesn't need to change yet; the integration slice passes the real instance. When nil the AI
+    /// section still shows the opt-in (the editor button is disabled).
+    var aiCommandStore: AICommandStore? = nil
+    /// The model manager backing the model-management surface. OPTIONAL for the same reason; when nil
+    /// the section shows the opt-in + a placeholder where model status will appear.
+    var modelManager: ModelManager? = nil
+    /// Begin (or retry) the on-device model download. Wired by the coordinator to `ModelManager`.
+    var onDownloadModel: () -> Void = {}
+
+    /// Whether the AI command authoring editor sheet is open.
+    @State private var showingAICommandEditor = false
+
     var body: some View {
         Form {
             Section("Sensitivity") {
@@ -122,6 +135,29 @@ struct SettingsView: View {
                 .disabled(!settings.keepClipboardHistory)
             }
 
+            Section("AI commands") {
+                Toggle("Enable AI commands", isOn: $settings.aiCommandsEnabled)
+                Text("Adds an AI band to the four-finger launcher: scrub to a command to transform your selection, run it on a screen region, or kick off a task. Runs an on-device Gemma 4 model — turning this on starts a one-time multi-gigabyte download. No new permission or logout needed (a calendar task asks for Calendar access the first time it runs). Off by default.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Button("Manage AI commands…") { showingAICommandEditor = true }
+                    .disabled(!settings.aiCommandsEnabled || aiCommandStore == nil)
+
+                modelPicker
+
+                if let modelManager {
+                    ModelManagementView(manager: modelManager,
+                                        descriptor: selectedModelDescriptor,
+                                        onDownload: onDownloadModel)
+                        .disabled(!settings.aiCommandsEnabled)
+                } else {
+                    Text("Model status appears here once AI commands are enabled.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Section("Reliability") {
                 Toggle("Self-heal focus after switching", isOn: $settings.focusWatchdogEnabled)
                 Text("Verifies the switched-to window actually receives focus and recovers automatically, so you never need Mission Control to escape a stuck state.")
@@ -149,6 +185,51 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 460, height: 460)
+        .sheet(isPresented: $showingAICommandEditor) {
+            if let aiCommandStore {
+                VStack(spacing: 0) {
+                    AICommandEditorView(store: aiCommandStore)
+                    Divider()
+                    HStack {
+                        Spacer()
+                        Button("Done") { showingAICommandEditor = false }
+                            .keyboardShortcut(.defaultAction)
+                    }
+                    .padding(10)
+                }
+            }
+        }
+    }
+
+    /// The global model picker (slice 6 writer): pins `AppSettings.aiSelectedModelID` over the
+    /// registry, so the persisted selection is no longer write-only. A "Default" tag writes `nil`
+    /// (the registry default). Disabled until the AI opt-in is on.
+    @ViewBuilder
+    private var modelPicker: some View {
+        let registry = ModelRegistry.standard
+        Picker("Model", selection: modelSelection) {
+            Text("Default (\(registry.defaultDescriptor?.displayName ?? "registry"))").tag(String?.none)
+            ForEach(registry.models, id: \.id) { model in
+                Text(model.displayName).tag(String?.some(model.id))
+            }
+        }
+        .disabled(!settings.aiCommandsEnabled)
+    }
+
+    /// Binding for the model picker: maps `AppSettings.aiSelectedModelID` (nil = registry default) to
+    /// the picker's optional-string selection, persisting on change.
+    private var modelSelection: Binding<String?> {
+        Binding(get: { settings.aiSelectedModelID },
+                set: { settings.aiSelectedModelID = $0 })
+    }
+
+    /// The model descriptor the management surface shows: the user's pinned selection if it resolves,
+    /// else the registry default. Lets the existing call site pass no descriptor while still showing
+    /// the right model once `aiSelectedModelID` is set.
+    private var selectedModelDescriptor: ModelDescriptor {
+        let registry = ModelRegistry.standard
+        if let id = settings.aiSelectedModelID, let d = registry.descriptor(id: id) { return d }
+        return registry.defaultDescriptor ?? registry.models[0]
     }
 
     /// The byte cap surfaced as megabytes for the slider.

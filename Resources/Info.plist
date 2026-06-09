@@ -28,5 +28,8 @@
     <!-- Shown if macOS ever prompts for Input Monitoring on the multitouch read. -->
     <key>NSInputMonitoringUsageDescription</key>
     <string>Reads raw trackpad touches to detect the three-finger swipe.</string>
+    <!-- Shown when an "add to calendar" AI command first creates an event (EventKit, lazy first-use). -->
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>Creates calendar events from text when you run an "add to calendar" AI command.</string>
 </dict>
 </plist>

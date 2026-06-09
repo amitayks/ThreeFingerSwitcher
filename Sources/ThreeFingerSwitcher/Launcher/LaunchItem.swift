@@ -187,6 +187,12 @@ enum LaunchItemKind: Codable, Equatable {
     /// built at launcher-open from `ClipboardStore`, never created in the editor and never written
     /// into the persisted `Favorites` record. Firing it pastes the entry into the captured front app.
     case clipboardEntry(ClipboardEntry)
+    /// A configured AI command shown in the synthetic AI-command band. **Synthetic and ephemeral**
+    /// (like `.clipboardEntry`): projected at launcher-open from `AICommandStore`, never created in
+    /// the favorites editor and never written into the persisted `Favorites` record. Firing it hands
+    /// off to the `AICommandExecutor` and opens the streaming preview canvas — it does NOT dismiss
+    /// the overlay or complete on the lift.
+    case aiCommand(AICommand)
 }
 
 /// A single launcher entry: stable identity + presentation + what it does.
@@ -205,7 +211,9 @@ struct LaunchItem: Codable, Equatable, Identifiable {
     var isConsequential: Bool {
         switch kind {
         case .script, .preset: return true
-        case .app, .path, .url, .shortcut, .action, .clipboardEntry: return false
+        // `.aiCommand` reports its own success/failure through the executor's canvas state, not the
+        // launcher's fire notification, so it is not "consequential" in this sense.
+        case .app, .path, .url, .shortcut, .action, .clipboardEntry, .aiCommand: return false
         }
     }
 }

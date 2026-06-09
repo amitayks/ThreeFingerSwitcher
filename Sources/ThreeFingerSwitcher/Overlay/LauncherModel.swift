@@ -35,6 +35,17 @@ final class LauncherModel: ObservableObject {
     /// Index of the synthetic Clipboard band, when present (always the last band). It navigates as a
     /// single-column master-detail list and repurposes horizontal travel (see `stepHorizontal`).
     @Published private(set) var clipboardBandIndex: Int?
+    /// Index of the synthetic AI-command band, when present. It navigates as a normal grid (icon +
+    /// label cells); firing one of its items opens the streaming preview canvas instead of dismissing.
+    @Published private(set) var aiCommandBandIndex: Int?
+
+    /// When non-nil, the launcher is showing the AI streaming preview canvas for the fired command
+    /// (the grid is replaced by the canvas; the overlay stays visible, non-activating). Cleared when
+    /// the canvas is dismissed (commit / discard). This is the only state the canvas-mode UI binds to;
+    /// the live model/streaming state lives in the injected `AICommandExecutor` the view observes.
+    @Published private(set) var canvasCommand: AICommand?
+    /// True while the AI preview canvas is on screen.
+    var canvasActive: Bool { canvasCommand != nil }
     /// Session-only set of clipboard entry ids whose pin was toggled this session — drives the pin
     /// marker without reordering the live list (the reorder is deferred to the next band build).
     @Published private(set) var sessionPinToggles: Set<UUID> = []
@@ -54,20 +65,45 @@ final class LauncherModel: ObservableObject {
     var bandCount: Int { bands.count }
     /// Whether the current band is the Clipboard band (single column, repurposed horizontal).
     var currentBandIsClipboard: Bool { clipboardBandIndex == currentBand }
+    /// Whether the current band is the AI-command band (a normal grid whose items open the canvas).
+    var currentBandIsAICommand: Bool { aiCommandBandIndex == currentBand }
+
+    /// The AI command of the currently selected item, when the selection is an AI-command item.
+    var selectedAICommand: AICommand? {
+        guard let item = selectedItem, case let .aiCommand(command) = item.kind else { return nil }
+        return command
+    }
     /// Columns for the current band: the Clipboard band is a single-column list; others use the grid.
     private var currentColumns: Int { currentBandIsClipboard ? 1 : LauncherGridLayout.columns }
 
     func setBands(_ bands: [[LaunchItem]], names: [String], colors: [ItemColor],
-                  startBand: Int, column: Int, clipboardBandIndex: Int? = nil) {
+                  startBand: Int, column: Int, clipboardBandIndex: Int? = nil,
+                  aiCommandBandIndex: Int? = nil) {
         self.bands = bands
         self.bandNames = names
         self.bandColors = colors
         self.clipboardBandIndex = clipboardBandIndex
+        self.aiCommandBandIndex = aiCommandBandIndex
+        self.canvasCommand = nil
         self.sessionPinToggles = []
         self.currentBand = clamp(startBand, 0, max(bands.count - 1, 0))
         self.focus = .grid                         // first trigger: first app of the first header
         applyCurrentBand(column: column)
         disarm()
+    }
+
+    // MARK: - AI preview canvas
+
+    /// Enter the AI streaming preview canvas for `command` (fired from an armed AI item). The grid is
+    /// replaced by the canvas; the panel stays visible and never becomes key.
+    func enterCanvas(_ command: AICommand) {
+        canvasCommand = command
+        disarm()
+    }
+
+    /// Leave the AI preview canvas (commit / discard). Restores the normal grid presentation.
+    func exitCanvas() {
+        canvasCommand = nil
     }
 
     /// Visual pin state for a clipboard item: the entry's stored pin XOR a session toggle.

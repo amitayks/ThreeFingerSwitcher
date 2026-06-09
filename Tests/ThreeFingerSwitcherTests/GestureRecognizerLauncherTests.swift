@@ -10,6 +10,7 @@ private final class LauncherMockDelegate: GestureRecognizerDelegate {
         case activate, step(Int), stepRow(Int), missionControl(Bool), commit, cancel
         case lActivate, lItem(Int), lContext(Int), lEnd, lCancel
         case lEdge(Int, Int)
+        case lCanvasResolve(Int, Int)
     }
     private(set) var events: [Event] = []
     /// Simulates the launcher cursor sitting on the band-headers row, so horizontal travel is treated
@@ -32,6 +33,7 @@ private final class LauncherMockDelegate: GestureRecognizerDelegate {
     func launcherDidCancel() { events.append(.lCancel) }
     func launcherEdgeChanged(dx: Int, dy: Int) { events.append(.lEdge(dx, dy)) }
     func launcherFocusIsOnHeaders() -> Bool { onHeaders }
+    func launcherCanvasResolve(dx: Int, dy: Int) { events.append(.lCanvasResolve(dx, dy)) }
 
     /// The sequence of edge states emitted (dx, dy) per change.
     var edges: [(Int, Int)] { events.compactMap { if case let .lEdge(x, y) = $0 { return (x, y) } else { return nil } } }
@@ -42,6 +44,10 @@ private final class LauncherMockDelegate: GestureRecognizerDelegate {
     var lCancelCount: Int { events.filter { $0 == .lCancel }.count }
     var lItems: [Int] { events.compactMap { if case let .lItem(d) = $0 { return d } else { return nil } } }
     var lContexts: [Int] { events.compactMap { if case let .lContext(d) = $0 { return d } else { return nil } } }
+    /// The (dx, dy) of each canvas-resolution emitted (horizontal swipe = discard; dy −1 down = apply).
+    var canvasResolves: [(Int, Int)] {
+        events.compactMap { if case let .lCanvasResolve(x, y) = $0 { return (x, y) } else { return nil } }
+    }
     var commitCount: Int { events.filter { $0 == .commit }.count }
     var cancelCount: Int { events.filter { $0 == .cancel }.count }
     var didSwitcherActivate: Bool { events.contains(.activate) }
@@ -284,5 +290,92 @@ final class GestureRecognizerLauncherTests: XCTestCase {
         feed(rec, x: 0.46, y: 0.50, fingers: 0)   // lift below two → end
         XCTAssertEqual(d.lEndCount, 1)
         XCTAssertEqual(d.lCancelCount, 0)
+    }
+
+    // MARK: - Canvas-resolution mode (a fresh four-finger swipe resolves the open AI canvas)
+
+    func test_canvasResolution_horizontal_emitsDiscard() {
+        // While the canvas is open a fresh four-finger HORIZONTAL swipe past the threshold resolves it
+        // as a discard: dx != 0, dy == 0. No launcher/switcher intents are emitted.
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
+        rec.launcherCanvasResolutionActive = true
+        feed(rec, x: 0.50, y: 0.50, fingers: 4)   // fresh four-finger contact (canvas resolution begin)
+        feed(rec, x: 0.62, y: 0.50, fingers: 4)   // dx +0.12 (clearly horizontal) ≥ 0.045 → discard
+        XCTAssertEqual(d.canvasResolves.map { [$0.0, $0.1] }, [[1, 0]], "horizontal → discard (dx=+1)")
+        XCTAssertEqual(d.lActivateCount, 0, "resolution mode never opens the launcher")
+        XCTAssertFalse(d.didSwitcherActivate)
+    }
+
+    func test_canvasResolution_down_emitsApply() {
+        // A DOWN swipe (y decreases in OMS coords) resolves as apply: dy = −1 ("bring it to the document").
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
+        rec.launcherCanvasResolutionActive = true
+        feed(rec, x: 0.50, y: 0.50, fingers: 4)   // begin
+        feed(rec, x: 0.50, y: 0.38, fingers: 4)   // dy −0.12 (clearly vertical, downward) → apply
+        XCTAssertEqual(d.canvasResolves.map { [$0.0, $0.1] }, [[0, -1]], "down → apply (dy=−1)")
+    }
+
+    func test_canvasResolution_up_emitsUp_ignoredUpstream() {
+        // An UP swipe emits dy = +1; the coordinator ignores it (no apply, no discard), but the recognizer
+        // still reports it so the wiring is exercised. Only the sign matters here.
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
+        rec.launcherCanvasResolutionActive = true
+        feed(rec, x: 0.50, y: 0.50, fingers: 4)   // begin
+        feed(rec, x: 0.50, y: 0.62, fingers: 4)   // dy +0.12 (upward) → dy=+1
+        XCTAssertEqual(d.canvasResolves.map { [$0.0, $0.1] }, [[0, 1]], "up → dy=+1 (ignored upstream)")
+    }
+
+    func test_canvasResolution_subThreshold_emitsNothing() {
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
+        rec.launcherCanvasResolutionActive = true
+        feed(rec, x: 0.50, y: 0.50, fingers: 4)   // begin
+        feed(rec, x: 0.52, y: 0.51, fingers: 4)   // dx 0.02 / dy 0.01 both < 0.045 → nothing
+        XCTAssertTrue(d.canvasResolves.isEmpty, "a sub-threshold swipe never resolves")
+        XCTAssertTrue(d.events.isEmpty)
+    }
+
+    func test_canvasResolution_emitsOncePerGesture() {
+        // Once resolved, continued travel within the same contact does NOT emit again (one swipe = one
+        // resolution). A lift re-arms it for the next swipe.
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
+        rec.launcherCanvasResolutionActive = true
+        feed(rec, x: 0.50, y: 0.50, fingers: 4)   // begin
+        feed(rec, x: 0.62, y: 0.50, fingers: 4)   // resolve discard
+        feed(rec, x: 0.74, y: 0.50, fingers: 4)   // more travel — must NOT re-emit
+        feed(rec, x: 0.50, y: 0.30, fingers: 4)   // even a vertical excursion — still no re-emit
+        XCTAssertEqual(d.canvasResolves.count, 1, "exactly one resolution per gesture")
+    }
+
+    func test_canvasResolution_requiresFreshFourFingerStart() {
+        // A swipe that begins with fewer than four fingers must not resolve — the gesture has to start
+        // from a deliberate four-finger contact, mirroring how the launcher itself is opened.
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
+        rec.launcherCanvasResolutionActive = true
+        feed(rec, x: 0.50, y: 0.50, fingers: 2)   // only two fingers down — no begin
+        feed(rec, x: 0.62, y: 0.50, fingers: 2)   // travel — must NOT resolve
+        XCTAssertTrue(d.canvasResolves.isEmpty, "resolution requires a fresh four-finger start")
+    }
+
+    func test_canvasResolution_liftReArmsForNextSwipe() {
+        // After a resolution + lift, a second fresh four-finger swipe resolves again (the model would
+        // normally have closed the canvas, but the recognizer's one-shot must reset on lift regardless).
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
+        rec.launcherCanvasResolutionActive = true
+        feed(rec, x: 0.50, y: 0.50, fingers: 4)   // begin
+        feed(rec, x: 0.62, y: 0.50, fingers: 4)   // resolve #1 (discard)
+        feed(rec, x: 0.62, y: 0.50, fingers: 0)   // lift → re-arm
+        feed(rec, x: 0.50, y: 0.50, fingers: 4)   // begin again
+        feed(rec, x: 0.50, y: 0.38, fingers: 4)   // resolve #2 (down → apply)
+        XCTAssertEqual(d.canvasResolves.map { [$0.0, $0.1] }, [[1, 0], [0, -1]], "lift re-arms resolution")
+    }
+
+    func test_canvasResolution_relaxToTwoFingers_stillResolves() {
+        // Matching the launcher latch feel: after a four-finger start the user may relax to two and the
+        // swipe still resolves.
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
+        rec.launcherCanvasResolutionActive = true
+        feed(rec, x: 0.50, y: 0.50, fingers: 4)   // begin
+        feed(rec, x: 0.50, y: 0.38, fingers: 2)   // relaxed to two AND a downward excursion → apply
+        XCTAssertEqual(d.canvasResolves.map { [$0.0, $0.1] }, [[0, -1]])
     }
 }

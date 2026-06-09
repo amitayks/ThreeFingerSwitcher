@@ -45,6 +45,11 @@ protocol GestureRecognizerDelegate: AnyObject {
     /// bands). Lets the recognizer apply the coarser context-step to band switching and the finer
     /// item-step to in-grid item movement — so the two can be tuned independently. Defaults to false.
     func launcherFocusIsOnHeaders() -> Bool
+    /// While the launcher's AI preview canvas is open, a fresh four-finger swipe RESOLVES it instead of
+    /// navigating: `dx != 0` is a horizontal swipe (discard); `dy` is vertical (`+1` up, `-1` down) — a
+    /// DOWN swipe applies the result ("bring it into the document"). Emitted once per gesture, only
+    /// while `launcherCanvasResolutionActive`.
+    func launcherCanvasResolve(dx: Int, dy: Int)
 }
 
 extension GestureRecognizerDelegate {
@@ -55,6 +60,7 @@ extension GestureRecognizerDelegate {
     func launcherDidCancel() {}
     func launcherEdgeChanged(dx: Int, dy: Int) {}
     func launcherFocusIsOnHeaders() -> Bool { false }
+    func launcherCanvasResolve(dx: Int, dy: Int) {}
 }
 
 /// Multi-finger scrub state machine. The active finger count is **latched at gesture start**:
@@ -92,6 +98,14 @@ final class GestureRecognizer {
     /// true only when the launcher opt-in is *effective* (enabled AND the native four-finger swipes
     /// have actually been freed). When false, four fingers behave exactly as before.
     var launcherEnabled = false
+
+    /// While true (the launcher's AI preview canvas is open), a fresh four-finger swipe is interpreted
+    /// as a one-shot canvas RESOLUTION (horizontal = discard, down = apply) via `launcherCanvasResolve`,
+    /// bypassing the normal launcher/switcher latch. The coordinator sets it from the canvas state.
+    var launcherCanvasResolutionActive = false
+    private var canvasResStarted = false
+    private var canvasResResolved = false
+    private var canvasResStart: CGPoint = .zero
 
     private enum Axis { case undetermined, horizontal, vertical }
     private enum State { case idle, tracking }
@@ -140,6 +154,13 @@ final class GestureRecognizer {
     }
 
     func feed(_ frame: TouchFrame) {
+        // While the launcher's AI preview canvas is open, a fresh four-finger swipe RESOLVES it
+        // (horizontal = discard, down = apply) — bypassing the normal launcher/switcher latch. When the
+        // flag is off (the default + all normal use), everything below is byte-identical to before.
+        if launcherCanvasResolutionActive {
+            trackCanvasResolution(frame)
+            return
+        }
         let switcherTarget = settings.requireExactlyThree ? (frame.fingerCount == 3) : (frame.fingerCount >= 3)
 
         switch state {
@@ -170,6 +191,40 @@ final class GestureRecognizer {
         switch mode {
         case .switcher: cancel()
         case .launcher: cancelLauncher()
+        }
+    }
+
+    /// One-shot canvas-resolution tracking (see `launcherCanvasResolutionActive`). A fresh four-finger
+    /// swipe past the activation threshold reports a single `launcherCanvasResolve`: vertical-dominant →
+    /// `dy` (`+1` up, `-1` down; down applies, up is ignored upstream), else horizontal → `dx` (discard).
+    /// Relaxing to ≥2 fingers after the four-finger start is allowed, matching the launcher's latch feel.
+    /// Runs INSTEAD of the normal state machine while the canvas is open, so it never opens the launcher
+    /// or switcher; it self-resets on lift.
+    private func trackCanvasResolution(_ frame: TouchFrame) {
+        let count = frame.fingerCount
+        if count == 0 {                       // lift → ready for the next resolution gesture
+            canvasResStarted = false
+            canvasResResolved = false
+            return
+        }
+        if !canvasResStarted {
+            guard count >= 4 else { return }  // require a fresh four-finger contact to begin
+            canvasResStarted = true
+            canvasResResolved = false
+            canvasResStart = frame.centroid
+            return
+        }
+        guard !canvasResResolved, count >= 2 else { return }
+        let dx = frame.centroid.x - canvasResStart.x
+        let dy = frame.centroid.y - canvasResStart.y
+        let threshold = CGFloat(settings.launcherActivationThreshold)
+        guard abs(dx) >= threshold || abs(dy) >= threshold else { return }
+        canvasResResolved = true
+        let ratio = CGFloat(settings.axisLockRatio)
+        if abs(dy) >= ratio * abs(dx) {
+            delegate?.launcherCanvasResolve(dx: 0, dy: dy > 0 ? 1 : -1)   // dy>0 = up, dy<0 = down
+        } else {
+            delegate?.launcherCanvasResolve(dx: dx > 0 ? 1 : -1, dy: 0)
         }
     }
 

@@ -3,6 +3,7 @@ import ApplicationServices
 import CoreGraphics
 import IOKit.hid
 import Combine
+import EventKit
 
 /// Detects and helps the user grant the permissions the app needs. Accessibility and Screen
 /// Recording are required; Input Monitoring is best-effort (spike 1.3 saw no prompt for the
@@ -14,11 +15,16 @@ final class PermissionsService: ObservableObject {
     @Published var accessibility: Status = .unknown
     @Published var screenRecording: Status = .unknown
     @Published var inputMonitoring: Status = .unknown
+    /// Calendar (EventKit) authorization. Additive for the AI calendar task — NOT a required
+    /// permission (it must never block other AI commands), so it stays out of `allRequiredGranted`
+    /// and is requested LAZILY at first calendar-task use (see permissions-onboarding).
+    @Published var calendar: Status = .unknown
 
     func refresh() {
         accessibility = AXIsProcessTrusted() ? .granted : .denied
         screenRecording = CGPreflightScreenCaptureAccess() ? .granted : .denied
         inputMonitoring = mapHID(IOHIDCheckAccess(kIOHIDRequestTypeListenEvent))
+        calendar = mapEventKit(EKEventStore.authorizationStatus(for: .event))
     }
 
     var allRequiredGranted: Bool {
@@ -44,10 +50,40 @@ final class PermissionsService: ObservableObject {
         openSettings(.inputMonitoring)
     }
 
+    // MARK: - Calendar (EventKit) — lazy, first-use for the calendar task
+
+    /// The current Calendar authorization, without prompting. `granted` only for full write access
+    /// (write-only/limited can't reliably create arbitrary events for our use).
+    var hasCalendarAccess: Bool {
+        mapEventKit(EKEventStore.authorizationStatus(for: .event)) == .granted
+    }
+
+    /// Request Calendar access lazily (first calendar-task use only — never at launch / opt-in). Uses
+    /// `requestFullAccessToEvents` (macOS 14+). Returns whether access is granted; updates `calendar`.
+    /// A denied/restricted result returns `false` so the task can fail gracefully (no event created,
+    /// the user is told access is required) without blocking other AI commands.
+    @discardableResult
+    func requestCalendarAccess(using store: EKEventStore = EKEventStore()) async -> Bool {
+        // Already decided: don't re-prompt; just report the standing decision.
+        let current = EKEventStore.authorizationStatus(for: .event)
+        if current == .fullAccess {
+            calendar = .granted
+            return true
+        }
+        if current == .denied || current == .restricted {
+            calendar = .denied
+            return false
+        }
+        // .notDetermined (and write-only) → prompt now (first use).
+        let granted = (try? await store.requestFullAccessToEvents()) ?? false
+        calendar = granted ? .granted : .denied
+        return granted
+    }
+
     // MARK: - Deep links
 
     enum Pane {
-        case accessibility, screenRecording, inputMonitoring
+        case accessibility, screenRecording, inputMonitoring, calendar
 
         var urlString: String {
             switch self {
@@ -57,6 +93,8 @@ final class PermissionsService: ObservableObject {
                 return "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
             case .inputMonitoring:
                 return "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
+            case .calendar:
+                return "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars"
             }
         }
     }
@@ -72,6 +110,14 @@ final class PermissionsService: ObservableObject {
         case kIOHIDAccessTypeGranted: return .granted
         case kIOHIDAccessTypeDenied: return .denied
         default: return .unknown
+        }
+    }
+
+    private func mapEventKit(_ status: EKAuthorizationStatus) -> Status {
+        switch status {
+        case .fullAccess: return .granted
+        case .denied, .restricted: return .denied
+        default: return .unknown   // .notDetermined / .writeOnly → undecided for our full-write need
         }
     }
 }

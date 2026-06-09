@@ -28,17 +28,25 @@ final class LaunchService {
     /// window of the destination Space once the switch settles — macOS leaves it visually front but
     /// not key, exactly like the native shortcut. No-op by default / in tests.
     private let onSpaceSwitch: () -> Void
+    /// Called when an `.aiCommand` item is fired. Wired by the coordinator to hand the command off to
+    /// the `AICommandExecutor` (which streams into the overlay's preview canvas). Injected so
+    /// `LaunchService` stays decoupled from the AI layer; no-op by default / in tests. Firing an AI
+    /// command does NOT dismiss the overlay (the order-out-before-fire rule does not apply) — the
+    /// overlay handles that exception itself (see `LauncherOverlayController.end`).
+    private let onAICommand: (AICommand) -> Void
 
     init(favoritesProvider: @escaping () -> Favorites,
          mover: WindowRelocating? = nil,
          goToWindow: @escaping (pid_t) -> Bool = { _ in false },
          frontAppProvider: @escaping () -> NSRunningApplication? = { NSWorkspace.shared.frontmostApplication },
-         onSpaceSwitch: @escaping () -> Void = {}) {
+         onSpaceSwitch: @escaping () -> Void = {},
+         onAICommand: @escaping (AICommand) -> Void = { _ in }) {
         self.favoritesProvider = favoritesProvider
         self.mover = mover ?? NullWindowMover()
         self.goToWindow = goToWindow
         self.frontAppProvider = frontAppProvider
         self.onSpaceSwitch = onSpaceSwitch
+        self.onAICommand = onAICommand
     }
 
     // MARK: - Fire
@@ -62,6 +70,11 @@ final class LaunchService {
             firePreset(item, inBand: band)
         case .clipboardEntry(let entry):
             pasteEntry(entry)
+        case .aiCommand(let command):
+            // Hand off to the executor (which streams into the overlay's preview canvas). Unlike every
+            // other kind, this does NOT complete or dismiss on the lift — a fresh four-finger DOWN swipe
+            // (commit) / horizontal swipe (discard) resolve it (see `LauncherOverlayController`).
+            onAICommand(command)
         }
     }
 

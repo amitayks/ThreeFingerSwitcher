@@ -15,10 +15,12 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-CONFIG="${CONFIG:-release}"
+# xcodebuild uses a capitalized configuration name ("Release"), unlike swift build's "release".
+CONFIG="${CONFIG:-Release}"
 APP="ThreeFingerSwitcher.app"
 PRODUCT="ThreeFingerSwitcher"
 DEV_CERT="ThreeFingerSwitcher Dev"
+DERIVED="$PWD/.derivedData"
 
 # Pick a signing identity: explicit SIGN_ID > stable dev cert > ad-hoc.
 if [ -n "${SIGN_ID:-}" ]; then
@@ -32,11 +34,23 @@ else
     echo "  Run ./scripts/make-dev-cert.sh once to fix this."
 fi
 
-echo "▸ swift build -c $CONFIG"
-swift build -c "$CONFIG" --product "$PRODUCT"
+# The app transitively links MLX (Gemma 4 runtime), whose Metal shaders ONLY compile under
+# xcodebuild — `swift build` cannot build the app target anymore. We still keep STABLE signing:
+# xcodebuild builds WITHOUT signing (CODE_SIGNING_ALLOWED=NO), then the codesign block below applies
+# the stable "ThreeFingerSwitcher Dev" identity, so TCC grants survive across rebuilds.
+echo "▸ xcodebuild build -scheme $PRODUCT -configuration $CONFIG (no xcodebuild signing; stable codesign below)"
+xcodebuild build \
+    -scheme "$PRODUCT" \
+    -destination 'platform=macOS' \
+    -configuration "$CONFIG" \
+    -derivedDataPath "$DERIVED" \
+    -skipMacroValidation \
+    -skipPackagePluginValidation \
+    CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
 
-BIN_PATH="$(swift build -c "$CONFIG" --product "$PRODUCT" --show-bin-path)"
-XCF_FRAMEWORK="$(find .build/artifacts -type d -name 'OpenMultitouchSupportXCF.framework' -path '*macos-arm64*' | head -1)"
+BIN_PATH="$DERIVED/Build/Products/$CONFIG"
+# xcodebuild copies the OpenMultitouchSupport XCFramework's macOS slice into the products dir.
+XCF_FRAMEWORK="$BIN_PATH/OpenMultitouchSupportXCF.framework"
 
 echo "▸ assembling $APP"
 rm -rf "$APP"
@@ -45,6 +59,17 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Framewor
 cp "$BIN_PATH/$PRODUCT" "$APP/Contents/MacOS/$PRODUCT"
 cp "Resources/Info.plist" "$APP/Contents/Info.plist"
 cp -R "$XCF_FRAMEWORK" "$APP/Contents/Frameworks/"
+
+# SwiftPM resource bundles (e.g. mlx-swift_Cmlx.bundle, which holds default.metallib — MLX's compiled
+# Metal shaders). xcodebuild emits these into the products dir; they are NOT baked into the binary.
+# Each package finds its bundle via `Bundle.module`, whose first candidate is `Bundle.main.resourceURL`
+# = Contents/Resources. WITHOUT this copy the app is SIGKILLed with no crash report the instant MLX
+# touches the GPU — i.e. "it disappears at 100%". Copy every produced *.bundle into Resources.
+for bundle in "$BIN_PATH"/*.bundle; do
+    [ -e "$bundle" ] || continue
+    echo "▸ bundling resource: $(basename "$bundle")"
+    cp -R "$bundle" "$APP/Contents/Resources/"
+done
 
 # App icon (shown in Finder / Spotlight / login-items / Accessibility list). Referenced by
 # CFBundleIconFile = "AppIcon" in Info.plist.

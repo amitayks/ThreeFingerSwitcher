@@ -74,6 +74,26 @@ final class LaunchItemTests: XCTestCase {
         }
     }
 
+    /// The synthetic `.aiCommand` kind round-trips through Codable (it shares the launcher plumbing),
+    /// even though it is never written into the persisted Favorites record (it's built fresh on open).
+    func testAICommandKindEncodesAndDecodes() throws {
+        let command = AICommand(name: "Fix Grammar", icon: .sfSymbol("text.badge.checkmark"),
+                                tint: ItemColor(red: 0.25, green: 0.72, blue: 0.40),
+                                input: .selection,
+                                promptTemplate: "Fix: {input}",
+                                output: .runTask(.addToCalendar),
+                                model: .onDevice(modelID: "gemma-4-31b"),
+                                confirmBeforeRun: true)
+        let item = LaunchItem(id: command.id, title: command.name, icon: command.icon,
+                              tint: command.tint, kind: .aiCommand(command))
+        let data = try JSONEncoder().encode(item)
+        let back = try JSONDecoder().decode(LaunchItem.self, from: data)
+        XCTAssertEqual(back, item, "the .aiCommand kind and its AICommand payload round-trip")
+        guard case let .aiCommand(decoded) = back.kind else { return XCTFail("kind is .aiCommand") }
+        XCTAssertEqual(decoded, command, "the carried AICommand survives the round-trip intact")
+        XCTAssertFalse(item.isConsequential, "an AI command is not a fire-notification kind")
+    }
+
     // MARK: - Persistence (versioned key)
 
     func testStorePersistsUnderFavoritesKeyAcrossInstances() {

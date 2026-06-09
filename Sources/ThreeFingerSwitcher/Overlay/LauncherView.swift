@@ -14,6 +14,9 @@ extension Color {
 /// The selection is a single Liquid Glass square that darkens over the dwell, then arms (haptic).
 struct LauncherView: View {
     @ObservedObject var model: LauncherModel
+    /// The AI command executor whose streaming state the preview canvas observes (nil when AI commands
+    /// aren't wired — the canvas is then never reached because no `.aiCommand` item can be fired).
+    var executor: AICommandExecutor? = nil
 
     private var columns: [GridItem] {
         Array(repeating: GridItem(.fixed(LauncherGridLayout.cellWidth), spacing: LauncherGridLayout.spacing),
@@ -22,12 +25,19 @@ struct LauncherView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            tabs
-            Divider().opacity(0.35)
-            if model.currentBandIsClipboard {
-                ClipboardBandView(model: model)
+            // The AI streaming preview canvas replaces the grid/headers entirely while it is open
+            // (an AI command was fired and is generating / awaiting commit). Everything else is the
+            // unchanged grid + Clipboard band.
+            if model.canvasActive {
+                canvas
             } else {
-                grid
+                tabs
+                Divider().opacity(0.35)
+                if model.currentBandIsClipboard {
+                    ClipboardBandView(model: model)
+                } else {
+                    grid
+                }
             }
         }
         .padding(LauncherGridLayout.containerPadding)
@@ -35,6 +45,18 @@ struct LauncherView: View {
         .background(
             RoundedRectangle(cornerRadius: 30, style: .continuous).fill(.ultraThinMaterial)
         )
+    }
+
+    /// The AI preview canvas, bound to the executor's streaming state. When no executor is wired it
+    /// falls back to an empty surface (defensive — the canvas is unreachable without one).
+    @ViewBuilder
+    private var canvas: some View {
+        if let executor, let command = model.canvasCommand {
+            AICommandCanvasView(executor: executor, command: command,
+                                tint: command.tint.map(Color.init) ?? Color(model.currentBandColor))
+        } else {
+            Color.clear
+        }
     }
 
     // MARK: Category tabs (the headers row)
@@ -158,6 +180,7 @@ struct LauncherView: View {
             switch item.kind {
             case .preset: return "square.stack.3d.up.fill"
             case .script: return "terminal.fill"
+            case .aiCommand: return "sparkles"
             default: return nil
             }
         }()

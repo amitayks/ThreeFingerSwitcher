@@ -12,7 +12,10 @@ let package = Package(
         .executable(name: "TouchSpike", targets: ["TouchSpike"])
     ],
     dependencies: [
-        .package(url: "https://github.com/Kyome22/OpenMultitouchSupport.git", from: "4.0.0")
+        .package(url: "https://github.com/Kyome22/OpenMultitouchSupport.git", from: "4.0.0"),
+        // The MLX/Gemma 4 runtime. Pulls mlx-swift / swift-transformers / mlx-swift-lm transitively.
+        // Building anything that links this needs `xcodebuild` (Metal shaders) — see GemmaRuntime target.
+        .package(url: "https://github.com/VincentGourbin/gemma-4-swift-mlx", branch: "main")
     ],
     targets: [
         // All app logic lives in this library so the test target can `@testable import` it.
@@ -29,10 +32,26 @@ let package = Package(
                 .swiftLanguageMode(.v5)
             ]
         ),
-        // Thin executable: just calls runThreeFingerSwitcher() from the Core library.
+        // The MLX/Gemma 4 runtime, ISOLATED in its own target so `ThreeFingerSwitcherCore` and the
+        // test target stay MLX-free and keep building under plain `swift build`/`swift test`. This
+        // target links MLX (Metal shaders) so it — and anything depending on it (the app) — builds
+        // ONLY via `xcodebuild`, never `swift build`. It conforms to Core's public `LLMRuntime` seam.
+        .target(
+            name: "GemmaRuntime",
+            dependencies: [
+                "ThreeFingerSwitcherCore",
+                .product(name: "Gemma4Swift", package: "gemma-4-swift-mlx")
+            ],
+            path: "Sources/GemmaRuntime",
+            swiftSettings: [
+                .swiftLanguageMode(.v5)
+            ]
+        ),
+        // Thin executable: calls runThreeFingerSwitcher() from Core and injects the real Gemma runtime
+        // (from GemmaRuntime) at the model seam. Builds via `xcodebuild` (it transitively links MLX).
         .executableTarget(
             name: "ThreeFingerSwitcher",
-            dependencies: ["ThreeFingerSwitcherCore"],
+            dependencies: ["ThreeFingerSwitcherCore", "GemmaRuntime"],
             path: "Sources/ThreeFingerSwitcherApp",
             swiftSettings: [
                 .swiftLanguageMode(.v5)

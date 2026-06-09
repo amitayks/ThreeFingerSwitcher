@@ -41,7 +41,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
         frontAppProvider: { [weak self] in self?.capturedFrontApp ?? NSWorkspace.shared.frontmostApplication },
         // After a Next/Previous Space shortcut, focus the destination Space's front window once the
         // switch settles (the OS leaves it visually front but not key — same as the native shortcut).
-        onSpaceSwitch: { [weak self] in self?.focusFrontWindowAfterSpaceSwitch() }
+        onSpaceSwitch: { [weak self] in self?.focusFrontWindowAfterSpaceSwitch() },
+        // An AI command hands off to the executor, which streams into the overlay's preview canvas.
+        // Firing it does NOT dismiss the overlay (the overlay handles that exception).
+        onAICommand: { [weak self] command in self?.aiCommandExecutor.fire(command) }
     )
 
     /// Frontmost app captured at launcher-open time (target for `.action(.closeFrontWindow)`).
@@ -50,6 +53,37 @@ final class AppCoordinator: GestureRecognizerDelegate {
     // Clipboard history (opt-in; the synthetic Clipboard band + the background recorder).
     private let clipboardStore = ClipboardStore.shared
     private lazy var clipboardMonitor = ClipboardMonitor(store: clipboardStore)
+
+    // AI commands (opt-in; the synthetic AI band + the on-device model + the streaming canvas).
+    private let aiCommandStore = AICommandStore.shared
+    /// Reads/writes the captured front app's selection (and the clipboard / screen region) for an AI
+    /// command. Reuses `capturedFrontApp` exactly like `LaunchService`, so output lands in the app the
+    /// user was looking at (the overlay is non-activating).
+    private lazy var selectionService = SelectionService(
+        frontAppProvider: { [weak self] in self?.capturedFrontApp ?? NSWorkspace.shared.frontmostApplication }
+    )
+    /// Manages the on-device model lifecycle. Until the real MLX/Gemma runtime (phase 10) is wired,
+    /// this runs against a **dev stub**: a `StubLLMRuntime` + a registry whose integrity SHA matches a
+    /// fabricated dev payload, so download/verify/load succeed WITHOUT a real multi-gigabyte fetch and
+    /// the streaming canvas is fully usable in a signed build today. Swapping in the real runtime is a
+    /// one-line `runtimeFactory` change (design D1/D7) — feature code never sees a concrete model.
+    private lazy var modelManager: ModelManager =
+        AIRuntimeInjection.modelManagerFactory?(settings.aiCommandsEnabled)
+        ?? DevAIRuntime.makeModelManager(optedIn: settings.aiCommandsEnabled)
+    /// The agentic task layer (calendar / save-to-project / open-tool / send-to), driven by the model's
+    /// structured output. Calendar permission is requested lazily at first calendar-task use.
+    private lazy var taskDispatcher = TaskDispatcher(modelManager: modelManager, permissions: permissions)
+    /// Orchestrates one AI command fire end-to-end (acquire → stream → commit), exposing the observable
+    /// state the launcher's preview canvas binds to. The context provider supplies the captured app
+    /// name so `{app}` resolves; input is filled by acquisition.
+    private lazy var aiCommandExecutor = AICommandExecutor(
+        modelManager: modelManager,
+        selection: selectionService,
+        dispatcher: taskDispatcher,
+        contextProvider: { [weak self] in
+            FireContext(capturedAppName: self?.capturedFrontApp?.localizedName)
+        }
+    )
 
     /// Whether the app currently has Mission Control open (it triggers MC itself via the vertical
     /// gesture). Lets the switcher float above MC and a commit dismiss it before raising.
@@ -96,11 +130,26 @@ final class AppCoordinator: GestureRecognizerDelegate {
             guard case let .clipboardEntry(entry) = item.kind else { return }
             self?.clipboardStore.togglePin(id: entry.id)
         }
+        // AI preview canvas: the executor it observes, and the two-stage commit / discard gestures.
+        launcherOverlay.executor = aiCommandExecutor
+        launcherOverlay.onCommitCanvas = { [weak self] in
+            // A fresh four-finger DOWN swipe commits: route the ready result per the command's output
+            // target (or fire the reviewed side effect). Errors surface in the executor's `.failed`
+            // state (the canvas is already dismissed by the controller, but the executor records them).
+            Task { @MainActor in try? await self?.aiCommandExecutor.commit() }
+        }
+        launcherOverlay.onDiscardCanvas = { [weak self] in self?.aiCommandExecutor.cancel() }
+        // When the canvas opens, put the recognizer in canvas-resolution mode so a FRESH four-finger
+        // swipe resolves it (horizontal = discard, down = apply) instead of re-opening the launcher.
+        launcherOverlay.onCanvasStateChanged = { [weak self] active in
+            self?.recognizer.launcherCanvasResolutionActive = active
+        }
         observeSleepWake()
         observeSpacesRearrangeToggle()
         observeVerticalGestureToggle()
         observeLauncherToggle()
         observeClipboardToggle()
+        observeAICommandsToggle()
     }
 
     deinit {
@@ -225,6 +274,12 @@ final class AppCoordinator: GestureRecognizerDelegate {
         recognizer.reset()
         overlay.hide()
         launcherOverlay.cancel()
+        // CRITICAL: stop the multitouch listener NOW, while its CFRunLoopSource is still valid. The OS
+        // invalidates the device source during system sleep; calling `manager.stopListening()` AFTER
+        // wake then traps on a freed source (EXC_BREAKPOINT in MTDeviceStop — observed during long
+        // model downloads that span a sleep). Stopping pre-sleep makes the post-wake `stop()` a no-op,
+        // and `restartTouchEngineAfterWake()` attaches a fresh listener on `didWake`.
+        touchEngine.stop()
     }
 
     /// Re-subscribe the multitouch listener after wake. Idempotent and guarded against
@@ -370,30 +425,47 @@ final class AppCoordinator: GestureRecognizerDelegate {
     // MARK: - GestureRecognizerDelegate (four-finger launcher)
 
     func launcherDidActivate() {
+        // Defensive: while the AI preview canvas is open the recognizer is in canvas-resolution mode and
+        // routes swipes to `launcherCanvasResolve` (down = commit, horizontal = discard), so it does NOT
+        // call this. Should it ever reach here, do NOT re-show — that would discard the canvas and reset
+        // to the grid; let the open canvas keep handling the gesture.
+        guard !launcherOverlay.canvasActive else { return }
+
         let fav = favoritesStore.favorites
         // When clipboard history is on, append the synthetic Clipboard band as the LAST band, built
         // fresh from the store (recent slice, pinned-first). It is never persisted and never the home.
         var bands = fav.bands
         var clipboardBandIndex: Int?
+        var aiCommandBandIndex: Int?
         if settings.keepClipboardHistory {
             let entries = clipboardStore.recentWindow(limit: settings.clipboardRecentWindow)
             bands.append(ClipboardBandBuilder.build(from: entries))
             clipboardBandIndex = bands.count - 1
         }
+        // When AI commands are on AND at least one command exists, append the synthetic AI band, built
+        // fresh from the command store. Never persisted, never the home (mirrors the Clipboard band).
+        if AICommandBandBuilder.shouldPresent(optedIn: settings.aiCommandsEnabled,
+                                              commands: aiCommandStore.commands) {
+            bands.append(AICommandBandBuilder.build(from: aiCommandStore.commands))
+            aiCommandBandIndex = bands.count - 1
+        }
         guard !bands.isEmpty else { return }
         // Capture the app the user was looking at before the (non-activating) overlay appears, so a
-        // `.action(.closeFrontWindow)` item — and a clipboard paste — targets that window.
+        // `.action(.closeFrontWindow)` item — a clipboard paste, and an AI command's selection I/O —
+        // targets that window.
         let front = NSWorkspace.shared.frontmostApplication
         capturedFrontApp = (front?.processIdentifier == getpid()) ? capturedFrontApp : front
         launcherOverlay.edgeAcceleration = settings.clipboardEdgeAcceleration
-        // Convert the deliberate pin-flick distance into a count of fine horizontal steps.
+        // Convert the deliberate pin-flick distance into a count of fine horizontal steps (also reused
+        // as the canvas discard-flick threshold).
         launcherOverlay.clipboardPinSteps =
             max(2, Int((settings.clipboardPinDistance / max(settings.launcherStepDistance, 0.01)).rounded()))
         launcherOverlay.show(bands: bands,
                              startBand: fav.homeBandIndex,
                              startColumn: fav.resolvedHomeColumn,
                              dwell: settings.dwellToArmDuration,
-                             clipboardBandIndex: clipboardBandIndex)
+                             clipboardBandIndex: clipboardBandIndex,
+                             aiCommandBandIndex: aiCommandBandIndex)
     }
 
     func launcherDidStepItem(_ direction: Int) {
@@ -419,6 +491,19 @@ final class AppCoordinator: GestureRecognizerDelegate {
 
     func launcherDidCancel() {
         launcherOverlay.cancel()
+    }
+
+    /// A fresh four-finger swipe while the AI preview canvas is open resolves it: a DOWN swipe applies
+    /// the result (`dy == -1` — "bring it into the document"), a horizontal swipe discards. An UP swipe
+    /// (`dy == +1`) is intentionally ignored so a stray upward motion never throws the result away.
+    func launcherCanvasResolve(dx: Int, dy: Int) {
+        guard launcherOverlay.canvasActive else { return }
+        if dy < 0 {
+            launcherOverlay.resolveCanvasCommit()   // swipe DOWN → apply (replace / paste / run task)
+        } else if dx != 0 {
+            launcherOverlay.discardCanvas()          // horizontal swipe → discard
+        }
+        // dy > 0 (up) → no-op
     }
 
     func launcherEdgeChanged(dx: Int, dy: Int) {
@@ -474,6 +559,39 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// Launch/enable/disable refresh: the opt-in value is stable at these call sites, so reading it is safe.
     private func refreshClipboardMonitor() {
         setClipboardRecording(settings.keepClipboardHistory)
+    }
+
+    // MARK: - AI commands opt-in lifecycle
+
+    /// React to the "Enable AI commands" toggle: drive the model manager's opt-in. Turning it OFF
+    /// evicts any resident model and forgets download progress (privacy + frees weights — handled in
+    /// `ModelManager`); turning it ON only allows a download (it never auto-fetches — the user starts
+    /// it from Settings). Uses the EMITTED value, not a re-read (the `@Published` willSet would still
+    /// report the OLD value here — same reason the gesture toggles pass `enabled` through).
+    private func observeAICommandsToggle() {
+        settings.$aiCommandsEnabled
+            .dropFirst()
+            .sink { [weak self] on in MainActor.assumeIsolated { self?.modelManager.setOptedIn(on) } }
+            .store(in: &cancellables)
+    }
+
+    /// Begin (or retry) the on-device model download from Settings. Gated on the opt-in by the manager
+    /// itself; surfaces a non-fatal alert if the (dev-stub today) download/verify fails. The real
+    /// MLX/Gemma fetch is deferred (phase 10) — this drives the dev-stub path so the model loads.
+    private func downloadAIModel() {
+        modelManager.setOptedIn(settings.aiCommandsEnabled)
+        guard let descriptor = modelManager.registry.defaultDescriptor
+            ?? modelManager.registry.models.first else { return }
+        Task { @MainActor in
+            do {
+                try await modelManager.downloadAndVerify(descriptor)
+            } catch {
+                // The manager already reflects `.failed`/`.notDownloaded` in its observable state for
+                // the Settings surface; this alert is a belt-and-suspenders for an unexpected failure.
+                infoAlert(title: "Couldn't prepare the model",
+                          text: (error as? LocalizedError)?.errorDescription ?? "\(error)")
+            }
+        }
     }
 
     // MARK: - Post-Space-switch cleanup & focus
@@ -941,7 +1059,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
             onOpenSetup: { [weak self] in self?.showOnboarding() },
             onRestoreMissionControl: { [weak self] in self?.restoreVerticalGestureSetting() },
             showRestoreMissionControl: verticalGesture.hasBackup,
-            onClearClipboard: { [weak self] includingPinned in self?.clipboardStore.clear(includingPinned: includingPinned) }
+            onClearClipboard: { [weak self] includingPinned in self?.clipboardStore.clear(includingPinned: includingPinned) },
+            aiCommandStore: aiCommandStore,
+            modelManager: modelManager,
+            onDownloadModel: { [weak self] in self?.downloadAIModel() }
         )
         if let settingsWindow {
             (settingsWindow.contentViewController as? NSHostingController<SettingsView>)?.rootView = view

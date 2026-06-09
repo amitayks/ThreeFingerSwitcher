@@ -121,6 +121,21 @@ final class AppSettings: ObservableObject {
     /// Bundle ids whose copies are never recorded (e.g. password managers the user wants excluded).
     @Published var clipboardExcludedApps: [String] { didSet { defaults.set(clipboardExcludedApps, forKey: Keys.clipboardExcludedApps) } }
 
+    // MARK: - AI commands (opt-in; default OFF)
+
+    /// Opt-in to the AI command band and the on-device model. Unlike the Space-row / launcher opt-ins
+    /// this relocates NO native gesture and needs NO re-login; unlike the clipboard opt-in, turning it
+    /// ON does allow the (later) multi-gigabyte model download + residency, and the first calendar task
+    /// will request the Calendar permission lazily. Default OFF — set only via explicit consent.
+    /// Older settings that predate this feature have no key and decode with the opt-in OFF, leaving the
+    /// band absent, nothing downloaded, and no commands surfaced.
+    @Published var aiCommandsEnabled: Bool { didSet { defaults.set(aiCommandsEnabled, forKey: Keys.aiCommandsEnabled) } }
+
+    /// The pinned on-device model id the model-management surface selects, or nil for "registry
+    /// default". Stored so a deliberate model choice survives across launches; nil encodes as absent,
+    /// so older settings (and a never-chosen default) read back identically.
+    @Published var aiSelectedModelID: String? { didSet { defaults.set(aiSelectedModelID, forKey: Keys.aiSelectedModelID) } }
+
     /// Shared singleton uses the standard user defaults.
     private convenience init() {
         self.init(defaults: .standard)
@@ -159,6 +174,8 @@ final class AppSettings: ObservableObject {
         clipboardEdgeAcceleration = defaults.object(forKey: Keys.clipboardEdgeAcceleration) as? Double ?? Defaults.clipboardEdgeAcceleration
         clipboardPinDistance = defaults.object(forKey: Keys.clipboardPinDistance) as? Double ?? Defaults.clipboardPinDistance
         clipboardExcludedApps = defaults.object(forKey: Keys.clipboardExcludedApps) as? [String] ?? Defaults.clipboardExcludedApps
+        aiCommandsEnabled = defaults.object(forKey: Keys.aiCommandsEnabled) as? Bool ?? Defaults.aiCommandsEnabled
+        aiSelectedModelID = defaults.object(forKey: Keys.aiSelectedModelID) as? String ?? Defaults.aiSelectedModelID
     }
 
     func resetToDefaults() {
@@ -188,6 +205,9 @@ final class AppSettings: ObservableObject {
         clipboardPollInterval = Defaults.clipboardPollInterval
         clipboardEdgeAcceleration = Defaults.clipboardEdgeAcceleration
         clipboardPinDistance = Defaults.clipboardPinDistance
+        // `aiCommandsEnabled` (a consent-gated opt-in that allows a multi-gigabyte download) and the
+        // selected-model pin are a deliberate user choice, so they're intentionally NOT reset — mirrors
+        // the launcher / clipboard opt-in handling.
     }
 
     private func persist(_ value: Double, _ key: String) { defaults.set(value, forKey: key) }
@@ -221,6 +241,8 @@ final class AppSettings: ObservableObject {
         static let clipboardEdgeAcceleration = 1.0 // edge-scroll acceleration sensitivity
         static let clipboardPinDistance = 0.22     // deliberate horizontal flick to pin / leave (≈3 item steps)
         static let clipboardExcludedApps: [String] = []
+        static let aiCommandsEnabled = false       // opt-in; gates the AI band + model download/residency
+        static let aiSelectedModelID: String? = nil  // nil = registry default model
     }
 
     private enum Keys {
@@ -253,5 +275,7 @@ final class AppSettings: ObservableObject {
         static let clipboardEdgeAcceleration = "clipboardEdgeAcceleration"
         static let clipboardPinDistance = "clipboardPinDistance"
         static let clipboardExcludedApps = "clipboardExcludedApps"
+        static let aiCommandsEnabled = "aiCommandsEnabled"
+        static let aiSelectedModelID = "aiSelectedModelID"
     }
 }

@@ -299,6 +299,79 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertEqual(settings.axisLockRatio, AppSettings.Defaults.axisLockRatio, accuracy: eps)
     }
 
+    // MARK: - AI commands opt-in
+
+    /// The AI-commands opt-in is off on first run (it gates a multi-gigabyte model download), and the
+    /// selected-model pin starts nil ("registry default").
+    func testAICommandsDefaultsOffAndNoSelectedModel() {
+        let settings = makeSettings()
+        XCTAssertFalse(settings.aiCommandsEnabled, "AI commands must default OFF (opt-in)")
+        XCTAssertEqual(settings.aiCommandsEnabled, AppSettings.Defaults.aiCommandsEnabled)
+        XCTAssertNil(settings.aiSelectedModelID, "no model pinned by default")
+        XCTAssertNil(AppSettings.Defaults.aiSelectedModelID)
+    }
+
+    /// The opt-in persists across a "relaunch" (a fresh instance on the same suite) and writes through
+    /// to the documented raw key, both directions.
+    func testAICommandsEnabledPersistsAcrossInstances() {
+        let writer = makeSettings()
+        XCTAssertFalse(writer.aiCommandsEnabled)
+
+        writer.aiCommandsEnabled = true
+        XCTAssertEqual(defaults.object(forKey: "aiCommandsEnabled") as? Bool, true, "writes the documented key")
+
+        let reader = AppSettings(defaults: defaults)
+        XCTAssertTrue(reader.aiCommandsEnabled, "persists across instances")
+
+        reader.aiCommandsEnabled = false
+        XCTAssertFalse(AppSettings(defaults: defaults).aiCommandsEnabled, "the off state persists too")
+    }
+
+    /// The selected-model pin persists across instances and writes through to its key.
+    func testAISelectedModelIDPersistsAcrossInstances() {
+        let writer = makeSettings()
+        writer.aiSelectedModelID = "gemma-4-26b-a4b"
+        XCTAssertEqual(defaults.object(forKey: "aiSelectedModelID") as? String, "gemma-4-26b-a4b")
+
+        let reader = AppSettings(defaults: defaults)
+        XCTAssertEqual(reader.aiSelectedModelID, "gemma-4-26b-a4b", "persists across instances")
+    }
+
+    /// Older settings (no AI keys present) decode with the opt-in OFF and no pinned model, while every
+    /// pre-existing setting is left untouched — proving the addition is purely additive.
+    func testOlderSettingsDecodeWithAICommandsOffAndUntouched() {
+        // Arrange: simulate a pre-feature store — populate unrelated keys, but NO AI keys.
+        defaults.set(0.0777, forKey: "stepDistance")
+        defaults.set(true, forKey: "wrapAtEnds")
+        defaults.set(true, forKey: "keepClipboardHistory")
+        XCTAssertNil(defaults.object(forKey: "aiCommandsEnabled"), "precondition: no AI key on disk")
+        XCTAssertNil(defaults.object(forKey: "aiSelectedModelID"), "precondition: no AI model key on disk")
+
+        // Act
+        let settings = AppSettings(defaults: defaults)
+
+        // Assert: the new opt-in defaults off / nil without a stored value...
+        XCTAssertFalse(settings.aiCommandsEnabled)
+        XCTAssertNil(settings.aiSelectedModelID)
+        // ...and the pre-existing settings are loaded exactly as stored (not reset).
+        XCTAssertEqual(settings.stepDistance, 0.0777, accuracy: eps)
+        XCTAssertTrue(settings.wrapAtEnds)
+        XCTAssertTrue(settings.keepClipboardHistory)
+    }
+
+    /// `resetToDefaults()` must NOT touch the AI opt-in (it's a consent-gated choice that allows a
+    /// multi-gigabyte download) nor the pinned model — mirrors the launcher / clipboard opt-in handling.
+    func testResetToDefaultsDoesNotTouchAICommands() {
+        let settings = makeSettings()
+        settings.aiCommandsEnabled = true
+        settings.aiSelectedModelID = "gemma-4-12b"
+
+        settings.resetToDefaults()
+
+        XCTAssertTrue(settings.aiCommandsEnabled, "reset must not flip the AI opt-in")
+        XCTAssertEqual(settings.aiSelectedModelID, "gemma-4-12b", "reset must not clear the pinned model")
+    }
+
     // MARK: - Isolation
 
     /// Two instances on different suites must not share state, proving suite isolation.
