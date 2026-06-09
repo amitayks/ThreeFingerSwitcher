@@ -15,7 +15,13 @@ let package = Package(
         .package(url: "https://github.com/Kyome22/OpenMultitouchSupport.git", from: "4.0.0"),
         // The MLX/Gemma 4 runtime. Pulls mlx-swift / swift-transformers / mlx-swift-lm transitively.
         // Building anything that links this needs `xcodebuild` (Metal shaders) — see GemmaRuntime target.
-        .package(url: "https://github.com/VincentGourbin/gemma-4-swift-mlx", branch: "main")
+        // PINNED to an exact revision (not `branch: "main"`): the upstream `main` drifts and has shipped
+        // commits that fail to compile (e.g. a `Float`→`MLXArray` type error in LoRA/TurboQuant). A
+        // branch requirement let CI re-resolve to a broken HEAD and fail the release build even though
+        // the committed Package.resolved pinned a good commit. An exact revision freezes it everywhere.
+        // To bump: change the SHA here, re-resolve, and verify with `xcodebuild`.
+        .package(url: "https://github.com/VincentGourbin/gemma-4-swift-mlx",
+                 revision: "c6f8ab5820379898b1d437e8e5c463f376672613")
     ],
     targets: [
         // All app logic lives in this library so the test target can `@testable import` it.
