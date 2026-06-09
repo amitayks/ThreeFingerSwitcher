@@ -2,6 +2,7 @@
 .swiftpm/
 *.app
 DerivedData/
+.derivedData/
 .DS_Store
 
 # Release packaging output (DMGs are built by CI / scripts/package-dmg.sh, never committed)

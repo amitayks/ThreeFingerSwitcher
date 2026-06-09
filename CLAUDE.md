@@ -8,7 +8,7 @@ Orientation lives in **`README.md`** (it's written for an agent: Job A = install
 
 So the division of labor is:
 
-- **Agent does:** edit code, and verify with **`swift build`** / **`swift test`** only. These compile and run logic — they don't sign, install, or launch the app, so they're safe and useful. To compile-check a *subset* of the tree in isolation (e.g. one feature without another's uncommitted files), use a throwaway **`git worktree`** and `swift build` there — never the shared working tree's `.app`.
+- **Agent does:** edit code, and verify with **`swift build`** / **`swift test`** (the MLX-free `ThreeFingerSwitcherCore` + test target) and, for the MLX-linked `GemmaRuntime`/app target, **`xcodebuild`** to *compile-verify only*. These compile and run logic — they don't sign, install, or launch the app, so they're safe and useful. To compile-check a *subset* of the tree in isolation (e.g. one feature without another's uncommitted files), use a throwaway **`git worktree`** and `swift build` there — never the shared working tree's `.app`.
 - **User does (in their own Terminal):** the real build for any in-app or permission testing —
   ```bash
   INSTALL=1 ./scripts/build-app.sh      # stable-signed, installed in place to /Applications
@@ -17,6 +17,15 @@ So the division of labor is:
   A stable signing identity means TCC grants (and Open-at-Login) **survive across rebuilds** — a rebuild *is* the update.
 
 **Releases are never built locally.** Pushing a `vX.Y.Z` git tag triggers `.github/workflows/release.yml`, which builds, **Developer-ID-signs + notarizes + staples**, and publishes a DMG to GitHub Releases (see `docs/RELEASING.md`). Don't try to notarize or Developer-ID-sign from the agent shell — that's the CI runner's job, and it has the secrets.
+
+## On-device AI (the AI Command Band) — build & landmines
+
+The AI band runs **Gemma 4 in-process via MLX**. Two targets, on purpose: **`ThreeFingerSwitcherCore` stays MLX-free** (the `LLMRuntime` seam + a `StubLLMRuntime`/`DevAIRuntime`, the executor, tasks, selection, canvas — all verify under `swift build`/`swift test`); the real model lives in **`GemmaRuntime`**, which links MLX and therefore builds via **`xcodebuild` only** (MLX compiles Metal shaders — one-time `xcodebuild -downloadComponent MetalToolchain`). The app injects the real runtime at the seam in `main.swift`.
+
+- **The metallib landmine:** MLX ships `default.metallib` as a SwiftPM resource bundle (`mlx-swift_Cmlx.bundle`). `build-app.sh` **must copy `*.bundle` into `Contents/Resources/`** — if it doesn't, the app launches but is **SIGKILL'd at first GPU use with no crash report**. This is already handled; don't regress it.
+- **Errors must be clean + non-blocking.** Never interpolate a raw error (`"\(error)"` / `String(describing:)`) into a user-facing string — route through the central translator and surface a clean headline; raw text is opt-in detail/logs only. Never surface a background AI failure via app-modal `NSAlert.runModal()` (it freezes the Settings window) — use the in-window `.failed` state. (See the `harden-ai-error-handling` change.)
+- **Swipe-to-resolve, not lift-to-commit:** while the preview canvas is open it's resolved by a *fresh four-finger swipe* — **down = commit/apply, horizontal = discard, up = ignored**; a stray re-lift is a no-op (the firing lift already raised the fingers).
+- **No vision in v1**, and the model is **Apple-Silicon-only** (no Intel/low-end fallback). The `LLMRuntime` seam exists so another backend can replace Gemma without touching feature code.
 
 ## Final gesture mechanism
 
