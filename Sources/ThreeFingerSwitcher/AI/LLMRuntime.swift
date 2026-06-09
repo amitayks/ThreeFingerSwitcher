@@ -121,6 +121,14 @@ public enum StructuredOutcome<Value>: Sendable where Value: Sendable {
 /// Failures the runtime layer can report. Distinct cases so the UI can message precisely (a missing
 /// model asks for a download; an integrity failure asks for a re-download; `unavailable` is the
 /// "this machine/config can't serve the feature" terminal state — never a silent degrade).
+///
+/// This is the SHARED error taxonomy for the AI feature (design D1/D6): each runtime backend maps its
+/// own native errors (e.g. a vendor download-library error, an `NSURLError`) into these cases at its
+/// boundary, so feature/UI code only ever sees this type — never a raw vendor/OS error. The taxonomy
+/// is `LocalizedError` so every case is self-describing with a clean, user-facing string; the central
+/// `AIError.message(for:)` translator routes through that `errorDescription` (never a reflected enum
+/// dump). Associated values stay `Equatable` (and carry no non-`Equatable` `Error`) so the enum is
+/// `Equatable` — copyable raw detail rides on `AIPresentedError.details`, derived at translation time.
 public enum RuntimeError: Error, Equatable {
     /// The feature can't be served on this machine/configuration (no silent fallback).
     case unavailable(reason: String)
@@ -136,6 +144,37 @@ public enum RuntimeError: Error, Equatable {
     case decodeFailed(detail: String)
     /// The runtime lacks a capability the request needs (e.g. vision asked of a text-only model).
     case unsupportedModality(Modality)
+    /// No internet connection reached the model service (e.g. provision/download with wifi off).
+    case offline
+    /// The model service was reachable but could not serve the request (5xx, transient outage).
+    case serverUnavailable
+    /// Access to the model was refused (auth/forbidden/not-found at the download endpoint).
+    case authOrAccessDenied
+    /// The weights downloaded but could not be loaded into the runtime. `detail` is opt-in copyable
+    /// diagnostic text (kept off the user-facing headline; surfaced only as `AIPresentedError.details`).
+    case modelLoadFailed(detail: String?)
+}
+
+/// Self-describing, user-facing messages for every case (so the "clean path" — reading
+/// `errorDescription` — never falls back to a reflected enum dump). These are the canonical strings
+/// the central `AIError.message(for:)` translator returns as the headline; raw error text never
+/// appears here, only in opt-in `details`/logs (spec: "No raw error text in user-facing strings").
+extension RuntimeError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case let .unavailable(reason): return reason
+        case .modelMissing: return "The model is not downloaded yet."
+        case .integrityFailed: return "The model failed its integrity check; re-download required."
+        case .cancelled: return "Cancelled."
+        case let .couldNotProduceValid(attempts): return "Could not produce a valid result (\(attempts) attempts)."
+        case .decodeFailed: return "Could not read the model's result."
+        case let .unsupportedModality(modality): return "The model can't handle \(modality.rawValue) input."
+        case .offline: return "No internet connection. Connect to the internet and try again."
+        case .serverUnavailable: return "The model service is temporarily unavailable. Please try again shortly."
+        case .authOrAccessDenied: return "Access to the model was denied. It may require sign-in or has moved."
+        case .modelLoadFailed: return "The model could not be loaded."
+        }
+    }
 }
 
 // MARK: - The protocol

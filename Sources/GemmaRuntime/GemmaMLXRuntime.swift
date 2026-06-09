@@ -91,9 +91,50 @@ public final class GemmaMLXRuntime: LLMRuntime, @unchecked Sendable {
         } catch is CancellationError {
             Self.log.notice("prepare: cancelled")
             throw RuntimeError.cancelled
+        } catch let runtime as RuntimeError {
+            // Already in the shared taxonomy (e.g. an inner `.cancelled`) — log + rethrow unchanged.
+            Self.log.error("prepare: FAILED: \(String(describing: runtime), privacy: .public)")
+            throw runtime
+        } catch let download as Gemma4DownloadError {
+            // Map the vendored download-library error into the shared taxonomy HERE, at the boundary
+            // (design D6) — stop re-throwing it raw. The diagnostic log line is KEEP-as-is.
+            Self.log.error("prepare: FAILED: \(String(describing: download), privacy: .public)")
+            throw Self.runtimeError(for: download)
         } catch {
+            // Any other failure is a model-load failure; carry the raw text as OPT-IN detail only
+            // (never the user-facing headline). The diagnostic log line is KEEP-as-is.
             Self.log.error("prepare: FAILED: \(String(describing: error), privacy: .public)")
-            throw error
+            throw RuntimeError.modelLoadFailed(detail: String(describing: error))
+        }
+    }
+
+    /// Map the vendored `Gemma4DownloadError` into Core's shared `RuntimeError` taxonomy. Reference the
+    /// vendored type by its PUBLIC shape only — never edit it (it lives in `.build/checkouts`). For a
+    /// `.networkError`, inspect the wrapped `NSError` code to split a genuine offline state from a
+    /// transient server failure; HTTP statuses reuse `AIError`'s shared classifier so the boundary and
+    /// the translator never disagree.
+    static func runtimeError(for error: Gemma4DownloadError) -> RuntimeError {
+        switch error {
+        case let .networkError(_, underlying):
+            switch (underlying as NSError).code {
+            case NSURLErrorNotConnectedToInternet,   // -1009
+                 NSURLErrorNetworkConnectionLost,     // -1005
+                 NSURLErrorCannotConnectToHost,       // -1004
+                 NSURLErrorCannotFindHost,            // -1003
+                 NSURLErrorDNSLookupFailed,           // -1006
+                 NSURLErrorTimedOut,                  // -1001
+                 NSURLErrorDataNotAllowed,            // -1020
+                 NSURLErrorInternationalRoamingOff:   // -1018
+                return .offline
+            default:
+                return .serverUnavailable
+            }
+        case let .httpError(_, code):
+            return AIError.runtimeError(forHTTPStatus: code) ?? .serverUnavailable
+        case .apiFailed, .parseError, .noFilesFound:
+            return .serverUnavailable
+        case .cancelled:
+            return .cancelled
         }
     }
 

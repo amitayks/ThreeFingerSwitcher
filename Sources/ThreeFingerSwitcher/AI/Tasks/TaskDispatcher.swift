@@ -178,16 +178,11 @@ final class TaskDispatcher: TaskDispatching {
         }
     }
 
+    /// Map any error to a clean `.unavailable` reason via the single central translator (`AIError`), so
+    /// a task-prepare failure shows the same clean headline as every other AI surface. (The exhausted
+    /// repair loop — `couldNotProduceValid` — is intercepted by the caller with a task-specific phrasing
+    /// before this is reached.)
     private static func message(for error: Error) -> String {
-        guard let runtime = error as? RuntimeError else { return "The action could not be produced." }
-        switch runtime {
-        case let .unavailable(reason): return reason
-        case .modelMissing: return "The model is not downloaded yet."
-        case .integrityFailed: return "The model failed its integrity check; re-download required."
-        case .cancelled: return "Cancelled."
-        case let .couldNotProduceValid(attempts): return "Couldn't produce a valid action (\(attempts) attempts)."
-        case let .decodeFailed(detail): return "Could not read the action: \(detail)"
-        case let .unsupportedModality(modality): return "The model can't handle \(modality.rawValue) input."
-        }
+        AIError.message(for: error).headline
     }
 }

@@ -285,4 +285,57 @@ final class ModelManagerTests: XCTestCase {
             return XCTFail("unsupported hardware leaves the manager .failed, got \(manager.state)")
         }
     }
+
+    // MARK: - A non-cancel download error resolves the state (never stuck .downloading)
+
+    /// A downloader that throws a scripted error instead of returning bytes.
+    private final class ThrowingDownloader: ModelDownloading, @unchecked Sendable {
+        let error: Error
+        init(_ error: Error) { self.error = error }
+        func download(_ descriptor: ModelDescriptor, to destination: URL,
+                      progress: @Sendable (Double) -> Void) async throws -> Data {
+            progress(0.25)
+            throw error
+        }
+    }
+
+    func testNonCancelDownloadErrorEndsFailedWithCleanHeadline() async {
+        let payload = Data("good".utf8)
+        // A bare offline NSError — the byte path's generic catch must convert it to a clean .failed.
+        let offline = NSError(domain: NSURLErrorDomain, code: NSURLErrorNotConnectedToInternet)
+        let manager = ModelManager(registry: registry(matching: payload),
+                                   downloader: ThrowingDownloader(offline),
+                                   optedIn: true,
+                                   storageRoot: tempRoot())
+        do {
+            try await manager.downloadAndVerify(manager.registry.models[0])
+            XCTFail("a failing download must throw")
+        } catch {
+            // any error type is fine; the STATE is the assertion below
+        }
+        guard case let .failed(reason, _) = manager.state else {
+            return XCTFail("a non-cancel download error must end .failed (not stuck .downloading), got \(manager.state)")
+        }
+        XCTAssertEqual(reason, RuntimeError.offline.errorDescription,
+                       "the headline is the clean connectivity message")
+        XCTAssertFalse(reason.contains("Domain="), "the headline never carries the raw NSError dump")
+    }
+
+    func testCancelledDownloadReturnsToNotDownloadedNotFailed() async {
+        let payload = Data("good".utf8)
+        let manager = ModelManager(registry: registry(matching: payload),
+                                   downloader: ThrowingDownloader(CancellationError()),
+                                   optedIn: true,
+                                   storageRoot: tempRoot())
+        do {
+            try await manager.downloadAndVerify(manager.registry.models[0])
+            XCTFail("a cancelled download throws")
+        } catch let e as RuntimeError {
+            XCTAssertEqual(e, .cancelled, "cancellation is surfaced as RuntimeError.cancelled")
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        XCTAssertEqual(manager.state, .notDownloaded,
+                       "cancellation returns to the resting state, never .failed")
+    }
 }

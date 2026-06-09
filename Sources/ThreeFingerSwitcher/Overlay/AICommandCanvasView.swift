@@ -97,6 +97,7 @@ struct AICommandCanvasView: View {
                 Text("The model declined this command").font(.system(size: 15, weight: .medium))
                 Text(reason).font(.system(size: 12)).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
+                    .lineLimit(6).truncationMode(.middle)   // bounded so a long reason can't overflow the panel
             }
         case let .failed(message):
             centered {
@@ -104,6 +105,7 @@ struct AICommandCanvasView: View {
                 Text("Something went wrong").font(.system(size: 15, weight: .medium))
                 Text(message).font(.system(size: 12)).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
+                    .lineLimit(6).truncationMode(.middle)   // bounded for symmetry with the Settings row cap
             }
         case .committed:
             centered {

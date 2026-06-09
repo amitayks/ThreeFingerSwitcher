@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// The on-device model-management surface (spec: "AI model management settings"). Binds to an
 /// injected `ModelManager` (`@ObservedObject`) and renders its observable `ModelLifecycleState`:
@@ -18,6 +19,10 @@ struct ModelManagementView: View {
     /// Begin (or retry) the download. The call site supplies it so the view stays free of the async
     /// orchestration / error handling; it just triggers the action and reflects the resulting state.
     var onDownload: () -> Void = {}
+
+    /// Whether the raw "Show details" disclosure is expanded for a failure (collapsed by default —
+    /// detail is opt-in, never shown inline; design D4).
+    @State private var showingDetails = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -57,11 +62,51 @@ struct ModelManagementView: View {
             label("Loading into memory…", systemImage: "memorychip", color: .accentColor)
         case .loaded:
             label("Loaded and ready", systemImage: "checkmark.circle.fill", color: .green)
-        case let .failed(reason):
-            VStack(alignment: .leading, spacing: 2) {
+        case let .failed(reason, details):
+            VStack(alignment: .leading, spacing: 6) {
                 label("Failed", systemImage: "exclamationmark.triangle.fill", color: .red)
-                Text(reason).font(.caption).foregroundStyle(.secondary)
+                // The concise headline is primary: capped + middle-truncating + selectable, so an
+                // unexpectedly long message degrades gracefully instead of overflowing the fixed frame.
+                Text(reason)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .truncationMode(.middle)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                if let details, !details.isEmpty {
+                    detailsDisclosure(details)
+                }
             }
+        }
+    }
+
+    /// A collapsed "Show details" disclosure for the raw technical text behind a failure: bounded
+    /// (scrolls past ~120pt) so even a giant dump can't grow the row, with a "Copy details" action.
+    @ViewBuilder
+    private func detailsDisclosure(_ details: String) -> some View {
+        DisclosureGroup(isExpanded: $showingDetails) {
+            VStack(alignment: .leading, spacing: 6) {
+                ScrollView {
+                    Text(details)
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 120)
+                Button {
+                    let pb = NSPasteboard.general
+                    pb.clearContents()
+                    pb.setString(details, forType: .string)
+                } label: {
+                    Label("Copy details", systemImage: "doc.on.doc")
+                }
+                .controlSize(.small)
+            }
+            .padding(.top, 4)
+        } label: {
+            Text("Show details").font(.caption).foregroundStyle(.secondary)
         }
     }
 

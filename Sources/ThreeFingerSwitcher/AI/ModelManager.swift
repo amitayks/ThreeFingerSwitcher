@@ -18,9 +18,12 @@ public enum ModelLifecycleState: Equatable, Sendable {
     case loading
     /// Resident in the runtime, ready to serve calls (kept resident between calls).
     case loaded
-    /// A terminal failure for this attempt (corrupt download, unavailable hardware, …). Carries a
-    /// reason string the UI can surface, with a retry affordance.
-    case failed(reason: String)
+    /// A terminal failure for this attempt (corrupt download, unavailable hardware, …). `reason` is the
+    /// clean, user-facing headline the UI surfaces (with a retry affordance); `details` is optional raw
+    /// technical text for an opt-in "Show details / Copy" disclosure — never shown inline (design D4).
+    /// Both are produced by the central `AIError` translator at the failure site; `reason` must never
+    /// be a raw error dump (spec: "No raw error text in user-facing strings").
+    case failed(reason: String, details: String? = nil)
 }
 
 /// Injectable download seam so tests use a fake — NO real network ever enters `swift test` (the
@@ -167,7 +170,10 @@ public final class ModelManager: ObservableObject {
                 state = .notDownloaded
                 throw RuntimeError.cancelled
             } catch {
-                state = .failed(reason: "Failed to provision \(descriptor.displayName): \(error)")
+                // De-leak: route the (already-boundary-mapped `RuntimeError`, or any error) through the
+                // single translator — a clean headline into `.failed`, raw text only as opt-in details.
+                let presented = AIError.message(for: error)
+                state = .failed(reason: presented.headline, details: presented.details)
                 throw error
             }
             return
@@ -183,6 +189,13 @@ public final class ModelManager: ObservableObject {
         } catch is CancellationError {
             state = .notDownloaded
             throw RuntimeError.cancelled
+        } catch {
+            // Without this generic catch a non-cancel download error would leave the state stuck at
+            // `.downloading` forever (spec: "Failure is an observable state that never stalls"). Settle
+            // `.failed` with a clean headline, symmetric with the provisioner path above.
+            let presented = AIError.message(for: error)
+            state = .failed(reason: presented.headline, details: presented.details)
+            throw error
         }
 
         // Integrity check BEFORE the weights are eligible for load.
@@ -231,7 +244,9 @@ public final class ModelManager: ObservableObject {
             state = .loaded
             return runtime
         } catch {
-            state = .failed(reason: "Failed to load \(descriptor.displayName): \(error)")
+            // De-leak the load failure through the central translator (clean headline + opt-in details).
+            let presented = AIError.message(for: error)
+            state = .failed(reason: presented.headline, details: presented.details)
             throw error
         }
     }

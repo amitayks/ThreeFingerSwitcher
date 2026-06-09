@@ -184,7 +184,11 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 460, height: 460)
+        // Scroll-safe (spec: "A long error never breaks the layout"): a grouped Form scrolls its rows,
+        // and a flexible height (with a resizable window) lets unexpectedly long content degrade to
+        // scrolling/resizing instead of overflowing a hard-pinned 460×460 frame.
+        .frame(minWidth: 460, idealWidth: 460, maxWidth: 460,
+               minHeight: 360, idealHeight: 460, maxHeight: .infinity)
         .sheet(isPresented: $showingAICommandEditor) {
             if let aiCommandStore {
                 VStack(spacing: 0) {

@@ -205,13 +205,14 @@ final class SelectionServiceTests: XCTestCase {
 
     // MARK: - captureScreenRegion() — Screen Recording gate
 
-    func testScreenCaptureReturnsNilWhenNotGranted() async {
+    func testScreenCaptureReportsPermissionDeniedWhenNotGranted() async {
         let pb = FakePasteboard()
         let svc = SelectionService(frontAppProvider: { self.realFrontApp() },
                                    pasteboard: pb,
                                    screenRecordingGranted: { false })
-        let data = await svc.captureScreenRegion()
-        XCTAssertNil(data, "no Screen Recording ⇒ no capture (executor reports no-input)")
+        let outcome = await svc.captureScreenRegion()
+        XCTAssertEqual(outcome, .permissionDenied,
+                       "no Screen Recording ⇒ a NAMED permission gap (not silent no-input)")
     }
 
     // MARK: - pngData() — encoding step

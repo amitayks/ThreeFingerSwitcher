@@ -576,8 +576,11 @@ final class AppCoordinator: GestureRecognizerDelegate {
     }
 
     /// Begin (or retry) the on-device model download from Settings. Gated on the opt-in by the manager
-    /// itself; surfaces a non-fatal alert if the (dev-stub today) download/verify fails. The real
-    /// MLX/Gemma fetch is deferred (phase 10) — this drives the dev-stub path so the model loads.
+    /// itself. The PRIMARY (and only) error surface is the in-window `.failed` status row + its Retry
+    /// button — the manager's observable state already carries the clean headline (and copyable
+    /// details) for it. No app-modal `NSAlert.runModal()` here: its nested run loop would freeze the
+    /// Settings window, and it would just duplicate the row's message (spec: "Error surfaces are
+    /// non-blocking and bounded"; design D3).
     private func downloadAIModel() {
         modelManager.setOptedIn(settings.aiCommandsEnabled)
         guard let descriptor = modelManager.registry.defaultDescriptor
@@ -585,11 +588,14 @@ final class AppCoordinator: GestureRecognizerDelegate {
         Task { @MainActor in
             do {
                 try await modelManager.downloadAndVerify(descriptor)
+            } catch is CancellationError {
+                // User cancelled — not a failure; the manager already reset its state.
+            } catch RuntimeError.cancelled {
+                // Same: a cancelled provision is not a failure surface.
             } catch {
-                // The manager already reflects `.failed`/`.notDownloaded` in its observable state for
-                // the Settings surface; this alert is a belt-and-suspenders for an unexpected failure.
-                infoAlert(title: "Couldn't prepare the model",
-                          text: (error as? LocalizedError)?.errorDescription ?? "\(error)")
+                // The manager already reflects `.failed` (clean headline + details) in its observable
+                // state, which the Settings row renders with a Retry action. Just log for diagnostics.
+                NSLog("[ThreeFingerSwitcher] AI model download failed: \(AIError.message(for: error).details ?? AIError.message(for: error).headline)")
             }
         }
     }
@@ -1070,7 +1076,9 @@ final class AppCoordinator: GestureRecognizerDelegate {
             let host = NSHostingController(rootView: view)
             let window = NSWindow(contentViewController: host)
             window.title = "Settings"
-            window.styleMask = [.titled, .closable, .miniaturizable]
+            // Resizable so variable-length content (e.g. a long error + details) degrades to scrolling /
+            // resizing rather than overflowing a fixed frame (spec: bounded, non-blocking error UI).
+            window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             window.isReleasedWhenClosed = false
             settingsWindow = window
         }

@@ -1,8 +1,14 @@
 import Foundation
 import EventKit
+import os
 #if canImport(AppKit)
 import AppKit
 #endif
+
+/// Breadcrumbs for side-effect failures. Raw OS errors are logged here (and only here) so a clean,
+/// human-facing `TaskError.sinkFailed` message can be surfaced without leaking the raw text to the UI
+/// (spec: "Diagnostic logging of the original error at the boundary is permitted and encouraged").
+private let taskSinkLog = Logger(subsystem: "ThreeFingerSwitcher", category: "TaskSinks")
 
 /// The SMALL injectable seams behind which each task's side effect lives (tasks phase 13.3–13.6), so
 /// the `TaskDispatcher` is unit-testable headless: tests inject fakes that record what they were
@@ -106,7 +112,10 @@ final class EventKitCalendarSink: CalendarSink {
         do {
             try store.save(ek, span: .thisEvent)
         } catch {
-            throw TaskError.sinkFailed("Could not save the event: \(error.localizedDescription)")
+            // Clean prefix only; the raw OS error goes to the log, never into the user-facing message
+            // (spec: "No raw error text in user-facing strings").
+            taskSinkLog.error("calendar save failed: \(String(describing: error), privacy: .public)")
+            throw TaskError.sinkFailed("Could not save the event to your calendar.")
         }
     }
 
@@ -163,17 +172,25 @@ final class DiskProjectStore: ProjectStore {
     convenience init() { self.init(directory: Self.defaultDirectory()) }
 
     func append(project: String, content: String, source: TaskSource) throws {
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let url = noteURL(for: project)
-        let block = Self.entryBlock(content: content, source: source)
-        let data = Data(block.utf8)
-        if let handle = try? FileHandle(forWritingTo: url) {
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: data)
-        } else {
-            // First write: create the file (atomic), seeding it with the block.
-            try data.write(to: url, options: .atomic)
+        // Map FileManager/FileHandle throws (disk full, permission, read-only volume) into a clean
+        // TaskError at this IO boundary — like the calendar sink — so a raw NSError never reaches the
+        // executor's fallback and dumps into the canvas (spec: "Errors are mapped at the boundary").
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let url = noteURL(for: project)
+            let block = Self.entryBlock(content: content, source: source)
+            let data = Data(block.utf8)
+            if let handle = try? FileHandle(forWritingTo: url) {
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+            } else {
+                // First write: create the file (atomic), seeding it with the block.
+                try data.write(to: url, options: .atomic)
+            }
+        } catch {
+            taskSinkLog.error("project note write failed: \(String(describing: error), privacy: .public)")
+            throw TaskError.sinkFailed("Could not save the note to “\(project)”.")
         }
     }
 
@@ -212,9 +229,11 @@ final class DiskProjectStore: ProjectStore {
 @MainActor
 final class WorkspaceToolOpener: ToolOpener {
     /// Injected so the AppKit `open` is testable/replaceable; defaults to opening via `NSWorkspace`.
-    private let openHandler: @MainActor (_ tool: String, _ payloadFile: URL) async -> Void
+    /// THROWS so a failed open is surfaced (not swallowed) — a tool that didn't actually open must
+    /// produce a `.failed` state, never a false "Done" (spec: "Failure is never silent").
+    private let openHandler: @MainActor (_ tool: String, _ payloadFile: URL) async throws -> Void
 
-    init(openHandler: @escaping @MainActor (_ tool: String, _ payloadFile: URL) async -> Void = WorkspaceToolOpener.defaultOpen) {
+    init(openHandler: @escaping @MainActor (_ tool: String, _ payloadFile: URL) async throws -> Void = WorkspaceToolOpener.defaultOpen) {
         self.openHandler = openHandler
     }
 
@@ -224,26 +243,37 @@ final class WorkspaceToolOpener: ToolOpener {
         do {
             try Data(payload.utf8).write(to: file, options: .atomic)
         } catch {
-            throw TaskError.sinkFailed("Could not write the payload: \(error.localizedDescription)")
+            taskSinkLog.error("payload write failed: \(String(describing: error), privacy: .public)")
+            throw TaskError.sinkFailed("Could not write the payload for “\(tool)”.")
         }
-        await openHandler(tool, file)
+        try await openHandler(tool, file)
     }
 
     /// Default open: a named Shortcut runs via `shortcuts run`; an app id/path opens the payload file
-    /// in that app. (Wired against the same primitives `LaunchService` uses.)
+    /// in that app. (Wired against the same primitives `LaunchService` uses.) Surfaces a real failure
+    /// (launch error, non-zero exit) as `TaskError.sinkFailed` rather than discarding it.
     @MainActor
-    static func defaultOpen(_ tool: String, _ payloadFile: URL) async {
+    static func defaultOpen(_ tool: String, _ payloadFile: URL) async throws {
         #if canImport(AppKit)
         if tool.contains("/") || tool.hasSuffix(".app") {
             // Treat as a bundle id or app path: open the payload file with that app. A bare dot
             // (e.g. a Shortcut named "My.Workflow") is NOT treated as an app path.
-            openFile(payloadFile, withAppAt: URL(fileURLWithPath: tool))
+            try await openFile(payloadFile, withAppAt: URL(fileURLWithPath: tool))
         } else {
             // Treat as a named Shortcut: run it (the payload file path is available to it).
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/bin/shortcuts")
             p.arguments = ["run", tool, "--input-path", payloadFile.path]
-            try? p.run()
+            do {
+                try p.run()
+            } catch {
+                taskSinkLog.error("shortcuts run failed to launch: \(String(describing: error), privacy: .public)")
+                throw TaskError.sinkFailed("Could not run “\(tool)”.")
+            }
+            p.waitUntilExit()
+            if p.terminationStatus != 0 {
+                throw TaskError.sinkFailed("“\(tool)” reported an error (exit code \(p.terminationStatus)).")
+            }
         }
         #endif
     }
@@ -251,10 +281,17 @@ final class WorkspaceToolOpener: ToolOpener {
 
 #if canImport(AppKit)
 private extension WorkspaceToolOpener {
-    static func openFile(_ payloadFile: URL, withAppAt appURL: URL) {
+    /// Open `payloadFile` with the app at `appURL`, awaiting the result so a failed open is surfaced
+    /// (the old fire-and-forget completion-handler form reported success unconditionally).
+    static func openFile(_ payloadFile: URL, withAppAt appURL: URL) async throws {
         let config = NSWorkspace.OpenConfiguration()
-        NSWorkspace.shared.open([payloadFile], withApplicationAt: appURL, configuration: config,
-                                completionHandler: nil)
+        do {
+            _ = try await NSWorkspace.shared.open([payloadFile], withApplicationAt: appURL,
+                                                  configuration: config)
+        } catch {
+            taskSinkLog.error("NSWorkspace.open failed: \(String(describing: error), privacy: .public)")
+            throw TaskError.sinkFailed("Could not open “\(appURL.lastPathComponent)”.")
+        }
     }
 }
 #endif
@@ -273,7 +310,12 @@ final class AdapterDestinationSender: DestinationSender {
         case let .urlScheme(template):
             #if canImport(AppKit)
             let urlString = Self.substitute(content, into: template)
-            if let url = URL(string: urlString) { NSWorkspace.shared.open(url) }
+            guard let url = URL(string: urlString) else {
+                throw TaskError.sinkFailed("The destination URL was malformed.")
+            }
+            guard NSWorkspace.shared.open(url) else {
+                throw TaskError.sinkFailed("Nothing could open the destination URL.")
+            }
             #endif
         case let .shell(command):
             try runProcess("/bin/zsh", ["-c", command], stdin: content)
@@ -299,11 +341,12 @@ final class AdapterDestinationSender: DestinationSender {
         do {
             try p.run()
         } catch {
-            throw TaskError.sinkFailed("Could not run the destination adapter: \(error.localizedDescription)")
+            taskSinkLog.error("destination adapter failed to launch: \(String(describing: error), privacy: .public)")
+            throw TaskError.sinkFailed("Could not run the destination.")
         }
         // The child may exit before we finish writing, so a blocking `write` can raise a broken-pipe
-        // failure — tolerate it (the adapter still ran). Then reap the process so it isn't left as a
-        // zombie (mirrors `LaunchService.run`'s `waitUntilExit`).
+        // failure — tolerate it (the adapter legitimately may not read stdin). The authoritative
+        // success signal is the exit STATUS below, not whether stdin was fully delivered.
         if let data = stdin.data(using: .utf8) {
             do {
                 try pipe.fileHandleForWriting.write(contentsOf: data)
@@ -313,5 +356,9 @@ final class AdapterDestinationSender: DestinationSender {
         }
         try? pipe.fileHandleForWriting.close()
         p.waitUntilExit()
+        // A non-zero exit means the destination did NOT do its job — surface it, don't report "Done".
+        if p.terminationStatus != 0 {
+            throw TaskError.sinkFailed("The destination reported an error (exit code \(p.terminationStatus)).")
+        }
     }
 }

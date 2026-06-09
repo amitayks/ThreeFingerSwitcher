@@ -294,6 +294,36 @@ final class TaskDispatcherTests: XCTestCase {
                           "the message is human-facing, not the raw enum case name")
     }
 
+    // MARK: - Honesty (D5): a failed tool open is surfaced, not swallowed
+
+    func testWorkspaceToolOpenerSurfacesOpenFailure() async {
+        // An injected open handler that fails (stands in for a failed NSWorkspace.open / non-zero
+        // `shortcuts run` exit) must propagate as a clean TaskError — never a silent success.
+        let opener = WorkspaceToolOpener(openHandler: { _, _ in
+            throw TaskError.sinkFailed("Could not open “MyApp”.")
+        })
+        do {
+            try await opener.open(tool: "MyApp.app", payload: "hello")
+            XCTFail("a failed open must throw, not silently succeed")
+        } catch let e as TaskError {
+            guard case let .sinkFailed(message) = e else {
+                return XCTFail("expected .sinkFailed, got \(e)")
+            }
+            XCTAssertEqual(message, "Could not open “MyApp”.")
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
+    func testWorkspaceToolOpenerSucceedsWhenOpenLands() async throws {
+        var openedWith: (tool: String, file: URL)?
+        let opener = WorkspaceToolOpener(openHandler: { tool, file in openedWith = (tool, file) })
+        try await opener.open(tool: "MyTool", payload: "payload-text")
+        let landed = try XCTUnwrap(openedWith)
+        XCTAssertEqual(landed.tool, "MyTool")
+        XCTAssertTrue(landed.file.lastPathComponent.hasPrefix("tfs-payload-"), "a payload file was written")
+    }
+
     // MARK: - in-payload applicable:false decline validates for save-to-project (Fix 4)
 
     func testSaveToProjectApplicableFalseAffordanceYieldsDecline() async throws {

@@ -94,10 +94,12 @@ final class SelectionService: SelectionProviding {
     }
 
     /// Paste `text` at the insertion point of the front app (set pasteboard → ⌘V → restore prior
-    /// clipboard). No AX-set path: a caret with no selection isn't a settable `AXSelectedText`.
-    func pasteAtCursor(_ text: String) async {
-        guard let app = frontApp() else { return }
-        _ = await paste(text, into: app)
+    /// clipboard). No AX-set path: a caret with no selection isn't a settable `AXSelectedText`. Returns
+    /// whether the paste was applied (false when there is no front app to act into, or `text` is empty).
+    @discardableResult
+    func pasteAtCursor(_ text: String) async -> Bool {
+        guard let app = frontApp() else { return false }
+        return await paste(text, into: app)
     }
 
     // MARK: - Screen capture
@@ -110,11 +112,13 @@ final class SelectionService: SelectionProviding {
     /// NOTE: the interactive region-PICKER overlay is a LATER slice (tasks phase 12). This captures the
     /// main display as a basic, working floor; the picker will refine *which* region without changing
     /// this seam.
-    func captureScreenRegion() async -> Data? {
-        guard screenRecordingGranted() else { return nil }
+    func captureScreenRegion() async -> ScreenCaptureOutcome {
+        // A missing Screen-Recording grant is a NAMED permission gap, not "no input" — surface it so
+        // the canvas can point the user at the right System Settings pane (spec: D5 / permission fix).
+        guard screenRecordingGranted() else { return .permissionDenied }
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            guard let display = content.displays.first else { return nil }
+            guard let display = content.displays.first else { return .unavailable }
             let config = SCStreamConfiguration()
             config.width = display.width
             config.height = display.height
@@ -123,9 +127,10 @@ final class SelectionService: SelectionProviding {
             let ours = content.windows.filter { $0.owningApplication?.processID == getpid() }
             let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: ours)
             let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-            return Self.pngData(from: cgImage)
+            guard let png = Self.pngData(from: cgImage) else { return .unavailable }
+            return .captured(png)
         } catch {
-            return nil   // permission revoked mid-flight, no display, or capture failed → no input.
+            return .unavailable   // no display, capture failed, or cancelled → plain "no input".
         }
     }
 

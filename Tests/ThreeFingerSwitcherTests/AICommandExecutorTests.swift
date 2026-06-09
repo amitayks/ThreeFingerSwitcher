@@ -12,11 +12,16 @@ final class AICommandExecutorTests: XCTestCase {
 
     // MARK: - Fakes
 
-    /// A scriptable `SelectionProviding`: records every write and serves canned reads.
+    /// A scriptable `SelectionProviding`: records every write and serves canned reads. `replaceLands` /
+    /// `pasteLands` script whether a write actually LANDED (so the non-landed → `.failed` honesty is
+    /// testable); `screenCaptureOutcome` overrides the derived capture result (e.g. `.permissionDenied`).
     private final class FakeSelectionProvider: SelectionProviding {
         var selectedText: String?
         var clipboardText: String?
         var screenRegionData: Data?
+        var screenCaptureOutcome: ScreenCaptureOutcome?
+        var replaceLands = true
+        var pasteLands = true
 
         private(set) var replacedWith: [String] = []
         private(set) var pastedAtCursor: [String] = []
@@ -30,11 +35,16 @@ final class AICommandExecutorTests: XCTestCase {
 
         func readSelectedText() async -> String? { selectedText }
         func readClipboardText() -> String? { clipboardText }
-        func captureScreenRegion() async -> Data? { screenCaptureCount += 1; return screenRegionData }
+        func captureScreenRegion() async -> ScreenCaptureOutcome {
+            screenCaptureCount += 1
+            if let outcome = screenCaptureOutcome { return outcome }
+            return screenRegionData.map { .captured($0) } ?? .unavailable
+        }
 
         @discardableResult
-        func replaceSelection(_ text: String) async -> Bool { replacedWith.append(text); return true }
-        func pasteAtCursor(_ text: String) async { pastedAtCursor.append(text) }
+        func replaceSelection(_ text: String) async -> Bool { replacedWith.append(text); return replaceLands }
+        @discardableResult
+        func pasteAtCursor(_ text: String) async -> Bool { pastedAtCursor.append(text); return pasteLands }
     }
 
     /// A fake `TaskDispatching` for the executor's new two-stage seam: `prepare` records the requested
@@ -421,5 +431,86 @@ final class AICommandExecutorTests: XCTestCase {
         executor.fire(command)
         await waitUntil { executor.state == .noInput }
         XCTAssertEqual(executor.state, .noInput, "a screen-region command with no capture is no-input")
+    }
+
+    // MARK: - Honesty (D5): a non-landed replaceSelection surfaces .failed, not .committed
+
+    func testNonLandedReplaceSelectionSurfacesFailed() async throws {
+        let stub = StubLLMRuntime(scriptedTokens: ["Fixed text"], interTokenDelayNanos: 0)
+        let manager = try await loadedManager(runtime: stub)
+        let selection = FakeSelectionProvider(selectedText: "teh txt")
+        selection.replaceLands = false   // the write does NOT actually land in the app
+        let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                         dispatcher: FakeTaskDispatcher())
+
+        let command = AICommand(name: "Fix", icon: .emoji("✅"), input: .selection,
+                                promptTemplate: "Fix: {input}", output: .replaceSelection)
+        executor.fire(command)
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+        try await executor.commit()
+
+        guard case let .failed(message) = executor.state else {
+            return XCTFail("a write that didn't land must surface .failed, got \(executor.state)")
+        }
+        XCTAssertFalse(message.isEmpty, "the failure carries a clean message")
+        XCTAssertTrue(selection.replacedWith == ["Fixed text"], "the write was attempted")
+    }
+
+    func testNonLandedPasteSurfacesFailed() async throws {
+        let stub = StubLLMRuntime(scriptedTokens: ["summary"], interTokenDelayNanos: 0)
+        let manager = try await loadedManager(runtime: stub)
+        let selection = FakeSelectionProvider(selectedText: "long text")
+        selection.pasteLands = false
+        let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                         dispatcher: FakeTaskDispatcher())
+        let command = AICommand(name: "Paste", icon: .emoji("📋"), input: .selection,
+                                promptTemplate: "{input}", output: .pasteAtCursor)
+        executor.fire(command)
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+        try await executor.commit()
+        guard case .failed = executor.state else {
+            return XCTFail("a paste that didn't land must surface .failed, got \(executor.state)")
+        }
+    }
+
+    // MARK: - Honesty (D5): a sink throw surfaces a clean task-failed message (never a raw dump)
+
+    func testSinkFailureSurfacesCleanTaskFailedMessage() async throws {
+        let stub = StubLLMRuntime(scriptedTokens: ["unused"], interTokenDelayNanos: 0)
+        let manager = try await loadedManager(runtime: stub)
+        let selection = FakeSelectionProvider(selectedText: "note this")
+        let dispatcher = FakeTaskDispatcher()
+        dispatcher.executeError = TaskError.sinkFailed("Could not save the note to “Roadmap”.")
+        let executor = AICommandExecutor(modelManager: manager, selection: selection, dispatcher: dispatcher)
+
+        let command = AICommand(name: "Save", icon: .emoji("💾"), input: .selection,
+                                promptTemplate: "{input}", output: .runTask(.saveToProject(project: "Roadmap")))
+        executor.fire(command)
+        await waitUntil { if case .reviewingAction = executor.state { return true }; return false }
+        _ = try? await executor.commit()
+        guard case let .failed(message) = executor.state else {
+            return XCTFail("a thrown sink failure must surface .failed, got \(executor.state)")
+        }
+        XCTAssertEqual(message, "Could not save the note to “Roadmap”.",
+                       "the clean sinkFailed message is shown verbatim, not a raw error dump")
+    }
+
+    // MARK: - Honesty (D5): a Screen-Recording permission gap names the permission, not "no input"
+
+    func testScreenRecordingPermissionGapSurfacesFailedNamingThePermission() async throws {
+        let stub = StubLLMRuntime(scriptedTokens: ["nope"], interTokenDelayNanos: 0)
+        let manager = try await loadedManager(runtime: stub, capabilities: [.text, .vision])
+        let selection = FakeSelectionProvider()
+        selection.screenCaptureOutcome = .permissionDenied
+        let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                         dispatcher: FakeTaskDispatcher())
+        let command = AICommand(name: "Describe", icon: .emoji("👁"), input: .screenRegion,
+                                promptTemplate: "What's here?", output: .previewOnly)
+        executor.fire(command)
+        await waitUntil { if case .failed = executor.state { return true }; return false }
+        guard case let .failed(message) = executor.state else {
+            return XCTFail("a permission gap must surface .failed (not .noInput), got \(executor.state)")
+        }
+        XCTAssertTrue(message.contains("Screen Recording"), "the message names the missing permission")
     }
 }

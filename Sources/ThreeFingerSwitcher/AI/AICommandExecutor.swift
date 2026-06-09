@@ -128,11 +128,18 @@ final class AICommandExecutor: ObservableObject {
         context.inputText = inputText
         let prompt = PromptTemplate.resolve(command.promptTemplate, with: context)
 
-        // 3) Optional image for a screen-region (vision) command.
+        // 3) Optional image for a screen-region (vision) command. A missing Screen-Recording grant is
+        // surfaced as a clear `.failed` that names the permission (not silently as "no input").
         var image: Data?
         if command.input == .screenRegion {
-            image = await selection.captureScreenRegion()
-            if image == nil {
+            switch await selection.captureScreenRegion() {
+            case let .captured(data):
+                image = data
+            case .permissionDenied:
+                state = .failed(message: "Screen Recording permission is required for this command. "
+                    + "Enable it in System Settings ▸ Privacy & Security ▸ Screen Recording.")
+                return
+            case .unavailable:
                 state = .noInput
                 return
             }
@@ -247,11 +254,18 @@ final class AICommandExecutor: ObservableObject {
 
         switch command.output {
         case .replaceSelection:
-            _ = await selection.replaceSelection(result)
-            state = .committed
+            // Honesty (spec D5): a write that didn't actually land is a failure, not a "Done".
+            if await selection.replaceSelection(result) {
+                state = .committed
+            } else {
+                state = .failed(message: "Couldn't apply the result to the active app.")
+            }
         case .pasteAtCursor:
-            await selection.pasteAtCursor(result)
-            state = .committed
+            if await selection.pasteAtCursor(result) {
+                state = .committed
+            } else {
+                state = .failed(message: "Couldn't paste the result into the active app.")
+            }
         case .previewOnly:
             // Deliberately writes nothing into the app (spec: "Preview-only never writes").
             state = .committed
@@ -298,20 +312,11 @@ final class AICommandExecutor: ObservableObject {
 
     // MARK: - Messaging
 
-    /// Map a runtime error to a short, user-facing message for the `.failed` state.
+    /// Map any error to a short, user-facing message for the `.failed` state, via the single central
+    /// translator (`AIError`). This guarantees the canvas shows the SAME clean headline the Settings
+    /// row shows for the same error, and that a non-`LocalizedError` can never dump raw text into the
+    /// canvas (the old `?? "\(error)"` fallback is gone — `AIError` returns a safe generic instead).
     private static func message(for error: Error) -> String {
-        guard let runtime = error as? RuntimeError else {
-            // Prefer a LocalizedError's human-facing description (e.g. TaskError) over the raw enum.
-            return (error as? LocalizedError)?.errorDescription ?? "\(error)"
-        }
-        switch runtime {
-        case let .unavailable(reason): return reason
-        case .modelMissing: return "The model is not downloaded yet."
-        case .integrityFailed: return "The model failed its integrity check; re-download required."
-        case .cancelled: return "Cancelled."
-        case let .couldNotProduceValid(attempts): return "Could not produce a valid result (\(attempts) attempts)."
-        case let .decodeFailed(detail): return "Could not read the result: \(detail)"
-        case let .unsupportedModality(modality): return "The model can't handle \(modality.rawValue) input."
-        }
+        AIError.message(for: error).headline
     }
 }
