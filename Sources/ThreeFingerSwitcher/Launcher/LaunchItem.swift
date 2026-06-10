@@ -187,11 +187,12 @@ enum LaunchItemKind: Codable, Equatable {
     /// built at launcher-open from `ClipboardStore`, never created in the editor and never written
     /// into the persisted `Favorites` record. Firing it pastes the entry into the captured front app.
     case clipboardEntry(ClipboardEntry)
-    /// A configured AI command shown in the synthetic AI-command band. **Synthetic and ephemeral**
-    /// (like `.clipboardEntry`): projected at launcher-open from `AICommandStore`, never created in
-    /// the favorites editor and never written into the persisted `Favorites` record. Firing it hands
-    /// off to the `AICommandExecutor` and opens the streaming preview canvas — it does NOT dismiss
-    /// the overlay or complete on the lift.
+    /// A configured AI command. **Persisted, first-class band item** (configuration-hub fold-in):
+    /// authored on the Hub's Bands page like any other item and stored inside the `Favorites` record,
+    /// so it can live in ANY band and move between bands. Its display fields (`title`/`icon`/`tint`)
+    /// mirror the embedded command. Firing it hands off to the `AICommandExecutor` and opens the
+    /// streaming preview canvas — it does NOT dismiss the overlay or complete on the lift. (Unlike
+    /// `.clipboardEntry`, which remains synthetic/ephemeral — clipboard entries are captured data.)
     case aiCommand(AICommand)
 }
 
@@ -252,7 +253,14 @@ struct Favorites: Codable, Equatable {
         self.homeColumn = homeColumn
     }
 
-    static let currentSchemaVersion = 1
+    /// v2 folds AI commands into the band model (configuration-hub): `.aiCommand` items are now
+    /// persisted inside bands. A record at v1 (or older) triggers the one-time AI fold-in migration in
+    /// `FavoritesStore`, which imports any legacy `AICommandStore` record into a normal "AI" band.
+    static let currentSchemaVersion = 2
+
+    /// The schema version at which AI commands became persisted band items. A stored record older than
+    /// this is folded in once (legacy `aiCommands` → an "AI" band).
+    static let aiCommandsFoldedSchemaVersion = 2
 
     // MARK: Resolved, deterministic accessors (never recency-ordered)
 

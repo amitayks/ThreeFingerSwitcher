@@ -108,8 +108,13 @@ final class OverlayController {
     }
 }
 
-/// NSPanel subclass that refuses key/main so it can never steal focus.
+/// NSPanel subclass that refuses key/main so it can never steal focus — EXCEPT when `keyInteractive`
+/// is set, which the launcher flips on for the AI "unavailable" canvas so its Enable/Download/model
+/// controls are clickable. Being a `.nonactivatingPanel`, becoming key there does not activate the app
+/// (the captured front app stays frontmost); the flag is reset/destroyed when the canvas dismisses.
 final class SwitcherPanel: NSPanel {
-    override var canBecomeKey: Bool { false }
+    /// When true, the panel may become key so hosted controls (buttons/picker) receive clicks.
+    var keyInteractive = false
+    override var canBecomeKey: Bool { keyInteractive }
     override var canBecomeMain: Bool { false }
 }

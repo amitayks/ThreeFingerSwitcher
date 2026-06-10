@@ -35,25 +35,6 @@ final class LauncherCanvasModeTests: XCTestCase {
         XCTAssertNil(model.canvasCommand)
     }
 
-    func testCurrentBandIsAICommandAndSelectedAICommand() {
-        let model = LauncherModel()
-        let apps = [appItem("A0"), appItem("A1")]
-        let aiBand = AICommandBandBuilder.build(from: [
-            AICommand(name: "Fix", icon: .emoji("✅"), input: .selection, promptTemplate: "{input}", output: .previewOnly)
-        ])
-        model.setBands([apps, aiBand.items],
-                       names: ["Dev", "AI"],
-                       colors: [ItemColor(red: 0, green: 0, blue: 1), AICommandBandBuilder.color],
-                       startBand: 0, column: 0, aiCommandBandIndex: 1)
-        XCTAssertFalse(model.currentBandIsAICommand, "starts on the app band")
-        // Rise to headers, switch to the AI band, drop into it.
-        model.stepVertical(1)          // → headers
-        model.stepHorizontal(1)        // → AI band
-        model.stepVertical(-1)         // → into the AI grid
-        XCTAssertTrue(model.currentBandIsAICommand, "now on the AI band")
-        XCTAssertEqual(model.selectedAICommand?.name, "Fix", "the selected item exposes its AICommand")
-    }
-
     // MARK: - Controller: armed AI lift opens the canvas (does NOT dismiss)
 
     func testArmedAILiftOpensCanvasAndDoesNotDismiss() {
@@ -66,10 +47,9 @@ final class LauncherCanvasModeTests: XCTestCase {
         controller.onDiscardCanvas = { discarded += 1 }
 
         let ai = aiItem("Summarize")
-        let band = ContextBand(id: AICommandBandBuilder.bandID, name: "AI",
-                               color: AICommandBandBuilder.color, items: [ai])
-        controller.show(bands: [band], startBand: 0, startColumn: 0, dwell: 0.01,
-                        aiCommandBandIndex: 0)
+        let band = ContextBand(id: AIBand.bandID, name: "AI",
+                               color: AIBand.color, items: [ai])
+        controller.show(bands: [band], startBand: 0, startColumn: 0, dwell: 0.01)
         controller.model.setArmed()    // simulate the dwell having armed the AI item
 
         let result = controller.end()  // first lift
@@ -96,9 +76,9 @@ final class LauncherCanvasModeTests: XCTestCase {
         controller.onDiscardCanvas = { discarded += 1 }
 
         let ai = aiItem("Explain")
-        let band = ContextBand(id: AICommandBandBuilder.bandID, name: "AI",
-                               color: AICommandBandBuilder.color, items: [ai])
-        controller.show(bands: [band], startBand: 0, startColumn: 0, dwell: 0.01, aiCommandBandIndex: 0)
+        let band = ContextBand(id: AIBand.bandID, name: "AI",
+                               color: AIBand.color, items: [ai])
+        controller.show(bands: [band], startBand: 0, startColumn: 0, dwell: 0.01)
         controller.model.setArmed()
         controller.end()                       // open the canvas
         XCTAssertTrue(controller.canvasActive)
@@ -122,9 +102,9 @@ final class LauncherCanvasModeTests: XCTestCase {
         controller.onDiscardCanvas = { XCTFail("commit must not discard") }
 
         let ai = aiItem("Explain")
-        let band = ContextBand(id: AICommandBandBuilder.bandID, name: "AI",
-                               color: AICommandBandBuilder.color, items: [ai])
-        controller.show(bands: [band], startBand: 0, startColumn: 0, dwell: 0.01, aiCommandBandIndex: 0)
+        let band = ContextBand(id: AIBand.bandID, name: "AI",
+                               color: AIBand.color, items: [ai])
+        controller.show(bands: [band], startBand: 0, startColumn: 0, dwell: 0.01)
         controller.model.setArmed()
         controller.end()                       // open the canvas
         XCTAssertTrue(controller.canvasActive)
@@ -158,9 +138,9 @@ final class LauncherCanvasModeTests: XCTestCase {
         controller.onDiscardCanvas = { discarded += 1 }
 
         let ai = aiItem("Translate")
-        let band = ContextBand(id: AICommandBandBuilder.bandID, name: "AI",
-                               color: AICommandBandBuilder.color, items: [ai])
-        controller.show(bands: [band], startBand: 0, startColumn: 0, dwell: 0.01, aiCommandBandIndex: 0)
+        let band = ContextBand(id: AIBand.bandID, name: "AI",
+                               color: AIBand.color, items: [ai])
+        controller.show(bands: [band], startBand: 0, startColumn: 0, dwell: 0.01)
         controller.model.setArmed()
         controller.end()                       // open the canvas
 
@@ -188,9 +168,9 @@ final class LauncherCanvasModeTests: XCTestCase {
         controller.onDiscardCanvas = { discarded += 1 }
 
         let ai = aiItem("Fix")
-        let band = ContextBand(id: AICommandBandBuilder.bandID, name: "AI",
-                               color: AICommandBandBuilder.color, items: [ai])
-        controller.show(bands: [band], startBand: 0, startColumn: 0, dwell: 0.01, aiCommandBandIndex: 0)
+        let band = ContextBand(id: AIBand.bandID, name: "AI",
+                               color: AIBand.color, items: [ai])
+        controller.show(bands: [band], startBand: 0, startColumn: 0, dwell: 0.01)
         controller.model.setArmed()
         controller.end()                       // open the canvas
 

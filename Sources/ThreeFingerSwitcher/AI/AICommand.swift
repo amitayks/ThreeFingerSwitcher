@@ -93,8 +93,8 @@ enum ModelSelector: Codable, Equatable, Sendable {
 
 // MARK: - The command
 
-/// One configured AI command. `Codable` for its dedicated store (`AICommandStore`); `Identifiable`
-/// (by `id`) so the editor and the synthetic band can key on it.
+/// One configured AI command. `Codable` so it persists as a band item inside the `Favorites` record
+/// (configuration-hub fold-in); `Identifiable` (by `id`) so the Bands editor and the launcher key on it.
 struct AICommand: Codable, Equatable, Identifiable, Sendable {
     var id: UUID
     var name: String

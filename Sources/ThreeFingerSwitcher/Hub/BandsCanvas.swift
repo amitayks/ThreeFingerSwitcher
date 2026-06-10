@@ -8,7 +8,8 @@ import UniformTypeIdentifiers
 /// which persists immediately, so the launcher reflects changes on its next activation.
 ///
 /// The selected band on the canvas IS the active add target — picking a sourced item drops it there.
-struct FavoritesEditorView: View {
+/// Hosted full-bleed in the Hub's Bands page (it was formerly a standalone Favorites window).
+struct BandsCanvas: View {
     @ObservedObject var store: FavoritesStore
 
     @State private var selectedBandID: UUID?
@@ -17,15 +18,15 @@ struct FavoritesEditorView: View {
     var body: some View {
         HSplitView {
             SourcesSidebar(store: store, targetBandID: activeBandID, selectedItemID: $selectedItemID)
-                .frame(minWidth: 220, idealWidth: 240, maxWidth: 320)
+                .frame(minWidth: 200, idealWidth: 230, maxWidth: 300)
 
             BandsPane(store: store, selectedBandID: $selectedBandID)
-                .frame(minWidth: 250, idealWidth: 290, maxWidth: 360)
+                .frame(minWidth: 220, idealWidth: 270, maxWidth: 340)
 
             ItemsPane(store: store, bandID: activeBandID, selectedItemID: $selectedItemID)
-                .frame(minWidth: 340, idealWidth: 460, maxWidth: .infinity)
+                .frame(minWidth: 300, idealWidth: 440, maxWidth: .infinity)
         }
-        .frame(minWidth: 860, minHeight: 600)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
             if selectedBandID == nil { selectedBandID = store.favorites.bands.first?.id }
         }
@@ -47,6 +48,7 @@ private enum SourceCategory: String, CaseIterable, Identifiable {
     case urls = "URLs"
     case scripts = "Scripts"
     case actions = "Actions"
+    case aiCommands = "AI Command"
     case presets = "Presets"
     var id: String { rawValue }
     var symbol: String {
@@ -57,6 +59,7 @@ private enum SourceCategory: String, CaseIterable, Identifiable {
         case .urls: return "link"
         case .scripts: return "terminal.fill"
         case .actions: return "bolt.horizontal.fill"
+        case .aiCommands: return "wand.and.stars"
         case .presets: return "square.stack.3d.up.fill"
         }
     }
@@ -123,6 +126,7 @@ private struct SourcesSidebar: View {
             case .urls:      URLForm { add($0) }
             case .scripts:   ScriptForm { add($0) }
             case .actions:   ActionBrowser { add($0) }
+            case .aiCommands: AICommandSource { add($0) }
             case .presets:   PresetComposer(store: store) { add($0) }
             }
         }
@@ -328,6 +332,29 @@ private struct ActionBrowser: View {
             }
         }
         .listStyle(.inset)
+    }
+}
+
+/// Source for AI commands: adds a fresh, default AI command to the active band, then auto-selects it
+/// so its inspector (right pane) opens for editing — the authoring lives inline in the item inspector
+/// (configuration-hub fold-in; the standalone AI-command editor is gone).
+private struct AICommandSource: View {
+    let onPick: (LaunchItem) -> Void
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Add an AI command to this band, then edit its prompt, input, and output on the right. "
+                 + "AI commands run on-device; firing one while AI is off offers to enable it.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Add AI Command") {
+                let cmd = AICommand(name: "New Command", icon: .sfSymbol("wand.and.stars"),
+                                    input: .selection, promptTemplate: "{input}", output: .previewOnly)
+                onPick(AIBand.item(for: cmd))
+            }
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
     }
 }
 
@@ -589,13 +616,25 @@ private struct ItemInspector: View {
     let bandID: UUID
     let item: LaunchItem
     @State private var title: String
+    @State private var prompt: String
 
     init(store: FavoritesStore, bandID: UUID, item: LaunchItem) {
         self.store = store; self.bandID = bandID; self.item = item
         _title = State(initialValue: item.title)
+        if case let .aiCommand(cmd) = item.kind {
+            _prompt = State(initialValue: cmd.promptTemplate)
+        } else {
+            _prompt = State(initialValue: "")
+        }
     }
 
     var body: some View {
+        if liveAICommand != nil { aiForm } else { standardForm }
+    }
+
+    // MARK: Standard item form (app / file / url / shortcut / script / action / preset)
+
+    private var standardForm: some View {
         Form {
             TextField("Name", text: $title)
                 .onChange(of: title) { store.updateItem(item.id, inBand: bandID) { $0.title = title } }
@@ -629,18 +668,34 @@ private struct ItemInspector: View {
                     screenshotClipboardControl(action: action, adjustment: adjustment, toClipboard: toClipboard ?? false)
                 }
             }
+            moveToBandControl
         }
         .formStyle(.grouped)
         .frame(height: inspectorHeight)
     }
 
     private var inspectorHeight: CGFloat {
-        if item.isAppKind { return 300 }
+        if item.isAppKind { return 340 }
         if case let .action(action, _, _) = item.kind {
-            if action.isValueAdjustable { return 270 }
-            if action.supportsClipboardDestination { return 240 }
+            if action.isValueAdjustable { return 310 }
+            if action.supportsClipboardDestination { return 280 }
         }
-        return 190
+        return 230
+    }
+
+    /// A "Move to band" menu shown when other bands exist, so any item (including an AI command) can be
+    /// moved between bands (spec: "An AI command moves between bands"; "movable between bands like any
+    /// other item"). After moving, the item leaves the current band's grid (it now lives elsewhere).
+    @ViewBuilder
+    private var moveToBandControl: some View {
+        let others = store.favorites.bands.filter { $0.id != bandID }
+        if !others.isEmpty {
+            Menu("Move to band") {
+                ForEach(others) { b in
+                    Button(b.name) { store.moveItem(item.id, fromBand: bandID, toBand: b.id) }
+                }
+            }
+        }
     }
 
     /// Optional value control for the volume/brightness actions: native step (default), set to a
@@ -725,6 +780,218 @@ private struct ItemInspector: View {
         panel.directoryURL = URL(fileURLWithPath: "/Applications")
         if panel.runModal() == .OK, let url = panel.url {
             store.updateItem(item.id, inBand: bandID) { $0.kind = .app(bundleURL: url, strategy: strategy) }
+        }
+    }
+
+    // MARK: - AI command editing (the embedded `.aiCommand` is authoritative; display fields mirror it)
+
+    /// The live embedded command for this item, re-read from the store each render so structural edits
+    /// reflect immediately. `nil` when this item isn't an AI command (→ the standard form is shown).
+    private var liveAICommand: AICommand? {
+        guard let b = store.favorites.bands.first(where: { $0.id == bandID }),
+              let it = b.items.first(where: { $0.id == item.id }),
+              case let .aiCommand(cmd) = it.kind else { return nil }
+        return cmd
+    }
+
+    /// A non-optional view of the command for the editors (the fallback is never rendered — `aiForm`
+    /// only appears when `liveAICommand != nil`).
+    private var ai: AICommand {
+        liveAICommand ?? AICommand(name: "", icon: .sfSymbol("wand.and.stars"),
+                                   input: .selection, promptTemplate: "", output: .previewOnly)
+    }
+
+    /// Apply an edit to the embedded command and persist it, mirroring name/icon/tint onto the
+    /// `LaunchItem`'s display fields so the grid and launcher render the command correctly.
+    private func updateCommand(_ block: (inout AICommand) -> Void) {
+        guard var cmd = liveAICommand else { return }
+        block(&cmd)
+        store.updateItem(item.id, inBand: bandID) {
+            $0.kind = .aiCommand(cmd)
+            $0.title = cmd.name
+            $0.icon = cmd.icon
+            $0.tint = cmd.tint
+        }
+    }
+
+    private func insertToken(_ token: String) {
+        prompt += token
+        updateCommand { $0.promptTemplate = prompt }
+    }
+
+    private var aiForm: some View {
+        ScrollView {
+            Form {
+                Section("Identity") {
+                    TextField("Name", text: $title)
+                        .onChange(of: title) { updateCommand { $0.name = title } }
+                    AppearanceEditor(
+                        icon: Binding(get: { ai.icon }, set: { ic in updateCommand { $0.icon = ic } }),
+                        tint: Binding(get: { ai.tint }, set: { t in updateCommand { $0.tint = t } }),
+                        naturalIcon: nil)
+                }
+                Section("Input") {
+                    Picker("Input source", selection: Binding(
+                        get: { ai.input }, set: { src in updateCommand { $0.input = src } })) {
+                        ForEach(InputSource.allCases, id: \.self) { Text(aiInputLabel($0)).tag($0) }
+                    }
+                    Text(aiInputHelp(ai.input)).font(.caption).foregroundStyle(.secondary)
+                }
+                Section("Prompt") {
+                    AITokenBar { insertToken($0) }
+                    TextEditor(text: $prompt)
+                        .frame(minHeight: 110)
+                        .font(.system(.body, design: .monospaced))
+                        .border(.quaternary)
+                        .onChange(of: prompt) { updateCommand { $0.promptTemplate = prompt } }
+                    Text("Tokens are substituted at fire time: {input} the acquired text, {date} today, {app} the front app, {url} the front document URL. Unknown braces are left as-is.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Section("Output") { aiOutputEditor }
+                Section("Model") { aiModelEditor }
+                Section("Confirmation") {
+                    Toggle("Confirm before running", isOn: Binding(
+                        get: { ai.confirmBeforeRun }, set: { on in updateCommand { $0.confirmBeforeRun = on } }))
+                    Text(ai.output.isSideEffecting
+                         ? "This output has a side effect; confirmation defaults on, but you can turn it off for a trusted command."
+                         : "In-place edits don't ask by default; turn this on to review the result before it's applied.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Section { moveToBandControl }
+            }
+            .formStyle(.grouped)
+            .padding(.bottom, 8)
+        }
+        .frame(height: 380)
+    }
+
+    @ViewBuilder
+    private var aiOutputEditor: some View {
+        Picker("Output target", selection: Binding(
+            get: { outputChoice(ai.output) }, set: { setOutputChoice($0) })) {
+            ForEach(OutputChoice.allCases) { Text($0.label).tag($0) }
+        }
+        Text(aiOutputLabel(ai.output)).font(.caption).foregroundStyle(.secondary)
+        if case let .runTask(kind) = ai.output { aiTaskKindEditor(kind) }
+        if case let .sendTo(dest) = ai.output {
+            aiDestinationEditor(dest) { newDest in updateCommand { $0.output = .sendTo(newDest) } }
+        }
+    }
+
+    @ViewBuilder
+    private func aiTaskKindEditor(_ kind: TaskKind) -> some View {
+        Picker("Task", selection: Binding(get: { taskChoice(kind) }, set: { setTaskChoice($0) })) {
+            ForEach(TaskChoice.allCases) { Text($0.label).tag($0) }
+        }
+        switch kind {
+        case .addToCalendar:
+            Text("Parses an event from the result and adds it to Calendar (asks for permission the first time).")
+                .font(.caption).foregroundStyle(.secondary)
+        case let .saveToProject(project):
+            TextField("Project", text: Binding(
+                get: { project }, set: { p in updateCommand { $0.output = .runTask(.saveToProject(project: p)) } }))
+        case let .openToolWithPayload(tool):
+            TextField("Tool (app or shortcut name)", text: Binding(
+                get: { tool }, set: { t in updateCommand { $0.output = .runTask(.openToolWithPayload(tool: t)) } }))
+        case let .sendTo(dest):
+            aiDestinationEditor(dest) { newDest in updateCommand { $0.output = .runTask(.sendTo(newDest)) } }
+        }
+    }
+
+    @ViewBuilder
+    private func aiDestinationEditor(_ dest: Destination, onChange: @escaping (Destination) -> Void) -> some View {
+        Picker("Destination", selection: Binding(
+            get: { destinationChoice(dest) }, set: { onChange(blankDestination(for: $0, from: dest)) })) {
+            ForEach(DestinationChoice.allCases) { Text($0.label).tag($0) }
+        }
+        switch dest {
+        case let .shortcut(n):
+            TextField("Shortcut name", text: Binding(get: { n }, set: { onChange(.shortcut(name: $0)) }))
+        case let .urlScheme(s):
+            TextField("URL scheme (use {content})", text: Binding(get: { s }, set: { onChange(.urlScheme($0)) }))
+        case let .shell(c):
+            TextField("Shell command (content on stdin)", text: Binding(get: { c }, set: { onChange(.shell(command: $0)) }))
+        }
+    }
+
+    @ViewBuilder
+    private var aiModelEditor: some View {
+        let registry = ModelRegistry.standard
+        Picker("Model", selection: Binding(
+            get: { selectedModelID(ai.model) }, set: { id in updateCommand { $0.model = .onDevice(modelID: id) } })) {
+            Text("Registry default").tag(String?.none)
+            ForEach(registry.models) { m in Text(m.displayName).tag(Optional(m.id)) }
+        }
+        Text("On-device Gemma 4. \"Registry default\" tracks the recommended model; pin a specific one only if you need it.")
+            .font(.caption).foregroundStyle(.secondary)
+    }
+
+    private func outputChoice(_ o: OutputTarget) -> OutputChoice {
+        switch o {
+        case .replaceSelection: return .replaceSelection
+        case .pasteAtCursor: return .pasteAtCursor
+        case .previewOnly: return .previewOnly
+        case .runTask: return .runTask
+        case .sendTo: return .sendTo
+        }
+    }
+
+    private func setOutputChoice(_ choice: OutputChoice) {
+        let newOutput: OutputTarget
+        switch choice {
+        case .replaceSelection: newOutput = .replaceSelection
+        case .pasteAtCursor: newOutput = .pasteAtCursor
+        case .previewOnly: newOutput = .previewOnly
+        case .runTask: newOutput = .runTask(.addToCalendar)
+        case .sendTo: newOutput = .sendTo(.shortcut(name: ""))
+        }
+        let crossedBoundary = ai.output.isSideEffecting != newOutput.isSideEffecting
+        updateCommand {
+            $0.output = newOutput
+            if crossedBoundary { $0.confirmBeforeRun = AICommand.defaultConfirmBeforeRun(for: newOutput) }
+        }
+    }
+
+    private func taskChoice(_ k: TaskKind) -> TaskChoice {
+        switch k {
+        case .addToCalendar: return .addToCalendar
+        case .saveToProject: return .saveToProject
+        case .openToolWithPayload: return .openToolWithPayload
+        case .sendTo: return .sendTo
+        }
+    }
+
+    private func setTaskChoice(_ choice: TaskChoice) {
+        let kind: TaskKind
+        switch choice {
+        case .addToCalendar: kind = .addToCalendar
+        case .saveToProject: kind = .saveToProject(project: "")
+        case .openToolWithPayload: kind = .openToolWithPayload(tool: "")
+        case .sendTo: kind = .sendTo(.shortcut(name: ""))
+        }
+        updateCommand { $0.output = .runTask(kind) }
+    }
+
+    private func destinationChoice(_ d: Destination) -> DestinationChoice {
+        switch d {
+        case .shortcut: return .shortcut
+        case .urlScheme: return .urlScheme
+        case .shell: return .shell
+        }
+    }
+
+    private func blankDestination(for choice: DestinationChoice, from current: Destination) -> Destination {
+        switch choice {
+        case .shortcut: if case .shortcut = current { return current }; return .shortcut(name: "")
+        case .urlScheme: if case .urlScheme = current { return current }; return .urlScheme("")
+        case .shell: if case .shell = current { return current }; return .shell(command: "")
+        }
+    }
+
+    private func selectedModelID(_ m: ModelSelector) -> String? {
+        switch m {
+        case let .onDevice(id): return id
+        case .cloud: return nil
         }
     }
 }
@@ -1083,4 +1350,107 @@ func loadShortcutNames() async -> [String] {
             .split(separator: "\n").map(String.init)
             .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
     }.value
+}
+
+// MARK: - AI command inspector helpers (ported from the former AI-command editor)
+
+/// Prompt-template token quick-insert bar for the AI command inspector.
+private struct AITokenBar: View {
+    let onInsert: (String) -> Void
+    private let tokens = ["{input}", "{date}", "{app}", "{url}"]
+    var body: some View {
+        HStack(spacing: 6) {
+            Text("Insert:").font(.caption).foregroundStyle(.secondary)
+            ForEach(tokens, id: \.self) { token in
+                Button(token) { onInsert(token) }
+                    .buttonStyle(.bordered).controlSize(.small)
+                    .font(.system(.caption, design: .monospaced))
+            }
+            Spacer()
+        }
+    }
+}
+
+private enum OutputChoice: String, CaseIterable, Identifiable {
+    case replaceSelection, pasteAtCursor, previewOnly, runTask, sendTo
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .replaceSelection: return "Replace selection"
+        case .pasteAtCursor: return "Paste at cursor"
+        case .previewOnly: return "Preview only"
+        case .runTask: return "Run a task"
+        case .sendTo: return "Send to…"
+        }
+    }
+}
+
+private enum TaskChoice: String, CaseIterable, Identifiable {
+    case addToCalendar, saveToProject, openToolWithPayload, sendTo
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .addToCalendar: return "Add to Calendar"
+        case .saveToProject: return "Save to project"
+        case .openToolWithPayload: return "Open tool with payload"
+        case .sendTo: return "Send to destination"
+        }
+    }
+}
+
+private enum DestinationChoice: String, CaseIterable, Identifiable {
+    case shortcut, urlScheme, shell
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .shortcut: return "Shortcut"
+        case .urlScheme: return "URL scheme"
+        case .shell: return "Shell command"
+        }
+    }
+}
+
+private func aiInputLabel(_ s: InputSource) -> String {
+    switch s {
+    case .selection: return "Selected text"
+    case .clipboard: return "Clipboard"
+    case .screenRegion: return "Screen region (vision)"
+    case .none: return "No input"
+    }
+}
+
+private func aiInputHelp(_ s: InputSource) -> String {
+    switch s {
+    case .selection: return "The front app's selected text (falls back to the clipboard when nothing is selected)."
+    case .clipboard: return "The current clipboard contents."
+    case .screenRegion: return "A captured screen region, fed to a vision-capable model."
+    case .none: return "No input — the prompt template stands alone."
+    }
+}
+
+private func aiOutputLabel(_ o: OutputTarget) -> String {
+    switch o {
+    case .replaceSelection: return "Replace the selected text with the result."
+    case .pasteAtCursor: return "Paste the result at the cursor."
+    case .previewOnly: return "Show the result in the preview only; write nothing back."
+    case let .runTask(kind): return "Run task: \(aiTaskLabel(kind))."
+    case let .sendTo(dest): return "Send to \(aiDestinationLabel(dest))."
+    }
+}
+
+private func aiTaskLabel(_ k: TaskKind) -> String {
+    switch k {
+    case .addToCalendar: return "Add to Calendar"
+    case let .saveToProject(p): return "Save to project \(p.isEmpty ? "…" : p)"
+    case let .openToolWithPayload(t): return "Open \(t.isEmpty ? "tool" : t) with payload"
+    case let .sendTo(d): return "Send to \(aiDestinationLabel(d))"
+    }
+}
+
+private func aiDestinationLabel(_ d: Destination) -> String {
+    switch d {
+    case let .shortcut(n): return "Shortcut \(n.isEmpty ? "…" : n)"
+    case let .urlScheme(s): return "URL \(s.isEmpty ? "…" : s)"
+    case let .shell(c): return "Shell \(c.isEmpty ? "…" : c)"
+    }
 }

@@ -37,6 +37,11 @@ final class AICommandExecutor: ObservableObject {
         case declined(reason: String)
         /// A typed failure with a human-readable message.
         case failed(message: String)
+        /// AI can't produce a result yet: the opt-in is off, or the model isn't downloaded/ready. The
+        /// canvas shows an enable/download affordance + a model picker; nothing is generated. A
+        /// horizontal discard dismisses, and any download started continues in the background
+        /// (configuration-hub: fire-time availability resolves in the canvas, not by hiding items).
+        case unavailable
         /// Committed and done (in-place written or task dispatched).
         case committed
 
@@ -56,7 +61,7 @@ final class AICommandExecutor: ObservableObject {
         static func == (lhs: State, rhs: State) -> Bool {
             switch (lhs, rhs) {
             case (.idle, .idle), (.loadingModel, .loadingModel), (.noInput, .noInput),
-                 (.committed, .committed):
+                 (.unavailable, .unavailable), (.committed, .committed):
                 return true
             case let (.streaming(a), .streaming(b)): return a == b
             case let (.ready(a), .ready(b)): return a == b
@@ -102,11 +107,31 @@ final class AICommandExecutor: ObservableObject {
     func fire(_ command: AICommand) {
         cancel()
         activeCommand = command
-        state = .loadingModel
 
+        // Fire-time availability gate (configuration-hub): if AI can't produce a result yet — the
+        // opt-in is off, or the model isn't downloaded/ready — open the canvas in the `.unavailable`
+        // state (enable/download + model picker) instead of generating. The model is never invoked
+        // here; the user enables/downloads from the canvas (the download continues in the background),
+        // and a horizontal discard dismisses.
+        guard modelManager.optedIn, Self.modelIsOnDisk(modelManager.state) else {
+            state = .unavailable
+            return
+        }
+
+        state = .loadingModel
         generationTask = Task { [weak self] in
             guard let self else { return }
             await self.run(command)
+        }
+    }
+
+    /// Whether the model's weights are present (downloaded/loaded) so a fire can produce a result
+    /// without a download. A download/verify still in flight — or not-downloaded / failed — is treated
+    /// as unavailable (the canvas offers download and reflects progress).
+    static func modelIsOnDisk(_ state: ModelLifecycleState) -> Bool {
+        switch state {
+        case .ready, .loading, .loaded: return true
+        case .notDownloaded, .downloading, .verifying, .failed: return false
         }
     }
 

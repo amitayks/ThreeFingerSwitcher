@@ -18,15 +18,15 @@ The system SHALL detect whether Accessibility and Screen Recording permissions a
 - **THEN** the app reports Screen Recording as missing in onboarding
 
 ### Requirement: Guide the user to grant permissions
-The system SHALL present an onboarding UI that explains each required permission and deep-links to the relevant System Settings pane.
+The system SHALL present permission guidance on the Hub's **Setup** page (not a separate Setup/Onboarding window) that explains each required permission and deep-links to the relevant System Settings pane, and reflects live permission status.
 
 #### Scenario: Deep-link to settings
-- **WHEN** the user chooses to grant a missing permission
+- **WHEN** the user chooses to grant a missing permission from the Hub's Setup page
 - **THEN** the app opens the corresponding System Settings privacy pane
 
-#### Scenario: Onboarding reflects live status
-- **WHEN** a permission is granted while onboarding is open
-- **THEN** the onboarding UI updates to reflect the granted state
+#### Scenario: Setup reflects live status
+- **WHEN** a permission is granted while the Hub's Setup page is open
+- **THEN** the Setup page updates to reflect the granted state
 
 ### Requirement: Degrade gracefully when permissions are missing
 The system SHALL behave safely when permissions are missing: without Accessibility it SHALL not attempt to raise windows; without Screen Recording it SHALL fall back to icon/title-only cards.

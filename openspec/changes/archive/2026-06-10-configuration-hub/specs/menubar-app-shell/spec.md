@@ -1,9 +1,5 @@
-# menubar-app-shell Specification
+## MODIFIED Requirements
 
-## Purpose
-
-Define the `LSUIElement` app lifecycle, the status-item menu, the sandbox-off packaging/distribution posture, and the app-wide wiring of the touch engine, gesture recognizer, window service, overlay, and settings.
-## Requirements
 ### Requirement: Background menu-bar presence
 The app SHALL run as a background agent (`LSUIElement = true`) with no Dock icon and no main window, presenting only a status-bar item. The status-bar item SHALL display the app's **brand mark** (a template image derived from the project logo) rather than a generic system symbol.
 
@@ -39,40 +35,6 @@ The status menu SHALL be trimmed to a minimal set of entries: **Open Hub**, a qu
 - **WHEN** the user wants Setup & Permissions or — when a Mission Control backup exists — to restore the native three-finger up/down gesture
 - **THEN** these are reached from the Hub, not the status menu
 
-### Requirement: Sandbox-off distribution posture
-The app SHALL be built with App Sandbox disabled (required to load the private MultitouchSupport framework) and SHALL be distributable as a direct, notarized download rather than via the Mac App Store. This posture SHALL be **realized** by a Developer-ID-signed, notarized, stapled DMG published to GitHub Releases (see the `release-pipeline` capability).
-
-#### Scenario: Sandbox disabled in build
-- **WHEN** the app's entitlements are inspected
-- **THEN** App Sandbox is not enabled
-
-#### Scenario: Distribution is a notarized direct download
-- **WHEN** a published release artifact is examined
-- **THEN** it is a Developer-ID-signed, notarized, stapled DMG offered as a direct download (not a Mac App Store listing)
-
-### Requirement: Engine lifecycle wiring
-The app SHALL own and wire together the touch engine, gesture recognizer, window service, overlay, and settings, starting touch listening when enabled and stopping it when disabled or quitting.
-
-#### Scenario: Enable starts listening
-- **WHEN** the switcher is enabled
-- **THEN** the app begins listening to the touch stream and the gesture recognizer is active
-
-#### Scenario: Disable stops listening
-- **WHEN** the switcher is disabled
-- **THEN** the app stops listening to the touch stream and no overlay can appear
-
-#### Scenario: Graceful quit
-- **WHEN** the user quits the app
-- **THEN** touch listening stops and any pending native-gesture-setting restore offer is honored per the native-gesture-config capability
-
-### Requirement: Inert when no trackpad is available
-The app SHALL remain stable and surface a clear non-error state when no multitouch trackpad is present.
-
-#### Scenario: No trackpad device
-- **WHEN** the app runs on a Mac with no multitouch trackpad
-- **THEN** the app does not crash
-- **AND** the status menu indicates the switcher is unavailable because no trackpad was detected
-
 ### Requirement: Favorites editor and quick-add entry points
 The status menu SHALL offer an entry that opens the Hub (whose Bands page edits the context bands and their items), and an entry that adds the frontmost application to a chosen context band without opening the Hub. The quick-add entry SHALL add the app to the favorites store and have it appear in the launcher on its next activation.
 
@@ -83,4 +45,3 @@ The status menu SHALL offer an entry that opens the Hub (whose Bands page edits 
 #### Scenario: Quick-add adds the front app
 - **WHEN** the user chooses to add the frontmost app to a context band from the status menu
 - **THEN** that app is added as an item to the chosen band and appears in the launcher on next activation
-

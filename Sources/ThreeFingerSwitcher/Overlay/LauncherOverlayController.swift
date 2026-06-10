@@ -27,6 +27,9 @@ final class LauncherOverlayController {
     /// coordinator before `show`; the panel's `LauncherView` is built with it (the panel is recreated
     /// fresh on every `show`, so a late-set executor is picked up on the next open).
     var executor: AICommandExecutor?
+    /// Enable/download wiring for the canvas's `.unavailable` state (configuration-hub). Set by the
+    /// coordinator before `show`; picked up when the panel's `LauncherView` is (re)built on each open.
+    var aiAvailability: AICanvasAvailability?
 
     private var panel: SwitcherPanel?
     private var bands: [ContextBand] = []
@@ -48,7 +51,7 @@ final class LauncherOverlayController {
     // MARK: - Show / navigate
 
     func show(bands: [ContextBand], startBand: Int, startColumn: Int, dwell: Double,
-              clipboardBandIndex: Int? = nil, aiCommandBandIndex: Int? = nil) {
+              clipboardBandIndex: Int? = nil) {
         self.bands = bands
         self.dwell = dwell
         model.dwell = dwell
@@ -59,8 +62,7 @@ final class LauncherOverlayController {
                        colors: bands.map(\.color),
                        startBand: startBand,
                        column: startColumn,
-                       clipboardBandIndex: clipboardBandIndex,
-                       aiCommandBandIndex: aiCommandBandIndex)
+                       clipboardBandIndex: clipboardBandIndex)
         let panel = self.panel ?? makePanel()
         self.panel = panel
         layout(panel)
@@ -148,7 +150,11 @@ final class LauncherOverlayController {
             model.enterCanvas(command)
             onCanvasStateChanged?(true)   // → recognizer enters canvas-resolution mode (swipe to resolve)
             if let panel { layout(panel, animated: true) }   // grow to the canvas metrics
-            onFire?(item, band)
+            onFire?(item, band)   // fires the executor synchronously → sets its state (.unavailable / .loadingModel)
+            // If AI is unavailable, the canvas shows clickable Enable/Download/model controls — make the
+            // (normally pass-through, gesture-only) panel interactive so those controls work. The
+            // streaming path leaves the panel pass-through (it resolves by swipe).
+            if executor?.state == .unavailable { setCanvasInteractive(true) }
             return true
         }
 
@@ -310,6 +316,17 @@ final class LauncherOverlayController {
 
     // MARK: - Panel
 
+    /// Make the panel clickable + key-capable while the AI "unavailable" canvas is showing, so its
+    /// Enable / Download / model-picker controls receive mouse events; otherwise the panel stays
+    /// pass-through (gesture-only). The panel is a `.nonactivatingPanel`, so becoming key here does not
+    /// activate the app. Reset implicitly on `hide()` (the panel is destroyed and recreated per open).
+    private func setCanvasInteractive(_ on: Bool) {
+        guard let panel else { return }
+        panel.ignoresMouseEvents = !on
+        panel.keyInteractive = on
+        if on { panel.makeKeyAndOrderFront(nil) }
+    }
+
     private func makePanel() -> SwitcherPanel {
         let panel = SwitcherPanel(
             contentRect: NSRect(x: 0, y: 0, width: 800, height: SwitcherLayout.panelHeight),
@@ -330,7 +347,8 @@ final class LauncherOverlayController {
         panel.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle]
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
-        panel.contentView = NSHostingView(rootView: LauncherView(model: model, executor: executor))
+        panel.contentView = NSHostingView(rootView: LauncherView(model: model, executor: executor,
+                                                                 availability: aiAvailability))
         return panel
     }
 

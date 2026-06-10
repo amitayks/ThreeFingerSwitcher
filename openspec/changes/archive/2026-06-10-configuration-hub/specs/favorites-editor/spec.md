@@ -1,10 +1,4 @@
-# favorites-editor Specification
-
-## Purpose
-
-Define the band/item editing canvas — the Hub's **Bands** page — that browses and sources launch items by type (including AI commands), arranges them into context bands on a canvas, and configures per-item and per-band appearance and strategy, with edits persisting immediately to the launcher.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Favorites editor window
 The system SHALL provide a band/item editing canvas as the Hub's **Bands** page (not a separate window), reachable from the status menu and from the Hub sidebar, that edits the context bands and their items. Edits SHALL persist immediately and be reflected in the launcher on its next activation.
@@ -36,6 +30,8 @@ The Bands page SHALL provide a source picker that lists item-source categories b
 - **WHEN** the user is in a category's browse list and chooses back
 - **THEN** the picker returns to the category index
 
+## ADDED Requirements
+
 ### Requirement: Author and edit AI commands inline as band items
 The Bands page SHALL let the user author and edit an AI command **inline**, as a band item, exposing every field of the command model — name, icon, tint, input source, prompt template (with token insertion), output target (and, for task/send-to targets, the task kind / destination), model selector, and confirm-before-run. Editing an AI-command item SHALL persist immediately into the Favorites record, and the command SHALL be movable between bands like any other item. There SHALL be no separate AI-command editor window or sheet.
 
@@ -54,37 +50,3 @@ The Bands page SHALL let the user author and edit an AI command **inline**, as a
 #### Scenario: No separate AI command editor
 - **WHEN** the user wants to edit AI commands
 - **THEN** they do so on the Bands page, and no standalone AI-command editor window or sheet exists
-
-### Requirement: Arrange items by context band on the canvas
-The editor canvas SHALL present the context bands as the user will swipe them, allowing: reordering items within a band by drag, reordering bands by drag, removing an item, creating a new band, and choosing which band is the active add target. The canvas SHALL be the same structure the launcher navigates.
-
-#### Scenario: Reorder within a band
-- **WHEN** the user drags an item to a new position within its band
-- **THEN** the stored order updates to match
-
-#### Scenario: Reorder bands
-- **WHEN** the user drags a band to a new position
-- **THEN** the stored band order updates to match
-
-#### Scenario: Remove an item
-- **WHEN** the user removes an item from a band
-- **THEN** the item no longer appears in that band
-
-#### Scenario: Active target band
-- **WHEN** the user selects a band as the add target and then picks a sourced item
-- **THEN** the item is added to that band
-
-### Requirement: Manual entry and per-item / per-band appearance
-The editor SHALL allow manually entering url, path, and script items with a custom short name, icon, and color. The editor SHALL allow setting a name, icon, and color per item and per band, and a default app strategy per band.
-
-#### Scenario: Add a manual script
-- **WHEN** the user adds a script manually with a short name, icon, and color
-- **THEN** a script item with that appearance is added to the targeted band
-
-#### Scenario: Set a band default strategy
-- **WHEN** the user sets a band's default app strategy
-- **THEN** app items in that band without an explicit override use that strategy
-
-#### Scenario: Recolor a band
-- **WHEN** the user changes a band's color
-- **THEN** the launcher renders that band and its indicator in the new color

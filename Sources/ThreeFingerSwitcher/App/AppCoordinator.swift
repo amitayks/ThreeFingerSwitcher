@@ -54,8 +54,9 @@ final class AppCoordinator: GestureRecognizerDelegate {
     private let clipboardStore = ClipboardStore.shared
     private lazy var clipboardMonitor = ClipboardMonitor(store: clipboardStore)
 
-    // AI commands (opt-in; the synthetic AI band + the on-device model + the streaming canvas).
-    private let aiCommandStore = AICommandStore.shared
+    // AI commands (opt-in; the on-device model + the streaming canvas). AI commands now live as
+    // persisted items inside the favorites bands (configuration-hub fold-in), so there is no separate
+    // command store — a fired `.aiCommand` item carries its `AICommand` to the executor directly.
     /// Reads/writes the captured front app's selection (and the clipboard / screen region) for an AI
     /// command. Reuses `capturedFrontApp` exactly like `LaunchService`, so output lands in the app the
     /// user was looking at (the overlay is non-activating).
@@ -89,9 +90,15 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// gesture). Lets the switcher float above MC and a commit dismiss it before raising.
     private var missionControlOpen = false
 
-    private var settingsWindow: NSWindow?
-    private var onboardingWindow: NSWindow?
-    private var favoritesEditorWindow: NSWindow?
+    // The unified configuration Hub: one reusable window, its navigation state, and the wiring context.
+    private var hubWindow: NSWindow?
+    private let hubNav = HubNavigation()
+    private lazy var hubContext: HubContext = makeHubContext()
+    /// The Space the Hub was last presented on (captured in `showHub`). Used to place the synthetic
+    /// Hub switcher entry on its own Space-row — the Hub deliberately does NOT join all Spaces, so it
+    /// stays where it was opened and the card lands in the right row (committing it raises across
+    /// Spaces like any other off-Space window).
+    private var hubSpaceID: CGSSpaceID?
 
     private(set) var isEnabled = false
     var isTrackpadAvailable: Bool { touchEngine.isAvailable }
@@ -132,6 +139,13 @@ final class AppCoordinator: GestureRecognizerDelegate {
         }
         // AI preview canvas: the executor it observes, and the two-stage commit / discard gestures.
         launcherOverlay.executor = aiCommandExecutor
+        // Enable/download wiring for the canvas's `.unavailable` state (fired an AI item while AI is
+        // off or the model isn't downloaded → the canvas offers Enable/Download + a model picker).
+        launcherOverlay.aiAvailability = AICanvasAvailability(
+            settings: settings,
+            models: modelManager,
+            onDownload: { [weak self] in self?.downloadAIModel() }
+        )
         launcherOverlay.onCommitCanvas = { [weak self] in
             // A fresh four-finger DOWN swipe commits: route the ready result per the command's output
             // target (or fire the reviewed side effect). Errors surface in the executor's `.failed`
@@ -145,6 +159,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
             self?.recognizer.launcherCanvasResolutionActive = active
         }
         observeSleepWake()
+        observeEnabledToggle()
         observeSpacesRearrangeToggle()
         observeVerticalGestureToggle()
         observeLauncherToggle()
@@ -208,7 +223,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         maybePromptSpacesRearrange()
         maybePromptVerticalGesture()
         maybePromptLauncher()
-        if !permissions.allRequiredGranted { showOnboarding() }
+        if !permissions.allRequiredGranted { showHub(selecting: .setup) }
     }
 
     // MARK: - Enable / disable
@@ -240,6 +255,32 @@ final class AppCoordinator: GestureRecognizerDelegate {
     }
 
     func toggleEnabled() { isEnabled ? disable() : enable() }
+
+    /// Guards `observeEnabledToggle` against re-entrancy: `enable()`/`disable()` themselves set
+    /// `settings.enabled`, which re-emits on this publisher. Without the guard, the no-trackpad case
+    /// (where `enable()` cannot set `isEnabled = true`, so its `guard !isEnabled` never trips) would
+    /// recurse forever.
+    private var applyingEnabledToggle = false
+
+    /// React to the switcher master toggle bound directly to `settings.enabled` (the Hub's Overview
+    /// and Switcher pages): start/stop the engine to match, so flipping it actually takes effect (a raw
+    /// binding only wrote the pref). Uses the EMITTED value (the `@Published` willSet reports the new
+    /// value to the sink). `dropFirst()` skips the persisted initial value (launch is handled in
+    /// `start()`); the re-entrancy guard absorbs the `settings.enabled =` that `enable()`/`disable()`
+    /// perform internally.
+    private func observeEnabledToggle() {
+        settings.$enabled
+            .dropFirst()
+            .sink { [weak self] on in
+                MainActor.assumeIsolated {
+                    guard let self, !self.applyingEnabledToggle else { return }
+                    self.applyingEnabledToggle = true
+                    if on { self.enable() } else { self.disable() }
+                    self.applyingEnabledToggle = false
+                }
+            }
+            .store(in: &cancellables)
+    }
 
     // MARK: - Sleep / wake recovery
 
@@ -342,7 +383,13 @@ final class AppCoordinator: GestureRecognizerDelegate {
     // MARK: - GestureRecognizerDelegate
 
     func gestureDidActivate() {
-        let windows = windowService.snapshot()
+        var windows = windowService.snapshot()
+        // Inject the configuration Hub as a synthetic switcher entry whenever it is open. The snapshot
+        // filters out our own PID (so the overlay panels never leak); the Hub is the one window we add
+        // back, on purpose, icon-only, on the Space it was opened on. Accessory mode is unchanged.
+        if let hub = hubSwitcherEntry(snapshot: windows) {
+            windows.append(hub)
+        }
         guard !windows.isEmpty else { return }
         let grid = SpaceGrouping.group(windows)
         // When the app has Mission Control open, float the overlay above it (otherwise it renders
@@ -350,6 +397,39 @@ final class AppCoordinator: GestureRecognizerDelegate {
         overlay.show(rows: grid.rows, labels: grid.labels, startRow: grid.startRow, column: 0,
                      aboveMissionControl: missionControlOpen)
         prefetchCurrentRow()
+    }
+
+    /// Build the synthetic Hub switcher entry from live state, or `nil` when the Hub isn't open. Reads
+    /// the current Space so the card can fall back to the active row when no other window shares the
+    /// Hub's Space. The app name (and so the card title) derives from the bundle/ProcessInfo with a
+    /// literal fallback.
+    private func hubSwitcherEntry(snapshot: [WindowInfo]) -> WindowInfo? {
+        guard let hubWindow, hubWindow.isVisible else { return nil }
+        let model = SpaceService.currentModel()
+        let currentSpaceID = model?.currentSpaceIDs.first
+        let currentSpaceIndex = currentSpaceID.flatMap { model?.indexBySpace[$0] } ?? 0
+        return HubSwitcherEntry.make(
+            isVisible: true,
+            windowNumber: hubWindow.windowNumber,
+            appName: Self.appDisplayName,
+            icon: NSApp.applicationIconImage,
+            hubSpaceID: hubSpaceID,
+            snapshot: snapshot,
+            currentSpaceID: currentSpaceID,
+            currentSpaceIndex: currentSpaceIndex
+        )
+    }
+
+    /// The app's display name (drives the Hub card title "<name> Hub"), derived from the bundle, then
+    /// ProcessInfo, with the literal fallback the design specifies.
+    private static var appDisplayName: String {
+        let info = Bundle.main.infoDictionary
+        if let name = (info?["CFBundleDisplayName"] as? String) ?? (info?["CFBundleName"] as? String),
+           !name.isEmpty {
+            return name
+        }
+        let proc = ProcessInfo.processInfo.processName
+        return proc.isEmpty ? "ThreeFingerSwitcher" : proc
     }
 
     func gestureDidStep(_ direction: Int) {
@@ -391,7 +471,11 @@ final class AppCoordinator: GestureRecognizerDelegate {
     }
 
     private func prefetchCurrentRow() {
-        let windows = overlay.model.windows
+        // Never attempt a ScreenCaptureKit capture of our OWN Hub window (it's the synthetic icon-only
+        // card) — exclude its id from both the cache seed and the live prefetch so no self-capture is
+        // tried; the switcher already renders the app icon for it.
+        let hubID = hubWindow.map { CGWindowID($0.windowNumber) }
+        let windows = overlay.model.windows.filter { $0.id != hubID }
         thumbnails.seed(into: overlay.model, ids: windows.map(\.id))  // instant from cache (no icon-only flash)
         thumbnails.prefetch(windows)                                  // refresh only cleanly-visible windows
     }
@@ -402,6 +486,24 @@ final class AppCoordinator: GestureRecognizerDelegate {
             return
         }
         overlay.hide()
+        // The synthetic Hub card: focus our OWN window directly (accessory mode → reliable via
+        // activate + makeKeyAndOrderFront, exactly what `present` does), switching to its Space if it's
+        // off the current one — never the cross-Space SkyLight raise meant for foreign windows. This
+        // also short-circuits the Accessibility gate below: focusing our own window needs no AX. If
+        // Mission Control is open, dismiss it first (as the normal commit does) so the Hub lands on the
+        // live desktop, then present after the close animation settles.
+        if HubSwitcherEntry.isHub(selectedID: window.id, hubWindowNumber: hubWindow?.windowNumber) {
+            if missionControlOpen {
+                missionControlOpen = false
+                MissionControl.dismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                    self?.present(self?.hubWindow)
+                }
+            } else {
+                present(hubWindow)
+            }
+            return
+        }
         guard permissions.accessibility == .granted else {
             permissions.requestAccessibility()
             return
@@ -433,22 +535,15 @@ final class AppCoordinator: GestureRecognizerDelegate {
         guard !launcherOverlay.canvasActive else { return }
 
         let fav = favoritesStore.favorites
-        // When clipboard history is on, append the synthetic Clipboard band as the LAST band, built
-        // fresh from the store (recent slice, pinned-first). It is never persisted and never the home.
+        // AI commands are persisted band items now (configuration-hub fold-in), so they project from
+        // `fav.bands` like any item — no synthetic AI band, no opt-in filtering (a fired AI item
+        // resolves its availability in the canvas). Only the Clipboard band remains synthetic.
         var bands = fav.bands
         var clipboardBandIndex: Int?
-        var aiCommandBandIndex: Int?
         if settings.keepClipboardHistory {
             let entries = clipboardStore.recentWindow(limit: settings.clipboardRecentWindow)
             bands.append(ClipboardBandBuilder.build(from: entries))
             clipboardBandIndex = bands.count - 1
-        }
-        // When AI commands are on AND at least one command exists, append the synthetic AI band, built
-        // fresh from the command store. Never persisted, never the home (mirrors the Clipboard band).
-        if AICommandBandBuilder.shouldPresent(optedIn: settings.aiCommandsEnabled,
-                                              commands: aiCommandStore.commands) {
-            bands.append(AICommandBandBuilder.build(from: aiCommandStore.commands))
-            aiCommandBandIndex = bands.count - 1
         }
         guard !bands.isEmpty else { return }
         // Capture the app the user was looking at before the (non-activating) overlay appears, so a
@@ -465,8 +560,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
                              startBand: fav.homeBandIndex,
                              startColumn: fav.resolvedHomeColumn,
                              dwell: settings.dwellToArmDuration,
-                             clipboardBandIndex: clipboardBandIndex,
-                             aiCommandBandIndex: aiCommandBandIndex)
+                             clipboardBandIndex: clipboardBandIndex)
     }
 
     func launcherDidStepItem(_ direction: Int) {
@@ -601,8 +695,11 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// non-blocking and bounded"; design D3).
     private func downloadAIModel() {
         modelManager.setOptedIn(settings.aiCommandsEnabled)
-        guard let descriptor = modelManager.registry.defaultDescriptor
-            ?? modelManager.registry.models.first else { return }
+        // Honor the user's pinned model selection (the AI page / unavailable canvas picker), falling
+        // back to the registry default.
+        let registry = modelManager.registry
+        guard let descriptor = settings.aiSelectedModelID.flatMap({ registry.descriptor(id: $0) })
+            ?? registry.defaultDescriptor ?? registry.models.first else { return }
         Task { @MainActor in
             do {
                 try await modelManager.downloadAndVerify(descriptor)
@@ -1040,25 +1137,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         onStateChange?()
     }
 
-    /// Open the favorites editor — the "small IDE" for arranging launcher bands and items.
-    func showFavoritesEditor() {
-        if favoritesEditorWindow == nil {
-            let host = NSHostingController(rootView: FavoritesEditorView(store: favoritesStore))
-            let window = NSWindow(contentViewController: host)
-            window.title = "Favorites"
-            window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-            window.isReleasedWhenClosed = false
-            // Persist position + size across launches/builds (stored in UserDefaults by the autosave
-            // name). Restore any saved frame; only center on the very first run.
-            let restored = window.setFrameUsingName("FavoritesEditorWindow")
-            window.setFrameAutosaveName("FavoritesEditorWindow")
-            if !restored { window.center() }
-            favoritesEditorWindow = window
-        }
-        present(favoritesEditorWindow)
-    }
-
-    /// Menu-bar quick-add: append the frontmost app to a band without opening the editor (10.2).
+    /// Menu-bar quick-add: append the frontmost app to a band without opening the Hub (10.2).
     func addFrontAppToBand(_ bandID: UUID) {
         guard let app = NSWorkspace.shared.frontmostApplication,
               let url = app.bundleURL else {
@@ -1073,69 +1152,79 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// Bands for the status-menu quick-add submenu.
     var favoriteBands: [ContextBand] { favoritesStore.favorites.bands }
 
-    // MARK: - Windows
+    // MARK: - Configuration Hub
 
-    func showSettings() {
-        // Rebuild the root view on each open so the actions are wired and `showRestoreMissionControl`
-        // reflects the current backup state (Setup & Permissions and the MC restore live here now).
-        let view = SettingsView(
-            settings: settings,
-            onOpenSetup: { [weak self] in self?.showOnboarding() },
-            onRestoreMissionControl: { [weak self] in self?.restoreVerticalGestureSetting() },
-            showRestoreMissionControl: verticalGesture.hasBackup,
-            onClearClipboard: { [weak self] includingPinned in self?.clipboardStore.clear(includingPinned: includingPinned) },
-            aiCommandStore: aiCommandStore,
-            modelManager: modelManager,
-            onDownloadModel: { [weak self] in self?.downloadAIModel() }
-        )
-        if let settingsWindow {
-            (settingsWindow.contentViewController as? NSHostingController<SettingsView>)?.rootView = view
-        } else {
-            let host = NSHostingController(rootView: view)
+    /// Open (or bring forward) the single configuration Hub window, optionally deep-linking a page.
+    /// One reusable window with a persisted frame, mirroring the former Settings/Favorites windows.
+    func showHub(selecting destination: HubDestination? = nil) {
+        if let destination { hubNav.selection = destination }
+        if hubWindow == nil {
+            let host = NSHostingController(rootView: HubView(context: hubContext, nav: hubNav))
             let window = NSWindow(contentViewController: host)
-            window.title = "Settings"
-            // Resizable so variable-length content (e.g. a long error + details) degrades to scrolling /
-            // resizing rather than overflowing a fixed frame (spec: bounded, non-blocking error UI).
+            window.title = "ThreeFingerSwitcher"
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             window.isReleasedWhenClosed = false
-            settingsWindow = window
+            let restored = window.setFrameUsingName("HubWindow")
+            window.setFrameAutosaveName("HubWindow")
+            if !restored {
+                window.setContentSize(NSSize(width: 1160, height: 720))
+                window.center()
+            }
+            hubWindow = window
         }
-        present(settingsWindow)
+        present(hubWindow)
+        // Remember which Space the Hub now lives on so the synthetic switcher entry lands in that
+        // Space's row. `present` activates + makes the Hub key on the current Space, so the current
+        // Space is where it is now visible (the Hub does not join all Spaces).
+        hubSpaceID = SpaceService.currentModel()?.currentSpaceIDs.first
     }
 
-    func showOnboarding() {
-        permissions.refresh()
-        if onboardingWindow == nil {
-            let view = OnboardingView(
-                permissions: permissions,
-                trackpadClaimed: trackpadConfig.isClaimed,
-                trackpadNeedsRelogin: trackpadConfig.needsReloginWarning,
-                spacesAutoRearrangeOn: spacesRearrange.isAutoRearrangeOn,
-                spaceRowSwitchingOn: settings.manageVerticalGesture,
-                spaceRowNeedsRelogin: verticalGesture.needsReloginWarning,
-                launcherOn: settings.enableLauncher,
-                launcherNeedsRelogin: fourFingerGesture.needsReloginWarning,
-                onSetupNativeGesture: { [weak self] in self?.promptNativeGestureSetup() },
-                onKeepSpacesFixed: { [weak self] in self?.promptSpacesRearrangeSetup() },
-                onEnableSpaceRowSwitching: { [weak self] in self?.promptVerticalGestureSetup() },
-                onEnableLauncher: { [weak self] in self?.promptLauncherSetup() },
-                onRefresh: { [weak self] in self?.permissions.refresh() }
-            )
-            let host = NSHostingController(rootView: view)
-            let window = NSWindow(contentViewController: host)
-            window.title = "Setup"
-            window.styleMask = [.titled, .closable]
-            window.isReleasedWhenClosed = false
-            onboardingWindow = window
-        }
-        present(onboardingWindow)
+    /// Wire the Hub's references and callbacks once. Closures are weak-self so the context never
+    /// retains the coordinator beyond its lifetime. Live state is provided as closures so each render
+    /// reads the current value (backup existence, re-login warnings, opt-in state).
+    private func makeHubContext() -> HubContext {
+        let ctx = HubContext(settings: settings,
+                             favorites: favoritesStore,
+                             clipboard: clipboardStore,
+                             models: modelManager,
+                             permissions: permissions)
+        // Clipboard.
+        ctx.onClearClipboard = { [weak self] includingPinned in self?.clipboardStore.clear(includingPinned: includingPinned) }
+        // AI.
+        ctx.onDownloadModel = { [weak self] in self?.downloadAIModel() }
+        // Setup — actions.
+        ctx.onSetupNativeGesture = { [weak self] in self?.promptNativeGestureSetup() }
+        ctx.onRestoreNativeGesture = { [weak self] in self?.restoreNativeGestureSetting() }
+        ctx.onKeepSpacesFixed = { [weak self] in self?.promptSpacesRearrangeSetup() }
+        ctx.onEnableSpaceRowSwitching = { [weak self] in self?.promptVerticalGestureSetup() }
+        ctx.onRestoreMissionControl = { [weak self] in self?.restoreVerticalGestureSetting() }
+        ctx.onEnableLauncher = { [weak self] in self?.promptLauncherSetup() }
+        ctx.onRestoreLauncher = { [weak self] in self?.restoreLauncherGestureSetting() }
+        ctx.onRefreshPermissions = { [weak self] in self?.permissions.refresh() }
+        // Setup — live state.
+        ctx.trackpadClaimed = { [weak self] in self?.trackpadConfig.isClaimed ?? false }
+        ctx.trackpadHasBackup = { [weak self] in self?.trackpadConfig.hasBackup ?? false }
+        ctx.trackpadNeedsRelogin = { [weak self] in self?.trackpadConfig.needsReloginWarning ?? false }
+        ctx.spacesAutoRearrangeOn = { [weak self] in self?.spacesRearrange.isAutoRearrangeOn ?? false }
+        ctx.spaceRowNeedsRelogin = { [weak self] in self?.verticalGesture.needsReloginWarning ?? false }
+        ctx.verticalGestureHasBackup = { [weak self] in self?.verticalGesture.hasBackup ?? false }
+        ctx.launcherNeedsRelogin = { [weak self] in self?.fourFingerGesture.needsReloginWarning ?? false }
+        ctx.launcherHasBackup = { [weak self] in self?.fourFingerGesture.hasBackup ?? false }
+        // General.
+        ctx.isOpenAtLogin = { [weak self] in self?.isOpenAtLogin ?? false }
+        ctx.onToggleOpenAtLogin = { [weak self] in self?.toggleOpenAtLogin() }
+        ctx.onWriteDiagnostics = { [weak self] in self?.writeDiagnostics() }
+        ctx.onCopyFocusLog = { [weak self] in self?.copyFocusLog() }
+        return ctx
     }
+
+    // MARK: - Windows
 
     private func present(_ window: NSWindow?) {
         guard let window else { return }
         NSApp.activate(ignoringOtherApps: true)
-        // Windows that persist their own frame (a non-empty autosave name) keep their saved position;
-        // only center the transient ones (Settings / Setup).
+        // Windows that persist their own frame (a non-empty autosave name, e.g. the Hub) keep their
+        // saved position; only center a transient window without one.
         if window.frameAutosaveName.isEmpty { window.center() }
         window.makeKeyAndOrderFront(nil)
     }

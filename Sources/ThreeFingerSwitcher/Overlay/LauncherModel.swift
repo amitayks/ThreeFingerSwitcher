@@ -35,9 +35,6 @@ final class LauncherModel: ObservableObject {
     /// Index of the synthetic Clipboard band, when present (always the last band). It navigates as a
     /// single-column master-detail list and repurposes horizontal travel (see `stepHorizontal`).
     @Published private(set) var clipboardBandIndex: Int?
-    /// Index of the synthetic AI-command band, when present. It navigates as a normal grid (icon +
-    /// label cells); firing one of its items opens the streaming preview canvas instead of dismissing.
-    @Published private(set) var aiCommandBandIndex: Int?
 
     /// When non-nil, the launcher is showing the AI streaming preview canvas for the fired command
     /// (the grid is replaced by the canvas; the overlay stays visible, non-activating). Cleared when
@@ -65,25 +62,16 @@ final class LauncherModel: ObservableObject {
     var bandCount: Int { bands.count }
     /// Whether the current band is the Clipboard band (single column, repurposed horizontal).
     var currentBandIsClipboard: Bool { clipboardBandIndex == currentBand }
-    /// Whether the current band is the AI-command band (a normal grid whose items open the canvas).
-    var currentBandIsAICommand: Bool { aiCommandBandIndex == currentBand }
 
-    /// The AI command of the currently selected item, when the selection is an AI-command item.
-    var selectedAICommand: AICommand? {
-        guard let item = selectedItem, case let .aiCommand(command) = item.kind else { return nil }
-        return command
-    }
     /// Columns for the current band: the Clipboard band is a single-column list; others use the grid.
     private var currentColumns: Int { currentBandIsClipboard ? 1 : LauncherGridLayout.columns }
 
     func setBands(_ bands: [[LaunchItem]], names: [String], colors: [ItemColor],
-                  startBand: Int, column: Int, clipboardBandIndex: Int? = nil,
-                  aiCommandBandIndex: Int? = nil) {
+                  startBand: Int, column: Int, clipboardBandIndex: Int? = nil) {
         self.bands = bands
         self.bandNames = names
         self.bandColors = colors
         self.clipboardBandIndex = clipboardBandIndex
-        self.aiCommandBandIndex = aiCommandBandIndex
         self.canvasCommand = nil
         self.sessionPinToggles = []
         self.currentBand = clamp(startBand, 0, max(bands.count - 1, 0))

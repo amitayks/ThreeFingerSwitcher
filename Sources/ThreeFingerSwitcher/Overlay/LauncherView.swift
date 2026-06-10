@@ -17,6 +17,8 @@ struct LauncherView: View {
     /// The AI command executor whose streaming state the preview canvas observes (nil when AI commands
     /// aren't wired — the canvas is then never reached because no `.aiCommand` item can be fired).
     var executor: AICommandExecutor? = nil
+    /// Enable/download wiring for the canvas's `.unavailable` state (configuration-hub).
+    var availability: AICanvasAvailability? = nil
 
     private var columns: [GridItem] {
         Array(repeating: GridItem(.fixed(LauncherGridLayout.cellWidth), spacing: LauncherGridLayout.spacing),
@@ -53,7 +55,8 @@ struct LauncherView: View {
     private var canvas: some View {
         if let executor, let command = model.canvasCommand {
             AICommandCanvasView(executor: executor, command: command,
-                                tint: command.tint.map(Color.init) ?? Color(model.currentBandColor))
+                                tint: command.tint.map(Color.init) ?? Color(model.currentBandColor),
+                                availability: availability)
         } else {
             Color.clear
         }

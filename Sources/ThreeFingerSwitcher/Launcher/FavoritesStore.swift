@@ -19,10 +19,30 @@ final class FavoritesStore: ObservableObject {
     private convenience init() { self.init(defaults: .standard) }
 
     /// Test/seam initializer: inject an isolated `UserDefaults`. Loads the stored record (migrating
-    /// older schema versions forward) or seeds the starter bands on first run.
+    /// older schema versions forward, and folding any legacy AI commands into a normal "AI" band on the
+    /// first upgrade) or seeds the starter bands (including the "AI" band) on first run.
     init(defaults: UserDefaults) {
         self.defaults = defaults
-        self.favorites = Self.load(from: defaults, key: key) ?? Self.seeded()
+        if let data = defaults.data(forKey: key),
+           let decoded = try? JSONDecoder().decode(Favorites.self, from: data) {
+            let storedVersion = decoded.schemaVersion
+            var record = Self.migrate(decoded)   // stamps forward only when upgrading; identity otherwise
+            let didFold = Self.foldInLegacyAICommands(into: &record, storedVersion: storedVersion, defaults: defaults)
+            self.favorites = record
+            // Persist once if the load did one-time work (an upgrade and/or the AI fold-in). The legacy
+            // "aiCommands" key is retired ONLY after the new record is durably written — a failed save
+            // leaves it intact so the fold-in retries next launch (never lose data; spec/design D4).
+            // A downgrade (storedVersion > current) is NOT saved, so a future record is never clobbered.
+            if didFold || storedVersion < Favorites.currentSchemaVersion {
+                if save(), storedVersion < Favorites.aiCommandsFoldedSchemaVersion {
+                    defaults.removeObject(forKey: Self.legacyAICommandsKey)
+                }
+            }
+        } else {
+            self.favorites = Self.seeded()
+            // Persist the seed so its ids (notably the seeded AI commands') are stable across relaunch.
+            save()
+        }
     }
 
     // MARK: - Mutation
@@ -85,6 +105,19 @@ final class FavoritesStore: ObservableObject {
         updateBand(bandID) { $0.items.removeAll { $0.id == itemID } }
     }
 
+    /// Move an item to a different band (any kind, including `.aiCommand`), appending it to the
+    /// destination. No-op when the item/bands can't be resolved or source == destination.
+    func moveItem(_ itemID: UUID, fromBand: UUID, toBand: UUID) {
+        guard fromBand != toBand else { return }
+        mutate { fav in
+            guard let si = fav.bands.firstIndex(where: { $0.id == fromBand }),
+                  let ii = fav.bands[si].items.firstIndex(where: { $0.id == itemID }),
+                  let di = fav.bands.firstIndex(where: { $0.id == toBand }) else { return }
+            let item = fav.bands[si].items.remove(at: ii)
+            fav.bands[di].items.append(item)
+        }
+    }
+
     /// Edit a single item in place (title / tint / per-item app strategy).
     func updateItem(_ itemID: UUID, inBand bandID: UUID, _ block: (inout LaunchItem) -> Void) {
         updateBand(bandID) { band in
@@ -93,26 +126,61 @@ final class FavoritesStore: ObservableObject {
         }
     }
 
-    func save() {
-        guard let data = try? JSONEncoder().encode(favorites) else { return }
+    @discardableResult
+    func save() -> Bool {
+        guard let data = try? JSONEncoder().encode(favorites) else { return false }
         defaults.set(data, forKey: key)
+        return true
     }
 
     // MARK: - Load / migrate
 
-    private static func load(from defaults: UserDefaults, key: String) -> Favorites? {
-        guard let data = defaults.data(forKey: key),
-              let decoded = try? JSONDecoder().decode(Favorites.self, from: data) else { return nil }
-        return migrate(decoded)
-    }
-
-    /// Forward-migrate an older record to the current schema. Identity for v1; future versions add
-    /// cases here. Always stamps the current version so a re-save is normalized.
+    /// Forward-migrate an older record to the current schema **content** (identity today) and stamp the
+    /// current version. The AI fold-in is handled separately (`foldInLegacyAICommands`) because it needs
+    /// `UserDefaults` access to read+retire the legacy `aiCommands` key.
     static func migrate(_ record: Favorites) -> Favorites {
         var record = record
-        // (No migrations yet — v1 is current.) Future: `if record.schemaVersion < N { … }`.
-        record.schemaVersion = Favorites.currentSchemaVersion
+        // Only stamp FORWARD when upgrading; never down-stamp a future record. (init won't persist a
+        // non-upgrade, so a newer-schema record written by a future build isn't clobbered on launch.)
+        if record.schemaVersion < Favorites.currentSchemaVersion {
+            record.schemaVersion = Favorites.currentSchemaVersion
+        }
         return record
+    }
+
+    // MARK: - AI fold-in migration (one-time, idempotent)
+
+    /// The legacy key the former `AICommandStore` persisted its commands under.
+    private static let legacyAICommandsKey = "aiCommands"
+
+    /// One-time AI fold-in (configuration-hub): when upgrading from a record predating the fold-in
+    /// (`storedVersion < aiCommandsFoldedSchemaVersion`), append an "AI" band to `record`. It does NOT
+    /// touch the legacy key — the caller retires `aiCommands` only after a successful save, so a failed
+    /// write never loses commands. Idempotent: never appends a second "AI" band. Cases:
+    /// • legacy `aiCommands` present with commands → import them, preserving id + order;
+    /// • legacy key present but empty → opted in then cleared: import nothing (respect the empty choice);
+    /// • legacy key ABSENT → never opted in → seed the default "AI" band for discoverability (design D4).
+    /// Returns whether it changed `record`.
+    @discardableResult
+    static func foldInLegacyAICommands(into record: inout Favorites, storedVersion: Int,
+                                       defaults: UserDefaults) -> Bool {
+        guard storedVersion < Favorites.aiCommandsFoldedSchemaVersion else { return false }
+        guard !record.bands.contains(where: { AIBand.isAIBand($0) }) else { return false }
+        if let data = defaults.data(forKey: legacyAICommandsKey) {
+            // Opted in before: import their commands (an empty record imports nothing).
+            guard let commands = decodeLegacyAICommands(data), !commands.isEmpty else { return false }
+            record.bands.append(AIBand.band(from: commands))
+            return true
+        }
+        // Never opted in (no legacy key): seed the default "AI" band so the feature is discoverable.
+        record.bands.append(AIBand.seededBand())
+        return true
+    }
+
+    /// Decode the legacy `AICommandStore` on-disk record (`{ schemaVersion, commands }`).
+    private static func decodeLegacyAICommands(_ data: Data) -> [AICommand]? {
+        struct LegacyStored: Codable { var schemaVersion: Int; var commands: [AICommand] }
+        return (try? JSONDecoder().decode(LegacyStored.self, from: data))?.commands
     }
 
     // MARK: - Seed
@@ -141,6 +209,9 @@ final class FavoritesStore: ObservableObject {
         let system = ContextBand(name: "System", color: ItemColor(red: 0.55, green: 0.55, blue: 0.58),
                                  defaultAppStrategy: .smart,
                                  items: [app("System Settings", "/System/Applications/System Settings.app")].compactMap { $0 })
-        return Favorites(bands: [dev, comms, media, system], homeBandID: dev.id, homeColumn: 0)
+        // Fresh installs also get the "AI" band (a normal, editable band of seeded AI commands). Its
+        // items only act once AI is enabled; firing one while AI is off opens the enable/download canvas.
+        return Favorites(bands: [dev, comms, media, system, AIBand.seededBand()],
+                         homeBandID: dev.id, homeColumn: 0)
     }
 }
