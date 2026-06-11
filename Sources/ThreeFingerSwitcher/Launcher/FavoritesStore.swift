@@ -65,11 +65,14 @@ final class FavoritesStore: ObservableObject {
 
     // MARK: - Editor mutations (each persists immediately via `mutate`)
 
-    /// Create a band and return its id (so the editor can select it as the active add target).
+    /// Create a band and return its id (so the editor can select it as the active add target). Bands are
+    /// identified by their **icon** (the launcher shows icons, not names), so a new band starts with a
+    /// neutral default icon and no name — the user picks an icon, not a title.
     @discardableResult
-    func addBand(name: String = "New band",
+    func addBand(name: String = "",
+                 icon: ItemIcon = .sfSymbol("square.grid.2x2.fill"),
                  color: ItemColor = ItemColor(red: 0.55, green: 0.55, blue: 0.58)) -> UUID {
-        let band = ContextBand(name: name, color: color)
+        let band = ContextBand(name: name, color: color, icon: icon)
         mutate { $0.bands.append(band) }
         return band.id
     }
@@ -195,18 +198,22 @@ final class FavoritesStore: ObservableObject {
                               kind: .app(bundleURL: URL(fileURLWithPath: path), strategy: nil))
         }
         let dev = ContextBand(name: "Dev", color: ItemColor(red: 0.20, green: 0.48, blue: 0.93),
+                              icon: .sfSymbol("chevron.left.forwardslash.chevron.right"),
                               defaultAppStrategy: .alwaysNewWindow,
                               items: [app("Terminal", "/System/Applications/Utilities/Terminal.app"),
                                       app("Finder", "/System/Library/CoreServices/Finder.app")].compactMap { $0 })
         let comms = ContextBand(name: "Comms", color: ItemColor(red: 0.25, green: 0.72, blue: 0.40),
+                                icon: .sfSymbol("message.fill"),
                                 defaultAppStrategy: .bringExistingHere,
                                 items: [app("Mail", "/System/Applications/Mail.app"),
                                         app("Messages", "/System/Applications/Messages.app")].compactMap { $0 })
         let media = ContextBand(name: "Media", color: ItemColor(red: 0.66, green: 0.36, blue: 0.86),
+                                icon: .sfSymbol("play.circle.fill"),
                                 defaultAppStrategy: .smart,
                                 items: [app("Music", "/System/Applications/Music.app"),
                                         app("Safari", "/Applications/Safari.app")].compactMap { $0 })
         let system = ContextBand(name: "System", color: ItemColor(red: 0.55, green: 0.55, blue: 0.58),
+                                 icon: .sfSymbol("gearshape.fill"),
                                  defaultAppStrategy: .smart,
                                  items: [app("System Settings", "/System/Applications/System Settings.app")].compactMap { $0 })
         // Fresh installs also get the "AI" band (a normal, editable band of seeded AI commands). Its

@@ -13,9 +13,10 @@ private final class LauncherMockDelegate: GestureRecognizerDelegate {
         case lCanvasResolve(Int, Int)
     }
     private(set) var events: [Event] = []
-    /// Simulates the launcher cursor sitting on the band-headers row, so horizontal travel is treated
-    /// as band switching (context-step) rather than in-grid item movement (item-step).
-    var onHeaders = false
+    /// Simulates the launcher cursor sitting on the band-title list (left), so **vertical** travel is
+    /// treated as band switching (the coarse context-step) rather than in-grid row movement (the fine
+    /// item-step). Horizontal travel is always the fine item-step.
+    var onBandList = false
 
     // Switcher
     func gestureDidActivate() { events.append(.activate) }
@@ -32,7 +33,7 @@ private final class LauncherMockDelegate: GestureRecognizerDelegate {
     func launcherDidEnd() { events.append(.lEnd) }
     func launcherDidCancel() { events.append(.lCancel) }
     func launcherEdgeChanged(dx: Int, dy: Int) { events.append(.lEdge(dx, dy)) }
-    func launcherFocusIsOnHeaders() -> Bool { onHeaders }
+    func launcherFocusIsOnBandList() -> Bool { onBandList }
     func launcherCanvasResolve(dx: Int, dy: Int) { events.append(.lCanvasResolve(dx, dy)) }
 
     /// The sequence of edge states emitted (dx, dy) per change.
@@ -112,29 +113,46 @@ final class GestureRecognizerLauncherTests: XCTestCase {
         XCTAssertEqual(d.lItems, [1, 1, 1])
     }
 
-    func test_verticalStepping_usesItemStep() {
-        // Vertical travel (grid rows / rising to the headers) steps at the ITEM-step threshold — band
-        // switching is no longer the vertical axis, so the coarser band threshold does not apply here.
+    func test_verticalStepping_inGrid_usesItemStep() {
+        // In the grid (NOT on the band list), vertical travel steps grid rows at the fine ITEM-step
+        // threshold — band switching is no longer the vertical axis here, so the coarser context/band
+        // threshold does not apply. (`onBandList` defaults to false → the grid case.)
         let (rec, d) = makeRecognizer(makeSettings(launcherStepDistance: 0.05,
                                                    launcherContextStepDistance: 0.10), launcher: true)
         feed(rec, x: 0.20, y: 0.50, fingers: 4)   // begin
         feed(rec, x: 0.26, y: 0.50, fingers: 4)   // activate
         feed(rec, x: 0.26, y: 0.651, fingers: 4)  // dy +0.151 at the 0.05 item step → 3 vertical steps
-        XCTAssertEqual(d.lContexts, [1, 1, 1], "vertical steps at the item-step, not the band threshold")
+        XCTAssertEqual(d.lContexts, [1, 1, 1], "grid rows step at the item-step, not the band threshold")
         XCTAssertTrue(d.lItems.isEmpty, "pure vertical emits no horizontal steps")
     }
 
-    func test_bandSwitch_onHeaders_usesBandThreshold() {
-        // On the headers row, horizontal travel switches bands at the coarser context/band step, so the
-        // same travel yields fewer steps than in-grid item movement — the two thresholds are decoupled.
+    func test_bandSwitch_onBandList_usesBandThreshold_onVertical() {
+        // On the band list, VERTICAL travel switches bands at the coarser context/band step, so the same
+        // vertical travel yields fewer steps than the fine item-step — the band gate moved to the
+        // vertical axis. Band switching is reported via `launcherDidStepContext` (→ `lContexts`).
         let (rec, d) = makeRecognizer(makeSettings(launcherStepDistance: 0.05,
                                                    launcherContextStepDistance: 0.10), launcher: true)
-        d.onHeaders = true
+        d.onBandList = true
         feed(rec, x: 0.20, y: 0.50, fingers: 4)   // begin
         feed(rec, x: 0.26, y: 0.50, fingers: 4)   // activate (dx 0.06 ≥ 0.045)
-        feed(rec, x: 0.461, y: 0.50, fingers: 4)  // dx +0.201 at the 0.10 band step → 2 steps
-        XCTAssertEqual(d.lItems, [1, 1], "band switching on the headers row steps at the band threshold")
-        // The same +0.201 travel in the grid (item step 0.05) would be 4 steps — see item-stepping test.
+        feed(rec, x: 0.26, y: 0.701, fingers: 4)  // dy +0.201 at the 0.10 band step → 2 steps
+        XCTAssertEqual(d.lContexts, [1, 1], "band switching on the band list steps at the band threshold")
+        XCTAssertTrue(d.lItems.isEmpty, "pure vertical emits no horizontal item steps")
+        // The same +0.201 vertical travel in the grid (item step 0.05) would be 4 steps — see the
+        // in-grid vertical-stepping test.
+    }
+
+    func test_horizontal_onBandList_usesItemStep() {
+        // On the band list, HORIZONTAL travel (crossing toward the grid / item movement) is always the
+        // fine item-step, never the coarse band gate — only the vertical axis carries the band gate.
+        let (rec, d) = makeRecognizer(makeSettings(launcherStepDistance: 0.05,
+                                                   launcherContextStepDistance: 0.10), launcher: true)
+        d.onBandList = true
+        feed(rec, x: 0.10, y: 0.50, fingers: 4)   // begin
+        feed(rec, x: 0.16, y: 0.50, fingers: 4)   // activate
+        feed(rec, x: 0.311, y: 0.50, fingers: 4)  // dx +0.151 at the 0.05 item step → 3 item steps
+        XCTAssertEqual(d.lItems, [1, 1, 1], "horizontal is the fine item-step even on the band list")
+        XCTAssertTrue(d.lContexts.isEmpty, "pure horizontal emits no vertical/band steps")
     }
 
     // MARK: - Edge-hold for auto-repeat (2D)

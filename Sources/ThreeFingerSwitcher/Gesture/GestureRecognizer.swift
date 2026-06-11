@@ -41,10 +41,11 @@ protocol GestureRecognizerDelegate: AnyObject {
     /// changes; `(0, 0)` means no edge. Drives edge-triggered auto-repeat of horizontal item/band
     /// stepping and vertical row stepping.
     func launcherEdgeChanged(dx: Int, dy: Int)
-    /// Whether the launcher cursor is on the band-headers row (where horizontal travel switches
-    /// bands). Lets the recognizer apply the coarser context-step to band switching and the finer
-    /// item-step to in-grid item movement — so the two can be tuned independently. Defaults to false.
-    func launcherFocusIsOnHeaders() -> Bool
+    /// Whether the launcher cursor is on the band list (the left title column, where vertical travel
+    /// switches bands). Lets the recognizer apply the coarser context-step to the VERTICAL band switch
+    /// and the finer item-step to in-grid item movement — so the two can be tuned independently.
+    /// Defaults to false.
+    func launcherFocusIsOnBandList() -> Bool
     /// While the launcher's AI preview canvas is open, a fresh four-finger swipe RESOLVES it instead of
     /// navigating: `dx != 0` is a horizontal swipe (discard); `dy` is vertical (`+1` up, `-1` down) — a
     /// DOWN swipe applies the result ("bring it into the document"). Emitted once per gesture, only
@@ -59,7 +60,7 @@ extension GestureRecognizerDelegate {
     func launcherDidEnd() {}
     func launcherDidCancel() {}
     func launcherEdgeChanged(dx: Int, dy: Int) {}
-    func launcherFocusIsOnHeaders() -> Bool { false }
+    func launcherFocusIsOnBandList() -> Bool { false }
     func launcherCanvasResolve(dx: Int, dy: Int) {}
 }
 
@@ -469,24 +470,26 @@ final class GestureRecognizer {
             return
         }
 
-        // Active: horizontal moves the cursor / switches bands, vertical moves between grid rows and
-        // the headers (both with carry). The launcher owns both axes; the freed four-finger scroll is
-        // consumed by the scroll tap. The threshold tracks the *action*, not the axis: switching bands
-        // (horizontal on the headers row) uses the coarser context-step so it can be made deliberate
-        // independently; all item movement — horizontal in the grid and every vertical step — uses the
-        // finer item-step. So raising the context-step slows band switching without touching items.
+        // Active: the launcher owns both axes (the freed four-finger scroll is consumed by the scroll
+        // tap). Horizontal moves the item cursor and crosses between the band list and the grid; vertical
+        // switches bands (on the band list) or steps between grid rows (in the grid) — both with carry.
+        // The threshold tracks the *action*, not the axis: switching bands (VERTICAL on the band list)
+        // uses the coarser context-step so it can be made deliberate independently; all item movement —
+        // horizontal in the grid and vertical between grid rows — uses the finer item-step. So raising
+        // the context-step slows band switching without touching item movement.
         stepAccumulator += (c.x - lastCentroid.x)
         stepAccumulatorY += (c.y - lastCentroid.y)
         lastCentroid = c
 
         let itemStep = CGFloat(max(settings.launcherStepDistance, 0.005))
-        let onHeaders = delegate?.launcherFocusIsOnHeaders() ?? false
-        let horizStep = onHeaders ? CGFloat(max(settings.launcherContextStepDistance, 0.02)) : itemStep
+        let onBandList = delegate?.launcherFocusIsOnBandList() ?? false
+        let horizStep = itemStep
+        let vertStep = onBandList ? CGFloat(max(settings.launcherContextStepDistance, 0.02)) : itemStep
         while stepAccumulator >= horizStep { stepAccumulator -= horizStep; emitItemStep(forward: true) }
         while stepAccumulator <= -horizStep { stepAccumulator += horizStep; emitItemStep(forward: false) }
 
-        while stepAccumulatorY >= itemStep { stepAccumulatorY -= itemStep; emitContextStep(up: true) }
-        while stepAccumulatorY <= -itemStep { stepAccumulatorY += itemStep; emitContextStep(up: false) }
+        while stepAccumulatorY >= vertStep { stepAccumulatorY -= vertStep; emitContextStep(up: true) }
+        while stepAccumulatorY <= -vertStep { stepAccumulatorY += vertStep; emitContextStep(up: false) }
 
         updateEdges(c)
     }

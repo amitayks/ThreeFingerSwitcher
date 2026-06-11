@@ -12,13 +12,15 @@ enum ClipboardBandBuilder {
     static let bandID = UUID(uuidString: "C11B0A12-0000-4000-8000-000000000001")!
     static let name = "Clipboard"
     static let color = ItemColor(red: 0.86, green: 0.62, blue: 0.20)
+    /// The Clipboard band's dedicated, preset launcher icon (not user-editable — it's a synthetic band).
+    static let icon: ItemIcon = .sfSymbol("clipboard.fill")
 
     static func build(from entries: [ClipboardEntry]) -> ContextBand {
         let items = entries.map { entry in
             LaunchItem(id: entry.id, title: entry.key, icon: glyph(for: entry.kind),
                        kind: .clipboardEntry(entry))
         }
-        return ContextBand(id: bandID, name: name, color: color, items: items)
+        return ContextBand(id: bandID, name: name, color: color, icon: icon, items: items)
     }
 
     /// True for a band produced by this builder (matched by the sentinel id).

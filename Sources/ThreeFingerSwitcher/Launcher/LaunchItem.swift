@@ -225,15 +225,22 @@ struct ContextBand: Codable, Equatable, Identifiable {
     var id: UUID
     var name: String
     var color: ItemColor
+    /// The band's launcher icon (the band list shows icons, not titles). Optional so records written
+    /// before bands had icons decode cleanly (a missing key → `nil`, no schema bump); `resolvedIcon`
+    /// supplies a neutral default for those.
+    var icon: ItemIcon?
     /// Default app strategy inherited by `.app` items in this band that don't override it.
     var defaultAppStrategy: AppStrategy
     var items: [LaunchItem]
 
-    init(id: UUID = UUID(), name: String, color: ItemColor,
+    init(id: UUID = UUID(), name: String, color: ItemColor, icon: ItemIcon? = nil,
          defaultAppStrategy: AppStrategy = .smart, items: [LaunchItem] = []) {
-        self.id = id; self.name = name; self.color = color
+        self.id = id; self.name = name; self.color = color; self.icon = icon
         self.defaultAppStrategy = defaultAppStrategy; self.items = items
     }
+
+    /// The band's launcher icon, resolving the nil/legacy case to a neutral default symbol.
+    var resolvedIcon: ItemIcon { icon ?? .sfSymbol("square.grid.2x2.fill") }
 }
 
 /// The root favorites record — the single persisted value (see `FavoritesStore`).

@@ -60,6 +60,7 @@ final class LauncherOverlayController {
         model.setBands(bands.map(\.items),
                        names: bands.map(\.name),
                        colors: bands.map(\.color),
+                       icons: bands.map(\.resolvedIcon),
                        startBand: startBand,
                        column: startColumn,
                        clipboardBandIndex: clipboardBandIndex)
@@ -70,11 +71,13 @@ final class LauncherOverlayController {
         manageDwell()
     }
 
-    /// Whether the cursor is on the band-headers row (where horizontal travel switches bands). Lets the
-    /// gesture recognizer apply the coarser context-step to band switching, finer item-step elsewhere.
-    var focusIsOnHeaders: Bool { model.focus == .headers }
+    /// Whether the cursor is on the left band-title list (where *vertical* travel switches bands). Lets
+    /// the gesture recognizer apply the coarser context-step to the vertical band-switch axis there, and
+    /// the finer item-step to everything else (horizontal crossing into the grid, grid stepping).
+    var focusIsOnBandList: Bool { model.focus == .bands }
 
-    /// Horizontal swipe step: switch batch on the headers row, else move the grid cursor.
+    /// Horizontal swipe step: cross between the band list and the grid, else move the grid cursor
+    /// within its row (band switching now lives on the *vertical* axis of the band list).
     ///
     /// While the AI preview canvas is open the recognizer is in canvas-resolution mode and emits no grid
     /// steps (it routes swipes to `launcherCanvasResolve`), so this branch is a **defensive fallback**:
@@ -92,10 +95,17 @@ final class LauncherOverlayController {
         manageDwell()
     }
 
-    /// Vertical swipe step: move between grid rows, rising onto / dropping from the headers row.
+    /// Vertical swipe step: switch the active band on the band list, else move between grid rows
+    /// (which now clamps at row 0 — there's no header strip to rise onto).
     func stepVertical(_ dir: Int) {
         if model.canvasActive { return }   // the canvas isn't grid-navigable
+        // Band switching now lives on the vertical axis (the band list), so re-size the panel here on a
+        // band change — the width shifts when crossing into / out of the Clipboard band, and the frame
+        // animates via the same path band switching used on the horizontal axis before. Height is stable
+        // across bands (clamped to the taller pane within min/max), so this is just an animated re-fit.
+        let bandBefore = model.currentBand
         model.stepVertical(dir)
+        if model.currentBand != bandBefore, let panel { layout(panel, animated: true) }
         manageDwell()
     }
 
@@ -239,8 +249,9 @@ final class LauncherOverlayController {
     }
 
     /// Auto-repeat stepping while a contact is held at a trackpad edge. `dx`/`dy` are −1 / 0 / +1 per
-    /// axis (horizontal steps items / switches bands on the headers row; vertical steps grid rows).
-    /// Horizontal is suppressed in the Clipboard band (there horizontal is pin / previous-band). When
+    /// axis (vertical switches bands on the band list / steps grid rows; horizontal crosses between the
+    /// band list and the grid, then steps items). Horizontal is suppressed in the Clipboard band (there
+    /// horizontal is the deliberate pin / cross-to-band-list action). When
     /// both axes are zero the timer stops. A step that doesn't move the selection (clamped at an end)
     /// does NOT reset the dwell, so holding at a dead edge still lets the current item arm and fire.
     func setEdgeAutoScroll(dx: Int, dy: Int) {
@@ -291,7 +302,7 @@ final class LauncherOverlayController {
     }
 
     /// After any navigation step: arm the selected app (restart dwell) when the cursor is on a grid
-    /// item; disarm when it's on the headers row (headers don't fire).
+    /// item; disarm when it's on the band list (band titles don't fire).
     private func manageDwell() {
         armWork?.cancel(); armWork = nil
         if model.focus == .grid, model.selectedItem != nil {
@@ -370,23 +381,48 @@ final class LauncherOverlayController {
         let screen = screenUnderMouse() ?? NSScreen.main ?? NSScreen.screens.first
         guard let frame = screen?.visibleFrame else { return }
 
-        // Constant-width "Applications"-style container; height grows with the band's item count
-        // up to a few rows, then the grid scrolls. The Clipboard band and the AI preview canvas use
-        // their own (larger) master-detail-style metrics. Both axes are clamped to the screen.
+        // Master-detail shell: a left band-title list (only when there's more than one band) plus the
+        // right content pane (the icon grid, or the Clipboard band's larger metrics). Width is the band
+        // column + the content width; height is the taller of the two panes clamped to the window's
+        // min/max bounds, so switching bands never jitters the frame (each pane scrolls inside). The AI
+        // preview canvas is a full-surface replacement and keeps its own (larger) metrics. Both axes are
+        // clamped to the screen.
         let width: CGFloat
         let height: CGFloat
-        if model.currentBandIsClipboard || model.canvasActive {
+        if model.canvasActive {
+            // The canvas owns the whole surface (no band list) — unchanged sizing path.
             width = min(ClipboardBandLayout.containerWidth, frame.width - SwitcherLayout.sideMargin * 2)
             height = min(ClipboardBandLayout.containerHeight, frame.height - 100)
         } else {
-            width = min(LauncherGridLayout.containerWidth, frame.width - SwitcherLayout.sideMargin * 2)
-            let wanted = LauncherGridLayout.containerHeight(forItemCount: model.items.count)
+            // Content pane width: the Clipboard band's master-detail width, else the icon-grid width.
+            let contentWidth = model.currentBandIsClipboard
+                ? ClipboardBandLayout.containerWidth
+                : LauncherGridLayout.containerWidth
+            // The left band column (only when there's a choice of bands) is a fixed-width icon strip.
+            let bandColumn = model.bandCount > 1 ? LauncherGridLayout.bandColumnWidth : 0
+            width = min(bandColumn + contentWidth, frame.width - SwitcherLayout.sideMargin * 2)
+
+            // Height is driven solely by the active band's content — the icon grid's item rows, or the
+            // Clipboard band's taller detail pane — clamped to the window's min/max. The band-title list
+            // divides this same height evenly, so it never makes the window taller than the items do.
+            let wanted = model.currentBandIsClipboard
+                ? min(max(ClipboardBandLayout.containerHeight, LauncherGridLayout.minHeight), LauncherGridLayout.maxHeight)
+                : LauncherGridLayout.windowHeight(itemCount: model.items.count)
             height = min(wanted, frame.height - 100)
         }
 
-        let x = frame.minX + (frame.width - width) / 2
-        let y = frame.minY + (frame.height - height) * 0.62   // a little above centre
-        let rect = NSRect(x: x, y: y, width: width, height: height)
+        // Round to whole points so the window never gets a fractional frame the WindowServer would snap
+        // to a pixel boundary (the `* 0.62` anchor otherwise yields a fractional y).
+        let x = (frame.minX + (frame.width - width) / 2).rounded()
+        let y = (frame.minY + (frame.height - height) * 0.62).rounded()   // a little above centre
+        let rect = NSRect(x: x, y: y, width: width.rounded(), height: height.rounded())
+
+        // Skip a no-op re-fit: switching between same-size bands yields the same rect, and animating to a
+        // rect the window is already at makes the panel visibly twitch in place. Compare with a sub-point
+        // tolerance (a real resize differs by tens of points) so pixel-snap residue never re-triggers it.
+        let f = panel.frame
+        if abs(f.minX - rect.minX) < 1, abs(f.minY - rect.minY) < 1,
+           abs(f.width - rect.width) < 1, abs(f.height - rect.height) < 1 { return }
 
         if animated {
             NSAnimationContext.runAnimationGroup { ctx in

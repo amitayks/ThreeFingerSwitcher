@@ -2,8 +2,10 @@ import XCTest
 @testable import ThreeFingerSwitcherCore
 
 /// Tests the Clipboard band's repurposed navigation in `LauncherModel`: vertical scrubs entries,
-/// a RIGHT step pins the selected entry without moving the selection, and a LEFT step leaves to the
-/// previous band.
+/// a RIGHT step pins the selected entry without moving the selection, and a LEFT step crosses back to
+/// the **band list** (the Clipboard band stays active, so a vertical step from there reaches the
+/// previous band). Two bands are present, so the model lands on the band list — the Clipboard tests
+/// cross into its key list first with one rightward step.
 @MainActor
 final class ClipboardNavigationTests: XCTestCase {
 
@@ -14,8 +16,31 @@ final class ClipboardNavigationTests: XCTestCase {
                        fingerprint: "text:\(text)")
     }
 
-    /// A model with one normal band and a Clipboard band (last), entered on the Clipboard band.
+    /// A model with one normal band and a Clipboard band (last), entered on the Clipboard band's title.
+    /// Multi-band lands on the band list, so the Clipboard key list is reached with one RIGHT step.
     private func makeModel(clipCount: Int = 3) -> (LauncherModel, [ClipboardEntry]) {
+        let entries = (0..<clipCount).map { entry("clip\($0)") }
+        let clipItems = entries.map { LaunchItem(id: $0.id, title: $0.key, icon: .sfSymbol("doc"),
+                                                 kind: .clipboardEntry($0)) }
+        let favItems = [LaunchItem(title: "Fav", icon: .sfSymbol("star"),
+                                   kind: .url(URL(string: "https://example.com")!))]
+        let color = ItemColor(red: 0.5, green: 0.5, blue: 0.5)
+        let model = LauncherModel()
+        model.setBands([favItems, clipItems], names: ["Fav", "Clipboard"], colors: [color, color],
+                       startBand: 1, column: 0, clipboardBandIndex: 1)
+        // Cross into the Clipboard key list (right from the band list lands on entry 0).
+        model.stepHorizontal(1)
+        return (model, entries)
+    }
+
+    func testEntersClipboardBandOnTheBandList() {
+        let (model, _) = makeModelOnBandList()
+        XCTAssertTrue(model.currentBandIsClipboard)
+        XCTAssertEqual(model.focus, .bands, "multi-band lands on the band list, Clipboard title active")
+    }
+
+    /// The model immediately after `setBands`, before crossing into the key list.
+    private func makeModelOnBandList(clipCount: Int = 3) -> (LauncherModel, [ClipboardEntry]) {
         let entries = (0..<clipCount).map { entry("clip\($0)") }
         let clipItems = entries.map { LaunchItem(id: $0.id, title: $0.key, icon: .sfSymbol("doc"),
                                                  kind: .clipboardEntry($0)) }
@@ -28,10 +53,9 @@ final class ClipboardNavigationTests: XCTestCase {
         return (model, entries)
     }
 
-    func testEntersClipboardBandInGridFocus() {
+    func testRightCrossesIntoTheKeyList() {
         let (model, _) = makeModel()
-        XCTAssertTrue(model.currentBandIsClipboard)
-        XCTAssertEqual(model.focus, .grid)
+        XCTAssertEqual(model.focus, .grid, "right from the band list crosses into the key list")
         XCTAssertEqual(model.selectedIndex, 0)
     }
 
@@ -45,11 +69,12 @@ final class ClipboardNavigationTests: XCTestCase {
         XCTAssertEqual(model.selectedIndex, 1)
     }
 
-    func testVerticalUpAtTopRisesToHeaders() {
+    func testVerticalUpAtTopClampsInTheKeyList() {
         let (model, _) = makeModel()
         XCTAssertEqual(model.selectedIndex, 0)
-        model.stepVertical(1)    // up from the first row → headers
-        XCTAssertEqual(model.focus, .headers)
+        model.stepVertical(1)    // up from the first row → clamp (no rise to a header strip)
+        XCTAssertEqual(model.focus, .grid, "vertical up from the first entry stays in the key list")
+        XCTAssertEqual(model.selectedIndex, 0)
     }
 
     func testSmallHorizontalStepDoesNotPin() {
@@ -91,13 +116,13 @@ final class ClipboardNavigationTests: XCTestCase {
         XCTAssertFalse(model.isPinned(model.selectedItem!), "two deliberate flicks return to unpinned")
     }
 
-    func testDeliberateLeftFlickLeavesToPreviousBand() {
+    func testDeliberateLeftFlickReturnsToBandList() {
         let (model, _) = makeModel()
         model.clipboardPinStepThreshold = 3
-        for _ in 0..<3 { model.stepHorizontal(-1) }   // LEFT flick → previous band
-        XCTAssertEqual(model.currentBand, 0)
-        XCTAssertFalse(model.currentBandIsClipboard)
-        XCTAssertEqual(model.focus, .grid)
+        for _ in 0..<3 { model.stepHorizontal(-1) }   // LEFT flick → back to the band list (Clipboard stays active)
+        XCTAssertEqual(model.focus, .bands, "left from the key list crosses to the band list, not the previous band")
+        XCTAssertEqual(model.currentBand, 1, "the Clipboard band stays active (vertical from here reaches the previous band)")
+        XCTAssertTrue(model.currentBandIsClipboard)
     }
 
     func testVerticalDoesNotPin() {
@@ -110,13 +135,14 @@ final class ClipboardNavigationTests: XCTestCase {
     }
 
     func testNormalBandHorizontalStillStepsItems() {
-        // Regression: a normal multi-item band still moves the cursor horizontally.
+        // Regression: a normal single-band launcher still moves the cursor horizontally in the grid.
         let items = (0..<3).map { LaunchItem(title: "i\($0)", icon: .sfSymbol("a"),
                                              kind: .url(URL(string: "https://e\($0).com")!)) }
         let color = ItemColor(red: 0.5, green: 0.5, blue: 0.5)
         let model = LauncherModel()
         model.setBands([items], names: ["Fav"], colors: [color], startBand: 0, column: 0,
                        clipboardBandIndex: nil)
+        XCTAssertEqual(model.focus, .grid, "single band lands directly on the grid")
         model.stepHorizontal(1)
         XCTAssertEqual(model.selectedIndex, 1)
     }

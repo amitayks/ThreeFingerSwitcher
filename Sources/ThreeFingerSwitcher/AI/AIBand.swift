@@ -12,6 +12,8 @@ enum AIBand {
     static let bandID = UUID(uuidString: "A1C0AAAA-0000-4000-8000-000000000001")!
     static let name = "AI"
     static let color = ItemColor(red: 0.55, green: 0.40, blue: 0.92)
+    /// The "AI" band's default launcher icon (the band list shows icons, not names).
+    static let icon: ItemIcon = .sfSymbol("wand.and.stars")
 
     /// One `.aiCommand` band item for a command. The item's id mirrors the command id (stable SwiftUI
     /// identity + the executor keys on it), and its title/icon/tint mirror the command for rendering.
@@ -22,7 +24,7 @@ enum AIBand {
 
     /// Build the "AI" band from a list of commands (used by seeding + migration).
     static func band(from commands: [AICommand]) -> ContextBand {
-        ContextBand(id: bandID, name: name, color: color, items: commands.map(item(for:)))
+        ContextBand(id: bandID, name: name, color: color, icon: icon, items: commands.map(item(for:)))
     }
 
     /// True for a band carrying the AI sentinel id (used by the migration's idempotency check).

@@ -91,11 +91,12 @@ private struct SourcesSidebar: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 4) {
             Text("Add to").font(.caption).foregroundStyle(.secondary)
-            HStack(spacing: 6) {
-                if let band = targetBand { Circle().fill(Color(band.color)).frame(width: 10, height: 10) }
-                Text(targetBand?.name ?? "—").font(.headline)
+            if let band = targetBand {
+                BandIconView(band: band, size: 24)
+            } else {
+                Text("—").font(.headline)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -392,7 +393,8 @@ private struct AICommandSource: View {
     private func addCategoryAsBand(_ category: AICommandCatalog.Category) {
         let items = AICommandCatalog.commands(in: category)
             .map { AIBand.item(for: AICommandCatalog.copy(of: $0)) }
-        let band = ContextBand(name: category.title, color: category.tint, items: items)
+        let band = ContextBand(name: category.title, color: category.tint,
+                               icon: .sfSymbol(category.sfSymbol), items: items)
         store.mutate { $0.bands.append(band) }
     }
 
@@ -491,9 +493,8 @@ private struct BandRow: View {
     let band: ContextBand
     let onDelete: () -> Void
     var body: some View {
-        HStack(spacing: 8) {
-            Circle().fill(Color(band.color)).frame(width: 12, height: 12)
-            Text(band.name)
+        HStack(spacing: 10) {
+            BandIconView(band: band, size: 20)
             Spacer()
             Text("\(band.items.count)").font(.caption).foregroundStyle(.secondary)
             Button(action: onDelete) { Image(systemName: "trash") }
@@ -631,17 +632,17 @@ private struct ItemReorderDrop: DropDelegate {
 private struct BandInspector: View {
     @ObservedObject var store: FavoritesStore
     let band: ContextBand
-    @State private var name: String
-
-    init(store: FavoritesStore, band: ContextBand) {
-        self.store = store; self.band = band
-        _name = State(initialValue: band.name)
-    }
 
     var body: some View {
         Form {
-            TextField("Band name", text: $name)
-                .onChange(of: name) { store.updateBand(band.id) { $0.name = name } }
+            // A band is identified by its ICON, not a name (the launcher shows icons only). Reuses the
+            // item icon picker; the band's own Color below tints it, so the per-icon tint is hidden.
+            AppearanceEditor(
+                icon: Binding(get: { band.resolvedIcon },
+                              set: { ic in store.updateBand(band.id) { $0.icon = ic } }),
+                tint: .constant(nil),
+                naturalIcon: nil,
+                showTint: false)
             ColorPicker("Color", selection: Binding(
                 get: { Color(band.color) },
                 set: { newColor in store.updateBand(band.id) { $0.color = ItemColor(newColor) } }))
@@ -653,7 +654,7 @@ private struct BandInspector: View {
             Text(strategyHelp(band.defaultAppStrategy)).font(.caption).foregroundStyle(.secondary)
         }
         .formStyle(.grouped)
-        .frame(height: 168)
+        .frame(height: 230)
     }
 }
 
@@ -738,9 +739,22 @@ private struct ItemInspector: View {
         if !others.isEmpty {
             Menu("Move to band") {
                 ForEach(others) { b in
-                    Button(b.name) { store.moveItem(item.id, fromBand: bandID, toBand: b.id) }
+                    Button { store.moveItem(item.id, fromBand: bandID, toBand: b.id) } label: {
+                        // Bands are icon-only — show the destination band's icon (+ color) in the menu.
+                        Label { Text(b.name) } icon: { bandMenuGlyph(b) }
+                    }
                 }
             }
+        }
+    }
+
+    /// The destination band's icon for the "Move to band" menu (bands are shown by icon, not name).
+    @ViewBuilder
+    private func bandMenuGlyph(_ b: ContextBand) -> some View {
+        switch b.resolvedIcon {
+        case .sfSymbol(let n): Image(systemName: n)
+        case .emoji(let g): Text(g)
+        case .appDefault, .fileIcon: Image(systemName: "square.grid.2x2.fill")
         }
     }
 
@@ -1072,6 +1086,8 @@ private struct AppearanceEditor: View {
     @Binding var icon: ItemIcon
     @Binding var tint: ItemColor?
     let naturalIcon: ItemIcon?
+    /// When false, the per-icon Tint picker is hidden (e.g. a band, which already has its own color).
+    var showTint: Bool = true
 
     private enum Mode: Hashable { case auto, symbol, emoji }
 
@@ -1094,9 +1110,11 @@ private struct AppearanceEditor: View {
         } else if case .emoji = icon {
             EmojiPickerRow(icon: $icon)
         }
-        ColorPicker("Tint", selection: Binding(
-            get: { tint.map(Color.init) ?? .accentColor },
-            set: { tint = ItemColor($0) }))
+        if showTint {
+            ColorPicker("Tint", selection: Binding(
+                get: { tint.map(Color.init) ?? .accentColor },
+                set: { tint = ItemColor($0) }))
+        }
     }
 
     private func setMode(_ m: Mode) {
@@ -1252,6 +1270,27 @@ let curatedEmojis: [String] = [
 ]
 
 // MARK: - Shared rendering helpers
+
+/// Renders a band's icon (SF Symbol / emoji) tinted by its color — used wherever a band is shown by
+/// icon in the Hub (the band list, the "Add to" header). Bands carry only an icon, not a name.
+private struct BandIconView: View {
+    let band: ContextBand
+    var size: CGFloat = 18
+
+    var body: some View {
+        switch band.resolvedIcon {
+        case .sfSymbol(let n):
+            Image(systemName: n).resizable().scaledToFit()
+                .foregroundStyle(Color(band.color))
+                .frame(width: size, height: size)
+        case .emoji(let g):
+            Text(g).font(.system(size: size * 0.9)).frame(width: size, height: size)
+        case .appDefault, .fileIcon:
+            Image(systemName: "square.grid.2x2.fill").resizable().scaledToFit()
+                .foregroundStyle(Color(band.color)).frame(width: size, height: size)
+        }
+    }
+}
 
 /// Renders a `LaunchItem`'s icon (app icon / file icon / SF Symbol / emoji), mirroring the launcher.
 struct LaunchItemIconView: View {

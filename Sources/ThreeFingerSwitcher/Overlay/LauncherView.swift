@@ -8,10 +8,12 @@ extension Color {
     }
 }
 
-/// The launcher HUD, styled like the macOS "Applications" grid: one big rounded container with
-/// category tabs across the top and the current band's items in a multi-column grid that scrolls
-/// vertically on overflow. The cursor is 2D and can rise onto the headers row (see `LauncherModel`).
-/// The selection is a single Liquid Glass square that darkens over the dwell, then arms (haptic).
+/// The launcher HUD, styled like the macOS "Applications" grid: one big rounded container whose bands
+/// render as a **vertical title list on the left** and the active band's items as a multi-column grid
+/// on the **right** that scrolls vertically on overflow. The cursor is 2D — `.bands` (the left list)
+/// or `.grid` (see `LauncherModel`); vertical switches the band on the list, horizontal crosses
+/// between the list and the grid. The selection is a single Liquid Glass square that darkens over the
+/// dwell, then arms (haptic).
 struct LauncherView: View {
     @ObservedObject var model: LauncherModel
     /// The AI command executor whose streaming state the preview canvas observes (nil when AI commands
@@ -26,19 +28,25 @@ struct LauncherView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // The AI streaming preview canvas replaces the grid/headers entirely while it is open
-            // (an AI command was fired and is generating / awaiting commit). Everything else is the
-            // unchanged grid + Clipboard band.
+        Group {
+            // The AI streaming preview canvas replaces the whole surface while it is open (an AI command
+            // was fired and is generating / awaiting commit) — no band list alongside it. Everything
+            // else is the master-detail shell: the band list on the left, the content on the right.
             if model.canvasActive {
                 canvas
             } else {
-                tabs
-                Divider().opacity(0.35)
-                if model.currentBandIsClipboard {
-                    ClipboardBandView(model: model)
-                } else {
-                    grid
+                HStack(spacing: 0) {
+                    // The left band-title list only exists when there's more than one band to choose
+                    // between; a single band shows just its content (lands on `.grid`, item 0).
+                    if model.bandCount > 1 {
+                        bandList
+                    }
+                    // The right pane: the Clipboard band's master-detail, else the icon grid.
+                    if model.currentBandIsClipboard {
+                        ClipboardBandView(model: model)
+                    } else {
+                        grid
+                    }
                 }
             }
         }
@@ -62,42 +70,65 @@ struct LauncherView: View {
         }
     }
 
-    // MARK: Category tabs (the headers row)
+    // MARK: Band icon list (the left column)
 
-    private var tabs: some View {
-        HStack(spacing: 10) {
+    /// The vertical list of band **icons** on the left, at a fixed small spacing and centered in the
+    /// column (not spread). Only the highlighted (active) band's icon shows its band color; the rest are
+    /// colorless until selected. The hidden band name is exposed as a tooltip for discoverability.
+    private var bandList: some View {
+        VStack(spacing: LauncherGridLayout.bandRowSpacing) {
             ForEach(Array(model.bandNames.enumerated()), id: \.offset) { idx, name in
-                headerPill(idx: idx, name: name)
+                bandIcon(idx: idx).help(name)
             }
         }
-        .frame(height: LauncherGridLayout.tabsHeight - LauncherGridLayout.containerPadding,
-               alignment: .center)
-        .frame(maxWidth: .infinity, alignment: .center)
+        .frame(width: LauncherGridLayout.bandColumnWidth - LauncherGridLayout.containerPadding)
+        .frame(maxHeight: .infinity, alignment: .center)
     }
 
     @ViewBuilder
-    private func headerPill(idx: Int, name: String) -> some View {
-        let isCursor = (model.focus == .headers && idx == model.currentBand)   // cursor on the headers
-        let isActive = (idx == model.currentBand)                              // whose grid is shown
-        Text(name)
-            .font(.system(size: 14, weight: isActive ? .semibold : .regular))
-            .foregroundStyle(isActive ? .primary : .secondary)
-            .padding(.horizontal, 14).padding(.vertical, 6)
-            .background(headerBackground(isCursor: isCursor))
-            .scaleEffect(isCursor ? 1.05 : 1.0)
-            .animation(.easeOut(duration: 0.12), value: isCursor)
+    private func bandIcon(idx: Int) -> some View {
+        let isActive = (idx == model.currentBand)                            // whose content is shown
+        let isCursor = (model.focus == .bands && idx == model.currentBand)   // cursor on the band list
+        let color = model.bandColors.indices.contains(idx)
+            ? Color(model.bandColors[idx]) : Color(model.currentBandColor)
+        ZStack {
+            bandIconBackground(isCursor: isCursor)
+            bandIconGlyph(idx: idx, active: isActive, color: color)
+                .frame(width: LauncherGridLayout.bandIconSize, height: LauncherGridLayout.bandIconSize)
+        }
+        .frame(width: LauncherGridLayout.bandIconSize + 18, height: LauncherGridLayout.bandIconSize + 18)
+        .scaleEffect(isCursor ? 1.08 : 1.0)
+        .animation(.easeOut(duration: 0.12), value: isCursor)
     }
 
-    /// Every category pill shares one neutral background (the band's color lives on its items, not
-    /// here). Only the pill being highlighted to select it (cursor on the headers) brightens — the
-    /// active band is distinguished by its bolder, brighter text instead.
+    /// Render a band's icon. The active band shows its band color; inactive bands are colorless (a
+    /// secondary tint for symbols, dimmed for emoji, which can't be desaturated) so color marks the
+    /// current band.
     @ViewBuilder
-    private func headerBackground(isCursor: Bool) -> some View {
-        let shape = Capsule(style: .continuous)
+    private func bandIconGlyph(idx: Int, active: Bool, color: Color) -> some View {
+        let icon = model.bandIcons.indices.contains(idx) ? model.bandIcons[idx] : .sfSymbol("square.grid.2x2.fill")
+        switch icon {
+        case .sfSymbol(let name):
+            Image(systemName: name).resizable().scaledToFit()
+                .foregroundStyle(active ? color : Color.secondary)
+        case .emoji(let glyph):
+            Text(glyph).font(.system(size: LauncherGridLayout.bandIconSize * 0.92))
+                .opacity(active ? 1 : 0.45)
+        case .appDefault, .fileIcon:
+            // Bands don't use app/file icons; fall back to a neutral symbol.
+            Image(systemName: "square.grid.2x2.fill").resizable().scaledToFit()
+                .foregroundStyle(active ? color : Color.secondary)
+        }
+    }
+
+    /// Only the icon under the cursor (on the band list) gets a subtle backing; the rest are bare.
+    @ViewBuilder
+    private func bandIconBackground(isCursor: Bool) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
         if #available(macOS 26.0, *), isCursor {
             Color.clear.glassEffect(.regular, in: shape)
         } else {
-            shape.fill(Color.white.opacity(isCursor ? 0.26 : 0.07))
+            shape.fill(Color.white.opacity(isCursor ? 0.22 : 0.0))
         }
     }
 
@@ -112,7 +143,7 @@ struct LauncherView: View {
                             .id(item.id)
                     }
                 }
-                .padding(.top, 14)
+                .padding(.top, LauncherGridLayout.gridTopInset)
             }
             .onChange(of: model.selectedIndex) { scroll(proxy) }
             .onChange(of: model.focus) { scroll(proxy) }

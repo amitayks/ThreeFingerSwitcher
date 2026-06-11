@@ -629,16 +629,19 @@ final class AppCoordinator: GestureRecognizerDelegate {
 
     func launcherDidStepItem(_ direction: Int) {
         guard launcherOverlay.isVisible else { return }
-        launcherOverlay.stepHorizontal(direction)   // grid cursor / batch switch (on the headers row)
+        launcherOverlay.stepHorizontal(direction)   // grid cursor / cross between band list and grid
     }
 
     func launcherDidStepContext(_ direction: Int) {
         guard launcherOverlay.isVisible else { return }
-        launcherOverlay.stepVertical(direction)      // grid rows / rise onto the headers row
+        launcherOverlay.stepVertical(direction)      // band switch (on the band list) / grid rows
     }
 
-    func launcherFocusIsOnHeaders() -> Bool {
-        launcherOverlay.isVisible && launcherOverlay.focusIsOnHeaders
+    /// The cursor is on the band list (left title column), where the coarse band-step applies to the
+    /// VERTICAL axis. Lets the recognizer use the coarser context-step for vertical band switching and
+    /// the finer item-step everywhere else.
+    func launcherFocusIsOnBandList() -> Bool {
+        launcherOverlay.isVisible && launcherOverlay.focusIsOnBandList
     }
 
     func launcherDidEnd() {
