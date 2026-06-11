@@ -146,6 +146,37 @@ final class AppSettings: ObservableObject {
     /// ON; gated behind the AI opt-in like the other AI prefs.
     @Published var aiReasoningEnabled: Bool { didSet { defaults.set(aiReasoningEnabled, forKey: Keys.aiReasoningEnabled) } }
 
+    // MARK: - Per-app keyboard language (opt-in; default OFF)
+
+    /// Opt-in to remembering and re-selecting the keyboard input source per application (bundle id),
+    /// auto-learned from the user's own changes. Unlike the gesture opt-ins this relocates NO native
+    /// gesture and needs NO re-login. While OFF the service registers no observers and performs no TIS
+    /// reads or writes (lifecycle-gated). Default OFF — set only via explicit consent.
+    /// Older settings that predate this feature have no key and decode with the opt-in OFF.
+    @Published var keyboardLanguageEnabled: Bool { didSet { defaults.set(keyboardLanguageEnabled, forKey: Keys.keyboardLanguageEnabled) } }
+
+    /// The user-chosen global default input-source id applied to apps with no remembered source, or ""
+    /// for "no global default" (pure learn-as-you-go — nothing is applied to unseen apps). Stored as an
+    /// `kTISPropertyInputSourceID` string; empty encodes the unset state, so older settings (and a
+    /// never-chosen default) read back identically.
+    @Published var keyboardLanguageDefaultSourceID: String { didSet { defaults.set(keyboardLanguageDefaultSourceID, forKey: Keys.keyboardLanguageDefaultSourceID) } }
+
+    /// Opt-in sub-toggle of the per-app feature: also remember/apply the input source per active-tab
+    /// *host* inside supported browsers (so `keep.google.com` and `mail.google.com` keep separate
+    /// languages in the same Chrome process), reusing the same string-keyed store with richer keys.
+    /// Relocates NO native gesture and needs NO re-login. While OFF the browser-context monitor never
+    /// runs and browsers behave exactly per-app. Requires `keyboardLanguageEnabled` to be ON to have
+    /// any effect. Default OFF — set only via explicit consent. Older settings have no key and decode
+    /// with the sub-toggle OFF.
+    @Published var keyboardLanguagePerSiteEnabled: Bool { didSet { defaults.set(keyboardLanguagePerSiteEnabled, forKey: Keys.keyboardLanguagePerSiteEnabled) } }
+
+    /// Opt-in to the Apple Events host reader for exact per-host precision everywhere (including Safari,
+    /// whose address bar hides the subdomain from the default Accessibility reader). When OFF the
+    /// feature uses the Accessibility reader only (no new permission); when ON the first read triggers
+    /// the per-browser Automation permission prompt, and a denied/undetermined grant degrades silently
+    /// back to Accessibility. Default OFF — set only via explicit consent. Older settings decode OFF.
+    @Published var keyboardLanguageAllowBrowserControl: Bool { didSet { defaults.set(keyboardLanguageAllowBrowserControl, forKey: Keys.keyboardLanguageAllowBrowserControl) } }
+
     /// The language last chosen for `commandID`, or nil if none has been chosen yet (cold start).
     func rememberedLanguage(for commandID: UUID) -> String? { aiCommandLanguages[commandID.uuidString] }
 
@@ -204,6 +235,10 @@ final class AppSettings: ObservableObject {
         aiSelectedModelID = defaults.object(forKey: Keys.aiSelectedModelID) as? String ?? Defaults.aiSelectedModelID
         aiCommandLanguages = defaults.object(forKey: Keys.aiCommandLanguages) as? [String: String] ?? Defaults.aiCommandLanguages
         aiReasoningEnabled = defaults.object(forKey: Keys.aiReasoningEnabled) as? Bool ?? Defaults.aiReasoningEnabled
+        keyboardLanguageEnabled = defaults.object(forKey: Keys.keyboardLanguageEnabled) as? Bool ?? Defaults.keyboardLanguageEnabled
+        keyboardLanguageDefaultSourceID = defaults.object(forKey: Keys.keyboardLanguageDefaultSourceID) as? String ?? Defaults.keyboardLanguageDefaultSourceID
+        keyboardLanguagePerSiteEnabled = defaults.object(forKey: Keys.keyboardLanguagePerSiteEnabled) as? Bool ?? Defaults.keyboardLanguagePerSiteEnabled
+        keyboardLanguageAllowBrowserControl = defaults.object(forKey: Keys.keyboardLanguageAllowBrowserControl) as? Bool ?? Defaults.keyboardLanguageAllowBrowserControl
     }
 
     func resetToDefaults() {
@@ -236,6 +271,10 @@ final class AppSettings: ObservableObject {
         // `aiCommandsEnabled` (a consent-gated opt-in that allows a multi-gigabyte download) and the
         // selected-model pin are a deliberate user choice, so they're intentionally NOT reset — mirrors
         // the launcher / clipboard opt-in handling.
+        // `keyboardLanguageEnabled` and the global-default source id are likewise an opt-in user choice
+        // (the learned per-app map is a separate store), so they're intentionally NOT reset either.
+        // The per-site sub-toggle and the Apple Events ("Allow browser control") opt-in are the same:
+        // consent-gated user choices (the latter governs a per-browser permission), NOT reset here.
     }
 
     private func persist(_ value: Double, _ key: String) { defaults.set(value, forKey: key) }
@@ -273,6 +312,10 @@ final class AppSettings: ObservableObject {
         static let aiSelectedModelID: String? = nil  // nil = registry default model
         static let aiCommandLanguages: [String: String] = [:]  // per-command remembered runtime language
         static let aiReasoningEnabled = true       // let the model think (filtered out of the result); gated by the AI opt-in
+        static let keyboardLanguageEnabled = false // opt-in; gates per-app input-source learn/apply (no re-login)
+        static let keyboardLanguageDefaultSourceID = ""  // "" = no global default (pure learn-as-you-go)
+        static let keyboardLanguagePerSiteEnabled = false        // opt-in sub-toggle; per-host memory inside browsers
+        static let keyboardLanguageAllowBrowserControl = false   // opt-in; Apple Events host reader (per-browser permission)
     }
 
     private enum Keys {
@@ -309,5 +352,9 @@ final class AppSettings: ObservableObject {
         static let aiSelectedModelID = "aiSelectedModelID"
         static let aiCommandLanguages = "aiCommandLanguages"
         static let aiReasoningEnabled = "aiReasoningEnabled"
+        static let keyboardLanguageEnabled = "keyboardLanguageEnabled"
+        static let keyboardLanguageDefaultSourceID = "keyboardLanguageDefaultSourceID"
+        static let keyboardLanguagePerSiteEnabled = "keyboardLanguagePerSiteEnabled"
+        static let keyboardLanguageAllowBrowserControl = "keyboardLanguageAllowBrowserControl"
     }
 }

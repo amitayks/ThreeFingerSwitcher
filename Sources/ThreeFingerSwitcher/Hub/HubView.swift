@@ -6,7 +6,7 @@ import AppKit
 enum HubDestination: Hashable, CaseIterable {
     case overview
     case bands
-    case switcher, spaces, launcher, clipboard, ai
+    case switcher, spaces, launcher, clipboard, ai, keyboardLanguage
     case setup, general
 
     var title: String {
@@ -18,6 +18,7 @@ enum HubDestination: Hashable, CaseIterable {
         case .launcher: return "Launcher"
         case .clipboard: return "Clipboard"
         case .ai: return "AI Commands"
+        case .keyboardLanguage: return "Keyboard Language"
         case .setup: return "Setup & Permissions"
         case .general: return "General"
         }
@@ -28,6 +29,7 @@ enum HubDestination: Hashable, CaseIterable {
         switch self {
         case .switcher: return "Switcher"
         case .ai: return "AI"
+        case .keyboardLanguage: return "Language"
         case .setup: return "Setup"
         default: return title
         }
@@ -42,6 +44,7 @@ enum HubDestination: Hashable, CaseIterable {
         case .launcher: return "square.grid.3x3.fill"
         case .clipboard: return "doc.on.clipboard"
         case .ai: return "sparkles"
+        case .keyboardLanguage: return "globe"
         case .setup: return "gearshape.2"
         case .general: return "slider.horizontal.3"
         }
@@ -72,6 +75,11 @@ final class HubContext {
 
     // AI feature page.
     var onDownloadModel: () -> Void = {}
+
+    // Keyboard Language feature page — the picker's source list (read fresh on each render). Provided by
+    // the coordinator so the page never imports Carbon directly (the list comes from the service's
+    // `InputSourceController`).
+    var enabledInputSources: () -> [(id: String, name: String)] = { [] }
 
     // Setup page — actions.
     var onSetupNativeGesture: () -> Void = {}
@@ -141,7 +149,7 @@ struct HubView: View {
                 row(.bands)
             }
             Section("Features") {
-                row(.switcher); row(.spaces); row(.launcher); row(.clipboard); row(.ai)
+                row(.switcher); row(.spaces); row(.launcher); row(.clipboard); row(.ai); row(.keyboardLanguage)
             }
             Section("System") {
                 row(.setup); row(.general)
@@ -166,6 +174,7 @@ struct HubView: View {
         case .launcher: LauncherPage(settings: context.settings)
         case .clipboard: ClipboardPage(context: context)
         case .ai: AIPage(context: context)
+        case .keyboardLanguage: KeyboardLanguagePage(context: context)
         case .setup: SetupPage(context: context)
         case .general: GeneralPage(context: context)
         }

@@ -92,6 +92,49 @@ final class AppCoordinator: GestureRecognizerDelegate {
         reasoning: { [weak self] in self?.settings.aiReasoningEnabled ?? false }
     )
 
+    // Per-app keyboard language (opt-in; remembers and re-selects the input source per app/site). Gated
+    // on its OWN toggle, independent of the switcher master enable. The store holds the learned
+    // context-key → source map; the service ties it to the pure policy and the Carbon
+    // `InputSourceController` seam. The `ContextResolver` maps the frontmost app to that context key
+    // (a bundle id, or `bundleID|host` for a supported browser when the per-site sub-toggle is on); the
+    // service learns/applies against whatever key it returns (design D1).
+    private let keyboardLanguageStore = KeyboardLanguageStore.shared
+    private lazy var keyboardLanguageContextResolver = ContextResolver(
+        // The active host reader: Apple Events (exact per-host, incl. Safari) when "allow browser control"
+        // is on, else Accessibility (no new permission). Swapped in place when that opt-in flips (see
+        // `observeKeyboardLanguagePerSiteToggle`). Read once here for the initial provider.
+        hostProvider: settings.keyboardLanguageAllowBrowserControl
+            ? AppleEventsHostProvider() : AXHostProvider(),
+        // Read the per-site sub-toggle live (a closure, not a captured bool) so flipping it takes effect on
+        // the very next resolution. Off ⇒ every app — browsers included — resolves to its bundle id, so the
+        // per-app path stays byte-for-byte the established behavior.
+        perSiteEnabled: { [weak self] in self?.settings.keyboardLanguagePerSiteEnabled ?? false }
+    )
+
+    /// The within-browser host-change signal (design D4): while a supported browser is frontmost it ticks
+    /// and nudges the service to re-resolve its context, so a mid-tab host change is handled exactly like
+    /// an app switch (which emits no `didActivateApplication`). Gated on BOTH the master keyboard-language
+    /// toggle AND the per-site sub-toggle; fully inert otherwise.
+    private lazy var keyboardLanguageBrowserMonitor = BrowserContextMonitor(
+        isSupportedBrowserFront: {
+            BrowserRegistry.isSupported(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "")
+        },
+        onTick: { [weak self] in self?.keyboardLanguageService.reevaluate() }
+    )
+    private lazy var keyboardLanguageService = KeyboardLanguageService(
+        store: keyboardLanguageStore,
+        controller: CarbonInputSourceController(),
+        globalDefault: { [weak self] in
+            // Normalize the picker's "None" (empty string) to nil so an unset default reads as "no default".
+            let value = self?.settings.keyboardLanguageDefaultSourceID
+            return (value?.isEmpty == false) ? value : nil
+        },
+        currentContextID: { [weak self] in
+            self?.keyboardLanguageContextResolver.contextID(
+                forFrontmost: NSWorkspace.shared.frontmostApplication?.bundleIdentifier)
+        }
+    )
+
     /// Whether the app currently has Mission Control open (it triggers MC itself via the vertical
     /// gesture). Lets the switcher float above MC and a commit dismiss it before raising.
     private var missionControlOpen = false
@@ -178,6 +221,9 @@ final class AppCoordinator: GestureRecognizerDelegate {
         observeLauncherToggle()
         observeClipboardToggle()
         observeAICommandsToggle()
+        observeKeyboardLanguageToggle()
+        observeKeyboardLanguagePerSiteToggle()
+        observeKeyboardLanguageBrowserControlToggle()
         reconcileAIModelAtLaunch()
     }
 
@@ -229,6 +275,11 @@ final class AppCoordinator: GestureRecognizerDelegate {
         applyVerticalGestureOnLaunchIfManaged()
         applyLauncherGestureOnLaunchIfManaged()
         if settings.enabled { enable() }
+        // Per-app keyboard language is gated ONLY on its own toggle, independent of the switcher master
+        // enable above — it observes app activations / input-source changes regardless (design D9).
+        if settings.keyboardLanguageEnabled { keyboardLanguageService.start() }
+        // The within-browser host-change poll is gated on the master toggle AND the per-site sub-toggle.
+        refreshKeyboardLanguageBrowserMonitor()
         refreshRowSwitchingGate()
         refreshClipboardMonitor()
         maybePromptNativeGestureSetup()
@@ -698,6 +749,71 @@ final class AppCoordinator: GestureRecognizerDelegate {
     private func reconcileAIModelAtLaunch() {
         guard settings.aiCommandsEnabled else { return }
         modelManager.reconcileWithDisk()
+    }
+
+    // MARK: - Keyboard language opt-in lifecycle
+
+    /// React to the "Remember the keyboard language per app" toggle: start/stop the service so its
+    /// activation and input-source observers exist only while the feature is on (design D9 — fully inert
+    /// when off). Gated solely on this toggle, independent of the switcher master enable. Uses the
+    /// EMITTED value, not a re-read (the `@Published` willSet would still report the OLD value here —
+    /// same reason the gesture and clipboard toggles pass `on` through).
+    private func observeKeyboardLanguageToggle() {
+        settings.$keyboardLanguageEnabled
+            .dropFirst()
+            .sink { [weak self] on in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    if on { self.keyboardLanguageService.start() } else { self.keyboardLanguageService.stop() }
+                    // Stopping the per-app feature must stop the within-browser poll too (and starting it
+                    // re-arms the poll if the per-site sub-toggle is also on).
+                    self.refreshKeyboardLanguageBrowserMonitor()
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    /// React to the "Per-site language in browsers" sub-toggle: start/stop the within-browser host-change
+    /// poll to match (it is gated on this AND the master toggle). The resolver reads `perSiteEnabled` live,
+    /// so the toggle takes effect on the next resolution without re-wiring — this only governs the poll
+    /// lifecycle. Mirrors `observeClipboardToggle`: uses the EMITTED value, not a re-read (the `@Published`
+    /// willSet would still report the OLD value here).
+    private func observeKeyboardLanguagePerSiteToggle() {
+        settings.$keyboardLanguagePerSiteEnabled
+            .dropFirst()
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshKeyboardLanguageBrowserMonitor() }
+            }
+            .store(in: &cancellables)
+    }
+
+    /// React to the "Allow browser control" opt-in: swap the resolver's host reader in place — Apple Events
+    /// (exact per-host, incl. Safari) when on, Accessibility (no new permission) when off — without
+    /// rebuilding the resolver or the service it feeds (design D3/D8). No permission pre-prompt: the Apple
+    /// Events reader triggers the OS Automation prompt lazily on its first read and degrades to AX (nil →
+    /// app-level) until granted (6.3). Uses the EMITTED value.
+    private func observeKeyboardLanguageBrowserControlToggle() {
+        settings.$keyboardLanguageAllowBrowserControl
+            .dropFirst()
+            .sink { [weak self] on in
+                MainActor.assumeIsolated {
+                    self?.keyboardLanguageContextResolver.hostProvider =
+                        on ? AppleEventsHostProvider() : AXHostProvider()
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    /// Start the within-browser host-change poll only while BOTH the master keyboard-language toggle and
+    /// the per-site sub-toggle are on; otherwise stop it (it then holds no timer and is fully inert). The
+    /// per-app activation path is independent of this monitor, so plain app switches keep working whether
+    /// or not the poll runs. Called at launch and from the two relevant toggle observers.
+    private func refreshKeyboardLanguageBrowserMonitor() {
+        if settings.keyboardLanguageEnabled && settings.keyboardLanguagePerSiteEnabled {
+            keyboardLanguageBrowserMonitor.start()
+        } else {
+            keyboardLanguageBrowserMonitor.stop()
+        }
     }
 
     /// Begin (or retry) the on-device model download from Settings. Gated on the opt-in by the manager
@@ -1205,6 +1321,9 @@ final class AppCoordinator: GestureRecognizerDelegate {
         ctx.onClearClipboard = { [weak self] includingPinned in self?.clipboardStore.clear(includingPinned: includingPinned) }
         // AI.
         ctx.onDownloadModel = { [weak self] in self?.downloadAIModel() }
+        // Keyboard Language — the picker's source list (forwarded from the service's controller seam so
+        // the page never imports Carbon).
+        ctx.enabledInputSources = { [weak self] in self?.keyboardLanguageService.controllerEnabledSources() ?? [] }
         // Setup — actions.
         ctx.onSetupNativeGesture = { [weak self] in self?.promptNativeGestureSetup() }
         ctx.onRestoreNativeGesture = { [weak self] in self?.restoreNativeGestureSetting() }

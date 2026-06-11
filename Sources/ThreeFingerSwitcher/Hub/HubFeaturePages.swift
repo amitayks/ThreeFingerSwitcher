@@ -224,6 +224,100 @@ struct AIPage: View {
     }
 }
 
+// MARK: - Keyboard Language
+
+struct KeyboardLanguagePage: View {
+    let context: HubContext
+    @ObservedObject private var settings: AppSettings
+    /// The live per-app/per-site memory. Observed so the "Saved sites" list updates the moment the engine
+    /// learns a site — it's the same shared store the coordinator's service writes to.
+    @ObservedObject private var keyboardStore = KeyboardLanguageStore.shared
+
+    init(context: HubContext) {
+        self.context = context
+        _settings = ObservedObject(wrappedValue: context.settings)
+    }
+
+    var body: some View {
+        HubPage(HubDestination.keyboardLanguage.title,
+                subtitle: "Remember and auto-switch the keyboard language per app.") {
+            HubSection(footnote: "Learns the keyboard input source you use in each app and re-selects it automatically when that app comes to the front — no manual setup. The language is remembered per app, learned from your own changes. No new permission or logout needed. Off by default.") {
+                ToggleRow(title: "Remember the keyboard language per app", isOn: $settings.keyboardLanguageEnabled)
+            }
+            HubSection("Default for new apps",
+                       footnote: "Applied to apps with no remembered language. Choose “None” to leave the current language untouched and learn from your next change.") {
+                Picker("Default for new apps", selection: $settings.keyboardLanguageDefaultSourceID) {
+                    Text("None").tag("")
+                    ForEach(context.enabledInputSources(), id: \.id) { source in
+                        Text(source.name).tag(source.id)
+                    }
+                }
+                .disabled(!settings.keyboardLanguageEnabled)
+            }
+            HubSection("In browsers") {
+                ToggleRow(title: "Per-site language in browsers",
+                          isOn: $settings.keyboardLanguagePerSiteEnabled,
+                          caption: "Remembers the language per website. Works at host level on Chrome/Chromium; on Safari it’s domain-level until browser control is on.")
+                    .disabled(!settings.keyboardLanguageEnabled)
+                ToggleRow(title: "Allow browser control (exact per-site, incl. Safari)",
+                          isOn: $settings.keyboardLanguageAllowBrowserControl,
+                          caption: "Asks macOS for permission to read your browser’s current address via Automation; off ⇒ uses Accessibility only.")
+                    .disabled(!settings.keyboardLanguagePerSiteEnabled)
+            }
+            if settings.keyboardLanguagePerSiteEnabled {
+                savedSitesSection
+            }
+        }
+    }
+
+    /// The saved-sites list — every website you've set a specific language on (only ones you actively
+    /// changed, not every site visited), each editable inline or removable. Doubles as a check that the
+    /// in-browser detection is catching hosts: if it stays empty after you change a site's language, the
+    /// address isn't being read (turn on "Allow browser control", especially for Safari).
+    private var savedSitesSection: some View {
+        HubSection("Saved sites",
+                   footnote: "Sites you've set a specific language on — only ones you actively changed, not every site you visit. Change the language inline, or remove an entry. If this stays empty after you change a site's keyboard language, your browser's address isn't being read; turn on “Allow browser control” above (required for Safari).") {
+            let entries = keyboardStore.siteEntries()
+            if entries.isEmpty {
+                Text("No sites saved yet. In a supported browser, change the keyboard language while on a site and it'll appear here.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ForEach(entries) { entry in
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(entry.host).font(.callout)
+                            Text(entry.browserName).font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 8)
+                        Picker("", selection: sourceBinding(forKey: entry.key, fallback: entry.source)) {
+                            ForEach(context.enabledInputSources(), id: \.id) { source in
+                                Text(source.name).tag(source.id)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(maxWidth: 180)
+                        Button { keyboardStore.removeSource(forBundleID: entry.key) } label: {
+                            Image(systemName: "minus.circle.fill")
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.secondary)
+                        .help("Forget \(entry.host)")
+                    }
+                }
+            }
+        }
+        .disabled(!settings.keyboardLanguageEnabled)
+    }
+
+    /// A two-way binding for a saved site's language: reads the stored source (falling back to the row's
+    /// known value), and writes the user's pick straight back into the shared store.
+    private func sourceBinding(forKey key: String, fallback: String) -> Binding<String> {
+        Binding(get: { keyboardStore.source(forBundleID: key) ?? fallback },
+                set: { keyboardStore.setSource($0, forBundleID: key) })
+    }
+}
+
 // MARK: - General
 
 struct GeneralPage: View {

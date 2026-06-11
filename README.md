@@ -127,12 +127,14 @@ Sources/ThreeFingerSwitcher/          ── ThreeFingerSwitcherCore library (AL
   AI/                 LLMRuntime (the swappable model seam + RuntimeError), StubLLMRuntime / DevAIRuntime (test/dev conformers), ModelManager + ModelRegistry (download/verify/residency lifecycle),
                       AICommand / AICommandStore / AICommandBandBuilder (the synthetic AI band), AICommandExecutor (input→template→model→output orchestration), PromptTemplate,
                       SelectionService (AX read/replace + ⌘C-restore + screen-region capture), Tasks/ (TaskDispatcher + EventKit/project/tool/adapter sinks + TaskReview) — all MLX-FREE
+  KeyboardLanguage/   per-app & per-site keyboard language (opt-in): KeyboardLanguageStore (context-key → input-source map), KeyboardLanguagePolicy (pure activate/learn), KeyboardLanguageService (learn-on-deactivation / apply-on-context-change engine),
+                      InputSourceController + CarbonInputSourceController (Carbon TIS seam), ContextResolver + BrowserRegistry + ContextKey + HostNormalizer (per-site host context = bundleID|host), AXHostProvider / AppleEventsHostProvider (host readers, AX default + Apple Events opt-in), BrowserContextMonitor (within-browser host-change poll) — auto-remembers the input source per app, and per website (host root) inside browsers
 Sources/GemmaRuntime/                 ── GemmaRuntime target (links MLX/Metal → builds via xcodebuild ONLY): GemmaMLXRuntime (in-process Gemma 4 via gemma-4-swift-mlx, conforms to LLMRuntime),
                       GemmaResumableDownloader (HTTP-Range resumable weights download), GemmaRuntime.makeModelManager (injects the real runtime at the seam)
 Sources/ThreeFingerSwitcherApp/main.swift   thin executable: import Core + GemmaRuntime; inject the MLX runtime, runThreeFingerSwitcher()
 Sources/TouchSpike/                   throwaway harness to print raw touch frames (swift run TouchSpike)
 Sources/LauncherSpike/                throwaway harness for the launcher spikes (haptics, window move) — not bundled
-Tests/ThreeFingerSwitcherTests/       443 XCTest unit tests (pure-logic core; @testable import ThreeFingerSwitcherCore — the MLX runtime is verified separately via xcodebuild)
+Tests/ThreeFingerSwitcherTests/       554 XCTest unit tests (pure-logic core; @testable import ThreeFingerSwitcherCore — the MLX runtime is verified separately via xcodebuild)
 scripts/                              build-app.sh, make-dev-cert.sh, allow-codesign-key.sh, install-launch-agent.sh
 openspec/                             specs (canonical) + changes/archive (history)
 ```

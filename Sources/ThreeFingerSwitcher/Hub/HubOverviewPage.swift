@@ -30,6 +30,9 @@ struct OverviewPage: View {
                 Divider()
                 featureRow(.ai, isOn: $settings.aiCommandsEnabled,
                            subtitle: "Run on-device AI commands on your selection, clipboard, or screen.")
+                Divider()
+                featureRow(.keyboardLanguage, isOn: $settings.keyboardLanguageEnabled,
+                           subtitle: "Remember and auto-switch the keyboard language per app.")
             }
         }
     }
