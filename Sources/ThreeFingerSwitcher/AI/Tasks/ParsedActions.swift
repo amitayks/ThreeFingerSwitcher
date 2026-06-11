@@ -64,6 +64,77 @@ struct ParsedCalendarEvent: DeclinableAction, Equatable {
     )
 }
 
+// MARK: - Reminder
+
+/// The parsed action for an "add to reminders" task: the to-do the model extracted from the input.
+/// Mirrors `ParsedCalendarEvent` (EventKit), but targets reminders rather than timed events.
+struct ParsedReminder: DeclinableAction, Equatable {
+    var applicable: Bool
+    var reason: String?
+    var title: String?
+    /// ISO-8601 (or model-emitted) due timestamp string; carried as a string so the parse layer never
+    /// fails on a slightly-off format — the sink resolves it to date components.
+    var due: String?
+    var notes: String?
+    /// EventKit reminder priority (0 = none, 1 = high … 9 = low). Optional; omitted ⇒ no priority.
+    var priority: Int?
+
+    var declineReason: String? { reason }
+
+    static let schema = StructuredSchema(
+        name: "reminder",
+        json: #"""
+        {
+          "type": "object",
+          "required": ["applicable"],
+          "properties": {
+            "applicable": { "type": "boolean", "description": "false if the text describes no task" },
+            "reason": { "type": "string" },
+            "title": { "type": "string" },
+            "due": { "type": "string", "description": "ISO-8601 due date/time, e.g. 2026-06-08T15:00" },
+            "notes": { "type": "string" },
+            "priority": { "type": "integer", "description": "0 none, 1 high … 9 low" }
+          }
+        }
+        """#
+    )
+}
+
+// MARK: - Contact
+
+/// The parsed action for a "new contact" task: the contact card the model extracted from the input
+/// (e.g. an email signature). The model may decline when the input carries no contact details.
+struct ParsedContact: DeclinableAction, Equatable {
+    var applicable: Bool
+    var reason: String?
+    var name: String?
+    var email: String?
+    var phone: String?
+    var organization: String?
+    var notes: String?
+
+    var declineReason: String? { reason }
+
+    static let schema = StructuredSchema(
+        name: "contact",
+        json: #"""
+        {
+          "type": "object",
+          "required": ["applicable"],
+          "properties": {
+            "applicable": { "type": "boolean", "description": "false if the text has no contact details" },
+            "reason": { "type": "string" },
+            "name": { "type": "string", "description": "the person's full name" },
+            "email": { "type": "string" },
+            "phone": { "type": "string" },
+            "organization": { "type": "string" },
+            "notes": { "type": "string" }
+          }
+        }
+        """#
+    )
+}
+
 // MARK: - Save to project
 
 /// The parsed action for a "save to project" task: the (optionally model-refined) content to append

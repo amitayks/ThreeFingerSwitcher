@@ -151,10 +151,17 @@ final class LauncherOverlayController {
             onCanvasStateChanged?(true)   // → recognizer enters canvas-resolution mode (swipe to resolve)
             if let panel { layout(panel, animated: true) }   // grow to the canvas metrics
             onFire?(item, band)   // fires the executor synchronously → sets its state (.unavailable / .loadingModel)
-            // If AI is unavailable, the canvas shows clickable Enable/Download/model controls — make the
-            // (normally pass-through, gesture-only) panel interactive so those controls work. The
-            // streaming path leaves the panel pass-through (it resolves by swipe).
-            if executor?.state == .unavailable { setCanvasInteractive(true) }
+            // The canvas is interactive for its WHOLE life (every AI command, every state), so the user
+            // can SCROLL the streamed thinking / response and TAP the language pill or the "Thinking"
+            // disclosure. The front app gets no scroll/click while the canvas is open.
+            //
+            // This is SAFE: the panel is a `.nonactivatingPanel`, so becoming key here never activates
+            // *this* app (the captured front app stays the active app); the four-finger swipe-to-resolve
+            // is recognized off the MULTITOUCH device (touch frames → `trackCanvasResolution`), NOT from
+            // window mouse/scroll events, so commit (down) / discard (horizontal) keep working while the
+            // panel is interactive; and write-back re-activates the captured app on commit. Reset is
+            // implicit on `hide()` (the panel is destroyed + recreated pass-through per open).
+            setCanvasInteractive(true)
             return true
         }
 
@@ -316,10 +323,17 @@ final class LauncherOverlayController {
 
     // MARK: - Panel
 
-    /// Make the panel clickable + key-capable while the AI "unavailable" canvas is showing, so its
-    /// Enable / Download / model-picker controls receive mouse events; otherwise the panel stays
-    /// pass-through (gesture-only). The panel is a `.nonactivatingPanel`, so becoming key here does not
-    /// activate the app. Reset implicitly on `hide()` (the panel is destroyed and recreated per open).
+    /// Make the panel clickable + key-capable while the canvas shows a control that needs the mouse —
+    /// the AI "unavailable" Enable / Download / model-picker controls, OR the in-canvas language
+    /// dropdown shown for a translate-style command (a runtime-parameter command). Otherwise the panel
+    /// stays pass-through (gesture-only). Reset implicitly on `hide()` (the panel is destroyed and
+    /// recreated per open).
+    ///
+    /// This is SAFE for the captured front app's focus: the panel is a `.nonactivatingPanel`, so
+    /// becoming key here never activates *this* app; the four-finger swipe-to-resolve is recognized off
+    /// the multitouch device (not window mouse events), so it keeps working while the panel is
+    /// interactive; and write-back re-activates the captured app on commit (`SelectionService` calls
+    /// `app.activate` + PID-targeted AX / key events), so the destination's focus is restored.
     private func setCanvasInteractive(_ on: Bool) {
         guard let panel else { return }
         panel.ignoresMouseEvents = !on

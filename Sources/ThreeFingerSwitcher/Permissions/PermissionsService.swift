@@ -4,6 +4,7 @@ import CoreGraphics
 import IOKit.hid
 import Combine
 import EventKit
+import Contacts
 
 /// Detects and helps the user grant the permissions the app needs. Accessibility and Screen
 /// Recording are required; Input Monitoring is best-effort (spike 1.3 saw no prompt for the
@@ -19,12 +20,18 @@ final class PermissionsService: ObservableObject {
     /// permission (it must never block other AI commands), so it stays out of `allRequiredGranted`
     /// and is requested LAZILY at first calendar-task use (see permissions-onboarding).
     @Published var calendar: Status = .unknown
+    /// Reminders (EventKit) authorization — additive for the AI reminder task, lazy first-use only.
+    @Published var reminders: Status = .unknown
+    /// Contacts authorization — additive for the AI new-contact task, lazy first-use only.
+    @Published var contacts: Status = .unknown
 
     func refresh() {
         accessibility = AXIsProcessTrusted() ? .granted : .denied
         screenRecording = CGPreflightScreenCaptureAccess() ? .granted : .denied
         inputMonitoring = mapHID(IOHIDCheckAccess(kIOHIDRequestTypeListenEvent))
         calendar = mapEventKit(EKEventStore.authorizationStatus(for: .event))
+        reminders = mapEventKit(EKEventStore.authorizationStatus(for: .reminder))
+        contacts = mapContacts(CNContactStore.authorizationStatus(for: .contacts))
     }
 
     var allRequiredGranted: Bool {
@@ -80,10 +87,38 @@ final class PermissionsService: ObservableObject {
         return granted
     }
 
+    // MARK: - Reminders (EventKit) — lazy, first-use for the reminder task
+
+    /// Request Reminders access lazily (first reminder-task use only). Mirrors `requestCalendarAccess`.
+    @discardableResult
+    func requestRemindersAccess(using store: EKEventStore = EKEventStore()) async -> Bool {
+        let current = EKEventStore.authorizationStatus(for: .reminder)
+        if current == .fullAccess { reminders = .granted; return true }
+        if current == .denied || current == .restricted { reminders = .denied; return false }
+        let granted = (try? await store.requestFullAccessToReminders()) ?? false
+        reminders = granted ? .granted : .denied
+        return granted
+    }
+
+    // MARK: - Contacts — lazy, first-use for the new-contact task
+
+    /// Request Contacts access lazily (first contact-task use only). Returns whether write access is
+    /// granted; updates `contacts`. A denied/restricted result returns `false` so the task fails
+    /// gracefully without blocking other AI commands.
+    @discardableResult
+    func requestContactsAccess(using store: CNContactStore = CNContactStore()) async -> Bool {
+        let current = CNContactStore.authorizationStatus(for: .contacts)
+        if current == .authorized { contacts = .granted; return true }
+        if current == .denied || current == .restricted { contacts = .denied; return false }
+        let granted = (try? await store.requestAccess(for: .contacts)) ?? false
+        contacts = granted ? .granted : .denied
+        return granted
+    }
+
     // MARK: - Deep links
 
     enum Pane {
-        case accessibility, screenRecording, inputMonitoring, calendar
+        case accessibility, screenRecording, inputMonitoring, calendar, reminders, contacts
 
         var urlString: String {
             switch self {
@@ -95,6 +130,10 @@ final class PermissionsService: ObservableObject {
                 return "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
             case .calendar:
                 return "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars"
+            case .reminders:
+                return "x-apple.systempreferences:com.apple.preference.security?Privacy_Reminders"
+            case .contacts:
+                return "x-apple.systempreferences:com.apple.preference.security?Privacy_Contacts"
             }
         }
     }
@@ -118,6 +157,14 @@ final class PermissionsService: ObservableObject {
         case .fullAccess: return .granted
         case .denied, .restricted: return .denied
         default: return .unknown   // .notDetermined / .writeOnly → undecided for our full-write need
+        }
+    }
+
+    private func mapContacts(_ status: CNAuthorizationStatus) -> Status {
+        switch status {
+        case .authorized: return .granted
+        case .denied, .restricted: return .denied
+        default: return .unknown   // .notDetermined → undecided
         }
     }
 }

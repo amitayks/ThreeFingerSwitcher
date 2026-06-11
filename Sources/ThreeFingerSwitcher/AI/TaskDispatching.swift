@@ -20,7 +20,10 @@ import Foundation
 protocol TaskDispatching {
     /// Produce a `TaskReview` for `kind` from `resolvedPrompt` (the already-resolved template). The
     /// `source` is the fire-time provenance (app/URL/timestamp) recorded with saved/sent content.
-    func prepare(_ kind: TaskKind, resolvedPrompt: String, source: TaskSource) async -> TaskReview
+    /// `reasoning` is the per-command-resolved think-before-answering flag the executor owns (an
+    /// explicit override, else the global default) — carried onto the structured `LLMRequest`.
+    func prepare(_ kind: TaskKind, resolvedPrompt: String, source: TaskSource,
+                 reasoning: Bool) async -> TaskReview
 
     /// Fire the side effect for a confirmed review. A no-op for a non-`.action` review.
     /// - Throws: the task's failure (permission denied, sink failure, …) so the caller can surface it.

@@ -45,11 +45,16 @@ public struct LLMRequest: Sendable {
     /// Optional encoded image for `.vision` requests (nil for text-only).
     public var image: Data?
     public var parameters: GenerationParameters
+    /// When true, the runtime should let the model think (reasoning) but stream/return only the final
+    /// response — never the thinking.
+    public var reasoning: Bool
 
-    public init(prompt: String, image: Data? = nil, parameters: GenerationParameters = .default) {
+    public init(prompt: String, image: Data? = nil, parameters: GenerationParameters = .default,
+                reasoning: Bool = false) {
         self.prompt = prompt
         self.image = image
         self.parameters = parameters
+        self.reasoning = reasoning
     }
 
     /// Whether this request needs a `.vision`-capable runtime.
@@ -58,17 +63,35 @@ public struct LLMRequest: Sendable {
 
 // MARK: - Streaming token
 
+/// Which channel a streamed token belongs to (design: "show the model's thinking"). The runtime
+/// classifies each chunk as either the model's reasoning (`.thinking`) or the final answer
+/// (`.response`); the preview canvas streams `.thinking` into a collapsible section and commits ONLY
+/// `.response`. Legacy emitters that don't classify default to `.response`, so today's behavior — a
+/// single response stream — is byte-identical until a runtime opts into emitting `.thinking`.
+public enum TokenChannel: Equatable, Sendable {
+    /// The final answer — accumulated, streamed into `state`, and committed.
+    case response
+    /// The model's reasoning — streamed into the canvas's collapsible Thinking section, NEVER committed.
+    case thinking
+}
+
 /// One incremental chunk of streamed output. A runtime emits these in order as the model produces
-/// them; the preview canvas concatenates `text` to render generation live (design D4).
+/// them; the preview canvas concatenates `text` to render generation live (design D4). `channel`
+/// classifies the chunk as the model's reasoning (`.thinking`) or its final answer (`.response`) so
+/// the canvas can split the two — thinking is shown but never committed.
 public struct Token: Equatable, Sendable {
     /// The piece of text produced for this step (a sub-word, word, or fragment).
     public var text: String
     /// True for the final token of a stream (lets a consumer finalize without waiting on stream end).
     public var isFinal: Bool
+    /// Which channel this chunk belongs to. Defaults to `.response` so existing emitters/tests that
+    /// build `Token(text)` keep compiling and mean "final answer".
+    public var channel: TokenChannel
 
-    public init(_ text: String, isFinal: Bool = false) {
+    public init(_ text: String, isFinal: Bool = false, channel: TokenChannel = .response) {
         self.text = text
         self.isFinal = isFinal
+        self.channel = channel
     }
 }
 

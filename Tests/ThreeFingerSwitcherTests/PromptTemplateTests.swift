@@ -68,4 +68,20 @@ final class PromptTemplateTests: XCTestCase {
         let resolved = PromptTemplate.resolve("a { b {input}", with: context)
         XCTAssertEqual(resolved, "a { b x")
     }
+
+    // MARK: - {lang} runtime-parameter token (spec: "Language token resolves to the active language")
+
+    func testLangTokenSubstitutesActiveLanguage() {
+        let context = FireContext(inputText: "hello")
+        let resolved = PromptTemplate.resolve("Translate to {lang}:\n{input}", with: context,
+                                              activeLanguage: "Hebrew")
+        XCTAssertEqual(resolved, "Translate to Hebrew:\nhello")
+    }
+
+    func testLangTokenWithoutActiveLanguageDegradesToEmpty() {
+        // A command with no language parameter passes activeLanguage == nil → {lang} resolves empty.
+        let context = FireContext(inputText: "hello")
+        let resolved = PromptTemplate.resolve("[{lang}] {input}", with: context)
+        XCTAssertEqual(resolved, "[] hello", "{lang} with no active language degrades to empty, never fails")
+    }
 }

@@ -66,6 +66,8 @@ struct ReviewField: Equatable, Sendable {
 /// destination), so `execute` routes to the right sink/store/opener/sender with the right values.
 enum PreparedAction: Sendable {
     case calendar(ParsedCalendarEvent)
+    case reminder(ParsedReminder)
+    case contact(ParsedContact)
     case saveToProject(project: String, action: ParsedSaveToProject, source: TaskSource)
     case openTool(tool: String, action: ParsedOpenTool)
     case sendTo(Destination, action: ParsedSendTo)

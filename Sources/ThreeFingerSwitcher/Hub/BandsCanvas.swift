@@ -126,7 +126,7 @@ private struct SourcesSidebar: View {
             case .urls:      URLForm { add($0) }
             case .scripts:   ScriptForm { add($0) }
             case .actions:   ActionBrowser { add($0) }
-            case .aiCommands: AICommandSource { add($0) }
+            case .aiCommands: AICommandSource(store: store) { add($0) }
             case .presets:   PresetComposer(store: store) { add($0) }
             }
         }
@@ -335,26 +335,72 @@ private struct ActionBrowser: View {
     }
 }
 
-/// Source for AI commands: adds a fresh, default AI command to the active band, then auto-selects it
-/// so its inspector (right pane) opens for editing — the authoring lives inline in the item inspector
-/// (configuration-hub fold-in; the standalone AI-command editor is gone).
+/// Source for AI commands: a CATALOG BROWSER over `AICommandCatalog`, mirroring `ActionBrowser` — a
+/// `List` with one `Section` per `Category`, each preset a row that adds a fresh copy (`copy(of:)`
+/// mints a new id) to the active band and auto-selects it so its inspector (right pane) opens for
+/// editing. Each section header carries an "Add all as a band" affordance that creates a new band
+/// named after the category (carrying its color) populated with that category's presets. A trailing
+/// "Custom command" entry adds the blank editable command. Authoring lives inline in the item
+/// inspector (configuration-hub fold-in; the standalone AI-command editor is gone).
 private struct AICommandSource: View {
+    @ObservedObject var store: FavoritesStore
     let onPick: (LaunchItem) -> Void
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Add an AI command to this band, then edit its prompt, input, and output on the right. "
-                 + "AI commands run on-device; firing one while AI is off offers to enable it.")
-                .font(.caption).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Button("Add AI Command") {
-                let cmd = AICommand(name: "New Command", icon: .sfSymbol("wand.and.stars"),
-                                    input: .selection, promptTemplate: "{input}", output: .previewOnly)
-                onPick(AIBand.item(for: cmd))
+        List {
+            ForEach(AICommandCatalog.Category.allCases) { category in
+                Section {
+                    ForEach(AICommandCatalog.commands(in: category)) { preset in
+                        Button {
+                            onPick(AIBand.item(for: AICommandCatalog.copy(of: preset)))
+                        } label: {
+                            Label(preset.name, systemImage: symbolName(preset.icon))
+                        }
+                        .buttonStyle(.plain)
+                        .help(preset.promptTemplate)
+                    }
+                } header: {
+                    HStack {
+                        Label(category.title, systemImage: category.sfSymbol)
+                        Spacer()
+                        Button("Add all as a band") { addCategoryAsBand(category) }
+                            .buttonStyle(.borderless)
+                            .controlSize(.small)
+                            .font(.caption)
+                            .help("Create a new \"\(category.title)\" band populated with these presets.")
+                    }
+                }
             }
-            Spacer()
+            Section {
+                Button {
+                    let cmd = AICommand(name: "New Command", icon: .sfSymbol("wand.and.stars"),
+                                        input: .selection, promptTemplate: "{input}", output: .previewOnly)
+                    onPick(AIBand.item(for: cmd))
+                } label: {
+                    Label("Custom command", systemImage: "wand.and.stars")
+                }
+                .buttonStyle(.plain)
+                .help("Add a blank AI command, then edit its prompt, input, and output on the right.")
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
+        .listStyle(.inset)
+    }
+
+    /// Create a new band named after the category (carrying its color), populated with that category's
+    /// presets — each a fresh copy (`copy(of:)`). Appending is correct even if a same-named band exists
+    /// (no dedupe/merge). Does not require the AI opt-in.
+    private func addCategoryAsBand(_ category: AICommandCatalog.Category) {
+        let items = AICommandCatalog.commands(in: category)
+            .map { AIBand.item(for: AICommandCatalog.copy(of: $0)) }
+        let band = ContextBand(name: category.title, color: category.tint, items: items)
+        store.mutate { $0.bands.append(band) }
+    }
+
+    /// The SF Symbol name behind a preset's `ItemIcon` (presets are always `.sfSymbol`; fall back to the
+    /// AI glyph for any non-symbol icon a future preset might carry).
+    private func symbolName(_ icon: ItemIcon) -> String {
+        if case let .sfSymbol(name) = icon { return name }
+        return "wand.and.stars"
     }
 }
 
@@ -849,6 +895,7 @@ private struct ItemInspector: View {
                 }
                 Section("Output") { aiOutputEditor }
                 Section("Model") { aiModelEditor }
+                Section("Reasoning") { aiReasoningEditor }
                 Section("Confirmation") {
                     Toggle("Confirm before running", isOn: Binding(
                         get: { ai.confirmBeforeRun }, set: { on in updateCommand { $0.confirmBeforeRun = on } }))
@@ -887,11 +934,17 @@ private struct ItemInspector: View {
         case .addToCalendar:
             Text("Parses an event from the result and adds it to Calendar (asks for permission the first time).")
                 .font(.caption).foregroundStyle(.secondary)
+        case .addToReminder:
+            Text("Parses a to-do from the result and adds it to Reminders (asks for permission the first time).")
+                .font(.caption).foregroundStyle(.secondary)
+        case .newContact:
+            Text("Parses contact details from the result and creates a Contacts card (asks for permission the first time).")
+                .font(.caption).foregroundStyle(.secondary)
         case let .saveToProject(project):
             TextField("Project", text: Binding(
                 get: { project }, set: { p in updateCommand { $0.output = .runTask(.saveToProject(project: p)) } }))
         case let .openToolWithPayload(tool):
-            TextField("Tool (app or shortcut name)", text: Binding(
+            ToolTargetPicker(tool: Binding(
                 get: { tool }, set: { t in updateCommand { $0.output = .runTask(.openToolWithPayload(tool: t)) } }))
         case let .sendTo(dest):
             aiDestinationEditor(dest) { newDest in updateCommand { $0.output = .runTask(.sendTo(newDest)) } }
@@ -906,7 +959,7 @@ private struct ItemInspector: View {
         }
         switch dest {
         case let .shortcut(n):
-            TextField("Shortcut name", text: Binding(get: { n }, set: { onChange(.shortcut(name: $0)) }))
+            ShortcutPicker(name: Binding(get: { n }, set: { onChange(.shortcut(name: $0)) }))
         case let .urlScheme(s):
             TextField("URL scheme (use {content})", text: Binding(get: { s }, set: { onChange(.urlScheme($0)) }))
         case let .shell(c):
@@ -923,6 +976,18 @@ private struct ItemInspector: View {
             ForEach(registry.models) { m in Text(m.displayName).tag(Optional(m.id)) }
         }
         Text("On-device Gemma 4. \"Registry default\" tracks the recommended model; pin a specific one only if you need it.")
+            .font(.caption).foregroundStyle(.secondary)
+    }
+
+    @ViewBuilder
+    private var aiReasoningEditor: some View {
+        Picker("Reasoning", selection: Binding(
+            get: { ai.reasoning }, set: { r in updateCommand { $0.reasoning = r } })) {
+            Text("Default").tag(AIReasoning?.none)
+            Text("On").tag(Optional(AIReasoning.on))
+            Text("Off").tag(Optional(AIReasoning.off))
+        }
+        Text("Default follows the AI Reasoning toggle; override per command.")
             .font(.caption).foregroundStyle(.secondary)
     }
 
@@ -955,6 +1020,8 @@ private struct ItemInspector: View {
     private func taskChoice(_ k: TaskKind) -> TaskChoice {
         switch k {
         case .addToCalendar: return .addToCalendar
+        case .addToReminder: return .addToReminder
+        case .newContact: return .newContact
         case .saveToProject: return .saveToProject
         case .openToolWithPayload: return .openToolWithPayload
         case .sendTo: return .sendTo
@@ -965,6 +1032,8 @@ private struct ItemInspector: View {
         let kind: TaskKind
         switch choice {
         case .addToCalendar: kind = .addToCalendar
+        case .addToReminder: kind = .addToReminder
+        case .newContact: kind = .newContact
         case .saveToProject: kind = .saveToProject(project: "")
         case .openToolWithPayload: kind = .openToolWithPayload(tool: "")
         case .sendTo: kind = .sendTo(.shortcut(name: ""))
@@ -1282,6 +1351,107 @@ private func kindLabel(_ kind: LaunchItemKind) -> String {
     }
 }
 
+// MARK: - AI tool/destination pickers
+
+/// Menu picker for the "Open tool with payload" task target. The stored value is a bare string with
+/// opener-defined semantics (see `WorkspaceToolOpener.defaultOpen`): an app *path* (contains "/" or
+/// ends ".app") is launched as an app, anything else is run as a named Shortcut. So an app pick
+/// stores `candidate.url.path` and a Shortcut pick stores its name. A "Custom…" escape hatch (also
+/// auto-shown for an unrecognised value) exposes a `TextField` for not-yet-created Shortcuts.
+private struct ToolTargetPicker: View {
+    @Binding var tool: String
+    @State private var apps: [AppCandidate] = []
+    @State private var shortcuts: [String] = []
+    @State private var showCustom = false
+    /// Set once the async lists have loaded, so a pre-existing listed value isn't briefly treated as
+    /// "custom" (the `matchesShortcut` check is meaningless against an empty, not-yet-loaded list).
+    @State private var loaded = false
+
+    private var isAppPath: Bool { tool.contains("/") || tool.hasSuffix(".app") }
+    private var matchesShortcut: Bool { shortcuts.contains(tool) }
+
+    /// Friendly label for the current value: app file name (no `.app`), shortcut name, or the raw value.
+    private var menuLabel: String {
+        if tool.isEmpty { return "Choose app or shortcut…" }
+        if isAppPath { return URL(fileURLWithPath: tool).deletingPathExtension().lastPathComponent }
+        return tool
+    }
+
+    /// Show the free-text field when explicitly requested, or — once the lists have loaded — when the
+    /// current value matches neither a known app path nor a listed shortcut (so an unusual/typed target
+    /// stays editable without flashing for a pre-existing listed value while the list loads).
+    private var showsField: Bool {
+        showCustom || (loaded && !tool.isEmpty && !isAppPath && !matchesShortcut)
+    }
+
+    var body: some View {
+        Menu {
+            if !shortcuts.isEmpty {
+                Section("Shortcuts") {
+                    ForEach(shortcuts, id: \.self) { name in
+                        Button { showCustom = false; tool = name } label: { Label(name, systemImage: "bolt.fill") }
+                    }
+                }
+            }
+            Section("Apps") {
+                ForEach(apps) { app in
+                    Button {
+                        showCustom = false; tool = app.url.path
+                    } label: {
+                        Label { Text(app.name) } icon: {
+                            Image(nsImage: NSWorkspace.shared.icon(forFile: app.url.path))
+                                .resizable().frame(width: 16, height: 16)
+                        }
+                    }
+                }
+            }
+            Divider()
+            Button("Custom…") { showCustom = true }
+        } label: {
+            if isAppPath {
+                Label { Text(menuLabel) } icon: {
+                    Image(nsImage: NSWorkspace.shared.icon(forFile: tool)).resizable().frame(width: 16, height: 16)
+                }
+            } else {
+                Label(menuLabel, systemImage: matchesShortcut ? "bolt.fill" : "wand.and.stars")
+            }
+        }
+        .task { apps = await loadInstalledApps(); shortcuts = await loadShortcutNames(); loaded = true }
+        if showsField {
+            TextField("Tool (app path or shortcut name)", text: $tool)
+        }
+    }
+}
+
+/// Menu picker for a `.shortcut(name:)` destination: the user's Shortcuts plus a "Custom…" → field
+/// escape hatch for a not-yet-created Shortcut. Lazy-loaded; tolerates an empty list.
+private struct ShortcutPicker: View {
+    @Binding var name: String
+    @State private var shortcuts: [String] = []
+    @State private var showCustom = false
+    /// Set once the list loads, so a pre-existing listed Shortcut isn't briefly shown as "custom".
+    @State private var loaded = false
+
+    private var menuLabel: String { name.isEmpty ? "Choose shortcut…" : name }
+    private var showsField: Bool { showCustom || (loaded && !name.isEmpty && !shortcuts.contains(name)) }
+
+    var body: some View {
+        Menu {
+            ForEach(shortcuts, id: \.self) { n in
+                Button { showCustom = false; name = n } label: { Label(n, systemImage: "bolt.fill") }
+            }
+            Divider()
+            Button("Custom…") { showCustom = true }
+        } label: {
+            Label(menuLabel, systemImage: "bolt.fill")
+        }
+        .task { shortcuts = await loadShortcutNames(); loaded = true }
+        if showsField {
+            TextField("Shortcut name", text: $name)
+        }
+    }
+}
+
 // MARK: - Async source loaders
 
 struct AppCandidate: Identifiable {
@@ -1386,11 +1556,13 @@ private enum OutputChoice: String, CaseIterable, Identifiable {
 }
 
 private enum TaskChoice: String, CaseIterable, Identifiable {
-    case addToCalendar, saveToProject, openToolWithPayload, sendTo
+    case addToCalendar, addToReminder, newContact, saveToProject, openToolWithPayload, sendTo
     var id: String { rawValue }
     var label: String {
         switch self {
         case .addToCalendar: return "Add to Calendar"
+        case .addToReminder: return "Add to Reminders"
+        case .newContact: return "New Contact"
         case .saveToProject: return "Save to project"
         case .openToolWithPayload: return "Open tool with payload"
         case .sendTo: return "Send to destination"
@@ -1441,6 +1613,8 @@ private func aiOutputLabel(_ o: OutputTarget) -> String {
 private func aiTaskLabel(_ k: TaskKind) -> String {
     switch k {
     case .addToCalendar: return "Add to Calendar"
+    case .addToReminder: return "Add to Reminders"
+    case .newContact: return "New Contact"
     case let .saveToProject(p): return "Save to project \(p.isEmpty ? "…" : p)"
     case let .openToolWithPayload(t): return "Open \(t.isEmpty ? "tool" : t) with payload"
     case let .sendTo(d): return "Send to \(aiDestinationLabel(d))"

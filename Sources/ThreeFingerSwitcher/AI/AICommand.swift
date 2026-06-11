@@ -32,6 +32,10 @@ enum InputSource: String, Codable, Equatable, Sendable, CaseIterable {
 enum TaskKind: Codable, Equatable, Sendable {
     /// Create a calendar event from the parsed action (EventKit).
     case addToCalendar
+    /// Create a reminder/to-do from the parsed action (EventKit reminders).
+    case addToReminder
+    /// Create a contact card from the parsed action (Contacts).
+    case newContact
     /// Append the content to a named project note on disk.
     case saveToProject(project: String)
     /// Generate a payload and open a tool with it (by bundle id / tool name).
@@ -91,6 +95,17 @@ enum ModelSelector: Codable, Equatable, Sendable {
     static let `default` = ModelSelector.onDevice(modelID: nil)
 }
 
+// MARK: - Reasoning override
+
+/// An explicit per-command reasoning override (think-before-answering). `nil`/absent ⇒ the command
+/// follows the global `aiReasoningEnabled` default; `.on`/`.off` pin it for this command regardless.
+enum AIReasoning: String, Codable, Equatable, Sendable, CaseIterable {
+    /// Force reasoning ON for this command.
+    case on
+    /// Force reasoning OFF for this command.
+    case off
+}
+
 // MARK: - The command
 
 /// One configured AI command. `Codable` so it persists as a band item inside the `Favorites` record
@@ -107,6 +122,14 @@ struct AICommand: Codable, Equatable, Identifiable, Sendable {
     /// Whether to show the action-review/confirmation step before committing. Defaults ON for
     /// side-effecting outputs at creation (see `init`), but the stored value is HONORED thereafter.
     var confirmBeforeRun: Bool
+    /// An optional fire-time parameter chosen in the canvas rather than baked into the template
+    /// (v1: a target language resolved into `{lang}`). `nil` ⇒ no parameter UI; the command behaves
+    /// exactly as before. Optional so old persisted commands (no key) decode with it absent.
+    var runtimeParameter: RuntimeParameter?
+    /// An explicit per-command reasoning override. `nil` ⇒ follow the global `aiReasoningEnabled`
+    /// default; `.on`/`.off` pin it for this command. Optional so old persisted commands (no key)
+    /// decode with it absent (synthesized Codable's `decodeIfPresent`).
+    var reasoning: AIReasoning?
 
     /// Designated initializer. When `confirmBeforeRun` is left `nil`, it is DERIVED from the output
     /// (true for side-effecting task/send-to, false otherwise). An explicit value is taken verbatim,
@@ -119,7 +142,9 @@ struct AICommand: Codable, Equatable, Identifiable, Sendable {
          promptTemplate: String,
          output: OutputTarget,
          model: ModelSelector = .default,
-         confirmBeforeRun: Bool? = nil) {
+         confirmBeforeRun: Bool? = nil,
+         runtimeParameter: RuntimeParameter? = nil,
+         reasoning: AIReasoning? = nil) {
         self.id = id
         self.name = name
         self.icon = icon
@@ -129,6 +154,8 @@ struct AICommand: Codable, Equatable, Identifiable, Sendable {
         self.output = output
         self.model = model
         self.confirmBeforeRun = confirmBeforeRun ?? Self.defaultConfirmBeforeRun(for: output)
+        self.runtimeParameter = runtimeParameter
+        self.reasoning = reasoning
     }
 
     /// The DEFAULT `confirmBeforeRun` for a given output, used ONLY at command creation: true for
@@ -136,6 +163,16 @@ struct AICommand: Codable, Equatable, Identifiable, Sendable {
     /// at run time and never recomputed from this (design D6).
     static func defaultConfirmBeforeRun(for output: OutputTarget) -> Bool {
         output.isSideEffecting
+    }
+
+    /// Resolve whether this command should reason: an explicit `.on`/`.off` override wins; an absent
+    /// override (`nil`) follows the global `aiReasoningEnabled` default passed in.
+    func resolvedReasoning(globalDefault: Bool) -> Bool {
+        switch reasoning {
+        case .on: return true
+        case .off: return false
+        case nil: return globalDefault
+        }
     }
 
     /// The runtime capabilities this command needs (drives capability-based model selection in the

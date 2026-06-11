@@ -21,17 +21,141 @@ struct AICommandCanvasView: View {
     /// still renders without it (a defensive fallback message); wired by the launcher overlay.
     var availability: AICanvasAvailability? = nil
 
+    /// Whether the collapsible Thinking section is expanded. COLLAPSED by default: the user sees only a
+    /// pulsing "Thinking…" label + a live elapsed timer until they tap to expand the full reasoning.
+    @State private var thinkingExpanded = false
+    /// When the model's reasoning FIRST became non-empty — anchors the live elapsed timer. Set once per
+    /// fire (cleared when thinking goes empty on a re-run/discard), so the timer counts from first token.
+    @State private var thinkingStart: Date?
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            // The language picker rides at the top-middle of the canvas as a centered Liquid-Glass pill,
+            // above the header, only for translate-style commands (`showsLanguagePicker`).
+            if showsLanguagePicker {
+                HStack { Spacer(); languagePill; Spacer() }
+                    .padding(.bottom, 6)
+            }
             header
             Divider().opacity(0.35).padding(.vertical, 8)
+            // The model's reasoning ("show the model's thinking"): a collapsible, scrollable section
+            // under the header and above the response content. Rendered only while there's thinking to
+            // show; the RESPONSE below is always the committed text (never the thinking).
+            if !executor.thinking.isEmpty {
+                thinkingSection
+                    .padding(.bottom, 8)
+            }
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             Divider().opacity(0.3).padding(.top, 8)
             footerHint
         }
         .padding(.top, 6)
+        // Anchor the elapsed timer to the moment thinking first appears; clear it when thinking resets
+        // (a fresh fire / discard empties `executor.thinking`), so the next run times from scratch.
+        // Also collapse the Thinking section on reset so a previously-expanded run doesn't leak its
+        // expanded state into the next fire (keeps the collapsed-by-default behavior).
+        .onChange(of: executor.thinking.isEmpty) { _, isEmpty in
+            thinkingStart = isEmpty ? nil : (thinkingStart ?? Date())
+            if isEmpty { thinkingExpanded = false }
+        }
+        .onAppear {
+            if !executor.thinking.isEmpty, thinkingStart == nil { thinkingStart = Date() }
+        }
     }
+
+    // MARK: Thinking (collapsible reasoning)
+
+    /// The collapsible "show the model's thinking" section. COLLAPSED (default) = a pulsing "✦ Thinking…"
+    /// label + a live elapsed timer (so the user sees it's alive, not stuck) and a `chevron.right`.
+    /// EXPANDED = a bounded, scrollable `BidiText` of the full streamed reasoning (capped at 160pt so it
+    /// never sprawls) + a `chevron.down`. Tapping the row toggles — the canvas is interactive for its
+    /// whole life (see `setCanvasInteractive`), so the tap lands.
+    private var thinkingSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                thinkingExpanded.toggle()
+            } label: {
+                thinkingHeaderRow
+            }
+            .buttonStyle(.plain)
+
+            if thinkingExpanded {
+                thinkingExpandedBody
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.04)))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.white.opacity(0.08)))
+    }
+
+    /// The always-visible header row: a pulsing sparkle + "Thinking…", a live elapsed readout, and a
+    /// chevron reflecting the expanded/collapsed state.
+    private var thinkingHeaderRow: some View {
+        HStack(spacing: 8) {
+            // A gentle pulse signals the reasoning is alive (TimelineView so it animates without a
+            // bound @State; harmless once thinking finishes — it just keeps a calm idle pulse).
+            TimelineView(.periodic(from: .now, by: 0.6)) { ctx in
+                let phase = ctx.date.timeIntervalSinceReferenceDate
+                Image(systemName: "sparkles")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(tint)
+                    .opacity(0.55 + 0.45 * (0.5 + 0.5 * sin(phase * 2.6)))
+            }
+            Text("Thinking…")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.secondary)
+            elapsedLabel
+            Spacer()
+            Image(systemName: thinkingExpanded ? "chevron.down" : "chevron.right")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+        }
+        .contentShape(Rectangle())   // the whole row is tappable, not just the glyphs
+    }
+
+    /// A live elapsed readout, recomputed ~10×/s off a `TimelineView` so the user sees it ticking. Shows
+    /// "3.2s" under a minute, "mm:ss" beyond, anchored at `thinkingStart`.
+    @ViewBuilder
+    private var elapsedLabel: some View {
+        if let start = thinkingStart {
+            TimelineView(.periodic(from: .now, by: 0.1)) { ctx in
+                Text(Self.elapsedString(ctx.date.timeIntervalSince(start)))
+                    .font(.system(size: 11, weight: .regular).monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// Format an elapsed interval: "3.2s" under a minute, "m:ss" at/over a minute. Pure (testable).
+    static func elapsedString(_ seconds: TimeInterval) -> String {
+        let s = max(0, seconds)
+        if s < 60 { return String(format: "%.1fs", s) }
+        let total = Int(s)
+        return String(format: "%d:%02d", total / 60, total % 60)
+    }
+
+    /// The expanded reasoning: a bounded, scrollable `BidiText` of the full streamed thinking, auto-
+    /// scrolling to the tail as it grows (a ScrollViewReader, best-effort). Capped at 160pt so streaming
+    /// reasoning never pushes the response off the canvas.
+    private var thinkingExpandedBody: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                BidiText(text: executor.thinking, fontSize: 12, color: .secondaryLabelColor)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                Color.clear.frame(height: 1).id(Self.thinkingTailID)   // scroll anchor at the bottom
+            }
+            .frame(maxHeight: 160)
+            .onChange(of: executor.thinking) {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    proxy.scrollTo(Self.thinkingTailID, anchor: .bottom)
+                }
+            }
+        }
+    }
+
+    /// Stable id for the bottom scroll anchor of the expanded reasoning.
+    private static let thinkingTailID = "ai-thinking-tail"
 
     // MARK: Header
 
@@ -73,6 +197,69 @@ struct AICommandCanvasView: View {
         }
     }
 
+    // MARK: Runtime language picker
+
+    /// Whether the in-canvas language dropdown is shown: only when the active command declares a
+    /// language runtime parameter (`executor.activeLanguage != nil`) AND the state still has a result
+    /// worth re-translating. It rides across the in-flight/result states (loadingModel, streaming,
+    /// ready, reviewingAction, …) but is hidden where re-running makes no sense — `.idle` (nothing in
+    /// flight), `.unavailable` (the enable/download canvas owns the surface), and `.committed` (done).
+    private var showsLanguagePicker: Bool {
+        guard executor.activeLanguage != nil else { return false }
+        switch executor.state {
+        case .idle, .unavailable, .committed: return false
+        default: return true
+        }
+    }
+
+    /// A centered Liquid-Glass pill at the top-middle of the canvas reading as the "Detect language →
+    /// dropdown" flow: a leading globe glyph + a subtle "Auto-detect" label, an arrow "→", then the
+    /// language `Menu`. Picking one calls `executor.setLanguage`, which cancels + re-runs the command in
+    /// place and persists the choice (the view only wires the control). The options come from the ACTIVE
+    /// command's declared parameter — human languages for Translate, programming languages for "Rewrite
+    /// in Language" — falling back to `AILanguages.all`. The current `executor.activeLanguage` is always
+    /// included (prepended if missing, mirroring `AILanguages.including`) so a persisted/declared default
+    /// off the canonical list stays selectable. The glass treatment matches `HubGlass` / `LauncherView`
+    /// (macOS 26+ `glassEffect`, `.ultraThinMaterial` fallback).
+    private var languagePill: some View {
+        let opts = command.runtimeParameter?.options ?? AILanguages.all
+        let active = executor.activeLanguage ?? opts.first ?? "English"
+        let options = opts.contains(active) ? opts : [active] + opts
+        return HStack(spacing: 8) {
+            Image(systemName: "globe")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(tint)
+            Text("Auto-detect")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            Image(systemName: "arrow.right")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Menu {
+                ForEach(options, id: \.self) { language in
+                    Button(language) { executor.setLanguage(language) }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(executor.activeLanguage ?? "English")
+                        .font(.system(size: 12, weight: .medium))
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                }
+                .foregroundStyle(tint)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+        }
+        .padding(.horizontal, 12).padding(.vertical, 6)
+        .background {
+            if #available(macOS 26.0, *) { Color.clear.glassEffect(.regular, in: Capsule()) }
+            else { Capsule().fill(.ultraThinMaterial) }
+        }
+        .overlay(Capsule().strokeBorder(.white.opacity(0.12)))
+    }
+
     // MARK: Content (the live preview surface)
 
     @ViewBuilder
@@ -100,17 +287,25 @@ struct AICommandCanvasView: View {
             centered {
                 Image(systemName: "hand.raised.fill").font(.system(size: 36)).foregroundStyle(.secondary)
                 Text("The model declined this command").font(.system(size: 15, weight: .medium))
-                Text(reason).font(.system(size: 12)).foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .lineLimit(6).truncationMode(.middle)   // bounded so a long reason can't overflow the panel
+                // A decline reason can be a full Hebrew/Arabic sentence (multi-paragraph), so route it
+                // through BidiText for true PER-PARAGRAPH base direction, not the single-direction helper.
+                ScrollView {
+                    BidiText(text: reason, fontSize: 12, color: .secondaryLabelColor)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                }
+                .frame(maxHeight: 120)   // bounded so a long reason can't overflow the panel
             }
         case let .failed(message):
             centered {
                 Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 36)).foregroundStyle(.red)
                 Text("Something went wrong").font(.system(size: 15, weight: .medium))
-                Text(message).font(.system(size: 12)).foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .lineLimit(6).truncationMode(.middle)   // bounded for symmetry with the Settings row cap
+                // A failure message can be a full Hebrew/Arabic sentence too — route it through BidiText
+                // for true per-paragraph base direction (mixed LTR+RTL resolves cleanly).
+                ScrollView {
+                    BidiText(text: message, fontSize: 12, color: .secondaryLabelColor)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                }
+                .frame(maxHeight: 120)   // bounded for symmetry with the Settings row cap
             }
         case .unavailable:
             if let availability {
@@ -134,12 +329,12 @@ struct AICommandCanvasView: View {
         }
     }
 
-    /// The streamed/ready text, scrollable, in the canvas's large value pane.
+    /// The streamed/ready text, scrollable, in the canvas's large value pane. Rendered through
+    /// `BidiText` (a natural-base-direction NSTextView) so Hebrew/Arabic output starts on the right and
+    /// mixed LTR+RTL resolves cleanly, recomputed per paragraph as tokens stream (design D6).
     private func resultScroll(text: String) -> some View {
         ScrollView {
-            Text(text)
-                .font(.system(size: 14))
-                .textSelection(.disabled)
+            BidiText(text: text, fontSize: 14)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
         }
     }
@@ -155,8 +350,12 @@ struct AICommandCanvasView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(field.label).font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(.secondary).textCase(.uppercase)
+                        // Review-field values (Title/Start/Email/…) are SHORT and single-paragraph by
+                        // construction, so the lightweight first-strong SwiftUI helper suffices here —
+                        // no BidiText / NSTextView needed for these single-line values.
                         Text(field.value).font(.system(size: 14))
                             .frame(maxWidth: .infinity, alignment: .leading)
+                            .naturalTextDirection(for: field.value)   // RTL value starts on the right
                     }
                 }
                 Text("Swipe down to confirm the action, or swipe aside to cancel.")

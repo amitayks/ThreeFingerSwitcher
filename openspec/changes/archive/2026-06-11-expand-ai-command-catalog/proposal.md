@@ -1,0 +1,33 @@
+## Why
+
+The AI feature ships with only six seeded commands and a single blank "Add AI Command" button — every other source in the Bands editor (Apps, Shortcuts, **Actions**) is a browsable, one-click catalog, but AI is not. The whole text path is already wired (in-place transforms, preview, and all four task sinks), so the feature is far more capable than its defaults expose. This change turns the AI source into a rich, categorized **catalog** of ready-made commands covering daily writing/dev/reply/capture work, finishes the two paths that are modeled-but-inert (**vision** screen-region commands and the **send-to/save/open** task family), adds a runtime **language picker** to the canvas so one Translate command serves every language, and makes the canvas render **bidirectional (RTL/LTR) text** correctly so Hebrew and mixed text read cleanly.
+
+## What Changes
+
+- **A curated AI command catalog** (~50 presets) grouped by category — Writing, Tone, Understand, Translate, Developer, Reply, Capture, Vision, Format — each a fully-formed `AICommand`. The Bands-editor AI source becomes a **browser** (mirroring the Actions browser): browse by category, one click adds a working command, or **add a whole category as a band**. A blank "Custom command…" entry stays for power users.
+- **A grown fresh-install seed** drawn from the catalog (still one tight, curated "AI" band — not everything at once).
+- **Runtime-adjustable language on the Translate path.** A command MAY declare a **runtime parameter** (v1: target language). The canvas shows a **language dropdown**; reselecting a language **re-runs the command in place** to that language, and the chosen language is **persisted as the default for the next run**. A new `{lang}` prompt token resolves to the active language.
+- **Bidirectional text in the canvas.** The streaming output canvas renders **RTL/LTR natively** — per-paragraph natural base-direction detection so Hebrew/Arabic start from the correct side, and mixed LTR+RTL runs resolve cleanly via the Unicode Bidi algorithm. Input echo, streamed output, and task-review fields all honor this.
+- **Vision becomes real.** The v1 Gemma 4 conformer **processes image input** instead of refusing it (`unsupportedModality(.vision)`), so `screenRegion` commands (What is this? · OCR · Explain chart · Solve · Transcribe · Extract table · Translate image text) work end-to-end. Captured as its **own task group**.
+- **Two new task sinks** to complete the catalog: **Add to Reminders** (EventKit reminders) and **New Contact** (Contacts), each a new `TaskKind` with a schema, decline affordance, and action-review — reusing the established task taxonomy/error conventions.
+- **Pickers for open-tool / send-to-Shortcut targets** in the command editor: instead of typing an app/tool/Shortcut identifier (which users can't reliably know), the inspector offers a **list of installed apps and the user's Shortcuts** (reusing the Bands-editor enumeration), storing a launchable reference — with a free-text "custom" escape hatch.
+
+## Capabilities
+
+### New Capabilities
+- `ai-command-catalog`: the curated, categorized catalog of ready-made `AICommand` presets; the Bands-editor **catalog browser** source (browse by category, add one or add-category-as-band, plus a blank custom entry); and the grown fresh-install seed drawn from it.
+
+### Modified Capabilities
+- `ai-command-band`: a command MAY carry a **runtime parameter** (v1: `language(default:)`) resolved via a new `{lang}` token; the executor **re-runs** with a newly chosen value and **persists the last choice per command** as the next run's default. The seeded default set grows (drawn from the catalog).
+- `launcher-overlay`: the AI canvas gains an in-canvas **runtime-parameter control** (a language dropdown that re-runs the command without reopening the launcher), renders **vision (screen-region) command results**, and renders **bidirectional RTL/LTR text** (natural base direction per paragraph, clean mixed-direction resolution) across input echo, streamed output, and task-review fields.
+- `on-device-ai-runtime`: the v1 Gemma 4 (MLX-Swift) conformer **processes image input** for vision-capable commands, replacing the current refuse-with-`unsupportedModality(.vision)` behavior, so `screenRegion` commands run end-to-end on a vision-capable model.
+- `ai-command-tasks`: two additional side-effecting tasks — **add-to-reminders** (EventKit reminders) and **new-contact** (Contacts) — each schema-targeted, declinable, and action-reviewed, following the existing task conventions and error taxonomy.
+- `permissions-onboarding`: the **Reminders (EventKit)** and **Contacts** permissions, each detected and requested **only at first use** of the corresponding task (never at launch, never on the AI opt-in), degrading gracefully with a System Settings deep-link — mirroring the existing Calendar-permission requirement.
+
+## Impact
+
+- **New:** `AI/AICommandCatalog.swift` (the preset table + `Category`), a catalog browser view in `Hub/BandsCanvas.swift` (replaces the single-button `AICommandSource`), `AI/RuntimeParameter.swift` (the `language` parameter + per-command last-choice persistence), `AI/Tasks/` additions (`RemindersSink`, `ContactsSink`, their parsed-action schemas).
+- **Modified:** `AI/AICommand.swift` (add `runtimeParameter`), `AI/PromptTemplate.swift` (add `{lang}` token + active-language resolution), `AI/AIBand.swift` (grown seed from the catalog), `AI/AICommandExecutor.swift` (re-run with a runtime parameter, resolve `{lang}`), `Overlay/AICommandCanvasView.swift` (language dropdown + re-run + RTL/LTR bidi rendering + vision result), `GemmaRuntime/GemmaMLXRuntime.swift` (implement the vision pipeline path), `AI/Tasks/ParsedActions.swift` + `TaskDispatcher.swift` + `TaskSinks.swift` (reminders/contacts kinds), `Settings/AppSettings.swift` (persisted per-command language choice).
+- **Permissions:** **new = Reminders (EventKit)** and **Contacts**, each consent-gated at first use of the corresponding task (never at launch), following `permissions-onboarding`. Vision reuses the already-held Screen Recording permission; no new gesture relocation or re-login.
+- **Build/verify:** catalog, runtime-parameter, RTL rendering, and the new sinks verify under `swift build`/`swift test` behind the `LLMRuntime` seam with the stub runtime; the vision pipeline change is in the MLX-linked `GemmaRuntime` target and compile-verifies via `xcodebuild` only.
+- **Privacy:** unchanged posture — selection, clipboard, and now screen regions are sent only to the local on-device model; the new sinks (reminders/contacts) write to the user's own local databases after action-review.

@@ -38,6 +38,31 @@ final class AppSettingsTests: XCTestCase {
         AppSettings(defaults: defaults)
     }
 
+    // MARK: - Per-command runtime language persistence (spec: ai-command-band)
+
+    /// A remembered language round-trips per command, survives a reload from the same suite, and
+    /// orphan entries (commands no longer present) are pruned best-effort without touching live ones.
+    func testPerCommandLanguagePersistenceRoundTripsAndPrunes() {
+        let a = UUID(), b = UUID()
+        let settings = makeSettings()
+        XCTAssertNil(settings.rememberedLanguage(for: a), "no remembered language at cold start")
+
+        settings.rememberLanguage("Hebrew", for: a)
+        settings.rememberLanguage("Spanish", for: b)
+        XCTAssertEqual(settings.rememberedLanguage(for: a), "Hebrew")
+        XCTAssertEqual(settings.rememberedLanguage(for: b), "Spanish", "two commands remember independently")
+
+        // Reload from the SAME suite: the choices persisted across instances.
+        let reloaded = AppSettings(defaults: defaults)
+        XCTAssertEqual(reloaded.rememberedLanguage(for: a), "Hebrew", "survives a reload")
+        XCTAssertEqual(reloaded.rememberedLanguage(for: b), "Spanish")
+
+        // Prune keeping only `a`: b's orphan entry is dropped, a is untouched.
+        reloaded.pruneCommandLanguages(keeping: [a])
+        XCTAssertEqual(reloaded.rememberedLanguage(for: a), "Hebrew", "a live command's entry is kept")
+        XCTAssertNil(reloaded.rememberedLanguage(for: b), "an orphaned entry is pruned")
+    }
+
     // MARK: - First-run defaults
 
     /// On first run (empty suite) every tunable must equal its `AppSettings.Defaults` value,
@@ -370,6 +395,55 @@ final class AppSettingsTests: XCTestCase {
 
         XCTAssertTrue(settings.aiCommandsEnabled, "reset must not flip the AI opt-in")
         XCTAssertEqual(settings.aiSelectedModelID, "gemma-4-12b", "reset must not clear the pinned model")
+    }
+
+    // MARK: - AI reasoning opt-in ("let the model think")
+
+    /// `aiReasoningEnabled` defaults ON (the model thinks; the thinking is shown but filtered out of the
+    /// committed result) and matches the `Defaults` enum value.
+    func testAIReasoningDefaultsOn() {
+        let settings = makeSettings()
+        XCTAssertTrue(settings.aiReasoningEnabled, "reasoning must default ON")
+        XCTAssertEqual(settings.aiReasoningEnabled, AppSettings.Defaults.aiReasoningEnabled)
+        XCTAssertTrue(AppSettings.Defaults.aiReasoningEnabled, "the Defaults literal is true")
+    }
+
+    /// The reasoning opt-in round-trips and persists across instances (both directions) and writes
+    /// through to its documented raw key.
+    func testAIReasoningEnabledPersistsAcrossInstances() {
+        let writer = makeSettings()
+        XCTAssertTrue(writer.aiReasoningEnabled)
+
+        writer.aiReasoningEnabled = false
+        XCTAssertEqual(defaults.object(forKey: "aiReasoningEnabled") as? Bool, false, "writes the documented key")
+
+        let reader = AppSettings(defaults: defaults)
+        XCTAssertFalse(reader.aiReasoningEnabled, "the off state persists across instances")
+
+        reader.aiReasoningEnabled = true
+        XCTAssertTrue(AppSettings(defaults: defaults).aiReasoningEnabled, "the on state persists too")
+    }
+
+    /// Older settings (no reasoning key present) decode with reasoning ON (the additive default), while
+    /// pre-existing settings are left untouched.
+    func testOlderSettingsDecodeWithReasoningOnAndUntouched() {
+        defaults.set(0.0777, forKey: "stepDistance")
+        XCTAssertNil(defaults.object(forKey: "aiReasoningEnabled"), "precondition: no reasoning key on disk")
+
+        let settings = AppSettings(defaults: defaults)
+        XCTAssertTrue(settings.aiReasoningEnabled, "absent key falls back to the ON default")
+        XCTAssertEqual(settings.stepDistance, 0.0777, accuracy: eps, "pre-existing settings untouched")
+    }
+
+    /// `resetToDefaults()` must NOT touch the reasoning opt-in — like the AI opt-in, it's a user choice
+    /// the tunables reset leaves alone (a disabled reasoning stays disabled across a reset).
+    func testResetToDefaultsDoesNotTouchAIReasoning() {
+        let settings = makeSettings()
+        settings.aiReasoningEnabled = false
+
+        settings.resetToDefaults()
+
+        XCTAssertFalse(settings.aiReasoningEnabled, "reset must not flip the reasoning opt-in")
     }
 
     // MARK: - Isolation

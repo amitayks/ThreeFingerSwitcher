@@ -215,6 +215,11 @@ struct AIPage: View {
                                     onDownload: context.onDownloadModel)
                     .disabled(!settings.aiCommandsEnabled)
             }
+            HubSection("Reasoning",
+                       footnote: "Let the model think before answering for higher-quality results (a bit slower). Thinking is never shown or pasted — only the final result.") {
+                Toggle("Reasoning", isOn: $settings.aiReasoningEnabled)
+                    .disabled(!settings.aiCommandsEnabled)
+            }
         }
     }
 }

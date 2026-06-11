@@ -1,5 +1,6 @@
 import Foundation
 import EventKit
+import Contacts
 import os
 #if canImport(AppKit)
 import AppKit
@@ -23,6 +24,10 @@ private let taskSinkLog = Logger(subsystem: "ThreeFingerSwitcher", category: "Ta
 enum TaskError: Error, Equatable {
     /// Calendar (EventKit) access was denied or restricted (spec: "Permission denied is handled").
     case calendarPermissionDenied
+    /// Reminders (EventKit) access was denied or restricted.
+    case remindersPermissionDenied
+    /// Contacts access was denied or restricted.
+    case contactsPermissionDenied
     /// The parsed action was missing a field the side effect requires (defensive; prepare guards this).
     case missingField(String)
     /// A sink/store/opener/sender failed to apply the effect.
@@ -30,12 +35,18 @@ enum TaskError: Error, Equatable {
 }
 
 /// Human-facing messages so the executor's `.failed` state shows a readable string rather than the
-/// raw enum case name (e.g. "calendarPermissionDenied").
+/// raw enum case name (e.g. "calendarPermissionDenied"). Each permission case names the missing
+/// permission and points to the relevant System Settings pane (spec: "A permission failure points to
+/// the fix").
 extension TaskError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .calendarPermissionDenied:
             return "Calendar access is required. Open System Settings ▸ Privacy & Security ▸ Calendars to allow it."
+        case .remindersPermissionDenied:
+            return "Reminders access is required. Open System Settings ▸ Privacy & Security ▸ Reminders to allow it."
+        case .contactsPermissionDenied:
+            return "Contacts access is required. Open System Settings ▸ Privacy & Security ▸ Contacts to allow it."
         case let .missingField(field):
             return "The action was missing a required field: \(field)."
         case let .sinkFailed(detail):
@@ -51,6 +62,24 @@ extension TaskError: LocalizedError {
 @MainActor
 protocol CalendarSink {
     func create(_ event: ParsedCalendarEvent) async throws
+}
+
+// MARK: - Reminders
+
+/// Creates a reminder/to-do. Production uses EventKit reminders; tests record it. Called ONLY after a
+/// confirmed review (and, in prod, a granted Reminders permission).
+@MainActor
+protocol ReminderSink {
+    func create(_ reminder: ParsedReminder) async throws
+}
+
+// MARK: - Contacts
+
+/// Creates a contact card. Production uses the Contacts framework; tests record it. Called ONLY after
+/// a confirmed review (and, in prod, a granted Contacts permission).
+@MainActor
+protocol ContactSink {
+    func create(_ contact: ParsedContact) async throws
 }
 
 // MARK: - Project note store
@@ -145,6 +174,101 @@ final class EventKitCalendarSink: CalendarSink {
             if let d = df.date(from: s) { return d }
         }
         return nil
+    }
+}
+
+// MARK: - Production: EventKit reminder sink
+
+/// The production `ReminderSink`: maps `{title, due, notes, priority}` to an `EKReminder` and saves it
+/// to the default reminders list. Requires the Reminders permission, requested lazily by
+/// `PermissionsService` before `create` runs (never at launch / opt-in — see permissions-onboarding).
+@MainActor
+final class EventKitReminderSink: ReminderSink {
+    private let store: EKEventStore
+    private let permissions: PermissionsService
+
+    init(store: EKEventStore = EKEventStore(), permissions: PermissionsService) {
+        self.store = store
+        self.permissions = permissions
+    }
+
+    func create(_ reminder: ParsedReminder) async throws {
+        let granted = await permissions.requestRemindersAccess()
+        guard granted else { throw TaskError.remindersPermissionDenied }
+
+        guard let title = reminder.title, !title.isEmpty else { throw TaskError.missingField("title") }
+        let ek = EKReminder(eventStore: store)
+        ek.title = title
+        ek.notes = reminder.notes
+        if let priority = reminder.priority { ek.priority = priority }
+        if let date = EventKitCalendarSink.parseDate(reminder.due) {
+            ek.dueDateComponents = Calendar.current.dateComponents(
+                [.year, .month, .day, .hour, .minute], from: date)
+        }
+        ek.calendar = store.defaultCalendarForNewReminders()
+        do {
+            try store.save(ek, commit: true)
+        } catch {
+            taskSinkLog.error("reminder save failed: \(String(describing: error), privacy: .public)")
+            throw TaskError.sinkFailed("Could not save the reminder.")
+        }
+    }
+}
+
+// MARK: - Production: Contacts sink
+
+/// The production `ContactSink`: maps `{name, email, phone, organization, notes}` to a `CNMutableContact`
+/// and saves it via `CNSaveRequest`. Requires the Contacts permission, requested lazily before `create`.
+@MainActor
+final class ContactsSink: ContactSink {
+    private let store: CNContactStore
+    private let permissions: PermissionsService
+
+    init(store: CNContactStore = CNContactStore(), permissions: PermissionsService) {
+        self.store = store
+        self.permissions = permissions
+    }
+
+    func create(_ contact: ParsedContact) async throws {
+        let granted = await permissions.requestContactsAccess()
+        guard granted else { throw TaskError.contactsPermissionDenied }
+
+        // A usable contact needs at least a name or a reachable handle; prepare guards this, but keep
+        // the sink defensive so it never saves an empty card.
+        let hasAny = [contact.name, contact.email, contact.phone, contact.organization]
+            .contains { ($0?.isEmpty == false) }
+        guard hasAny else { throw TaskError.missingField("name") }
+
+        let card = CNMutableContact()
+        if let name = contact.name, !name.isEmpty {
+            // Split a full name into given/family on the last space (best effort).
+            if let lastSpace = name.range(of: " ", options: .backwards) {
+                card.givenName = String(name[..<lastSpace.lowerBound])
+                card.familyName = String(name[lastSpace.upperBound...])
+            } else {
+                card.givenName = name
+            }
+        }
+        if let org = contact.organization, !org.isEmpty { card.organizationName = org }
+        if let email = contact.email, !email.isEmpty {
+            card.emailAddresses = [CNLabeledValue(label: CNLabelWork, value: email as NSString)]
+        }
+        if let phone = contact.phone, !phone.isEmpty {
+            card.phoneNumbers = [CNLabeledValue(label: CNLabelPhoneNumberMain,
+                                                value: CNPhoneNumber(stringValue: phone))]
+        }
+        // NOTE: `CNMutableContact.note` is intentionally NOT set — writing it requires the special,
+        // Apple-approval-gated `com.apple.developer.contacts.notes` entitlement, and attempting it
+        // without that throws at save time. The parsed `notes` still appears in the action-review.
+
+        let save = CNSaveRequest()
+        save.add(card, toContainerWithIdentifier: nil)
+        do {
+            try store.execute(save)
+        } catch {
+            taskSinkLog.error("contact save failed: \(String(describing: error), privacy: .public)")
+            throw TaskError.sinkFailed("Could not save the contact.")
+        }
     }
 }
 

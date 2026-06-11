@@ -3,9 +3,7 @@
 ## Purpose
 
 Define the AI command feature surfaced in the launcher: a Codable AI-command value model persisted as a first-class band item inside Favorites (folded in from the former separate store), inline authoring on the Hub's Bands page, prompt-template token resolution, command input acquisition with sensible fallback, in-place output routing into the captured front app, a one-time migration of legacy commands into a normal "AI" band, and a single opt-in that gates the on-device model's download/residency (but never the visibility of AI items).
-
 ## Requirements
-
 ### Requirement: AI command value model and persistence
 The system SHALL define an AI command as a Codable value type carrying: a stable identifier, a display name, an icon and tint, an **input source** (`selection` | `clipboard` | `screenRegion` | `none`), a **prompt template** string, an **output target** (`replaceSelection` | `pasteAtCursor` | `previewOnly` | `task(TaskKind)` | `sendTo(Destination)`), a **model selector** (v1: on-device Gemma 4), and a **confirmBeforeRun** flag. An AI command SHALL be a first-class, persisted **band item**: it is stored **inside the Favorites record** as the item of a context band, persists across launches, applies immediately when changed, and SHALL be movable between bands like any other item. Its stable identifier SHALL be preserved across edits and the migration into the band model (the identifier keys the executor and the UI).
 
@@ -37,7 +35,7 @@ On upgrade from a version that stored AI commands separately, the system SHALL p
 - **THEN** a default "AI" band with the seeded starter commands is created as part of normal seeding
 
 ### Requirement: Prompt template token resolution
-A command's prompt template SHALL support tokens that are resolved at fire time from the captured context: `{input}` (the acquired input text), `{date}` (the current date/time), `{app}` (the captured front app's name), and `{url}` (the front document/page URL when available). Unknown tokens SHALL be left untouched, and a missing `{url}`/`{app}` SHALL resolve to an empty string rather than failing the command.
+A command's prompt template SHALL support tokens that are resolved at fire time from the captured context: `{input}` (the acquired input text), `{date}` (the current date/time), `{app}` (the captured front app's name), `{url}` (the front document/page URL when available), and `{lang}` (the command's **active runtime language** — the canvas selection, falling back to the persisted last choice, falling back to the command's language-parameter default). Unknown tokens SHALL be left untouched, and a missing `{url}`/`{app}` SHALL resolve to an empty string rather than failing the command. A `{lang}` token on a command that declares no language parameter SHALL resolve to an empty string rather than failing.
 
 #### Scenario: Input token is substituted
 - **WHEN** a command with template `"Fix the grammar:\n{input}"` is fired on selected text
@@ -46,6 +44,14 @@ A command's prompt template SHALL support tokens that are resolved at fire time 
 #### Scenario: Missing context token degrades to empty
 - **WHEN** a template references `{url}` but the front app exposes no URL
 - **THEN** `{url}` resolves to an empty string and the command still runs
+
+#### Scenario: Language token resolves to the active language
+- **WHEN** a translate command with template `"Translate to {lang}:\n{input}"` and active language "Hebrew" is fired
+- **THEN** the model receives the template with `{lang}` replaced by "Hebrew"
+
+#### Scenario: Language token without a language parameter degrades to empty
+- **WHEN** a command that declares no language parameter references `{lang}`
+- **THEN** `{lang}` resolves to an empty string and the command still runs
 
 ### Requirement: Command input acquisition
 When an AI command is fired, the system SHALL acquire its input according to the command's configured input source: `selection` reads the front app's selected text, `clipboard` reads the current clipboard, `screenRegion` captures a screen region for the vision model, and `none` supplies no input. If the configured source yields nothing (e.g. no selection), the system SHALL fall back where sensible (selection → clipboard) and, if no input can be obtained for a command that requires input, SHALL surface a clear "no input" state rather than running on empty.
@@ -87,3 +93,34 @@ The AI commands opt-in SHALL gate the on-device model's **download and residency
 #### Scenario: Turning the opt-in off frees the model
 - **WHEN** the user turns the opt-in off after using the feature
 - **THEN** the resident model is evicted from memory (the AI items remain visible but inert until re-enabled)
+
+### Requirement: Runtime-adjustable command parameter
+A command MAY declare a **runtime parameter** that is chosen at fire time rather than baked into the template. In v1 the only runtime parameter SHALL be a **target language** (`language(default:)`). When a command declares a language parameter, its **active language** SHALL be resolved into the `{lang}` token at fire time, and the system SHALL expose the parameter for in-canvas adjustment (see launcher-overlay). Re-resolving the parameter SHALL re-run the command (see launcher-overlay) using the existing cancellable generation. The runtime parameter SHALL be optional and default to absent, so commands without one behave exactly as before.
+
+#### Scenario: A command without a runtime parameter is unchanged
+- **WHEN** a command that declares no runtime parameter is fired
+- **THEN** it resolves and runs exactly as before, with no parameter UI
+
+#### Scenario: A language-parameter command resolves its active language
+- **WHEN** a command declaring `language(default: "English")` is fired with no prior choice
+- **THEN** its active language is "English" and `{lang}` resolves to "English"
+
+### Requirement: Per-command runtime-parameter persistence
+The system SHALL persist the **last chosen value** of a command's runtime parameter **per command** (keyed by the command's identifier) and use it as the **default active value on the next run** of that command. Persistence SHALL NOT mutate the stored command (so seeds, catalog presets, and band edits are unaffected); it SHALL be an out-of-band preference that survives relaunch. The command's declared default SHALL be the cold-start fallback when no value has been chosen yet. The store SHALL be **best-effort**: an entry whose command no longer exists (deleted, or a never-re-added copy) MAY be pruned and SHALL otherwise be ignored, and a persisted entry SHALL never block deleting its command.
+
+#### Scenario: A chosen language is remembered next run
+- **WHEN** the user picks "Spanish" while running a translate command, then fires the same command again later
+- **THEN** the command's initial active language is "Spanish"
+
+#### Scenario: Two language commands remember independently
+- **WHEN** the user sets one command to "Hebrew" and another to "French"
+- **THEN** each command re-opens with its own remembered language
+
+#### Scenario: Persistence does not change the stored command
+- **WHEN** a runtime-parameter value is chosen and persisted
+- **THEN** the stored `AICommand` (and any catalog/seed source it came from) is unchanged; only the out-of-band preference records the choice
+
+#### Scenario: A deleted command's persisted value is harmless
+- **WHEN** a command with a persisted runtime-parameter value is deleted
+- **THEN** the deletion succeeds and the now-orphaned persisted entry is ignored (and MAY be pruned), never resurfacing on an unrelated command
+

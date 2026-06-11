@@ -51,7 +51,7 @@ final class AICommandExecutorTests: XCTestCase {
     /// (kind, prompt, source) and returns a scripted review; `execute` records the executed review's
     /// preview title so a test can assert the side effect fired exactly once, only on commit.
     private final class FakeTaskDispatcher: TaskDispatching {
-        private(set) var prepared: [(kind: TaskKind, prompt: String, source: TaskSource)] = []
+        private(set) var prepared: [(kind: TaskKind, prompt: String, source: TaskSource, reasoning: Bool)] = []
         private(set) var executed: [TaskReview] = []
         /// The review `prepare` returns. Defaults to a ready `.action` so the happy path lands in
         /// `.reviewingAction` / `.committed`.
@@ -63,8 +63,9 @@ final class AICommandExecutorTests: XCTestCase {
                                                                                            payload: "p")))
         var executeError: Error?
 
-        func prepare(_ kind: TaskKind, resolvedPrompt: String, source: TaskSource) async -> TaskReview {
-            prepared.append((kind, resolvedPrompt, source))
+        func prepare(_ kind: TaskKind, resolvedPrompt: String, source: TaskSource,
+                     reasoning: Bool) async -> TaskReview {
+            prepared.append((kind, resolvedPrompt, source, reasoning))
             return reviewToReturn
         }
 
@@ -113,6 +114,151 @@ final class AICommandExecutorTests: XCTestCase {
                       progress: @Sendable (Double) -> Void) async throws -> Data {
             progress(1.0); return payload
         }
+    }
+
+    /// A runtime that records the last `LLMRequest` it was handed, so a test can assert the executor
+    /// propagated `reasoning` onto the text-path request. Echoes the prompt as a single token.
+    private final class CapturingLLMRuntime: LLMRuntime, @unchecked Sendable {
+        let capabilities: Set<Modality> = [.text, .vision]
+        private(set) var lastRequest: LLMRequest?
+
+        func generate(_ request: LLMRequest) -> AsyncThrowingStream<Token, Error> {
+            lastRequest = request
+            return AsyncThrowingStream { continuation in
+                continuation.yield(Token(request.prompt, isFinal: true))
+                continuation.finish()
+            }
+        }
+
+        func structured<T: Decodable & Sendable>(
+            _ request: LLMRequest, schema: StructuredSchema, as type: T.Type
+        ) async throws -> StructuredOutcome<T> {
+            lastRequest = request
+            throw RuntimeError.couldNotProduceValid(attempts: 1)
+        }
+    }
+
+    /// A `ModelManager` opted-in + verified whose `runtimeFactory` returns `runtime` — variant of
+    /// `loadedManager(runtime:)` that accepts any `LLMRuntime` (used by the reasoning-propagation test).
+    private func loadedManager(anyRuntime runtime: LLMRuntime) async throws -> ModelManager {
+        let payload = Data("weights".utf8)
+        let registry = ModelRegistry(
+            models: [ModelDescriptor(
+                id: "test-model",
+                displayName: "Test Model",
+                sizeBytes: Int64(payload.count),
+                integritySHA: ModelManager.sha256Hex(payload),
+                downloadURL: URL(string: "https://models.invalid/test-model")!,
+                capabilities: [.text, .vision],
+                quantization: .qat4bit
+            )],
+            defaultModelID: "test-model"
+        )
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("tfs-executor-tests-\(UUID().uuidString)", isDirectory: true)
+        let manager = ModelManager(
+            registry: registry,
+            downloader: FakeDownloader(payload: payload),
+            optedIn: true,
+            storageRoot: root,
+            runtimeFactory: { _ in runtime }
+        )
+        try await manager.downloadAndVerify(registry.models[0])
+        return manager
+    }
+
+    // MARK: - Reasoning flag propagation (text path)
+
+    func testReasoningFlagPropagatesToTextRequest() async throws {
+        let runtime = CapturingLLMRuntime()
+        let manager = try await loadedManager(anyRuntime: runtime)
+        let selection = FakeSelectionProvider(selectedText: "input")
+        let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                         dispatcher: FakeTaskDispatcher(),
+                                         reasoning: { true })
+
+        let command = AICommand(name: "Echo", icon: .emoji("🔁"), input: .selection,
+                                promptTemplate: "{input}", output: .previewOnly)
+        executor.fire(command)
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+        XCTAssertEqual(runtime.lastRequest?.reasoning, true,
+                       "the executor sets request.reasoning from the injected closure")
+    }
+
+    // MARK: - Per-command reasoning override (text path): the command's override wins over the global
+
+    /// A per-command `.off` override beats a global default of TRUE: the text request reasons FALSE.
+    func testCommandReasoningOffOverridesGlobalTrue() async throws {
+        let runtime = CapturingLLMRuntime()
+        let manager = try await loadedManager(anyRuntime: runtime)
+        let selection = FakeSelectionProvider(selectedText: "input")
+        let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                         dispatcher: FakeTaskDispatcher(),
+                                         reasoning: { true })   // global default ON
+
+        let command = AICommand(name: "Echo", icon: .emoji("🔁"), input: .selection,
+                                promptTemplate: "{input}", output: .previewOnly, reasoning: .off)
+        executor.fire(command)
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+        XCTAssertEqual(runtime.lastRequest?.reasoning, false,
+                       "a per-command .off override forces reasoning off even when the global default is on")
+    }
+
+    /// A per-command `.on` override beats a global default of FALSE: the text request reasons TRUE.
+    func testCommandReasoningOnOverridesGlobalFalse() async throws {
+        let runtime = CapturingLLMRuntime()
+        let manager = try await loadedManager(anyRuntime: runtime)
+        let selection = FakeSelectionProvider(selectedText: "input")
+        let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                         dispatcher: FakeTaskDispatcher(),
+                                         reasoning: { false })   // global default OFF
+
+        let command = AICommand(name: "Echo", icon: .emoji("🔁"), input: .selection,
+                                promptTemplate: "{input}", output: .previewOnly, reasoning: .on)
+        executor.fire(command)
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+        XCTAssertEqual(runtime.lastRequest?.reasoning, true,
+                       "a per-command .on override forces reasoning on even when the global default is off")
+    }
+
+    /// An absent per-command override (`nil`) follows the global default on the text request.
+    func testCommandReasoningNilFollowsGlobalDefault() async throws {
+        let runtime = CapturingLLMRuntime()
+        let manager = try await loadedManager(anyRuntime: runtime)
+        let selection = FakeSelectionProvider(selectedText: "input")
+        let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                         dispatcher: FakeTaskDispatcher(),
+                                         reasoning: { true })   // global default ON
+
+        let command = AICommand(name: "Echo", icon: .emoji("🔁"), input: .selection,
+                                promptTemplate: "{input}", output: .previewOnly)  // no override
+        XCTAssertNil(command.reasoning, "a fresh command has no reasoning override")
+        executor.fire(command)
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+        XCTAssertEqual(runtime.lastRequest?.reasoning, true,
+                       "an absent override follows the injected global default")
+    }
+
+    // MARK: - Per-command reasoning override (task path): the executor passes the resolved value
+
+    /// The executor resolves reasoning per command and passes it into `dispatcher.prepare(..., reasoning:)`:
+    /// a task command with `.on` + a global default of FALSE prepares with reasoning TRUE.
+    func testTaskPathReceivesPerCommandResolvedReasoning() async throws {
+        let stub = StubLLMRuntime(scriptedTokens: ["unused for tasks"], interTokenDelayNanos: 0)
+        let manager = try await loadedManager(runtime: stub)
+        let selection = FakeSelectionProvider(selectedText: "lunch with sam tomorrow")
+        let dispatcher = FakeTaskDispatcher()
+        let executor = AICommandExecutor(modelManager: manager, selection: selection, dispatcher: dispatcher,
+                                         reasoning: { false })   // global default OFF
+
+        let command = AICommand(name: "Add to Calendar", icon: .emoji("📅"), input: .selection,
+                                promptTemplate: "{input}", output: .runTask(.addToCalendar),
+                                confirmBeforeRun: false, reasoning: .on)
+        executor.fire(command)
+        await waitUntil { executor.state == .committed }
+        let prep = try XCTUnwrap(dispatcher.prepared.first)
+        XCTAssertTrue(prep.reasoning,
+                      "a per-command .on override is passed into prepare even when the global default is off")
     }
 
     /// Spin the run loop until `predicate` holds or a deadline elapses (the executor streams off a
@@ -231,6 +377,76 @@ final class AICommandExecutorTests: XCTestCase {
         await waitUntil { stub.observedCancellation }
         XCTAssertTrue(stub.observedCancellation, "the runtime observed and honored cancellation")
         XCTAssertEqual(executor.state, .idle, "state stays idle after cancel (no ready appears)")
+    }
+
+    // MARK: - Show the model's thinking: channel split (thinking vs response)
+
+    /// The runtime streams `.thinking`-channel tokens BEFORE the `.response` tokens. The executor must
+    /// accumulate the reasoning into the observable `thinking` (so the canvas's collapsible section can
+    /// render it live) while STREAMING/COMMITTING only the response — the thinking must never appear in
+    /// the ready result nor in what commit routes to the app.
+    func testThinkingStreamsSeparatelyAndOnlyResponseCommits() async throws {
+        let stub = StubLLMRuntime(scriptedTokens: ["Fixed ", "text"],
+                                  scriptedThinking: ["Let me think… ", "checking grammar"],
+                                  interTokenDelayNanos: 0)
+        let manager = try await loadedManager(runtime: stub)
+        let selection = FakeSelectionProvider(selectedText: "teh txt")
+        let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                         dispatcher: FakeTaskDispatcher())
+
+        let command = AICommand(name: "Fix", icon: .emoji("✅"), input: .selection,
+                                promptTemplate: "Fix: {input}", output: .replaceSelection)
+        executor.fire(command)
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+
+        // The reasoning accumulated into `thinking`...
+        XCTAssertEqual(executor.thinking, "Let me think… checking grammar",
+                       "every .thinking-channel token accumulates into the observable thinking")
+        // ...but the result is RESPONSE-ONLY (no thinking text leaked in).
+        XCTAssertEqual(executor.state, .ready(result: "Fixed text"),
+                       "the ready result is the response only — thinking never appears in it")
+        XCTAssertFalse(executor.state == .ready(result: "Let me think… checking grammarFixed text"),
+                       "thinking is not prepended to the committed result")
+
+        // And commit routes the RESPONSE only to the app — the thinking is never written.
+        try await executor.commit()
+        XCTAssertEqual(executor.state, .committed)
+        XCTAssertEqual(selection.replacedWith, ["Fixed text"],
+                       "commit writes the response only; the thinking is never routed to the app")
+    }
+
+    /// A fresh fire and a cancel must each CLEAR the previously-streamed thinking, so a re-run/discard
+    /// never shows stale reasoning.
+    func testThinkingResetsOnNewFireAndOnCancel() async throws {
+        let stub = StubLLMRuntime(scriptedTokens: ["done"],
+                                  scriptedThinking: ["reasoning A"],
+                                  interTokenDelayNanos: 0)
+        let manager = try await loadedManager(runtime: stub)
+        let selection = FakeSelectionProvider(selectedText: "input")
+        let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                         dispatcher: FakeTaskDispatcher())
+        let command = AICommand(name: "Echo", icon: .emoji("🔁"), input: .selection,
+                                promptTemplate: "{input}", output: .previewOnly)
+
+        executor.fire(command)
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+        XCTAssertEqual(executor.thinking, "reasoning A", "the first run accumulates its reasoning")
+
+        // A cancel (horizontal discard) clears the thinking immediately.
+        executor.cancel()
+        XCTAssertEqual(executor.thinking, "", "cancel clears the streamed thinking")
+
+        // A fresh fire also starts with empty thinking before its own reasoning streams in.
+        let stub2 = StubLLMRuntime(scriptedTokens: ["done2"],
+                                   scriptedThinking: ["reasoning B"],
+                                   interTokenDelayNanos: 0)
+        let manager2 = try await loadedManager(runtime: stub2)
+        let executor2 = AICommandExecutor(modelManager: manager2, selection: selection,
+                                          dispatcher: FakeTaskDispatcher())
+        executor2.fire(command)
+        await waitUntil { if case .ready = executor2.state { return true }; return false }
+        XCTAssertEqual(executor2.thinking, "reasoning B",
+                       "a fresh fire shows only its own reasoning, never the prior run's")
     }
 
     // MARK: - Commit-vs-ignore decision (down-swipe gate)
@@ -415,6 +631,69 @@ final class AICommandExecutorTests: XCTestCase {
                       "the message is human-facing and mentions Calendar")
         XCTAssertNotEqual(message, "calendarPermissionDenied",
                           "NOT the raw enum case name (Fix 2 surfaces the LocalizedError description)")
+    }
+
+    // MARK: - Runtime language parameter: persisted default + in-canvas re-run
+
+    func testActiveLanguageResolvesDeclaredDefaultAtColdStart() async throws {
+        let stub = StubLLMRuntime(scriptedTokens: [], interTokenDelayNanos: 0) // echoes the prompt
+        let manager = try await loadedManager(runtime: stub)
+        let selection = FakeSelectionProvider(selectedText: "hello")
+        var store: [UUID: String] = [:]
+        let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                         dispatcher: FakeTaskDispatcher(),
+                                         loadLanguage: { store[$0] }, saveLanguage: { store[$0] = $1 })
+        let command = AICommand(name: "Translate", icon: .emoji("🌍"), input: .selection,
+                                promptTemplate: "Translate to {lang}:\n{input}", output: .previewOnly,
+                                runtimeParameter: .language(default: "English"))
+        executor.fire(command)
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+        XCTAssertEqual(executor.activeLanguage, "English", "cold start uses the declared default")
+        XCTAssertEqual(executor.state, .ready(result: "Translate to English:\nhello"),
+                       "{lang} resolves to the active language in the streamed prompt")
+    }
+
+    func testSetLanguagePersistsAndRetranslatesInPlace() async throws {
+        let stub = StubLLMRuntime(scriptedTokens: [], interTokenDelayNanos: 0) // echoes the prompt
+        let manager = try await loadedManager(runtime: stub)
+        let selection = FakeSelectionProvider(selectedText: "hello")
+        var store: [UUID: String] = [:]
+        let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                         dispatcher: FakeTaskDispatcher(),
+                                         loadLanguage: { store[$0] }, saveLanguage: { store[$0] = $1 })
+        let command = AICommand(name: "Translate", icon: .emoji("🌍"), input: .selection,
+                                promptTemplate: "Translate to {lang}:\n{input}", output: .previewOnly,
+                                runtimeParameter: .language(default: "English"))
+        executor.fire(command)
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+
+        // Repick a language in the canvas: re-runs in place AND persists for the next run.
+        executor.setLanguage("Hebrew")
+        await waitUntil { executor.state == .ready(result: "Translate to Hebrew:\nhello") }
+        XCTAssertEqual(executor.activeLanguage, "Hebrew")
+        XCTAssertEqual(store[command.id], "Hebrew", "the choice is persisted per command")
+
+        // A fresh fire now defaults to the remembered language (the next-run default).
+        executor.fire(command)
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+        XCTAssertEqual(executor.activeLanguage, "Hebrew", "next run defaults to the remembered language")
+        XCTAssertEqual(executor.state, .ready(result: "Translate to Hebrew:\nhello"))
+    }
+
+    func testSetLanguageIsIgnoredWithoutARuntimeParameter() async throws {
+        let stub = StubLLMRuntime(scriptedTokens: [], interTokenDelayNanos: 0)
+        let manager = try await loadedManager(runtime: stub)
+        let selection = FakeSelectionProvider(selectedText: "hello")
+        let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                         dispatcher: FakeTaskDispatcher())
+        let command = AICommand(name: "Echo", icon: .emoji("🔁"), input: .selection,
+                                promptTemplate: "{input}", output: .previewOnly) // no runtimeParameter
+        executor.fire(command)
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+        XCTAssertNil(executor.activeLanguage, "a command with no runtime parameter has no active language")
+        executor.setLanguage("Hebrew")  // must be a no-op
+        XCTAssertNil(executor.activeLanguage, "setLanguage is ignored without a language parameter")
+        XCTAssertEqual(executor.state, .ready(result: "hello"), "the result is unchanged")
     }
 
     // MARK: - Screen-region with no capture surfaces no-input

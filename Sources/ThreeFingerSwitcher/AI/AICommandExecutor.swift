@@ -76,6 +76,16 @@ final class AICommandExecutor: ObservableObject {
     }
 
     @Published private(set) var state: State = .idle
+    /// The model's streamed REASONING for the in-flight command ("show the model's thinking"). The
+    /// text-path streaming loop appends every `.thinking`-channel token here (live, so the canvas's
+    /// collapsible Thinking section updates as it streams) — while ONLY `.response` tokens accumulate
+    /// into `state`/commit. Reset at the start of every `fire(...)` and on `cancel()` so a re-run or
+    /// discard never shows stale thinking. Empty when the runtime emits no thinking (today's default).
+    @Published private(set) var thinking: String = ""
+    /// The active runtime language of the command in flight (spec: runtime parameter). `nil` when the
+    /// active command declares no language parameter — drives whether the canvas shows the dropdown
+    /// and what it shows selected. Resolved on every `fire` from persistence → declared default.
+    @Published private(set) var activeLanguage: String?
 
     private let modelManager: ModelManager
     private let selection: SelectionProviding
@@ -83,6 +93,14 @@ final class AICommandExecutor: ObservableObject {
     /// The fire-time context provider (front app name / URL). Injected so the executor doesn't reach
     /// into AppKit itself; the input text is filled in by acquisition.
     private let contextProvider: @MainActor () -> FireContext
+    /// Per-command remembered runtime language (the next-run default). Injected as closures so the
+    /// executor stays AppKit/AppSettings-free; the app wires these to `AppSettings`, tests pass theirs.
+    private let loadLanguage: @MainActor (UUID) -> String?
+    private let saveLanguage: @MainActor (UUID, String) -> Void
+    /// Whether the model should reason (think) before answering — thinking is filtered from the
+    /// result. Injected as a closure so the executor stays AppSettings-free; the app wires it to the
+    /// `aiReasoningEnabled` pref, tests pass their own.
+    private let reasoning: @MainActor () -> Bool
 
     /// The command currently being executed (set by `fire`, read by `commit`).
     private(set) var activeCommand: AICommand?
@@ -92,11 +110,24 @@ final class AICommandExecutor: ObservableObject {
     init(modelManager: ModelManager,
          selection: SelectionProviding,
          dispatcher: TaskDispatching,
-         contextProvider: @escaping @MainActor () -> FireContext = { FireContext() }) {
+         contextProvider: @escaping @MainActor () -> FireContext = { FireContext() },
+         loadLanguage: @escaping @MainActor (UUID) -> String? = { _ in nil },
+         saveLanguage: @escaping @MainActor (UUID, String) -> Void = { _, _ in },
+         reasoning: @escaping @MainActor () -> Bool = { false }) {
         self.modelManager = modelManager
         self.selection = selection
         self.dispatcher = dispatcher
         self.contextProvider = contextProvider
+        self.loadLanguage = loadLanguage
+        self.saveLanguage = saveLanguage
+        self.reasoning = reasoning
+    }
+
+    /// The active language for `command`: the remembered per-command choice, falling back to the
+    /// command's declared `.language` default. `nil` when the command declares no language parameter.
+    func resolvedLanguage(for command: AICommand) -> String? {
+        guard case let .languageChoice(def, _)? = command.runtimeParameter else { return nil }
+        return loadLanguage(command.id) ?? def
     }
 
     // MARK: - Fire (acquire → resolve → stream)
@@ -106,7 +137,11 @@ final class AICommandExecutor: ObservableObject {
     /// Cancels any in-flight generation first (a new fire supersedes the old).
     func fire(_ command: AICommand) {
         cancel()
+        thinking = ""   // clear any previous run's reasoning before the new fire streams its own
         activeCommand = command
+        // Resolve the active runtime language up front (persisted choice → declared default → nil), so
+        // the canvas dropdown reflects it even while loading / in the `.unavailable` state.
+        activeLanguage = resolvedLanguage(for: command)
 
         // Fire-time availability gate (configuration-hub): if AI can't produce a result yet — the
         // opt-in is off, or the model isn't downloaded/ready — open the canvas in the `.unavailable`
@@ -148,10 +183,10 @@ final class AICommandExecutor: ObservableObject {
             return
         }
 
-        // 2) Build the fire context and resolve the prompt template.
+        // 2) Build the fire context and resolve the prompt template (`{lang}` ⇐ the active language).
         var context = contextProvider()
         context.inputText = inputText
-        let prompt = PromptTemplate.resolve(command.promptTemplate, with: context)
+        let prompt = PromptTemplate.resolve(command.promptTemplate, with: context, activeLanguage: activeLanguage)
 
         // 3) Optional image for a screen-region (vision) command. A missing Screen-Recording grant is
         // surfaced as a clear `.failed` that names the permission (not silently as "no input").
@@ -181,28 +216,42 @@ final class AICommandExecutor: ObservableObject {
 
         if Task.isCancelled { return }
 
+        // Resolve reasoning ONCE for this command: an explicit per-command override wins, else the
+        // global default (the injected closure). The executor owns this resolution and threads the
+        // result into both the text request and the task path.
+        let useReasoning = command.resolvedReasoning(globalDefault: reasoning())
+
         // 5) Branch on the output's nature. A SIDE-EFFECTING output (`.runTask` / `.sendTo`) does NOT
         // stream text — it resolves a schema-targeted, validated, parsed ACTION via the dispatcher and
         // lands in `.reviewingAction` (armed-confirmation) / `.declined` / `.failed`, or — when the
         // command's `confirmBeforeRun` is OFF — commits the side effect directly (honoring the stored
         // value; design D6). An IN-PLACE output streams as before.
         if let kind = Self.taskKind(for: command.output) {
-            await runTask(kind, command: command, resolvedPrompt: prompt, context: context)
+            await runTask(kind, command: command, resolvedPrompt: prompt, context: context,
+                          reasoning: useReasoning)
             return
         }
 
-        // In-place: stream generation into observable state (so the canvas renders live).
-        let request = LLMRequest(prompt: prompt, image: image)
+        // In-place: stream generation into observable state (so the canvas renders live). Tokens are
+        // split by channel: `.thinking` chunks accumulate into the observable `thinking` (the canvas's
+        // collapsible reasoning section) and NEVER reach the committed result; only `.response` chunks
+        // accumulate into `accumulated` → `state` → commit ("show the thinking, commit the response").
+        let request = LLMRequest(prompt: prompt, image: image, reasoning: useReasoning)
         state = .streaming(partial: "")
         var accumulated = ""
         do {
             for try await token in runtime.generate(request) {
                 if Task.isCancelled { return }
-                accumulated += token.text
-                state = .streaming(partial: accumulated)
+                switch token.channel {
+                case .thinking:
+                    thinking += token.text   // live into the canvas's Thinking section; never committed
+                case .response:
+                    accumulated += token.text
+                    state = .streaming(partial: accumulated)
+                }
             }
             if Task.isCancelled { return }
-            state = .ready(result: accumulated)
+            state = .ready(result: accumulated)   // RESPONSE ONLY — thinking is never part of the result
         } catch let error as RuntimeError {
             if case .cancelled = error { return }   // a discard is not a failure
             state = .failed(message: Self.message(for: error))
@@ -217,9 +266,10 @@ final class AICommandExecutor: ObservableObject {
     /// state: `.declined` → `.declined`; `.unavailable` → `.failed`; `.action` → `.reviewingAction`
     /// when `confirmBeforeRun` is on, else `execute` it directly → `.committed`.
     private func runTask(_ kind: TaskKind, command: AICommand, resolvedPrompt: String,
-                         context: FireContext) async {
+                         context: FireContext, reasoning: Bool) async {
         let source = TaskSource(appName: context.capturedAppName, url: context.url, timestamp: context.date)
-        let review = await dispatcher.prepare(kind, resolvedPrompt: resolvedPrompt, source: source)
+        let review = await dispatcher.prepare(kind, resolvedPrompt: resolvedPrompt, source: source,
+                                              reasoning: reasoning)
         if Task.isCancelled { return }
 
         switch review {
@@ -302,10 +352,27 @@ final class AICommandExecutor: ObservableObject {
     }
 
     /// Discard the current fire: cancel any in-flight generation and reset to idle. Writes nothing.
+    /// Also clears any streamed reasoning so a discard never leaves stale thinking behind.
     func cancel() {
         generationTask?.cancel()
         generationTask = nil
+        thinking = ""
         state = .idle
+    }
+
+    // MARK: - Runtime parameter (in-canvas language re-run)
+
+    /// Re-run the active command against a newly chosen runtime `language` (launcher-overlay: the
+    /// in-canvas dropdown re-translates in place). Persists the choice per command — so the next run
+    /// defaults to it — then re-fires, which cancels the in-flight generation (cancellation is not a
+    /// failure) and streams the new language into the same canvas. A no-op when the active command
+    /// declares no language parameter, or when the language is unchanged (avoids a redundant re-run).
+    func setLanguage(_ language: String) {
+        guard let command = activeCommand,
+              case .languageChoice? = command.runtimeParameter,
+              language != activeLanguage else { return }
+        saveLanguage(command.id, language)
+        fire(command)   // re-reads the just-persisted language via `resolvedLanguage`
     }
 
     // MARK: - Input acquisition

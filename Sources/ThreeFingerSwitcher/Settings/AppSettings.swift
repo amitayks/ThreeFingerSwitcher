@@ -136,6 +136,32 @@ final class AppSettings: ObservableObject {
     /// so older settings (and a never-chosen default) read back identically.
     @Published var aiSelectedModelID: String? { didSet { defaults.set(aiSelectedModelID, forKey: Keys.aiSelectedModelID) } }
 
+    /// Per-command remembered runtime-parameter language (spec: "Per-command runtime-parameter
+    /// persistence"), keyed by the command's identifier string → the last chosen language. Out-of-band
+    /// from the command itself, so seeds/catalog/band edits are unaffected; orphan keys (deleted
+    /// commands) are harmless and pruned opportunistically. Stored as a `[String: String]` dictionary.
+    @Published var aiCommandLanguages: [String: String] { didSet { defaults.set(aiCommandLanguages, forKey: Keys.aiCommandLanguages) } }
+
+    /// Let the on-device model reason before answering (thinking is filtered from the result). Default
+    /// ON; gated behind the AI opt-in like the other AI prefs.
+    @Published var aiReasoningEnabled: Bool { didSet { defaults.set(aiReasoningEnabled, forKey: Keys.aiReasoningEnabled) } }
+
+    /// The language last chosen for `commandID`, or nil if none has been chosen yet (cold start).
+    func rememberedLanguage(for commandID: UUID) -> String? { aiCommandLanguages[commandID.uuidString] }
+
+    /// Remember `language` as the next-run default for `commandID` (written when the user repicks).
+    func rememberLanguage(_ language: String, for commandID: UUID) {
+        aiCommandLanguages[commandID.uuidString] = language
+    }
+
+    /// Best-effort orphan cleanup: drop persisted language entries whose command id is not in
+    /// `liveIDs`. A no-op when nothing is orphaned (so it doesn't churn UserDefaults needlessly).
+    func pruneCommandLanguages(keeping liveIDs: Set<UUID>) {
+        let live = Set(liveIDs.map(\.uuidString))
+        let kept = aiCommandLanguages.filter { live.contains($0.key) }
+        if kept.count != aiCommandLanguages.count { aiCommandLanguages = kept }
+    }
+
     /// Shared singleton uses the standard user defaults.
     private convenience init() {
         self.init(defaults: .standard)
@@ -176,6 +202,8 @@ final class AppSettings: ObservableObject {
         clipboardExcludedApps = defaults.object(forKey: Keys.clipboardExcludedApps) as? [String] ?? Defaults.clipboardExcludedApps
         aiCommandsEnabled = defaults.object(forKey: Keys.aiCommandsEnabled) as? Bool ?? Defaults.aiCommandsEnabled
         aiSelectedModelID = defaults.object(forKey: Keys.aiSelectedModelID) as? String ?? Defaults.aiSelectedModelID
+        aiCommandLanguages = defaults.object(forKey: Keys.aiCommandLanguages) as? [String: String] ?? Defaults.aiCommandLanguages
+        aiReasoningEnabled = defaults.object(forKey: Keys.aiReasoningEnabled) as? Bool ?? Defaults.aiReasoningEnabled
     }
 
     func resetToDefaults() {
@@ -243,6 +271,8 @@ final class AppSettings: ObservableObject {
         static let clipboardExcludedApps: [String] = []
         static let aiCommandsEnabled = false       // opt-in; gates the AI band + model download/residency
         static let aiSelectedModelID: String? = nil  // nil = registry default model
+        static let aiCommandLanguages: [String: String] = [:]  // per-command remembered runtime language
+        static let aiReasoningEnabled = true       // let the model think (filtered out of the result); gated by the AI opt-in
     }
 
     private enum Keys {
@@ -277,5 +307,7 @@ final class AppSettings: ObservableObject {
         static let clipboardExcludedApps = "clipboardExcludedApps"
         static let aiCommandsEnabled = "aiCommandsEnabled"
         static let aiSelectedModelID = "aiSelectedModelID"
+        static let aiCommandLanguages = "aiCommandLanguages"
+        static let aiReasoningEnabled = "aiReasoningEnabled"
     }
 }

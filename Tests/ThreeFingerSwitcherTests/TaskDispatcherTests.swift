@@ -22,6 +22,24 @@ final class TaskDispatcherTests: XCTestCase {
         }
     }
 
+    private final class FakeReminderSink: ReminderSink {
+        private(set) var created: [ParsedReminder] = []
+        var errorToThrow: Error?
+        func create(_ reminder: ParsedReminder) async throws {
+            if let e = errorToThrow { throw e }
+            created.append(reminder)
+        }
+    }
+
+    private final class FakeContactSink: ContactSink {
+        private(set) var created: [ParsedContact] = []
+        var errorToThrow: Error?
+        func create(_ contact: ParsedContact) async throws {
+            if let e = errorToThrow { throw e }
+            created.append(contact)
+        }
+    }
+
     private final class FakeProjectStore: ProjectStore {
         private(set) var appended: [(project: String, content: String, source: TaskSource)] = []
         func append(project: String, content: String, source: TaskSource) throws {
@@ -41,15 +59,44 @@ final class TaskDispatcherTests: XCTestCase {
         }
     }
 
+    /// A runtime that records the `LLMRequest` handed to `structured(...)`, then runs the real validate
+    /// pipeline over `scriptedJSON`. Lets a test assert the dispatcher propagated `reasoning` onto the
+    /// structured request (the lock guards the capture so it's robust under the dispatcher's async work).
+    private final class CapturingStructuredRuntime: LLMRuntime, @unchecked Sendable {
+        let capabilities: Set<Modality> = [.text]
+        private let scriptedJSON: String
+        private let lock = NSLock()
+        private var _lastRequest: LLMRequest?
+        var lastRequest: LLMRequest? { lock.lock(); defer { lock.unlock() }; return _lastRequest }
+
+        init(scriptedJSON: String) { self.scriptedJSON = scriptedJSON }
+
+        func generate(_ request: LLMRequest) -> AsyncThrowingStream<Token, Error> {
+            AsyncThrowingStream { $0.finish() }
+        }
+
+        func structured<T: Decodable & Sendable>(
+            _ request: LLMRequest, schema: StructuredSchema, as type: T.Type
+        ) async throws -> StructuredOutcome<T> {
+            lock.lock(); _lastRequest = request; lock.unlock()
+            let data = Data(scriptedJSON.utf8)
+            return .value(try JSONDecoder().decode(T.self, from: data))
+        }
+    }
+
     /// Build a dispatcher over a scripted stub runtime + the four fakes (created here so the fakes'
     /// main-actor inits aren't evaluated in a nonisolated default-argument context).
     private func makeDispatcher(stub: StubLLMRuntime,
                                 calendar: FakeCalendarSink? = nil,
+                                reminders: FakeReminderSink? = nil,
+                                contacts: FakeContactSink? = nil,
                                 projects: FakeProjectStore? = nil,
                                 tools: FakeToolOpener? = nil,
                                 senders: FakeDestinationSender? = nil) -> TaskDispatcher {
         TaskDispatcher(runtimeProvider: { stub },
                        calendarSink: calendar ?? FakeCalendarSink(),
+                       reminderSink: reminders ?? FakeReminderSink(),
+                       contactSink: contacts ?? FakeContactSink(),
                        projectStore: projects ?? FakeProjectStore(),
                        toolOpener: tools ?? FakeToolOpener(),
                        destinationSender: senders ?? FakeDestinationSender())
@@ -62,7 +109,7 @@ final class TaskDispatcherTests: XCTestCase {
             json: #"{"applicable":true,"title":"Sync","start":"2026-06-09T15:00","end":"2026-06-09T16:00","attendees":["sam"],"notes":"weekly"}"#))
         let dispatcher = makeDispatcher(stub: stub)
         let review = await dispatcher.prepare(.addToCalendar, resolvedPrompt: "meet sam tue 3pm",
-                                              source: TaskSource())
+                                              source: TaskSource(), reasoning: false)
         guard case let .action(title, fields, _) = review else {
             return XCTFail("a meeting text should yield an action, got \(review)")
         }
@@ -72,13 +119,100 @@ final class TaskDispatcherTests: XCTestCase {
         XCTAssertEqual(fields.first(where: { $0.label == "Attendees" })?.value, "sam")
     }
 
+    // MARK: - Reasoning flag propagation (structured path)
+
+    /// The dispatcher must carry the `reasoning` value passed to `prepare(...)` onto the structured
+    /// `LLMRequest`: when `prepare(..., reasoning: true)`, the request it hands `runtime.structured(...)`
+    /// has `reasoning == true` (the executor now owns reasoning resolution and threads it through).
+    func testReasoningFlagPropagatesToStructuredRequest() async throws {
+        let runtime = CapturingStructuredRuntime(
+            scriptedJSON: #"{"applicable":true,"title":"Sync","start":"2026-06-09T15:00"}"#)
+        let dispatcher = TaskDispatcher(runtimeProvider: { runtime },
+                                        calendarSink: FakeCalendarSink(),
+                                        reminderSink: FakeReminderSink(),
+                                        contactSink: FakeContactSink(),
+                                        projectStore: FakeProjectStore(),
+                                        toolOpener: FakeToolOpener(),
+                                        destinationSender: FakeDestinationSender())
+        _ = await dispatcher.prepare(.addToCalendar, resolvedPrompt: "meet sam tue 3pm",
+                                     source: TaskSource(), reasoning: true)
+        XCTAssertEqual(runtime.lastRequest?.reasoning, true,
+                       "the dispatcher sets request.reasoning from the value passed to prepare")
+    }
+
+    // MARK: - Reminders: schema-valid action routes to the reminder sink on commit
+
+    func testReminderProducesActionAndExecutesToSink() async throws {
+        let stub = StubLLMRuntime(structuredScript: .valid(
+            json: #"{"applicable":true,"title":"Email Sam","due":"2026-06-09T09:00","priority":1,"notes":"re: launch"}"#))
+        let reminders = FakeReminderSink()
+        let dispatcher = makeDispatcher(stub: stub, reminders: reminders)
+        let review = await dispatcher.prepare(.addToReminder, resolvedPrompt: "remind me to email sam",
+                                              source: TaskSource(), reasoning: false)
+        guard case let .action(title, fields, _) = review else {
+            return XCTFail("a task text should yield an action, got \(review)")
+        }
+        XCTAssertEqual(title, "Add to Reminders")
+        XCTAssertEqual(fields.first(where: { $0.label == "Title" })?.value, "Email Sam")
+        XCTAssertEqual(fields.first(where: { $0.label == "Due" })?.value, "2026-06-09T09:00")
+
+        try await dispatcher.execute(review)
+        XCTAssertEqual(reminders.created.count, 1, "the reminder is created exactly once on commit")
+        XCTAssertEqual(reminders.created.first?.title, "Email Sam")
+    }
+
+    func testReminderDeclineYieldsNoAction() async throws {
+        let stub = StubLLMRuntime(structuredScript: .valid(
+            json: #"{"applicable":false,"reason":"No task described"}"#))
+        let reminders = FakeReminderSink()
+        let dispatcher = makeDispatcher(stub: stub, reminders: reminders)
+        let review = await dispatcher.prepare(.addToReminder, resolvedPrompt: "nice weather",
+                                              source: TaskSource(), reasoning: false)
+        guard case .declined = review else { return XCTFail("no-task text should decline, got \(review)") }
+        try await dispatcher.execute(review)
+        XCTAssertTrue(reminders.created.isEmpty, "a declined reminder fires no side effect")
+    }
+
+    // MARK: - Contacts: schema-valid action routes to the contact sink on commit
+
+    func testContactProducesActionAndExecutesToSink() async throws {
+        let stub = StubLLMRuntime(structuredScript: .valid(
+            json: #"{"applicable":true,"name":"Sam Rivera","email":"sam@example.com","phone":"+1 555 0100","organization":"Acme"}"#))
+        let contacts = FakeContactSink()
+        let dispatcher = makeDispatcher(stub: stub, contacts: contacts)
+        let review = await dispatcher.prepare(.newContact, resolvedPrompt: "Sam Rivera, Acme, sam@example.com",
+                                              source: TaskSource(), reasoning: false)
+        guard case let .action(title, fields, _) = review else {
+            return XCTFail("a signature should yield an action, got \(review)")
+        }
+        XCTAssertEqual(title, "New Contact")
+        XCTAssertEqual(fields.first(where: { $0.label == "Name" })?.value, "Sam Rivera")
+        XCTAssertEqual(fields.first(where: { $0.label == "Email" })?.value, "sam@example.com")
+
+        try await dispatcher.execute(review)
+        XCTAssertEqual(contacts.created.count, 1, "the contact is created exactly once on commit")
+        XCTAssertEqual(contacts.created.first?.organization, "Acme")
+    }
+
+    func testContactDeclineWhenNoDetails() async throws {
+        let stub = StubLLMRuntime(structuredScript: .valid(
+            json: #"{"applicable":false,"reason":"No contact details"}"#))
+        let contacts = FakeContactSink()
+        let dispatcher = makeDispatcher(stub: stub, contacts: contacts)
+        let review = await dispatcher.prepare(.newContact, resolvedPrompt: "let's meet sometime",
+                                              source: TaskSource(), reasoning: false)
+        guard case .declined = review else { return XCTFail("no-detail text should decline, got \(review)") }
+        try await dispatcher.execute(review)
+        XCTAssertTrue(contacts.created.isEmpty, "a declined contact fires no side effect")
+    }
+
     // MARK: - Calendar: model declines (typed) → no action
 
     func testCalendarTypedDeclineYieldsNoAction() async throws {
         let stub = StubLLMRuntime(structuredScript: .decline(reason: "This text is not a meeting"))
         let dispatcher = makeDispatcher(stub: stub)
         let review = await dispatcher.prepare(.addToCalendar, resolvedPrompt: "just a thought",
-                                              source: TaskSource())
+                                              source: TaskSource(), reasoning: false)
         guard case let .declined(reason) = review else {
             return XCTFail("a non-meeting text should decline, got \(review)")
         }
@@ -93,7 +227,7 @@ final class TaskDispatcherTests: XCTestCase {
             json: #"{"applicable":false,"reason":"No meeting described"}"#))
         let dispatcher = makeDispatcher(stub: stub)
         let review = await dispatcher.prepare(.addToCalendar, resolvedPrompt: "groceries",
-                                              source: TaskSource())
+                                              source: TaskSource(), reasoning: false)
         guard case let .declined(reason) = review else {
             return XCTFail("applicable:false should decline, got \(review)")
         }
@@ -108,7 +242,7 @@ final class TaskDispatcherTests: XCTestCase {
             bad: #"{"title":"Sync"}"#,
             good: #"{"applicable":true,"title":"Sync","start":"2026-06-09T15:00"}"#))
         let dispatcher = makeDispatcher(stub: stub)
-        let review = await dispatcher.prepare(.addToCalendar, resolvedPrompt: "p", source: TaskSource())
+        let review = await dispatcher.prepare(.addToCalendar, resolvedPrompt: "p", source: TaskSource(), reasoning: false)
         XCTAssertTrue(review.isAction, "the repaired emission yields a valid action")
         XCTAssertEqual(stub.lastAttemptCount, 2, "one repair attempt converged")
     }
@@ -120,7 +254,7 @@ final class TaskDispatcherTests: XCTestCase {
                                   maxRepairAttempts: 3)
         let calendar = FakeCalendarSink()
         let dispatcher = makeDispatcher(stub: stub, calendar: calendar)
-        let review = await dispatcher.prepare(.addToCalendar, resolvedPrompt: "p", source: TaskSource())
+        let review = await dispatcher.prepare(.addToCalendar, resolvedPrompt: "p", source: TaskSource(), reasoning: false)
         guard case .unavailable = review else {
             return XCTFail("persistently invalid output must be .unavailable, got \(review)")
         }
@@ -136,7 +270,7 @@ final class TaskDispatcherTests: XCTestCase {
             json: #"{"applicable":true,"title":"Sync","start":"2026-06-09T15:00"}"#))
         let calendar = FakeCalendarSink()
         let dispatcher = makeDispatcher(stub: stub, calendar: calendar)
-        let review = await dispatcher.prepare(.addToCalendar, resolvedPrompt: "p", source: TaskSource())
+        let review = await dispatcher.prepare(.addToCalendar, resolvedPrompt: "p", source: TaskSource(), reasoning: false)
 
         XCTAssertTrue(calendar.created.isEmpty, "prepare alone fires no side effect")
         try await dispatcher.execute(review)
@@ -163,7 +297,7 @@ final class TaskDispatcherTests: XCTestCase {
         let source = TaskSource(appName: "Notes", url: URL(string: "https://x.test"),
                                 timestamp: Date(timeIntervalSince1970: 1_700_000_000))
         let review = await dispatcher.prepare(.saveToProject(project: "Roadmap"),
-                                              resolvedPrompt: "save this", source: source)
+                                              resolvedPrompt: "save this", source: source, reasoning: false)
         guard case let .action(_, fields, _) = review else {
             return XCTFail("save-to-project should yield an action, got \(review)")
         }
@@ -184,7 +318,7 @@ final class TaskDispatcherTests: XCTestCase {
         let tools = FakeToolOpener()
         let dispatcher = makeDispatcher(stub: stub, tools: tools)
         let review = await dispatcher.prepare(.openToolWithPayload(tool: "MyTool"),
-                                              resolvedPrompt: "idea", source: TaskSource())
+                                              resolvedPrompt: "idea", source: TaskSource(), reasoning: false)
         try await dispatcher.execute(review)
         let routed = try XCTUnwrap(tools.opened.first)
         XCTAssertEqual(routed.tool, "MyTool")
@@ -199,7 +333,7 @@ final class TaskDispatcherTests: XCTestCase {
         let senders = FakeDestinationSender()
         let dispatcher = makeDispatcher(stub: stub, senders: senders)
         let review = await dispatcher.prepare(.sendTo(.shortcut(name: "Log")),
-                                              resolvedPrompt: "msg", source: TaskSource())
+                                              resolvedPrompt: "msg", source: TaskSource(), reasoning: false)
         try await dispatcher.execute(review)
         let routed = try XCTUnwrap(senders.sent.first)
         XCTAssertEqual(routed.destination, .shortcut(name: "Log"))
@@ -218,7 +352,7 @@ final class TaskDispatcherTests: XCTestCase {
         for kind in kinds {
             let stub = StubLLMRuntime(structuredScript: .decline(reason: "not applicable"))
             let dispatcher = makeDispatcher(stub: stub)
-            let review = await dispatcher.prepare(kind, resolvedPrompt: "p", source: TaskSource())
+            let review = await dispatcher.prepare(kind, resolvedPrompt: "p", source: TaskSource(), reasoning: false)
             guard case .declined = review else {
                 return XCTFail("\(kind) should be able to decline, got \(review)")
             }
@@ -334,7 +468,7 @@ final class TaskDispatcherTests: XCTestCase {
         let projects = FakeProjectStore()
         let dispatcher = makeDispatcher(stub: stub, projects: projects)
         let review = await dispatcher.prepare(.saveToProject(project: "Roadmap"),
-                                              resolvedPrompt: "groceries", source: TaskSource())
+                                              resolvedPrompt: "groceries", source: TaskSource(), reasoning: false)
         guard case let .declined(reason) = review else {
             return XCTFail("applicable:false should decline (not .unavailable), got \(review)")
         }

@@ -73,7 +73,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
         ?? DevAIRuntime.makeModelManager(optedIn: settings.aiCommandsEnabled)
     /// The agentic task layer (calendar / save-to-project / open-tool / send-to), driven by the model's
     /// structured output. Calendar permission is requested lazily at first calendar-task use.
-    private lazy var taskDispatcher = TaskDispatcher(modelManager: modelManager, permissions: permissions)
+    private lazy var taskDispatcher = TaskDispatcher(
+        modelManager: modelManager,
+        permissions: permissions
+    )
     /// Orchestrates one AI command fire end-to-end (acquire → stream → commit), exposing the observable
     /// state the launcher's preview canvas binds to. The context provider supplies the captured app
     /// name so `{app}` resolves; input is filled by acquisition.
@@ -83,7 +86,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
         dispatcher: taskDispatcher,
         contextProvider: { [weak self] in
             FireContext(capturedAppName: self?.capturedFrontApp?.localizedName)
-        }
+        },
+        loadLanguage: { [weak self] id in self?.settings.rememberedLanguage(for: id) },
+        saveLanguage: { [weak self] id, lang in self?.settings.rememberLanguage(lang, for: id) },
+        reasoning: { [weak self] in self?.settings.aiReasoningEnabled ?? false }
     )
 
     /// Whether the app currently has Mission Control open (it triggers MC itself via the vertical
@@ -115,8 +121,14 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// navigation (after a three- or four-finger trigger relaxes to two) so it doesn't scroll the
     /// window underneath; with both overlays closed it reverts to the `≥3`-fingers rule, leaving
     /// normal two-finger scroll alone.
-    static func shouldConsumeScroll(fingerCount: Int, launcherOpen: Bool, switcherOpen: Bool) -> Bool {
-        fingerCount >= 3 || launcherOpen || switcherOpen
+    ///
+    /// `3+` finger is always consumed (gesture territory — a 4-finger resolve swipe's incidental
+    /// scroll must not leak to the front app); the normal launcher / switcher still consume 1-2
+    /// finger so stray scroll doesn't leak during nav; but while the AI **canvas** is active we
+    /// DON'T consume 1-2 finger scroll, so it reaches the canvas's SwiftUI ScrollView (the panel is
+    /// key + interactive and under the cursor) to scroll the thinking / response.
+    static func shouldConsumeScroll(fingerCount: Int, launcherOpen: Bool, switcherOpen: Bool, canvasActive: Bool) -> Bool {
+        fingerCount >= 3 || ((launcherOpen || switcherOpen) && !canvasActive)
     }
 
     init() {
@@ -129,7 +141,8 @@ final class AppCoordinator: GestureRecognizerDelegate {
             guard let self else { return false }
             return Self.shouldConsumeScroll(fingerCount: self.currentFingerCount,
                                             launcherOpen: self.launcherOverlay.isVisible,
-                                            switcherOpen: self.overlay.isVisible)
+                                            switcherOpen: self.overlay.isVisible,
+                                            canvasActive: self.launcherOverlay.canvasActive)
         }
         thumbnails.onThumbnail = { [weak self] id, image in self?.overlay.model.setThumbnail(image, for: id) }
         launcherOverlay.onFire = { [weak self] item, band in self?.launchService.fire(item, inBand: band) }

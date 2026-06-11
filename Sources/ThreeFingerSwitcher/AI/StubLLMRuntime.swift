@@ -39,8 +39,13 @@ public final class StubLLMRuntime: LLMRuntime, @unchecked Sendable {
     public let capabilities: Set<Modality>
 
     /// Scripted streaming chunks emitted, in order, for every `generate(_:)` call. If empty, the stub
-    /// echoes the request prompt as a single token.
+    /// echoes the request prompt as a single token. These are RESPONSE-channel chunks (the final answer).
     var scriptedTokens: [String]
+
+    /// Scripted REASONING chunks, emitted as `.thinking`-channel tokens BEFORE the response tokens (so a
+    /// test can drive the canvas's "show the model's thinking" channel split). Default empty = today's
+    /// behavior: a pure `.response` stream, byte-identical to before.
+    var scriptedThinking: [String]
 
     /// Artificial delay between emitted tokens, in nanoseconds. Lets a test observe streaming order
     /// and cancel mid-stream. Default is a tiny delay so tests stay fast.
@@ -68,11 +73,13 @@ public final class StubLLMRuntime: LLMRuntime, @unchecked Sendable {
 
     public init(capabilities: Set<Modality> = [.text, .vision],
                 scriptedTokens: [String] = [],
+                scriptedThinking: [String] = [],
                 interTokenDelayNanos: UInt64 = 1_000_000, // 1 ms
                 structuredScript: StructuredScript? = nil,
                 maxRepairAttempts: Int = 3) {
         self.capabilities = capabilities
         self.scriptedTokens = scriptedTokens
+        self.scriptedThinking = scriptedThinking
         self.interTokenDelayNanos = interTokenDelayNanos
         self.structuredScript = structuredScript
         self.maxRepairAttempts = maxRepairAttempts
@@ -83,6 +90,7 @@ public final class StubLLMRuntime: LLMRuntime, @unchecked Sendable {
     public func generate(_ request: LLMRequest) -> AsyncThrowingStream<Token, Error> {
         // Capture the script up-front so the closure doesn't race on `self` mutation mid-stream.
         let chunks = scriptedTokens.isEmpty ? [request.prompt] : scriptedTokens
+        let thinkingChunks = scriptedThinking
         let delay = interTokenDelayNanos
         let needsVision = request.requiresVision
         let caps = capabilities
@@ -95,6 +103,15 @@ public final class StubLLMRuntime: LLMRuntime, @unchecked Sendable {
                     return
                 }
                 do {
+                    // Reasoning first: `.thinking`-channel chunks stream BEFORE the response (so a
+                    // consumer can split the model's thinking from its answer). isFinal stays false —
+                    // only the last RESPONSE token is final. Empty by default (a pure response stream).
+                    for chunk in thinkingChunks {
+                        try Task.checkCancellation()
+                        if delay > 0 { try await Task.sleep(nanoseconds: delay) }
+                        try Task.checkCancellation()
+                        continuation.yield(Token(chunk, isFinal: false, channel: .thinking))
+                    }
                     for (i, chunk) in chunks.enumerated() {
                         // Honor cancellation BEFORE emitting so a discard stops work promptly.
                         try Task.checkCancellation()

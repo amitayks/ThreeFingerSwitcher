@@ -45,6 +45,53 @@ final class AICommandTests: XCTestCase {
         }
     }
 
+    // MARK: - RuntimeParameter Codable (new shape + legacy back-compat)
+
+    func testRuntimeParameterRoundTripsBothFactories() throws {
+        for param: RuntimeParameter in [.language(default: "Hebrew"), .codeLanguage(default: "Rust")] {
+            let data = try JSONEncoder().encode(param)
+            let decoded = try JSONDecoder().decode(RuntimeParameter.self, from: data)
+            XCTAssertEqual(decoded, param, "the runtime parameter round-trips with its own option set")
+        }
+    }
+
+    func testLegacyLanguageParameterPayloadStillDecodes() throws {
+        // A band persisted BEFORE the case was renamed stored `{"language": {"default": …}}` (no
+        // options). It must still decode — as a `.languageChoice` defaulting to the human-language list —
+        // so an existing install's AI band keeps loading (no migration pass runs).
+        let legacy = Data(#"{"language":{"default":"Spanish"}}"#.utf8)
+        let decoded = try JSONDecoder().decode(RuntimeParameter.self, from: legacy)
+        XCTAssertEqual(decoded.languageDefault, "Spanish", "the legacy default survives")
+        XCTAssertEqual(decoded.options, AILanguages.all,
+                       "a legacy payload (no options) defaults to the human-language list")
+    }
+
+    // MARK: - Per-command reasoning override (resolution + legacy back-compat)
+
+    func testResolvedReasoningResolvesAgainstGlobalDefault() {
+        func cmd(_ r: AIReasoning?) -> AICommand {
+            AICommand(name: "R", icon: .emoji("🧠"), input: .selection,
+                      promptTemplate: "{input}", output: .previewOnly, reasoning: r)
+        }
+        // .on / .off pin regardless of the global; nil follows the global default.
+        XCTAssertTrue(cmd(.on).resolvedReasoning(globalDefault: false), ".on forces reasoning on")
+        XCTAssertFalse(cmd(.off).resolvedReasoning(globalDefault: true), ".off forces reasoning off")
+        XCTAssertTrue(cmd(nil).resolvedReasoning(globalDefault: true), "nil follows the global (on)")
+        XCTAssertFalse(cmd(nil).resolvedReasoning(globalDefault: false), "nil follows the global (off)")
+    }
+
+    func testLegacyCommandPayloadWithoutReasoningDecodesToNil() throws {
+        // A command persisted before `reasoning` existed has no key; synthesized Codable's
+        // decodeIfPresent must yield nil (⇒ follow the global default), not fail to decode.
+        let original = AICommand(name: "Fix", icon: .sfSymbol("checkmark"), input: .selection,
+                                 promptTemplate: "{input}", output: .replaceSelection)
+        var json = try JSONSerialization.jsonObject(with: try JSONEncoder().encode(original)) as! [String: Any]
+        json.removeValue(forKey: "reasoning")   // simulate a pre-feature payload
+        let stripped = try JSONSerialization.data(withJSONObject: json)
+        let decoded = try JSONDecoder().decode(AICommand.self, from: stripped)
+        XCTAssertNil(decoded.reasoning, "a legacy command without the key decodes to nil (follows global)")
+    }
+
     // MARK: - confirmBeforeRun default + honored
 
     func testConfirmDefaultsOnForSideEffectingOutputs() {
