@@ -483,4 +483,134 @@ final class ModelManagerTests: XCTestCase {
         XCTAssertEqual(manager.state, .loaded)
         XCTAssertEqual(counter.count, 2, "the warm reload re-runs the provisioner (load), still no byte fetch path")
     }
+
+    // MARK: - Per-model status + delete
+
+    /// A mutable on-disk model set the provisioner-path probe & delete read/write, so a test can assert a
+    /// delete actually removes the weights (and a re-probe then reads "not downloaded").
+    private final class DiskState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var present: Set<String>
+        private(set) var deleted: [String] = []
+        init(_ present: Set<String>) { self.present = present }
+        func contains(_ id: String) -> Bool { lock.lock(); defer { lock.unlock() }; return present.contains(id) }
+        func remove(_ id: String) { lock.lock(); present.remove(id); deleted.append(id); lock.unlock() }
+    }
+
+    /// A two-model registry (default = "model-a") so per-model selection/status is exercisable.
+    private func twoModelRegistry() -> ModelRegistry {
+        func descriptor(_ id: String) -> ModelDescriptor {
+            ModelDescriptor(id: id, displayName: id, sizeBytes: 1, integritySHA: "sha-\(id)",
+                            downloadURL: URL(string: "https://models.invalid/\(id)")!,
+                            capabilities: [.text, .vision], quantization: .qat4bit)
+        }
+        return ModelRegistry(models: [descriptor("model-a"), descriptor("model-b")], defaultModelID: "model-a")
+    }
+
+    /// A provisioner-backed manager whose disk state is the mutable `disk` (probe + delete go through it).
+    private func managerBackedBy(_ disk: DiskState) -> ModelManager {
+        ModelManager(
+            registry: twoModelRegistry(),
+            downloader: FakeDownloader(),
+            optedIn: true,
+            storageRoot: tempRoot(),
+            provisioner: { descriptor, progress in
+                progress(1.0)
+                return StubLLMRuntime(capabilities: descriptor.capabilities)
+            },
+            provisionedOnDisk: { disk.contains($0.id) },
+            provisionedDelete: { disk.remove($0.id) }
+        )
+    }
+
+    func testShowStatusTracksSelectedModelPerDisk() {
+        let disk = DiskState(["model-b"])      // B downloaded, A not
+        let manager = managerBackedBy(disk)
+        let a = manager.registry.descriptor(id: "model-a")!
+        let b = manager.registry.descriptor(id: "model-b")!
+
+        manager.showStatus(for: a)
+        XCTAssertEqual(manager.state, .notDownloaded, "the selected model A is not on disk")
+        manager.showStatus(for: b)
+        XCTAssertEqual(manager.state, .ready, "selecting B reflects B's own on-disk status")
+        manager.showStatus(for: a)
+        XCTAssertEqual(manager.state, .notDownloaded,
+                       "switching back to A shows A's status, not a stale carry-over from B")
+    }
+
+    func testShowStatusIsNoOpWhileOptedOut() {
+        let disk = DiskState(["model-b"])
+        let manager = managerBackedBy(disk)
+        manager.setOptedIn(false)
+        manager.showStatus(for: manager.registry.descriptor(id: "model-b")!)
+        XCTAssertEqual(manager.state, .notDownloaded, "no status surfaces while AI is opted out")
+    }
+
+    func testDeleteFromDiskRemovesWeightsAndResetsSelected() {
+        let disk = DiskState(["model-b"])
+        let manager = managerBackedBy(disk)
+        let b = manager.registry.descriptor(id: "model-b")!
+        manager.showStatus(for: b)
+        XCTAssertEqual(manager.state, .ready)
+
+        manager.deleteFromDisk(b)
+        XCTAssertFalse(disk.contains("model-b"), "delete removes the provisioned weights from disk")
+        XCTAssertTrue(disk.deleted.contains("model-b"), "the injected provisioner-delete ran for B")
+        XCTAssertEqual(manager.state, .notDownloaded, "the on-screen model resets to not-downloaded")
+    }
+
+    func testDeletedModelDoesNotRediscoverAsDownloaded() {
+        // The reported bug: after deleting, re-opening the AI section / re-enabling must NOT say
+        // "Downloaded". With the weights actually gone, every re-probe reads not-downloaded.
+        let disk = DiskState(["model-b"])
+        let manager = managerBackedBy(disk)
+        let b = manager.registry.descriptor(id: "model-b")!
+        manager.showStatus(for: b)
+        manager.deleteFromDisk(b)
+
+        manager.showStatus(for: b)             // re-open the AI section
+        XCTAssertEqual(manager.state, .notDownloaded, "a deleted model never re-discovers as Downloaded")
+        manager.reconcileWithDisk()            // launch / opt-in rediscovery path
+        XCTAssertEqual(manager.state, .notDownloaded)
+    }
+
+    func testDeleteResidentModelEvictsIt() async throws {
+        let disk = DiskState(["model-a"])
+        let manager = managerBackedBy(disk)
+        let a = manager.registry.descriptor(id: "model-a")!
+        _ = try await manager.runtime(requiring: [.text])   // A resident + .loaded
+        XCTAssertEqual(manager.state, .loaded)
+
+        manager.deleteFromDisk(a)
+        XCTAssertFalse(manager.isResident, "deleting the resident model unloads it")
+        XCTAssertEqual(manager.state, .notDownloaded)
+        XCTAssertFalse(disk.contains("model-a"))
+    }
+
+    func testDeleteAllFromDiskClearsEveryModelAndResidency() async throws {
+        let disk = DiskState(["model-a", "model-b"])
+        let manager = managerBackedBy(disk)
+        _ = try await manager.runtime(requiring: [.text])   // load the default (A) resident
+        XCTAssertTrue(manager.isResident)
+
+        manager.deleteAllFromDisk()
+        XCTAssertFalse(manager.isResident, "deleting all drops residency")
+        XCTAssertEqual(manager.state, .notDownloaded)
+        XCTAssertFalse(disk.contains("model-a"))
+        XCTAssertFalse(disk.contains("model-b"))
+    }
+
+    func testDeleteFromDiskBytePathClearsVerifiedWeights() async throws {
+        // Dev/byte path: no provisioner — deleting clears the held verified weights and resets state.
+        let payload = Data("good".utf8)
+        let manager = ModelManager(registry: registry(matching: payload),
+                                   downloader: FakeDownloader(payload: payload),
+                                   optedIn: true,
+                                   storageRoot: tempRoot())
+        try await manager.downloadAndVerify(manager.registry.models[0])
+        XCTAssertEqual(manager.state, .ready)
+
+        manager.deleteFromDisk(manager.registry.models[0])
+        XCTAssertEqual(manager.state, .notDownloaded, "deleting clears the verified weights → not-downloaded")
+    }
 }

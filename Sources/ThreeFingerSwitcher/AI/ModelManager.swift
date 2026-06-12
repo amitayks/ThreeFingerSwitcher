@@ -94,12 +94,22 @@ public final class ModelManager: ObservableObject {
     /// it on first use WITHOUT a re-download. Default: `false` (the dev-stub/byte path proves presence
     /// via `verifiedBytes`, not this probe).
     private let provisionedOnDisk: @Sendable (ModelDescriptor) -> Bool
+    /// Delete a descriptor's on-disk weights on the provisioner (real-runtime) path — the HF-cache dir
+    /// the runtime actually loads from. Injected by the backend (Core doesn't know the cache layout),
+    /// mirroring `provisionedOnDisk`. Without it a delete would remove the wrong (app-support) dir and
+    /// the model would re-discover as "Downloaded". Default: no-op (the dev/byte path removes its own
+    /// `storageRoot` weights, which need no backend knowledge).
+    private let provisionedDelete: @Sendable (ModelDescriptor) -> Void
 
     private let storageRoot: URL
 
     /// The resident runtime once loaded; nil means not loaded (notDownloaded/ready/evicted).
     private var residentRuntime: LLMRuntime?
-    /// The descriptor whose weights are verified on disk and (when loaded) resident.
+    /// The descriptor actually resident in `residentRuntime`. Decoupled from `activeDescriptor` because
+    /// the latter follows the user's *displayed* selection (via `showStatus`) and may point at a
+    /// different model than the one loaded in memory — eviction/delete must act on the resident one.
+    private var residentDescriptor: ModelDescriptor?
+    /// The descriptor the displayed `state` currently describes (the on-screen / selected model).
     private var activeDescriptor: ModelDescriptor?
     /// Verified-on-disk weight bytes, kept so a subsequent load doesn't re-download (residency test).
     /// Unused on the provisioner path (the pipeline owns the weights on disk).
@@ -112,6 +122,7 @@ public final class ModelManager: ObservableObject {
                 hardwareSupports: @escaping @Sendable (ModelDescriptor) -> Bool = { _ in true },
                 provisioner: ModelProvisioner? = nil,
                 provisionedOnDisk: @escaping @Sendable (ModelDescriptor) -> Bool = { _ in false },
+                provisionedDelete: @escaping @Sendable (ModelDescriptor) -> Void = { _ in },
                 runtimeFactory: @escaping @Sendable (ModelDescriptor) throws -> LLMRuntime = { descriptor in
                     StubLLMRuntime(capabilities: descriptor.capabilities)
                 }) {
@@ -122,6 +133,7 @@ public final class ModelManager: ObservableObject {
         self.hardwareSupports = hardwareSupports
         self.provisioner = provisioner
         self.provisionedOnDisk = provisionedOnDisk
+        self.provisionedDelete = provisionedDelete
         self.runtimeFactory = runtimeFactory
     }
 
@@ -165,6 +177,75 @@ public final class ModelManager: ObservableObject {
         activeDescriptor = descriptor
         verifiedBytes = nil   // the pipeline owns the on-disk weights on this path
         state = .ready
+    }
+
+    // MARK: - Per-model display status
+
+    /// Re-settle the DISPLAYED lifecycle (`state`) to reflect `descriptor` — the user's current model
+    /// selection — so the status row tracks the picker instead of whichever model was last active (the
+    /// single `state` is otherwise shared, so switching the picker would keep showing the old model's
+    /// status). Shows `.loaded` when `descriptor` is the resident model, `.ready` when its weights are on
+    /// disk, else `.notDownloaded`. Never disturbs an in-flight download/verify/load (its progress must
+    /// keep showing) and only acts while opted in. A pure disk probe — safe to call on selection change /
+    /// when the AI page appears.
+    public func showStatus(for descriptor: ModelDescriptor) {
+        guard optedIn else { return }
+        switch state {
+        case .downloading, .verifying, .loading: return
+        case .notDownloaded, .ready, .loaded, .failed: break
+        }
+        if residentRuntime != nil, residentDescriptor?.id == descriptor.id {
+            activeDescriptor = descriptor
+            state = .loaded
+            return
+        }
+        let onDisk = isOnDisk(descriptor)   // probe BEFORE repointing (the byte path keys off activeDescriptor)
+        activeDescriptor = descriptor
+        state = onDisk ? .ready : .notDownloaded
+    }
+
+    /// Whether `descriptor`'s weights are present on disk: the per-descriptor probe on the provisioner
+    /// (real-runtime) path; on the dev/byte path, the held `verifiedBytes` for the active descriptor.
+    private func isOnDisk(_ descriptor: ModelDescriptor) -> Bool {
+        if provisioner != nil { return provisionedOnDisk(descriptor) }
+        return verifiedBytes != nil && activeDescriptor?.id == descriptor.id
+    }
+
+    // MARK: - Delete (remove weights from disk)
+
+    /// Delete `descriptor`'s weights from disk and evict it if it is the resident model, so it reads as
+    /// `.notDownloaded` again (a re-acquire is a fresh download). Removes BOTH the dev/byte weights
+    /// (`storageRoot/<id>`) and — via the injected `provisionedDelete` — the provisioner's on-disk copy
+    /// (the HF-cache dir the real runtime loads from). The displayed `state` resets only when the deleted
+    /// model is the one currently on screen.
+    public func deleteFromDisk(_ descriptor: ModelDescriptor) {
+        if residentDescriptor?.id == descriptor.id {
+            residentRuntime = nil
+            residentDescriptor = nil
+        }
+        try? FileManager.default.removeItem(
+            at: storageRoot.appendingPathComponent(descriptor.id, isDirectory: true))
+        provisionedDelete(descriptor)
+        if activeDescriptor?.id == descriptor.id {
+            verifiedBytes = nil
+            state = .notDownloaded
+        }
+    }
+
+    /// Delete every known model's weights from disk and drop residency — the Danger zone's "AI models"
+    /// wipe. Removes both on-disk paths for each registry model; afterwards the manager is
+    /// `.notDownloaded` with nothing resident.
+    public func deleteAllFromDisk() {
+        residentRuntime = nil
+        residentDescriptor = nil
+        verifiedBytes = nil
+        for descriptor in registry.models {
+            try? FileManager.default.removeItem(
+                at: storageRoot.appendingPathComponent(descriptor.id, isDirectory: true))
+            provisionedDelete(descriptor)
+        }
+        activeDescriptor = nil
+        state = .notDownloaded
     }
 
     // MARK: - Download + verify
@@ -256,6 +337,7 @@ public final class ModelManager: ObservableObject {
             }
             residentRuntime = runtime
             activeDescriptor = descriptor
+            residentDescriptor = descriptor
             verifiedBytes = nil // the pipeline owns the on-disk weights; no in-memory copy here
             state = .loaded
         } catch is CancellationError {
@@ -319,6 +401,7 @@ public final class ModelManager: ObservableObject {
         do {
             let runtime = try runtimeFactory(descriptor)
             residentRuntime = runtime
+            residentDescriptor = descriptor
             state = .loaded
             return runtime
         } catch {
@@ -371,8 +454,10 @@ public final class ModelManager: ObservableObject {
     /// provisioner branch, "Evict from memory" would leave the row stuck showing "Loaded" while nothing
     /// is resident.
     public func evict() {
+        let descriptor = residentDescriptor
         residentRuntime = nil
-        guard case .loaded = state, let descriptor = activeDescriptor else { return }
+        residentDescriptor = nil
+        guard case .loaded = state, let descriptor else { return }
         // On the byte path, `verifiedBytes` proves on-disk presence; on the provisioner path it is
         // always nil (the pipeline owns the weights), so the disk probe is what proves presence. If the
         // weights are still there, fall back to `.ready` (warm reload); if they vanished underneath us,

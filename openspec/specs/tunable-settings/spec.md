@@ -177,11 +177,19 @@ The settings SHALL expose an "AI commands" opt-in that defaults to OFF and gates
 - **THEN** they decode successfully with the opt-in OFF and no AI data, and existing settings are not reset
 
 ### Requirement: AI model management settings
-With the AI commands opt-in on, the settings SHALL let the user manage the on-device model: see which Gemma 4 model is selected, see download status and size, trigger or retry the download, and evict the resident model from memory. These controls SHALL persist their state across launches and apply immediately.
+With the AI commands opt-in on, the settings SHALL let the user manage the on-device model: choose which Gemma 4 model is selected, see the **selected** model's download status and size, trigger or retry the download, evict the resident model from memory, and **delete the selected model's weights from disk**. The displayed status SHALL track the selected model (switching the picker SHALL refresh it). These controls SHALL persist their state across launches and apply immediately.
 
 #### Scenario: Download status is visible
 - **WHEN** the user opens settings with the opt-in on and a model downloading
 - **THEN** the settings show the model identity, size, and download progress/status
+
+#### Scenario: Status tracks the selected model
+- **WHEN** the user switches the model picker to a different model
+- **THEN** the status row refreshes to that model's own download/loaded state
+
+#### Scenario: Delete the selected model
+- **WHEN** the user deletes the selected, downloaded model
+- **THEN** its weights are removed from disk and the row shows it as not-downloaded (re-downloadable)
 
 #### Scenario: Evict frees memory immediately
 - **WHEN** the user chooses to evict the resident model

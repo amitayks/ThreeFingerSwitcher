@@ -42,8 +42,25 @@ public enum GemmaRuntime {
             // again. Deliberately stricter than `Gemma4ModelCache.isDownloaded` (see `isFullyDownloaded`).
             provisionedOnDisk: { descriptor in
                 isFullyDownloaded(pipelineModel(for: descriptor))
+            },
+            // Delete the weights from the EXACT dir the app loads from / `isFullyDownloaded` probes, so a
+            // per-model Delete or the Danger zone genuinely frees them and the model reads as
+            // not-downloaded afterwards (Core deletes only its own app-support dir, the wrong location).
+            provisionedDelete: { descriptor in
+                deleteFromCache(pipelineModel(for: descriptor))
             }
         )
+    }
+
+    /// Remove `model`'s weights from `Gemma4ModelCache.modelsDirectory/<org>/<model>` — the exact dir
+    /// `GemmaMLXRuntime.prepare` loads from and `isFullyDownloaded` probes — so a delete truly frees the
+    /// weights. Mirrors `isFullyDownloaded`'s path construction; a missing dir is a silent no-op.
+    static func deleteFromCache(_ model: Gemma4Pipeline.Model) {
+        var dir = Gemma4ModelCache.modelsDirectory
+        for part in model.rawValue.split(separator: "/") {
+            dir.appendPathComponent(String(part))
+        }
+        try? FileManager.default.removeItem(at: dir)
     }
 
     /// Whether `model`'s weights are COMPLETELY present in the EXACT directory the app loads from —

@@ -212,6 +212,14 @@ struct AIPage: View {
                     .disabled(!settings.aiCommandsEnabled)
             }
         }
+        // Keep the status row tied to the SELECTED model: re-settle the manager's displayed state on
+        // appear, when the picked model changes, and when AI is turned on — otherwise the single shared
+        // status would keep showing whichever model was last active.
+        .onAppear { models.showStatus(for: selectedModelDescriptor) }
+        .onChange(of: settings.aiSelectedModelID) { models.showStatus(for: selectedModelDescriptor) }
+        .onChange(of: settings.aiCommandsEnabled) {
+            if settings.aiCommandsEnabled { models.showStatus(for: selectedModelDescriptor) }
+        }
     }
 }
 

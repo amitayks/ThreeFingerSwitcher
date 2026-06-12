@@ -24,6 +24,9 @@ struct ModelManagementView: View {
     /// detail is opt-in, never shown inline; design D4).
     @State private var showingDetails = false
 
+    /// Drives the in-window delete confirmation (no app-modal NSAlert — that would freeze the window).
+    @State private var confirmingDelete = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
@@ -130,6 +133,31 @@ struct ModelManagementView: View {
                     .help("Unloads the model from memory; the next command reloads it on demand.")
             }
             Spacer()
+            // Delete the selected model's weights from disk whenever it is present (`.ready`/`.loaded`).
+            if isOnDisk { deleteButton }
+        }
+        .confirmationDialog("Delete \(descriptor.displayName)?",
+                            isPresented: $confirmingDelete, titleVisibility: .visible) {
+            Button("Delete model", role: .destructive) { manager.deleteFromDisk(descriptor) }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Removes the downloaded weights (\(sizeLabel)) from disk. You can re-download it later.")
+        }
+    }
+
+    /// "Delete" affordance for the selected model — confirms in-window before removing the weights.
+    private var deleteButton: some View {
+        Button("Delete", role: .destructive) { confirmingDelete = true }
+            .help("Delete this model's weights from disk (frees \(sizeLabel)).")
+    }
+
+    /// Whether the selected model's weights are on disk, so a Delete affordance is meaningful. `state`
+    /// is kept in sync with the selected model by the call site (`ModelManager.showStatus(for:)`), so
+    /// `.ready` or `.loaded` means present.
+    private var isOnDisk: Bool {
+        switch manager.state {
+        case .ready, .loaded: return true
+        default: return false
         }
     }
 

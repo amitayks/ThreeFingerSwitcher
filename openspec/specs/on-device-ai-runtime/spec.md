@@ -57,11 +57,20 @@ The runtime conformer SHALL accept an image input (e.g. a captured screen region
 - **THEN** the conformer serves it on the text-only path without loading the multimodal graph
 
 ### Requirement: Model lifecycle management
-The system SHALL manage model weights via a lifecycle: weights are downloaded only after the user opts in (a multi-gigabyte, quantized QAT download), the download SHALL be resumable and **integrity-verified** before use, the model SHALL be **lazy-loaded** on first use, **kept resident** between calls to avoid repeated cold loads, and **evicted** on memory pressure or when the opt-in is turned off. While a model is loading, the system SHALL expose a loading state to the UI rather than blocking silently.
+The system SHALL manage model weights via a lifecycle: weights are downloaded only after the user opts in (a multi-gigabyte, quantized QAT download), the download SHALL be resumable and **integrity-verified** before use, the model SHALL be **lazy-loaded** on first use, **kept resident** between calls to avoid repeated cold loads, **evicted** (from memory) on memory pressure or when the opt-in is turned off, and **deletable** (from disk) per model. Deleting a model SHALL remove its weights from the exact on-disk location the runtime loads from, so the model reads as not-downloaded afterwards and is not re-discovered as downloaded; a delete SHALL also evict the model if it is the one resident. The **displayed** lifecycle status SHALL reflect the **currently selected** model (each model's own on-disk/resident status), not a single global status carried over from a previously active model. While a model is loading, the system SHALL expose a loading state to the UI rather than blocking silently.
 
 #### Scenario: No download until opt-in
 - **WHEN** the AI commands opt-in is off
 - **THEN** no model weights are downloaded
+
+#### Scenario: Deleting a model frees its weights and does not re-discover
+- **WHEN** a downloaded model is deleted (per-model, or via the danger-zone clear)
+- **THEN** its weights are removed from the directory the runtime loads from
+- **AND** re-opening the AI surface or re-enabling the opt-in shows it as not-downloaded rather than "downloaded"
+
+#### Scenario: Status follows the selected model
+- **WHEN** the user switches the selected model in the picker
+- **THEN** the displayed status reflects that model's own on-disk/resident state, not the previously selected model's
 
 #### Scenario: Corrupt download is rejected
 - **WHEN** a downloaded model fails its integrity check

@@ -858,8 +858,12 @@ final class AppCoordinator: GestureRecognizerDelegate {
                     guard let self else { return }
                     self.modelManager.setOptedIn(on)
                     // Re-enabling rediscovers an already-downloaded model (→ .ready) so the user isn't
-                    // asked to "Download" again; the heavy load stays lazy (first command).
-                    if on { self.modelManager.reconcileWithDisk() }
+                    // asked to "Download" again; the heavy load stays lazy (first command). Then settle
+                    // the displayed status to the SELECTED model (reconcile probes only the default).
+                    if on {
+                        self.modelManager.reconcileWithDisk()
+                        if let d = self.selectedAIModelDescriptor() { self.modelManager.showStatus(for: d) }
+                    }
                 }
             }
             .store(in: &cancellables)
@@ -872,6 +876,16 @@ final class AppCoordinator: GestureRecognizerDelegate {
     private func reconcileAIModelAtLaunch() {
         guard settings.aiCommandsEnabled else { return }
         modelManager.reconcileWithDisk()
+        if let d = selectedAIModelDescriptor() { modelManager.showStatus(for: d) }
+    }
+
+    /// The model the AI surfaces act on: the user's pinned selection if it resolves, else the registry
+    /// default. Single source of truth for the download action and the displayed-status settle
+    /// (`showStatus`) across launch and the opt-in observer.
+    private func selectedAIModelDescriptor() -> ModelDescriptor? {
+        let registry = modelManager.registry
+        return settings.aiSelectedModelID.flatMap { registry.descriptor(id: $0) }
+            ?? registry.defaultDescriptor ?? registry.models.first
     }
 
     // MARK: - Keyboard language opt-in lifecycle
@@ -956,9 +970,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         modelManager.setOptedIn(settings.aiCommandsEnabled)
         // Honor the user's pinned model selection (the AI page / unavailable canvas picker), falling
         // back to the registry default.
-        let registry = modelManager.registry
-        guard let descriptor = settings.aiSelectedModelID.flatMap({ registry.descriptor(id: $0) })
-            ?? registry.defaultDescriptor ?? registry.models.first else { return }
+        guard let descriptor = selectedAIModelDescriptor() else { return }
         Task { @MainActor in
             do {
                 try await modelManager.downloadAndVerify(descriptor)
@@ -1525,6 +1537,13 @@ final class AppCoordinator: GestureRecognizerDelegate {
         clipboardMonitor.stop()
         if selection.contains(.aiModels) || selection.contains(.appData) {
             settings.aiCommandsEnabled = false   // evicts residency + forgets download progress
+        }
+        if selection.contains(.aiModels) {
+            // Delete the weights from the dir the runtime actually loads from (the HF cache, via the
+            // manager's injected provisioner-delete). `appDataReset` below only removes the app-support
+            // `models/` dir — the WRONG location on the real path — so without this the weights survive
+            // and the model re-discovers as "Downloaded" on the next opt-in.
+            modelManager.deleteAllFromDisk()
         }
         // 3. Delete (preferences last, inside `clear`).
         let outcome = appDataReset.clear(selection)
