@@ -14,7 +14,8 @@ final class AppCoordinator: GestureRecognizerDelegate {
     let firstRun = FirstRunStore()
 
     private let mru = MRUTracker()
-    private lazy var windowService = WindowService(mru: mru, settings: settings)
+    private let focus = WindowFocusTracker()
+    private lazy var windowService = WindowService(mru: mru, focus: focus, settings: settings)
     private let thumbnails = ThumbnailService()
     private let overlay = OverlayController()
     private let touchEngine = TouchEngine()
@@ -329,6 +330,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         guard !isEnabled else { return }
         permissions.refresh()
         mru.start()
+        focus.start()
         touchEngine.start()
         isEnabled = touchEngine.isAvailable
         settings.enabled = true
@@ -343,6 +345,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         touchEngine.stop()
         scrollTap.stop()
         mru.stop()
+        focus.stop()
         overlay.hide()
         stopLivePreview()
         launcherOverlay.cancel()
@@ -424,6 +427,9 @@ final class AppCoordinator: GestureRecognizerDelegate {
         // model downloads that span a sleep). Stopping pre-sleep makes the post-wake `stop()` a no-op,
         // and `restartTouchEngineAfterWake()` attaches a fresh listener on `didWake`.
         touchEngine.stop()
+        // Tear down the focus tracker's AX observer (its main-run-loop source) pre-sleep, alongside
+        // the multitouch listener; `restartTouchEngineAfterWake()` re-attaches a fresh one on wake.
+        focus.stop()
     }
 
     /// Re-subscribe the multitouch listener after wake. Idempotent and guarded against
@@ -433,6 +439,9 @@ final class AppCoordinator: GestureRecognizerDelegate {
         recognizer.reset()
         touchEngine.stop()
         touchEngine.start()
+        // Re-attach the focus tracker's AX observer torn down in `handleWillSleep`. Idempotent.
+        focus.stop()
+        focus.start()
         // If the trackpad couldn't be re-acquired, reflect that in the menu state.
         let available = touchEngine.isAvailable
         if isEnabled != available {

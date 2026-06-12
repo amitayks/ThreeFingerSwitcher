@@ -16,6 +16,7 @@ import CoreGraphics
 @MainActor
 final class WindowService {
     private let mru: MRUTracker
+    private let focus: WindowFocusTracker
     private let settings: AppSettings
 
     /// Monotonic token bumped on every `raise()` commit. The watchdog closure captures the value
@@ -37,8 +38,9 @@ final class WindowService {
 
     private var activationObserver: NSObjectProtocol?
 
-    init(mru: MRUTracker, settings: AppSettings) {
+    init(mru: MRUTracker, focus: WindowFocusTracker, settings: AppSettings) {
         self.mru = mru
+        self.focus = focus
         self.settings = settings
         // Seed the element cache when an app activates: its windows are then on the current Space and
         // resolvable via kAXWindowsAttribute. Capturing the element now lets us raise the window later,
@@ -174,6 +176,14 @@ final class WindowService {
         }
         let selfPid = getpid()
 
+        // Backstop: re-assert the current frontmost app's focused window as most-recent before
+        // ordering, so the current window is index 0 even if an earlier focus event did not resolve a
+        // window id (e.g. some Electron/Chromium builds), and to self-heal any missed event.
+        if let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+           let wid = focus.focusedWindowID(pid: frontPID) {
+            focus.promote(wid)
+        }
+
         let appsByPid: [pid_t: NSRunningApplication] = Dictionary(
             NSWorkspace.shared.runningApplications
                 .filter { $0.activationPolicy == .regular && $0.processIdentifier != selfPid && !$0.isTerminated }
@@ -192,13 +202,17 @@ final class WindowService {
         }
         guard !spaceForWindow.isEmpty else { return legacySnapshot() }
 
+        // Prune the focus history to currently-enumerated window ids so closed windows don't linger
+        // (ids are unique per window lifetime, so a stale id can never mis-rank a new window).
+        focus.evict(keepingLive: Set(spaceForWindow.keys))
+
         let meta = metadata(for: Array(spaceForWindow.keys))
 
         // Per-snapshot AX element caches.
         var axCurrentByPid: [pid_t: [CGWindowID: AXUIElement]] = [:]
         var axBruteByPid: [pid_t: [CGWindowID: AXUIElement]] = [:]
 
-        var rows: [(window: WindowInfo, appRank: Int, onCurrent: Int, spaceIdx: Int, z: Int)] = []
+        var rows: [(window: WindowInfo, winRank: Int, appRank: Int, onCurrent: Bool, spaceIdx: Int, z: Int)] = []
 
         for (wid, placement) in spaceForWindow {
             guard let m = meta[wid] else { continue }
@@ -257,18 +271,18 @@ final class WindowService {
                 spaceID: placement.space,
                 spaceIndex: model.indexBySpace[placement.space] ?? Int.max
             )
-            rows.append((info, mru.rank(m.pid), onCurrent ? 0 : 1, model.indexBySpace[placement.space] ?? Int.max, placement.z))
+            rows.append((info, focus.rank(wid), mru.rank(m.pid), onCurrent, model.indexBySpace[placement.space] ?? Int.max, placement.z))
         }
 
         // Evict cached elements for windows that no longer exist (keep only currently-enumerated ids).
         // `elementCache` is now the sole Bug-A guard, so this prune must stay correct.
         elementCache = elementCache.filter { spaceForWindow[$0.key] != nil }
 
-        rows.sort { a, b in
-            if a.appRank != b.appRank { return a.appRank < b.appRank }   // MRU app first
-            if a.onCurrent != b.onCurrent { return a.onCurrent < b.onCurrent } // current Space first
-            if a.spaceIdx != b.spaceIdx { return a.spaceIdx < b.spaceIdx }
-            return a.z < b.z                                              // z-order within Space
+        // Order by per-window focus recency (primary), falling back to current-Space → Space index →
+        // z-order for never-focused windows. Routed through the pure `WindowOrdering` helper so the
+        // sort key is unit-testable without AppKit/AX.
+        WindowOrdering.sort(&rows) { r in
+            WindowOrdering.Key(winRank: r.winRank, onCurrent: r.onCurrent, spaceIdx: r.spaceIdx, z: r.z, appRank: r.appRank)
         }
         return rows.map(\.window)
     }
@@ -278,17 +292,20 @@ final class WindowService {
     private func legacySnapshot() -> [WindowInfo] {
         guard AXIsProcessTrusted() else { return [] }
         let selfPid = getpid()
-        var result: [(window: WindowInfo, appRank: Int, zIndex: Int)] = []
+        var result: [(window: WindowInfo, winRank: Int, appRank: Int, z: Int)] = []
 
         let apps = NSWorkspace.shared.runningApplications.filter {
             $0.activationPolicy == .regular && $0.processIdentifier != selfPid && !$0.isTerminated
         }
+        // A single running index across the whole enumeration so `z` is globally unique (like
+        // snapshot()'s global z), keeping the appRank tiebreak unreachable on this path too.
+        var z = 0
         for app in apps {
             let pid = app.processIdentifier
             let appEl = AXUIElementCreateApplication(pid)
             guard let axWindows = axCopy(appEl, kAXWindowsAttribute as String) as? [AXUIElement] else { continue }
             let appRank = mru.rank(pid)
-            for (zIndex, axWin) in axWindows.enumerated() {
+            for axWin in axWindows {
                 guard isSwitchable(axWin), let wid = axWindowID(axWin) else { continue }
                 let info = WindowInfo(
                     id: wid, pid: pid, appName: app.localizedName ?? "",
@@ -296,10 +313,19 @@ final class WindowService {
                     appIcon: app.icon, frame: axFrame(axWin),
                     axElement: axWin, isOnCurrentSpace: true, spaceID: nil, spaceIndex: 0
                 )
-                result.append((info, appRank, zIndex))
+                result.append((info, focus.rank(wid), appRank, z))
+                z += 1
             }
         }
-        result.sort { a, b in a.appRank != b.appRank ? a.appRank < b.appRank : a.zIndex < b.zIndex }
+        // Prune the focus history to the enumerated ids (parity with snapshot()), so closed windows
+        // don't linger on the legacy fallback path.
+        focus.evict(keepingLive: Set(result.map(\.window.id)))
+        // Same window-rank-first key as snapshot(); here every window is current-Space at spaceIndex 0
+        // and `z` is a global running index, so once recency is exhausted the order is the stable
+        // enumeration order and the appRank tiebreak is unreachable.
+        WindowOrdering.sort(&result) { r in
+            WindowOrdering.Key(winRank: r.winRank, onCurrent: true, spaceIdx: 0, z: r.z, appRank: r.appRank)
+        }
         return result.map(\.window)
     }
 
@@ -322,6 +348,11 @@ final class WindowService {
     func raise(_ window: WindowInfo) {
         commitSeq &+= 1
         let token = commitSeq
+
+        // Switcher commit is the most authoritative focus source: promote immediately so this window
+        // is index 0 on the next snapshot (covers same-app/current-Space raises that emit no
+        // app-activation notification).
+        focus.promote(window.id)
 
         focusSequence(window, offSpaceHandshake: !window.isOnCurrentSpace)
 
