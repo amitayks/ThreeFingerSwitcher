@@ -147,6 +147,13 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// gesture). Lets the switcher float above MC and a commit dismiss it before raising.
     private var missionControlOpen = false
 
+    /// Drives live preview: while the switcher overlay is open (and the opt-in is on) this re-captures
+    /// ONLY the highlighted window each tick so its card updates live, the focus following the
+    /// selection. The effective rate self-paces below this cadence via ThumbnailService's `inFlight`
+    /// guard (a tick whose capture is still in flight is dropped, never queued).
+    private var livePreviewTimer: Timer?
+    private static let livePreviewCadence: TimeInterval = 0.1
+
     // The unified configuration Hub: one reusable window, its navigation state, and the wiring context.
     private var hubWindow: NSWindow?
     private let hubNav = HubNavigation()
@@ -237,6 +244,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         }
         observeSleepWake()
         observeEnabledToggle()
+        observeLivePreviewToggle()
         observeSpacesRearrangeToggle()
         observeVerticalGestureToggle()
         observeLauncherToggle()
@@ -336,6 +344,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         scrollTap.stop()
         mru.stop()
         overlay.hide()
+        stopLivePreview()
         launcherOverlay.cancel()
         clipboardMonitor.stop()
         isEnabled = false
@@ -404,6 +413,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         guard isEnabled else { return }
         recognizer.reset()
         overlay.hide()
+        stopLivePreview()
         launcherOverlay.cancel()
         // CRITICAL: stop the multitouch listener NOW, while its CFRunLoopSource is still valid. The OS
         // invalidates the device source during system sleep; calling `manager.stopListening()` AFTER
@@ -493,6 +503,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
                      // dim with a pending glyph so the gated vertical axis explains itself.
                      rowSwitchingPending: settings.manageVerticalGesture && !isSpaceRowSwitchingEffective)
         prefetchCurrentRow()
+        startLivePreview()
     }
 
     /// Build the synthetic Hub switcher entry from live state, or `nil` when the Hub isn't open. Reads
@@ -539,6 +550,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
             idx = min(max(idx, 0), count - 1)
         }
         overlay.updateColumn(idx)
+        tickLivePreview()   // re-capture the newly highlighted window now, ahead of the next timer tick
     }
 
     func gestureDidStepRow(_ direction: Int) {
@@ -554,6 +566,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
         guard row != overlay.currentRow else { return }
         overlay.updateRow(row)
         prefetchCurrentRow()
+        // The visible window set changed, so the live session's snapshot must be re-enumerated before
+        // the next capture; then kick the newly highlighted window immediately.
+        Task { await thumbnails.refreshLiveSession() }
+        tickLivePreview()
     }
 
     func gestureDidTriggerMissionControl(up: Bool) {
@@ -577,12 +593,63 @@ final class AppCoordinator: GestureRecognizerDelegate {
         thumbnails.prefetch(windows)                                  // refresh only cleanly-visible windows
     }
 
+    /// Begin the live-preview loop for the open switcher: gated on the opt-in and the overlay actually
+    /// being visible. Opens a live session (one SCShareableContent enumeration) and schedules a repeating
+    /// timer whose ticks re-capture only the highlighted window. Invalidates any prior timer first so it
+    /// is safe to call again (e.g. the opt-in flipping back on mid-overlay).
+    private func startLivePreview() {
+        guard settings.livePreviewEnabled, overlay.isVisible else { return }
+        livePreviewTimer?.invalidate()
+        Task { await thumbnails.prepareLiveSession() }
+        livePreviewTimer = Timer.scheduledTimer(withTimeInterval: Self.livePreviewCadence, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tickLivePreview() }
+        }
+    }
+
+    /// Stop the live-preview loop and drop the live session. Idempotent — safe when already stopped (the
+    /// timer is nil and `endLiveSession` clears empty state) — so it can be paired with every overlay
+    /// teardown unconditionally.
+    private func stopLivePreview() {
+        livePreviewTimer?.invalidate()
+        livePreviewTimer = nil
+        thumbnails.endLiveSession()
+    }
+
+    /// One live-preview frame: re-capture ONLY the currently highlighted window so its card updates live.
+    /// Skips the synthetic Hub entry (excluded the same way `prefetchCurrentRow` does — its id is never
+    /// captured) and reads the logical frame exactly as prefetch does.
+    private func tickLivePreview() {
+        guard let selected = overlay.model.selectedWindow else { return }
+        let hubID = hubWindow.map { CGWindowID($0.windowNumber) }
+        guard selected.id != hubID else { return }
+        let logical = selected.realFrame.width > 1 ? selected.realFrame : selected.frame
+        Task { await thumbnails.liveCapture(selected.id, logicalFrame: logical) }
+    }
+
+    /// React to the "Live preview" toggle: turning it OFF stops the loop immediately; turning it ON
+    /// starts it only if the switcher overlay is currently open (otherwise the next `gestureDidActivate`
+    /// will). `dropFirst()` skips the persisted initial value (a closed overlay at launch needs nothing);
+    /// uses the EMITTED value, not a re-read (the `@Published` willSet would still report the OLD value).
+    private func observeLivePreviewToggle() {
+        settings.$livePreviewEnabled
+            .dropFirst()
+            .sink { [weak self] on in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    if on { self.startLivePreview() } else { self.stopLivePreview() }
+                }
+            }
+            .store(in: &cancellables)
+    }
+
     func gestureDidCommit() {
         guard overlay.isVisible, let window = overlay.model.selectedWindow else {
             overlay.hide()
+            stopLivePreview()
             return
         }
         overlay.hide()
+        stopLivePreview()
         // The synthetic Hub card: focus our OWN window directly (accessory mode → reliable via
         // activate + makeKeyAndOrderFront, exactly what `present` does), switching to its Space if it's
         // off the current one — never the cross-Space SkyLight raise meant for foreign windows. This
@@ -625,6 +692,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
 
     func gestureDidCancel() {
         overlay.hide()
+        stopLivePreview()
     }
 
     // MARK: - GestureRecognizerDelegate (four-finger launcher)
@@ -1825,5 +1893,6 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// Order the overlay out (idempotent) — used on resign-active to avoid a leaked panel.
     func hideOverlay() {
         overlay.hide()
+        stopLivePreview()
     }
 }

@@ -18,6 +18,14 @@ final class ThumbnailService {
 
     private var inFlight: Set<CGWindowID> = []
 
+    /// Per-gesture "live session" cache: while a switcher gesture is held, the visible row's window can
+    /// be re-captured every frame via `liveCapture` WITHOUT re-enumerating SCShareableContent each time
+    /// (the enumeration in `capture` is the expensive part). `prepareLiveSession` snapshots the windows
+    /// and display union once at gesture start; `refreshLiveSession` re-snapshots when the visible row
+    /// changes; `endLiveSession` drops it. `.null` union makes the degraded checks no-op, as elsewhere.
+    private var liveWindows: [CGWindowID: SCWindow] = [:]
+    private var liveDisplayUnion: CGRect = .null
+
     /// When set (env var `TFS_THUMB_LOG`), each capture logs its ScreenCaptureKit frame next to the
     /// window's logical frame so the set-aside/off-screen "degraded" signal can be confirmed and the
     /// thresholds in `isDegradedCapture` tuned against real data (see the change's task 1.2 / 1.3).
@@ -142,6 +150,69 @@ final class ThumbnailService {
         return out.joined(separator: "\n")
     }
 
+    /// Open a per-gesture live session: enumerate SCShareableContent ONCE and snapshot every window by
+    /// id, so `liveCapture` can re-capture the highlighted window each frame without paying for the
+    /// enumeration again. Degrades silently (clears state) when Screen Recording permission is missing.
+    func prepareLiveSession() async {
+        guard CGPreflightScreenCaptureAccess() else {
+            endLiveSession()
+            return
+        }
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            liveWindows = Dictionary(content.windows.map { ($0.windowID, $0) }, uniquingKeysWith: { _, new in new })
+            liveDisplayUnion = Self.displayUnion()
+        } catch {
+            endLiveSession()
+        }
+    }
+
+    /// Re-enumerate the live-session snapshot (same work as `prepareLiveSession`), for when the visible
+    /// row changes and the highlighted window's SCWindow may not be in the existing snapshot.
+    func refreshLiveSession() async {
+        await prepareLiveSession()
+    }
+
+    /// Drop the live-session snapshot at gesture end.
+    func endLiveSession() {
+        liveWindows = [:]
+        liveDisplayUnion = .null
+    }
+
+    /// Fast per-frame capture of a single highlighted window during a held gesture, reusing the
+    /// `prepareLiveSession` snapshot instead of re-enumerating SCShareableContent. `inFlight` provides
+    /// back-pressure (self-pacing): a frame requested while one is still in flight is dropped, never
+    /// queued. If the id is missing from the snapshot we fall back to the enumeration path so coverage
+    /// is never lost. Otherwise it runs the same degraded gate and capture config as `capture`.
+    func liveCapture(_ id: CGWindowID, logicalFrame: CGRect) async {
+        if inFlight.contains(id) { return }
+        guard let scWindow = liveWindows[id] else {
+            await capture(id, logicalFrame: logicalFrame, displayUnion: Self.displayUnion())
+            return
+        }
+        inFlight.insert(id)
+        defer { inFlight.remove(id) }
+
+        if frameLoggingEnabled {
+            NSLog("[TFS-thumb] liveCapture id=\(id) sc=\(scWindow.frame) logical=\(logicalFrame)")
+        }
+        // Don't overwrite a good cached thumbnail with a degraded capture — keep the last good frame.
+        if Self.isDegradedCapture(scFrame: scWindow.frame, logicalFrame: logicalFrame, displayUnion: liveDisplayUnion) {
+            return
+        }
+
+        do {
+            let config = streamConfiguration(for: scWindow)
+            let filter = SCContentFilter(desktopIndependentWindow: scWindow)
+            let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            let image = NSImage(cgImage: cgImage, size: NSSize(width: config.width, height: config.height))
+            store(id, image)
+            onThumbnail?(id, image)
+        } catch {
+            // Window gone or capture failed: leave the cached frame untouched.
+        }
+    }
+
     private func capture(_ id: CGWindowID, logicalFrame: CGRect, displayUnion: CGRect) async {
         defer { inFlight.remove(id) }
 
@@ -158,17 +229,7 @@ final class ThumbnailService {
                 return
             }
 
-            let config = SCStreamConfiguration()
-            let scale = min(
-                thumbnailMaxSize.width / max(scWindow.frame.width, 1),
-                thumbnailMaxSize.height / max(scWindow.frame.height, 1),
-                1
-            )
-            config.width = max(Int(scWindow.frame.width * scale), 1)
-            config.height = max(Int(scWindow.frame.height * scale), 1)
-            config.showsCursor = false
-            config.ignoreShadowsSingleWindow = true
-
+            let config = streamConfiguration(for: scWindow)
             let filter = SCContentFilter(desktopIndependentWindow: scWindow)
             let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
             let image = NSImage(cgImage: cgImage, size: NSSize(width: config.width, height: config.height))
@@ -177,6 +238,23 @@ final class ThumbnailService {
         } catch {
             // Permission denied, window gone, or capture failed: leave the placeholder in place.
         }
+    }
+
+    /// Shared single-window screenshot configuration used by both `capture` and `liveCapture`: scale
+    /// the window down to fit `thumbnailMaxSize`, no cursor, no surrounding shadow. Behavior-identical
+    /// across both paths so the fast live capture matches the enumeration capture pixel-for-pixel.
+    private func streamConfiguration(for scWindow: SCWindow) -> SCStreamConfiguration {
+        let config = SCStreamConfiguration()
+        let scale = min(
+            thumbnailMaxSize.width / max(scWindow.frame.width, 1),
+            thumbnailMaxSize.height / max(scWindow.frame.height, 1),
+            1
+        )
+        config.width = max(Int(scWindow.frame.width * scale), 1)
+        config.height = max(Int(scWindow.frame.height * scale), 1)
+        config.showsCursor = false
+        config.ignoreShadowsSingleWindow = true
+        return config
     }
 
     private func store(_ id: CGWindowID, _ image: NSImage) {
