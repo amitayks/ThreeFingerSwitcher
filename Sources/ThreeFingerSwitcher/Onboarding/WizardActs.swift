@@ -462,6 +462,11 @@ struct PlaygroundAct: View {
                         .allowsHitTesting(false)
                         .animation(WizardMotion.arrival, value: playing)
                         .animation(.easeInOut(duration: 0.3), value: launcherDemo.bandCount)
+                        // The box's size now genuinely varies per band (item rows vs band-list
+                        // demand, like the real panel) — animate the SIZE value too, at the
+                        // launcher panel's exact re-fit timing, or the frames snap ("cut") on
+                        // band switches and the slot reflows the act column without motion.
+                        .animation(.easeInOut(duration: 0.24), value: tourSize)
                 }
                 // While the hand plays full-size, everything else steps back into the wings.
                 Group {
