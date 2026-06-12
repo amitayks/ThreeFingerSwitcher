@@ -11,7 +11,7 @@ import Contacts
 /// multitouch read, but we still surface it if the OS ever requires it).
 @MainActor
 final class PermissionsService: ObservableObject {
-    enum Status { case granted, denied, unknown }
+    enum Status: Equatable { case granted, denied, unknown }
 
     @Published var accessibility: Status = .unknown
     @Published var screenRecording: Status = .unknown
@@ -26,35 +26,110 @@ final class PermissionsService: ObservableObject {
     @Published var contacts: Status = .unknown
 
     func refresh() {
-        accessibility = AXIsProcessTrusted() ? .granted : .denied
-        screenRecording = CGPreflightScreenCaptureAccess() ? .granted : .denied
-        inputMonitoring = mapHID(IOHIDCheckAccess(kIOHIDRequestTypeListenEvent))
-        calendar = mapEventKit(EKEventStore.authorizationStatus(for: .event))
-        reminders = mapEventKit(EKEventStore.authorizationStatus(for: .reminder))
-        contacts = mapContacts(CNContactStore.authorizationStatus(for: .contacts))
+        // Assign only on change so the poll doesn't spam objectWillChange every second.
+        setIfChanged(\.accessibility, AXIsProcessTrusted() ? .granted : .denied)
+        setIfChanged(\.screenRecording, CGPreflightScreenCaptureAccess() ? .granted : .denied)
+        setIfChanged(\.inputMonitoring, mapHID(IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)))
+        setIfChanged(\.calendar, mapEventKit(EKEventStore.authorizationStatus(for: .event)))
+        setIfChanged(\.reminders, mapEventKit(EKEventStore.authorizationStatus(for: .reminder)))
+        setIfChanged(\.contacts, mapContacts(CNContactStore.authorizationStatus(for: .contacts)))
+    }
+
+    private func setIfChanged(_ keyPath: ReferenceWritableKeyPath<PermissionsService, Status>, _ value: Status) {
+        if self[keyPath: keyPath] != value { self[keyPath: keyPath] = value }
     }
 
     var allRequiredGranted: Bool {
         accessibility == .granted && screenRecording == .granted
     }
 
+    // MARK: - Live polling (the wizard's permission acts and the Hub Setup page poll while visible)
+
+    /// Reference-counted so overlapping surfaces (a wizard act + the Setup page) compose: the timer
+    /// lives while at least one `startPolling()` is unbalanced. A `didBecomeActive` refresh rides
+    /// along so returning from System Settings updates instantly even between ticks.
+    private var pollCount = 0
+    private var pollTimer: Timer?
+    private var activationObserver: NSObjectProtocol?
+
+    /// Injectable for tests: builds the (already-scheduled) repeating poll timer.
+    var pollTimerFactory: (TimeInterval, @escaping @MainActor () -> Void) -> Timer = { interval, tick in
+        Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { _ in
+            Task { @MainActor in tick() }
+        }
+    }
+
+    var isPolling: Bool { pollTimer != nil }
+
+    func startPolling(interval: TimeInterval = 1.0) {
+        pollCount += 1
+        guard pollTimer == nil else { return }
+        refresh()
+        pollTimer = pollTimerFactory(interval) { [weak self] in self?.refresh() }
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refresh() }
+        }
+    }
+
+    func stopPolling() {
+        pollCount = max(0, pollCount - 1)
+        guard pollCount == 0 else { return }
+        pollTimer?.invalidate()
+        pollTimer = nil
+        if let activationObserver {
+            NotificationCenter.default.removeObserver(activationObserver)
+            self.activationObserver = nil
+        }
+    }
+
     // MARK: - Requests
 
+    // The OS consent dialog and a parallel Settings deep-link are redundant together (the dialog's
+    // own button opens the exact pane) — showing both was a double-surface bug. But the dialog is
+    // ALSO what registers the app's row in the pane's list on the first-ever request, so it can't
+    // simply be skipped. The split: the FIRST request fires the OS dialog only; every later
+    // request deep-links the pane only, silently. The once-flags live in the app's preferences, so
+    // a Danger-zone data wipe (which also resets TCC, removing the row) correctly starts over.
+
+    /// Pure: the first-ever request shows the system dialog (which registers the app's row);
+    /// later requests go straight to the System Settings pane.
+    static func shouldShowSystemPrompt(alreadyPrompted: Bool) -> Bool { !alreadyPrompted }
+
+    private let defaults = UserDefaults.standard
+    private enum PromptOnceKeys {
+        static let accessibility = "didRequestAccessibilityPrompt"
+        static let screenRecording = "didRequestScreenRecordingPrompt"
+        static let inputMonitoring = "didRequestInputMonitoringPrompt"
+    }
+
     func requestAccessibility() {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(options)
-        openSettings(.accessibility)
+        if Self.shouldShowSystemPrompt(alreadyPrompted: defaults.bool(forKey: PromptOnceKeys.accessibility)) {
+            defaults.set(true, forKey: PromptOnceKeys.accessibility)
+            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+            _ = AXIsProcessTrustedWithOptions(options)
+        } else {
+            openSettings(.accessibility)
+        }
     }
 
     func requestScreenRecording() {
-        // Triggers the system prompt the first time; afterwards deep-link to Settings.
-        _ = CGRequestScreenCaptureAccess()
-        openSettings(.screenRecording)
+        if Self.shouldShowSystemPrompt(alreadyPrompted: defaults.bool(forKey: PromptOnceKeys.screenRecording)) {
+            defaults.set(true, forKey: PromptOnceKeys.screenRecording)
+            _ = CGRequestScreenCaptureAccess()
+        } else {
+            openSettings(.screenRecording)
+        }
     }
 
     func requestInputMonitoring() {
-        _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
-        openSettings(.inputMonitoring)
+        if Self.shouldShowSystemPrompt(alreadyPrompted: defaults.bool(forKey: PromptOnceKeys.inputMonitoring)) {
+            defaults.set(true, forKey: PromptOnceKeys.inputMonitoring)
+            _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+        } else {
+            openSettings(.inputMonitoring)
+        }
     }
 
     // MARK: - Calendar (EventKit) — lazy, first-use for the calendar task

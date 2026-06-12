@@ -24,10 +24,38 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         coordinator.onStateChange = { [weak self] in self?.rebuildMenu() }
+        coordinator.onMenuBarPulse = { [weak self] in self?.pulseMark() }
         rebuildMenu()
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) { rebuildMenu() }
+
+    /// The First Touch wizard's menu-bar moment: breathe the mark a few times so the eye finds
+    /// where the app lives — fired on the wizard's overture and curtain. Best-effort and idempotent
+    /// (alpha always lands back at 1).
+    private func pulseMark(times: Int = 3) {
+        guard let button = statusItem.button else { return }
+        func breathe(_ remaining: Int) {
+            guard remaining > 0 else {
+                button.alphaValue = 1
+                return
+            }
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.30
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                button.animator().alphaValue = 0.25
+            }, completionHandler: {
+                NSAnimationContext.runAnimationGroup({ context in
+                    context.duration = 0.36
+                    context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                    button.animator().alphaValue = 1
+                }, completionHandler: {
+                    breathe(remaining - 1)
+                })
+            })
+        }
+        breathe(times)
+    }
 
     /// The configuration Hub is the single home for every setting (configuration-hub), so the status
     /// menu is trimmed to a minimal set of quick actions: open the Hub, toggle the switcher, add the

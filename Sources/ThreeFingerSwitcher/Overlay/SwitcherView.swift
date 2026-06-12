@@ -67,19 +67,34 @@ struct SwitcherView: View {
 
     /// Vertical dots on the left showing which Space-row is active and how many exist. The first
     /// Space-row (current) is at the bottom so swiping up moves the highlight upward. Hidden for
-    /// a single row.
+    /// a single row. While the Space-row relocation still awaits its re-login the dots dim and a
+    /// pending glyph sits above them — the axis is gated, not broken, and the overlay says so at
+    /// the point of use instead of showing a silently dead control.
     @ViewBuilder
     private var rowIndicator: some View {
         if model.rowCount > 1 {
             VStack(spacing: 8) {
+                if model.rowSwitchingPending {
+                    Image(systemName: "arrow.clockwise.circle.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.orange)
+                        .help("Log out and back in to switch Spaces here")
+                }
                 ForEach((0..<model.rowCount).reversed(), id: \.self) { i in
                     Circle()
-                        .fill(i == model.currentRow ? Color.accentColor : Color.white.opacity(0.35))
+                        .fill(dotColor(isCurrent: i == model.currentRow))
                         .frame(width: 7, height: 7)
                 }
             }
             .padding(.leading, 11)
         }
+    }
+
+    private func dotColor(isCurrent: Bool) -> Color {
+        if model.rowSwitchingPending {
+            return Color.white.opacity(isCurrent ? 0.35 : 0.15)   // gated: the whole axis dims
+        }
+        return isCurrent ? Color.accentColor : Color.white.opacity(0.35)
     }
 
     @ViewBuilder

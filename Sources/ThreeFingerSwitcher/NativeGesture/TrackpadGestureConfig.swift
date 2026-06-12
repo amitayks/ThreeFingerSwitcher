@@ -1,104 +1,109 @@
 import Foundation
 
-/// Reads, disables, and restores the native "Swipe between full-screen applications" gesture
-/// so the horizontal three-finger swipe is unclaimed by the OS. Per spike 1.4 the relevant
-/// key is `TrackpadThreeFingerHorizSwipeGesture` in two trackpad domains. Mission Control /
-/// App Exposé live on the *Vert* keys, which we never touch.
+/// Reads and restores the native "Swipe between full-screen applications" gesture state so the
+/// horizontal three-finger swipe is unclaimed by the OS. Per spike 1.4 the relevant key is
+/// `TrackpadThreeFingerHorizSwipeGesture` in two trackpad domains. Mission Control / App Exposé
+/// live on the *Vert* keys, which this class never touches.
+///
+/// Mutation (freeing the gesture) goes through `RelocationApplier` — the one write path for all
+/// relocations — so combined applies resolve the shared four-finger keys correctly and snapshot
+/// pristine backups first. This class keeps the reads, the restore, and the status surface.
 @MainActor
 final class TrackpadGestureConfig {
-    enum State {
+    enum State: Equatable {
         case claimedByThreeFinger   // horizontal three-finger swipe is taken by the OS (conflict)
         case free                   // not claimed by three fingers (our gesture is unobstructed)
         case unknown
     }
 
-    private let domains = [
-        "com.apple.AppleMultitouchTrackpad",
-        "com.apple.driver.AppleBluetoothMultitouch.trackpad"
-    ]
-    private let horizKey = "TrackpadThreeFingerHorizSwipeGesture"
-    private let fourFingerHorizKey = "TrackpadFourFingerHorizSwipeGesture"
+    private let domains = TrackpadKey.domains
+    private let horizKey = TrackpadKey.threeFingerHoriz
 
     private let backupKey = "trackpadGestureBackup"
-    /// Set when we change the setting this session; runtime effect generally needs re-login.
-    private(set) var changedThisSession = false
+    private let markers: ReloginMarkers
+
+    init(markers: ReloginMarkers = ReloginMarkers()) {
+        self.markers = markers
+    }
 
     // MARK: - Read
 
     func currentState() -> State {
-        guard let value = readInt(domain: domains[0], key: horizKey) else { return .unknown }
-        // 1 == three-finger horizontal swipe assigned to "swipe between full-screen apps".
-        return value == 1 ? .claimedByThreeFinger : .free
+        Self.horizState(forRawValue: runDefaults(["read", domains[0], horizKey]))
     }
 
     var isClaimed: Bool { currentState() == .claimedByThreeFinger }
 
     /// The native horizontal gesture may still be effectively active until the next login.
-    var needsReloginWarning: Bool { changedThisSession }
+    /// Persisted (audit-session) marker — survives app relaunches, clears after a real re-login.
+    var needsReloginWarning: Bool { markers.isPending(.horizontal) }
 
-    // MARK: - Mutate
+    // MARK: - Restore
 
-    /// Move "swipe between full-screen apps" to four fingers, freeing three-finger horizontal.
-    /// Backs up prior values first. Returns false if any write failed.
-    @discardableResult
-    func disableThreeFingerHorizontal() -> Bool {
-        backupCurrentValues()
-        var ok = true
-        for domain in domains {
-            ok = writeInt(2, domain: domain, key: horizKey) && ok          // three-finger horiz OFF
-            ok = writeInt(1, domain: domain, key: fourFingerHorizKey) && ok // four-finger horiz ON
-        }
-        changedThisSession = ok || changedThisSession
-        return ok
-    }
-
-    /// Restore whatever values were present before we changed them.
+    /// Restore the system to exactly its prior state — absent-aware: a key that was unset before is
+    /// deleted rather than written. Decodes both the current token-map backup format and the legacy
+    /// `[domain: [key: Int]]` format (pre-absent-aware backups written by earlier versions).
     @discardableResult
     func restore() -> Bool {
-        guard let data = UserDefaults.standard.data(forKey: backupKey),
-              let backup = try? JSONDecoder().decode([String: [String: Int]].self, from: data) else {
+        guard let data = UserDefaults.standard.data(forKey: backupKey) else { return false }
+        var ok = true
+        if let tokens = try? JSONDecoder().decode([String: [String: String]].self, from: data) {
+            for (domain, keys) in tokens {
+                for (key, token) in keys {
+                    switch Self.restoreAction(forToken: token) {
+                    case .delete:       ok = deleteKey(domain: domain, key: key) && ok
+                    case .write(let v): ok = writeInt(v, domain: domain, key: key) && ok
+                    case .none:         break
+                    }
+                }
+            }
+        } else if let legacy = try? JSONDecoder().decode([String: [String: Int]].self, from: data) {
+            for (domain, keys) in legacy {
+                for (key, value) in keys {
+                    ok = writeInt(value, domain: domain, key: key) && ok
+                }
+            }
+        } else {
             return false
         }
-        var ok = true
-        for (domain, keys) in backup {
-            for (key, value) in keys {
-                ok = writeInt(value, domain: domain, key: key) && ok
-            }
-        }
         UserDefaults.standard.removeObject(forKey: backupKey)
-        changedThisSession = false
+        markers.clear(.horizontal)
         return ok
     }
 
     var hasBackup: Bool { UserDefaults.standard.data(forKey: backupKey) != nil }
 
-    // MARK: - Backup
+    // MARK: - Pure decision logic (unit-tested; no system access)
 
-    private func backupCurrentValues() {
-        guard !hasBackup else { return } // don't overwrite an existing backup
-        var backup: [String: [String: Int]] = [:]
-        for domain in domains {
-            var keys: [String: Int] = [:]
-            if let v = readInt(domain: domain, key: horizKey) { keys[horizKey] = v }
-            if let v = readInt(domain: domain, key: fourFingerHorizKey) { keys[fourFingerHorizKey] = v }
-            if !keys.isEmpty { backup[domain] = keys }
-        }
-        if let data = try? JSONEncoder().encode(backup) {
-            UserDefaults.standard.set(data, forKey: backupKey)
-        }
+    /// Map a raw `defaults read` of the three-finger horizontal key to a State:
+    /// 1 ⇒ claimed by the OS ("swipe between full-screen apps"), any other number ⇒ free,
+    /// absent/unrecognized ⇒ unknown.
+    nonisolated static func horizState(forRawValue raw: String?) -> State {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty,
+              let v = Int(raw) else { return .unknown }
+        return v == 1 ? .claimedByThreeFinger : .free
+    }
+
+    enum RestoreAction: Equatable { case delete, write(Int), none }
+
+    /// What restoring a given backup token should do ("absent" ⇒ delete the key).
+    nonisolated static func restoreAction(forToken token: String?) -> RestoreAction {
+        guard let token else { return .none }
+        if token == "absent" { return .delete }
+        if let v = Int(token.trimmingCharacters(in: .whitespacesAndNewlines)) { return .write(v) }
+        return .none
     }
 
     // MARK: - `defaults` shell helpers (reliable for these system-managed domains)
 
-    private func readInt(domain: String, key: String) -> Int? {
-        let out = runDefaults(["read", domain, key])
-        guard let out, let value = Int(out.trimmingCharacters(in: .whitespacesAndNewlines)) else { return nil }
-        return value
-    }
-
     @discardableResult
     private func writeInt(_ value: Int, domain: String, key: String) -> Bool {
         runDefaults(["write", domain, key, "-int", String(value)]) != nil
+    }
+
+    @discardableResult
+    private func deleteKey(domain: String, key: String) -> Bool {
+        runDefaults(["delete", domain, key]) != nil
     }
 
     private func runDefaults(_ args: [String]) -> String? {

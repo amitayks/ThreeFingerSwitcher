@@ -7,7 +7,9 @@ Define the single, unified configuration **Hub** window that is the only surface
 ## Requirements
 
 ### Requirement: Unified configuration Hub window
-The system SHALL provide a single configuration **Hub** window that is the only surface for configuring every feature. Opening any configuration entry point (from the status menu or from in-app deep links) SHALL open this one window — there SHALL be no separate Settings, Favorites, Setup/Onboarding, or AI-command-editor window or sheet. The Hub SHALL be a single reusable window: re-opening it SHALL bring the existing window forward rather than creating another, and its frame SHALL persist across launches.
+The system SHALL provide a single configuration **Hub** window that is the only surface for configuring every feature. Opening any configuration entry point (from the status menu or from in-app deep links) SHALL open this one window — there SHALL be no separate Settings, Favorites, Setup, or AI-command-editor window or sheet. The Hub SHALL be a single reusable window: re-opening it SHALL bring the existing window forward rather than creating another, and its frame SHALL persist across launches.
+
+The one exception is the **First Touch wizard**: a transient first-run/replay window that is an onboarding performance, not a configuration surface. Every preference the wizard writes SHALL be the same persisted preference the Hub owns, and the wizard SHALL NOT host any configuration capability beyond its onboarding steps — the Hub remains the only place to configure the app.
 
 #### Scenario: One window for all configuration
 - **WHEN** the user opens configuration from the status menu
@@ -20,6 +22,10 @@ The system SHALL provide a single configuration **Hub** window that is the only 
 #### Scenario: Window frame persists
 - **WHEN** the user resizes or moves the Hub and relaunches the app
 - **THEN** the Hub reopens at its last position and size
+
+#### Scenario: The wizard is not a configuration surface
+- **WHEN** the First Touch wizard toggles a feature or opt-in
+- **THEN** it writes the identical persisted preference as the corresponding Hub page, and any further configuration of that feature happens in the Hub
 
 ### Requirement: Overview landing page with feature master toggles
 The Hub SHALL present an **Overview** landing page that shows every feature's master enable toggle at a glance — the window switcher, Space-row switching, the four-finger launcher, clipboard history, and AI commands — and SHALL let the user turn each feature on or off directly from this page. Each feature row SHALL deep-link to that feature's detail page. Toggling a feature on the Overview SHALL write the same persisted preference as toggling it on its detail page.
@@ -59,11 +65,15 @@ Every tunable and control that existed in the former Settings window SHALL be pr
 - **THEN** the same tunables reset and the same opt-in preferences (gesture relocations, clipboard and AI opt-ins, excluded apps, selected model) are preserved exactly as before
 
 ### Requirement: Setup page hosts permissions and native-gesture opt-ins
-The Hub SHALL provide a **Setup** page that hosts the permissions status and guidance and the native-gesture opt-ins that previously lived in the standalone Setup/Onboarding window. The configuration entry point for permissions and setup SHALL be this page, not a separate window.
+The Hub SHALL provide a **Setup** page that hosts the permissions status and guidance and the native-gesture opt-ins for ongoing (post-onboarding) use. The configuration entry point for permissions and setup SHALL be this page. The Setup page SHALL also offer the First Touch wizard entry: **Resume the welcome tour** while first-run onboarding is incomplete, and **Replay the welcome tour** after completion.
 
-#### Scenario: Setup is a Hub page, not a window
-- **WHEN** the user opens setup or permissions
-- **THEN** the Hub's Setup page is shown and no separate Setup/Onboarding window opens
+#### Scenario: Setup is the ongoing surface
+- **WHEN** the user opens setup or permissions after onboarding is complete
+- **THEN** the Hub's Setup page is shown
+
+#### Scenario: Resume or replay the tour from Setup
+- **WHEN** the user opens the Setup page
+- **THEN** a resume entry is offered if onboarding is incomplete, or a replay entry if it is complete
 
 ### Requirement: Bands page edits only authored bands
 The Hub SHALL provide a **Bands** page that is the single surface for arranging launcher content. The Bands page SHALL edit only **authored** bands (the user's favorites bands, which now include AI-command items). It SHALL NOT present **live** bands — bands whose items are auto-populated rather than authored, such as the clipboard band — for item-level editing; such features are configured on their own feature page and projected into the launcher at runtime.
@@ -86,3 +96,32 @@ The Hub SHALL adopt the same Liquid Glass / material visual language used by the
 #### Scenario: Graceful fallback below the glass material
 - **WHEN** the Hub is shown on a system that does not support the glass material
 - **THEN** it renders with the same graceful fallback the overlays use, without error
+
+### Requirement: General page Danger zone
+The Hub's **General** page SHALL provide a "Danger zone" section with selective, explicit reset controls:
+
+- Four opt-in toggles, all default off, each gating one deletion category: **App data & settings** (the app's preferences domain, Application Support data excluding the AI model weights, and saved window state), **Caches**, **AI models** (the on-disk weights, with the AI opt-in turned off first), and **Permissions** (a TCC reset for every service the app can hold).
+- A destructive **Clear selected** action that SHALL be disabled while no category is selected and SHALL require an explicit confirmation enumerating exactly what will happen before anything is deleted.
+- WHEN App data & settings is selected and any native-gesture/Spaces backup exists, the relocations SHALL be restored FIRST (and the confirmation SHALL say so) — the wipe must never delete the backups while leaving the system relocated.
+- WHEN App data & settings or Permissions was cleared, the app SHALL relaunch itself so the fresh process reads the cleared state (a data wipe re-enters first-run onboarding); cache/model-only clears SHALL report a non-blocking summary and stay running.
+- A **Restore native gestures** action that restores every app-made gesture and Spaces relocation from its absent-aware backup, turns the corresponding opt-ins off, and states that a re-login finishes the trackpad changes.
+
+#### Scenario: Nothing selected, nothing clearable
+- **WHEN** the Danger zone is shown with no category toggled on
+- **THEN** the Clear action is disabled and nothing is deleted
+
+#### Scenario: Selective clear honors the selection
+- **WHEN** the user selects only Caches and AI models and confirms
+- **THEN** only the cache directories and the model weights are removed (the AI opt-in turning off first), preferences and permissions are untouched, and the app keeps running with a summary
+
+#### Scenario: Data wipe restores gestures first
+- **WHEN** App data & settings is selected while a trackpad relocation backup exists and the user confirms
+- **THEN** the relocations are restored from their backups before any deletion, and the app relaunches into first-run onboarding
+
+#### Scenario: Permissions reset
+- **WHEN** the Permissions category is selected and confirmed
+- **THEN** every TCC service the app can hold is reset for the app's bundle id and the app relaunches
+
+#### Scenario: Restore-all gestures
+- **WHEN** the user invokes Restore native gestures with backups present
+- **THEN** the trackpad keys and Spaces setting return to their exact backed-up values (deleting previously-absent keys), the opt-ins turn off, and the user is told a re-login completes the trackpad changes

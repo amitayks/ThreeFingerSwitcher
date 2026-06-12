@@ -96,7 +96,8 @@ struct LauncherView: View {
             bandIconGlyph(idx: idx, active: isActive, color: color)
                 .frame(width: LauncherGridLayout.bandIconSize, height: LauncherGridLayout.bandIconSize)
         }
-        .frame(width: LauncherGridLayout.bandIconSize + 18, height: LauncherGridLayout.bandIconSize + 18)
+        .frame(width: LauncherGridLayout.bandIconSize + LauncherGridLayout.bandIconTilePadding,
+               height: LauncherGridLayout.bandIconSize + LauncherGridLayout.bandIconTilePadding)
         .scaleEffect(isCursor ? 1.08 : 1.0)
         .animation(.easeOut(duration: 0.12), value: isCursor)
     }

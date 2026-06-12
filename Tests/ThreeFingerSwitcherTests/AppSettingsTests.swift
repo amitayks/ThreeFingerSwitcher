@@ -104,14 +104,16 @@ final class AppSettingsTests: XCTestCase {
 
     /// Spot-check the literal default values so a silent change to `Defaults` is caught.
     func testDefaultsEnumHasExpectedLiteralValues() {
-        XCTAssertEqual(AppSettings.Defaults.activationThreshold, 0.045, accuracy: eps)
-        XCTAssertEqual(AppSettings.Defaults.axisLockRatio, 1.4, accuracy: eps)
-        XCTAssertEqual(AppSettings.Defaults.stepDistance, 0.05, accuracy: eps)
+        // The shipped gesture-feel numbers are the maintainer's dialed-in daily-use values
+        // (feather-light trigger, fine steps) — change them only as deliberately as they were set.
+        XCTAssertEqual(AppSettings.Defaults.activationThreshold, 0.01, accuracy: eps)
+        XCTAssertEqual(AppSettings.Defaults.axisLockRatio, 1.0, accuracy: eps)
+        XCTAssertEqual(AppSettings.Defaults.stepDistance, 0.03, accuracy: eps)
         XCTAssertFalse(AppSettings.Defaults.wrapAtEnds)
         XCTAssertFalse(AppSettings.Defaults.reverseDirection)
         XCTAssertEqual(AppSettings.Defaults.velocitySmoothing, 0.35, accuracy: eps)
         XCTAssertTrue(AppSettings.Defaults.requireExactlyThree)
-        XCTAssertEqual(AppSettings.Defaults.rowStepDistance, 0.12, accuracy: eps)
+        XCTAssertEqual(AppSettings.Defaults.rowStepDistance, 0.06, accuracy: eps)
         XCTAssertFalse(AppSettings.Defaults.reverseVerticalDirection)
     }
 

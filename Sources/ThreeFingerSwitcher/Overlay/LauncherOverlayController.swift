@@ -34,7 +34,9 @@ final class LauncherOverlayController {
     private var panel: SwitcherPanel?
     private var bands: [ContextBand] = []
     private var dwell: Double = 0.5
-    private var armWork: DispatchWorkItem?
+    /// Shared with the wizard's hold-to-continue (Overlay/DwellArmDriver.swift) so the taught
+    /// charge and the real charge are one implementation.
+    private let dwellDriver = DwellArmDriver()
 
     // Edge-triggered auto-repeat state (per axis: −1 / 0 / +1; horizontal steps items/bands, vertical
     // steps rows). A single timer advances both axes each tick.
@@ -138,7 +140,7 @@ final class LauncherOverlayController {
     ///    Space-switching action doesn't drag the panel onto the destination Space), then fire.
     @discardableResult
     func end() -> Bool {
-        armWork?.cancel(); armWork = nil
+        dwellDriver.cancel()
 
         // Case 1: a lift while the canvas is open is a NO-OP. After the firing lift (case 2) the fingers
         // are already up, so the canvas is resolved by a FRESH four-finger swipe — horizontal = discard,
@@ -205,7 +207,7 @@ final class LauncherOverlayController {
     }
 
     func cancel() {
-        armWork?.cancel(); armWork = nil
+        dwellDriver.cancel()
         // A hard cancel (gesture abandoned, disable, sleep) while the canvas is open must also stop any
         // in-flight generation and write nothing — same as a discard swipe.
         if model.canvasActive { onDiscardCanvas?() }
@@ -213,7 +215,7 @@ final class LauncherOverlayController {
     }
 
     func hide() {
-        armWork?.cancel(); armWork = nil
+        dwellDriver.cancel()
         endEdgeAutoScroll()
         canvasDiscardAccum = 0
         let wasCanvas = model.canvasActive
@@ -304,7 +306,7 @@ final class LauncherOverlayController {
     /// After any navigation step: arm the selected app (restart dwell) when the cursor is on a grid
     /// item; disarm when it's on the band list (band titles don't fire).
     private func manageDwell() {
-        armWork?.cancel(); armWork = nil
+        dwellDriver.cancel()
         if model.focus == .grid, model.selectedItem != nil {
             startDwell()
         } else {
@@ -316,12 +318,9 @@ final class LauncherOverlayController {
 
     /// Begin charging the selected item: the ring fills over `dwell`, then `arm()` locks it.
     private func startDwell() {
-        armWork?.cancel()
-        guard model.selectedItem != nil else { model.disarm(); return }
+        guard model.selectedItem != nil else { dwellDriver.cancel(); model.disarm(); return }
         model.beginArming()
-        let work = DispatchWorkItem { [weak self] in self?.arm() }
-        armWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + dwell, execute: work)
+        dwellDriver.charge(after: dwell) { [weak self] in self?.arm() }
     }
 
     private func arm() {
@@ -329,7 +328,7 @@ final class LauncherOverlayController {
         model.setArmed()
         // Best-effort haptic tick (S-OQ1). Harmless if the Taptic Engine doesn't actuate; the
         // charge-ring is the primary, always-present arm signal.
-        NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+        DwellArmDriver.hapticTick()
     }
 
     // MARK: - Panel
@@ -402,12 +401,17 @@ final class LauncherOverlayController {
             let bandColumn = model.bandCount > 1 ? LauncherGridLayout.bandColumnWidth : 0
             width = min(bandColumn + contentWidth, frame.width - SwitcherLayout.sideMargin * 2)
 
-            // Height is driven solely by the active band's content — the icon grid's item rows, or the
-            // Clipboard band's taller detail pane — clamped to the window's min/max. The band-title list
-            // divides this same height evenly, so it never makes the window taller than the items do.
+            // Height is the LARGER of the active band's content demand — the icon grid's item rows,
+            // or the Clipboard band's taller detail pane — and the band-icon list's demand, clamped
+            // to the window's min/max. The list term matters with many bands: its icons are
+            // fixed-size, so sizing from the content alone re-stretches the container a beat after
+            // each band switch (fit the rows, then grow for the list — the mid-move jitter). One
+            // max() computation sizes the frame once per switch, stable across short bands.
+            let bandListWanted = LauncherGridLayout.bandListHeight(bandCount: model.bandCount)
             let wanted = model.currentBandIsClipboard
-                ? min(max(ClipboardBandLayout.containerHeight, LauncherGridLayout.minHeight), LauncherGridLayout.maxHeight)
-                : LauncherGridLayout.windowHeight(itemCount: model.items.count)
+                ? min(max(max(ClipboardBandLayout.containerHeight, bandListWanted), LauncherGridLayout.minHeight),
+                      LauncherGridLayout.maxHeight)
+                : LauncherGridLayout.windowHeight(itemCount: model.items.count, bandCount: model.bandCount)
             height = min(wanted, frame.height - 100)
         }
 

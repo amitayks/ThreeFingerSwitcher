@@ -358,6 +358,49 @@ struct GeneralPage: View {
                     Button("Reset to defaults") { settings.resetToDefaults() }
                 }
             }
+            dangerZone
         }
+    }
+
+    // MARK: - Danger zone
+
+    private var dangerZone: some View {
+        HubSection("Danger zone",
+                   footnote: "Each category is deleted only if its switch is on. Clearing app data or permissions relaunches the app; a data wipe restores any gesture relocations first (their backups live in the app data) and replays the welcome tour.") {
+            ToggleRow(title: "App data & settings", isOn: $wipeAppData,
+                      caption: "Preferences, bands, AI commands, keyboard-language memory, clipboard history, project outputs, first-run state.")
+            Divider()
+            ToggleRow(title: "Caches", isOn: $wipeCaches,
+                      caption: "The app's cache and HTTP storage directories.")
+            Divider()
+            ToggleRow(title: "AI models", isOn: $wipeAIModels,
+                      caption: "The downloaded on-device model weights (multi-GB, re-downloadable). Turns the AI opt-in off.")
+            Divider()
+            ToggleRow(title: "Permissions", isOn: $wipePermissions,
+                      caption: "Resets every permission the app can hold (Accessibility, Screen Recording, Input Monitoring, Automation, Calendar, Reminders, Contacts) — macOS will prompt again.")
+            Divider()
+            HStack {
+                Button("Restore native gestures…") { context.onRestoreAllGestures() }
+                    .help("Put every trackpad and Spaces setting the app changed back from its backup, and turn the gesture opt-ins off.")
+                Spacer()
+                Button("Clear selected…") { context.onDangerZoneClear(dangerSelection) }
+                    .tint(.red)
+                    .disabled(dangerSelection.isEmpty)
+            }
+        }
+    }
+
+    @State private var wipeAppData = false
+    @State private var wipeCaches = false
+    @State private var wipeAIModels = false
+    @State private var wipePermissions = false
+
+    private var dangerSelection: DangerZoneSelection {
+        var selection: DangerZoneSelection = []
+        if wipeAppData { selection.insert(.appData) }
+        if wipeCaches { selection.insert(.caches) }
+        if wipeAIModels { selection.insert(.aiModels) }
+        if wipePermissions { selection.insert(.permissions) }
+        return selection
     }
 }

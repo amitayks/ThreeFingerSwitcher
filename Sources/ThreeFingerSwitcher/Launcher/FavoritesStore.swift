@@ -188,37 +188,32 @@ final class FavoritesStore: ObservableObject {
 
     // MARK: - Seed
 
-    /// Starter bands shown on first run — named/colored and pre-filled with a few stock apps so the
-    /// gesture is demonstrable immediately. The user re-arranges them from the editor; empty bands
-    /// are also valid. Home cell points at the first band, column 0.
+    /// Starter bands shown on first run — the SAME composition the First Touch wizard's tour
+    /// teaches with, so what the user learns in onboarding is exactly what the launcher holds:
+    /// **Apps** (flame — the stock apps in one row), **Windows** (display — the twelve
+    /// window-management actions, two exact grid rows; built by `WizardTourBands.windowsBand()`
+    /// so tour and seed cannot drift), and the **AI** band. The user re-arranges everything from
+    /// the editor; empty bands are also valid. Home cell points at the Apps band, column 0.
     static func seeded() -> Favorites {
         func app(_ name: String, _ path: String) -> LaunchItem? {
             guard FileManager.default.fileExists(atPath: path) else { return nil }
             return LaunchItem(title: name, icon: .appDefault,
                               kind: .app(bundleURL: URL(fileURLWithPath: path), strategy: nil))
         }
-        let dev = ContextBand(name: "Dev", color: ItemColor(red: 0.20, green: 0.48, blue: 0.93),
-                              icon: .sfSymbol("chevron.left.forwardslash.chevron.right"),
-                              defaultAppStrategy: .alwaysNewWindow,
-                              items: [app("Terminal", "/System/Applications/Utilities/Terminal.app"),
-                                      app("Finder", "/System/Library/CoreServices/Finder.app")].compactMap { $0 })
-        let comms = ContextBand(name: "Comms", color: ItemColor(red: 0.25, green: 0.72, blue: 0.40),
-                                icon: .sfSymbol("message.fill"),
-                                defaultAppStrategy: .bringExistingHere,
-                                items: [app("Mail", "/System/Applications/Mail.app"),
-                                        app("Messages", "/System/Applications/Messages.app")].compactMap { $0 })
-        let media = ContextBand(name: "Media", color: ItemColor(red: 0.66, green: 0.36, blue: 0.86),
-                                icon: .sfSymbol("play.circle.fill"),
-                                defaultAppStrategy: .smart,
-                                items: [app("Music", "/System/Applications/Music.app"),
-                                        app("Safari", "/Applications/Safari.app")].compactMap { $0 })
-        let system = ContextBand(name: "System", color: ItemColor(red: 0.55, green: 0.55, blue: 0.58),
-                                 icon: .sfSymbol("gearshape.fill"),
-                                 defaultAppStrategy: .smart,
-                                 items: [app("System Settings", "/System/Applications/System Settings.app")].compactMap { $0 })
+        let apps = ContextBand(name: "Apps", color: ItemColor(red: 0.95, green: 0.45, blue: 0.20),
+                               icon: .sfSymbol("flame.fill"),
+                               defaultAppStrategy: .smart,
+                               items: [app("Safari", "/Applications/Safari.app"),
+                                       app("Mail", "/System/Applications/Mail.app"),
+                                       app("Messages", "/System/Applications/Messages.app"),
+                                       app("Music", "/System/Applications/Music.app"),
+                                       app("Terminal", "/System/Applications/Utilities/Terminal.app"),
+                                       app("Finder", "/System/Library/CoreServices/Finder.app"),
+                                       app("System Settings", "/System/Applications/System Settings.app")].compactMap { $0 })
+        let windows = WizardTourBands.windowsBand()
         // Fresh installs also get the "AI" band (a normal, editable band of seeded AI commands). Its
         // items only act once AI is enabled; firing one while AI is off opens the enable/download canvas.
-        return Favorites(bands: [dev, comms, media, system, AIBand.seededBand()],
-                         homeBandID: dev.id, homeColumn: 0)
+        return Favorites(bands: [apps, windows, AIBand.seededBand()],
+                         homeBandID: apps.id, homeColumn: 0)
     }
 }

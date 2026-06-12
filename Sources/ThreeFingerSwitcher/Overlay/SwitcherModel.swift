@@ -19,6 +19,10 @@ final class SwitcherModel: ObservableObject {
     @Published var selectedIndex: Int = 0   // selected column within the current row
     @Published var thumbnails: [CGWindowID: NSImage] = [:]
     @Published var overflow: Bool = false
+    /// True when Space-row switching is opted in but its gesture relocation still awaits the
+    /// one-time re-login — the row indicator then shows a pending hint instead of a silently
+    /// dead vertical axis.
+    @Published var rowSwitchingPending: Bool = false
 
     var rowCount: Int { rows.count }
 

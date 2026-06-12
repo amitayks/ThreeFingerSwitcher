@@ -36,16 +36,14 @@ final class VerticalGestureConfig {
         "com.apple.AppleMultitouchTrackpad",
         "com.apple.driver.AppleBluetoothMultitouch.trackpad"
     ]
-    private let threeFingerKey = "TrackpadThreeFingerVertSwipeGesture"
-    private let fourFingerKey = "TrackpadFourFingerVertSwipeGesture"
-
-    /// `*VertSwipeGesture` integer values: 2 == enabled for that finger count, 0 == disabled.
-    private let enabledValue = 2
-    private let disabledValue = 0
+    private let threeFingerKey = TrackpadKey.threeFingerVert
 
     private let backupKey = "verticalGestureBackup"
-    /// Set when we change the setting this session; runtime effect generally needs re-login.
-    private(set) var changedThisSession = false
+    private let markers: ReloginMarkers
+
+    init(markers: ReloginMarkers = ReloginMarkers()) {
+        self.markers = markers
+    }
 
     // MARK: - Read
 
@@ -61,36 +59,21 @@ final class VerticalGestureConfig {
     var isFree: Bool { currentState() == .free }
 
     /// The relocation is *effective* (safe to enable row stepping) only when the three-finger
-    /// vertical gesture currently reads as free AND we did not change it this session — because a
-    /// change made this session has not yet taken effect at runtime (a re-login is required).
-    var isEffectivelyFree: Bool { isFree && !changedThisSession }
+    /// vertical gesture currently reads as free AND no re-login is still pending for it. The
+    /// pending state is a persisted (audit-session) marker, so a mere app relaunch within the same
+    /// login session no longer fakes effectiveness — only a real re-login clears it.
+    var isEffectivelyFree: Bool { isFree && !markers.isPending(.spaceRows) }
 
     /// The relocation may still be effectively inactive until the next login.
-    var needsReloginWarning: Bool { changedThisSession }
+    var needsReloginWarning: Bool { markers.isPending(.spaceRows) }
 
     var hasBackup: Bool { UserDefaults.standard.data(forKey: backupKey) != nil }
 
     // MARK: - Mutate
 
-    /// Relocate Mission Control / App Exposé to four fingers (three-finger vertical OFF,
-    /// four-finger vertical ON), freeing the three-finger vertical swipe. Backs up prior values
-    /// first (absent-aware). No-op (no write) when already free. Returns false if any write failed.
-    @discardableResult
-    func relocateToFourFingers() -> Bool {
-        guard currentState() != .free else { return true }   // already free: nothing to do
-        backupCurrentValues()
-        // Mark dirty as soon as we commit to changing the system (past the no-op guard, backup
-        // taken), independent of per-write success: a partial write still leaves the system altered
-        // and pending a re-login, so it must still be detectable for restore-on-disable and the
-        // re-login warning. (Restore-on-disable keys off `hasBackup`, not this flag.)
-        changedThisSession = true
-        var ok = true
-        for domain in domains {
-            ok = writeInt(disabledValue, domain: domain, key: threeFingerKey) && ok  // three-finger vert OFF
-            ok = writeInt(enabledValue, domain: domain, key: fourFingerKey) && ok     // four-finger vert ON
-        }
-        return ok
-    }
+    // Relocation (freeing the gesture) goes through `RelocationApplier` — the one write path for
+    // all relocations — which snapshots this class's backup slot pristine before any write and
+    // marks the persisted pending-re-login state.
 
     /// Restore the system to exactly its prior state (delete keys that were absent, otherwise
     /// write back the backed-up value), and clear the backup. No-op without a backup.
@@ -111,24 +94,8 @@ final class VerticalGestureConfig {
             }
         }
         UserDefaults.standard.removeObject(forKey: backupKey)
-        changedThisSession = false
+        markers.clear(.spaceRows)
         return ok
-    }
-
-    // MARK: - Backup
-
-    private func backupCurrentValues() {
-        guard !hasBackup else { return }   // don't overwrite an existing backup
-        var backup: [String: [String: String]] = [:]
-        for domain in domains {
-            var keys: [String: String] = [:]
-            keys[threeFingerKey] = Self.backupToken(forRawValue: runDefaults(["read", domain, threeFingerKey]))
-            keys[fourFingerKey] = Self.backupToken(forRawValue: runDefaults(["read", domain, fourFingerKey]))
-            backup[domain] = keys
-        }
-        if let data = try? JSONEncoder().encode(backup) {
-            UserDefaults.standard.set(data, forKey: backupKey)
-        }
     }
 
     // MARK: - Pure decision logic (unit-tested; no system access)

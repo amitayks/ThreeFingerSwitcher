@@ -35,18 +35,14 @@ final class FourFingerGestureConfig {
         "com.apple.AppleMultitouchTrackpad",
         "com.apple.driver.AppleBluetoothMultitouch.trackpad"
     ]
-    private let horizKey = "TrackpadFourFingerHorizSwipeGesture"
-    private let vertKey = "TrackpadFourFingerVertSwipeGesture"
-
-    /// HORIZONTAL: `1` == assigned to this finger count (claimed); `2` == not assigned (freed).
-    private let horizClaimedValue = 1
-    private let horizFreeValue = 2
-    /// VERTICAL: `2` == enabled (Mission Control on four fingers); `0` == disabled (freed).
-    private let vertFreeValue = 0
+    private let horizKey = TrackpadKey.fourFingerHoriz
 
     private let backupKey = "fourFingerGestureBackup"
-    /// Set when we change the setting this session; runtime effect generally needs re-login.
-    private(set) var changedThisSession = false
+    private let markers: ReloginMarkers
+
+    init(markers: ReloginMarkers = ReloginMarkers()) {
+        self.markers = markers
+    }
 
     // MARK: - Read
 
@@ -61,31 +57,20 @@ final class FourFingerGestureConfig {
     var isFree: Bool { currentState() == .free }
 
     /// Effective (safe to enable launcher emission) only when the gesture currently reads free AND
-    /// we did not change it this session — a change made this session needs a re-login to take effect.
-    var isEffectivelyFree: Bool { isFree && !changedThisSession }
+    /// no re-login is still pending for it. The pending state is a persisted (audit-session)
+    /// marker, so an app relaunch within the same login session no longer fakes effectiveness.
+    var isEffectivelyFree: Bool { isFree && !markers.isPending(.launcher) }
 
     /// The relocation may still be effectively inactive until the next login.
-    var needsReloginWarning: Bool { changedThisSession }
+    var needsReloginWarning: Bool { markers.isPending(.launcher) }
 
     var hasBackup: Bool { UserDefaults.standard.data(forKey: backupKey) != nil }
 
     // MARK: - Mutate
 
-    /// Free the four-finger swipes (horizontal full-screen-app swipe OFF, vertical Mission Control
-    /// OFF), backing up prior values absent-aware first. No-op (no write) when already free. Returns
-    /// false if any write failed.
-    @discardableResult
-    func freeFourFingerSwipes() -> Bool {
-        guard currentState() != .free else { return true }   // already free: nothing to do
-        backupCurrentValues()
-        var ok = true
-        for domain in domains {
-            ok = writeInt(horizFreeValue, domain: domain, key: horizKey) && ok  // full-screen swipe OFF
-            ok = writeInt(vertFreeValue, domain: domain, key: vertKey) && ok    // four-finger MC OFF
-        }
-        changedThisSession = ok || changedThisSession
-        return ok
-    }
+    // Freeing the four-finger swipes goes through `RelocationApplier` — the one write path for all
+    // relocations — which snapshots this class's backup slot pristine before any write and marks
+    // the persisted pending-re-login state.
 
     /// Restore the system to exactly its prior state (delete keys that were absent, otherwise write
     /// back the backed-up value), and clear the backup. No-op without a backup. Restoring re-enables
@@ -107,24 +92,8 @@ final class FourFingerGestureConfig {
             }
         }
         UserDefaults.standard.removeObject(forKey: backupKey)
-        changedThisSession = false
+        markers.clear(.launcher)
         return ok
-    }
-
-    // MARK: - Backup
-
-    private func backupCurrentValues() {
-        guard !hasBackup else { return }   // don't overwrite an existing backup
-        var backup: [String: [String: String]] = [:]
-        for domain in domains {
-            var keys: [String: String] = [:]
-            keys[horizKey] = Self.backupToken(forRawValue: runDefaults(["read", domain, horizKey]))
-            keys[vertKey] = Self.backupToken(forRawValue: runDefaults(["read", domain, vertKey]))
-            backup[domain] = keys
-        }
-        if let data = try? JSONEncoder().encode(backup) {
-            UserDefaults.standard.set(data, forKey: backupKey)
-        }
     }
 
     // MARK: - Pure decision logic (unit-tested; no system access)

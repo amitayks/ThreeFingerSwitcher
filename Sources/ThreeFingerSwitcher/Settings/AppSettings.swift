@@ -279,24 +279,27 @@ final class AppSettings: ObservableObject {
 
     private func persist(_ value: Double, _ key: String) { defaults.set(value, forKey: key) }
 
+    // The gesture-feel numbers below are tuned from extended real daily use (the maintainer's
+    // dialed-in values, adopted as the shipped defaults): a feather-light trigger, fine steps,
+    // and a quick dwell — the feel the product is meant to have out of the box.
     enum Defaults {
-        static let activationThreshold = 0.045   // ~4.5% of trackpad width to trigger
-        static let axisLockRatio = 1.4           // horizontal must clearly dominate vertical
-        static let stepDistance = 0.05           // one window per ~5% of trackpad width
+        static let activationThreshold = 0.01    // feather-light trigger (~1% of trackpad width)
+        static let axisLockRatio = 1.0           // no dominance requirement; any drift picks the axis
+        static let stepDistance = 0.03           // one window per ~3% of trackpad width (fine scrub)
         static let wrapAtEnds = false
         static let reverseDirection = false
         static let velocitySmoothing = 0.35
         static let requireExactlyThree = true
-        static let rowStepDistance = 0.12       // ~2.4× the horizontal step; deliberate up/down
+        static let rowStepDistance = 0.06       // 2× the horizontal step; deliberate up/down
         static let reverseVerticalDirection = false
         static let focusWatchdogEnabled = true
         static let manageSpacesRearrange = false   // opt-in; only enabled via explicit consent
         static let manageVerticalGesture = false   // opt-in; relocates Mission Control to four fingers
         static let enableLauncher = false          // opt-in; frees four-finger native gestures
-        static let launcherActivationThreshold = 0.045  // same deliberate trigger as the horizontal switcher
-        static let launcherStepDistance = 0.07     // one item per ~7%; items are larger, fewer targets
-        static let launcherContextStepDistance = 0.12   // ~1.7× the item step; deliberate horizontal band switching
-        static let dwellToArmDuration = 0.5        // brief but deliberate; not a full second
+        static let launcherActivationThreshold = 0.01   // same feather-light trigger as the switcher
+        static let launcherStepDistance = 0.04     // one item per ~4%; items are larger, fewer targets
+        static let launcherContextStepDistance = 0.09   // ~2.2× the item step; deliberate band switching
+        static let dwellToArmDuration = 0.3        // quick tick; the charge stays readable
         static let showDiagnostics = false         // troubleshooting tools hidden from the menu by default
         static let keepClipboardHistory = false    // opt-in; records copied content locally (privacy)
         static let clipboardPaused = false
@@ -314,7 +317,11 @@ final class AppSettings: ObservableObject {
         static let aiReasoningEnabled = true       // let the model think (filtered out of the result); gated by the AI opt-in
         static let keyboardLanguageEnabled = false // opt-in; gates per-app input-source learn/apply (no re-login)
         static let keyboardLanguageDefaultSourceID = ""  // "" = no global default (pure learn-as-you-go)
-        static let keyboardLanguagePerSiteEnabled = false        // opt-in sub-toggle; per-host memory inside browsers
+        // Per-host memory inside browsers rides along by default when the keyboard-language master
+        // opt-in is enabled: the default (Accessibility) host reader needs NO new permission, so the
+        // soft path costs nothing — only the Apple-Events "allow browser control" reader stays a
+        // deliberate opt-in below. The feature is still fully inert until the MASTER toggle is on.
+        static let keyboardLanguagePerSiteEnabled = true
         static let keyboardLanguageAllowBrowserControl = false   // opt-in; Apple Events host reader (per-browser permission)
     }
 

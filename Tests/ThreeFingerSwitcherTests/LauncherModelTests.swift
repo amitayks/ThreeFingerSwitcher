@@ -159,4 +159,37 @@ final class LauncherModelTests: XCTestCase {
         m.stepHorizontal(1)
         XCTAssertEqual(m.selectedIndex, cols + 1, "clamps — the short row has no 3rd item")
     }
+
+    // MARK: - Window height accounts for the band-icon list (no mid-switch stretch jitter)
+
+    func testWindowHeightNeverBelowTheBandListDemand() {
+        // Ten bands of fixed-size icons need more height than a one-row band's grid — the
+        // container must size to the list in ONE computation, not re-stretch after fitting rows.
+        let oneRowGrid = LauncherGridLayout.containerHeight(forItemCount: 3)
+        let list = LauncherGridLayout.bandListHeight(bandCount: 10)
+        XCTAssertGreaterThan(list, oneRowGrid, "precondition: many bands out-demand a short band")
+        XCTAssertEqual(LauncherGridLayout.windowHeight(itemCount: 3, bandCount: 10), list,
+                       "the larger demand wins")
+    }
+
+    func testWindowHeightStableAcrossShortBandsWithManyBands() {
+        // Scrubbing between two short bands must not change the height when the list dominates.
+        let a = LauncherGridLayout.windowHeight(itemCount: 2, bandCount: 9)
+        let b = LauncherGridLayout.windowHeight(itemCount: 7, bandCount: 9)
+        XCTAssertEqual(a, b, "the band list sets the floor; short bands share one height")
+    }
+
+    func testWindowHeightStillGrowsForTallBandsAndClampsAtMax() {
+        let tall = LauncherGridLayout.windowHeight(itemCount: 24, bandCount: 9)
+        XCTAssertGreaterThan(tall, LauncherGridLayout.bandListHeight(bandCount: 9),
+                             "a genuinely tall band still out-grows the list")
+        XCTAssertLessThanOrEqual(LauncherGridLayout.windowHeight(itemCount: 200, bandCount: 40),
+                                 LauncherGridLayout.maxHeight, "the max is the ceiling for both demands")
+    }
+
+    func testSingleBandHasNoListDemand() {
+        XCTAssertEqual(LauncherGridLayout.bandListHeight(bandCount: 1), 0, "no list shown for one band")
+        XCTAssertEqual(LauncherGridLayout.windowHeight(itemCount: 3, bandCount: 1),
+                       LauncherGridLayout.windowHeight(itemCount: 3), "default matches the no-list case")
+    }
 }

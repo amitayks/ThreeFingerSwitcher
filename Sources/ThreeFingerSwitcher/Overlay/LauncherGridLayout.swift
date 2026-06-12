@@ -28,6 +28,10 @@ enum LauncherGridLayout {
 
     /// The bands render as a vertical list of **icons** (not titles). Each icon's tile size.
     static let bandIconSize: CGFloat = 30
+    /// Padding the icon's hit/highlight tile adds around the glyph — the REAL per-row height is
+    /// `bandIconSize + bandIconTilePadding` (shared with `LauncherView.bandIcon` so the window
+    /// sizing math and the rendered rows can never drift apart again).
+    static let bandIconTilePadding: CGFloat = 18
     /// Fixed (small) vertical gap between band icons — the list sits centered in the column, not spread.
     static let bandRowSpacing: CGFloat = 12
     /// Fixed width of the left band-icon column (icon tile + padding on each side + the gap to the grid).
@@ -61,12 +65,27 @@ enum LauncherGridLayout {
         return gridHeight + gridTopInset + 2 * containerPadding
     }
 
-    /// Window height: driven *solely* by the active band's item rows (so a 2-row band is exactly two
-    /// rows tall, a 3-row band three), clamped to the min/max bounds. The band-title list divides this
-    /// same height evenly between its titles, so it never makes the window taller than the items do —
-    /// and switching between same-row-count bands yields an identical height (no jitter).
-    static func windowHeight(itemCount: Int) -> CGFloat {
-        min(max(containerHeight(forItemCount: itemCount), minHeight), maxHeight)
+    /// Height the band-icon list needs to show every band's fixed-size icon TILE (icon + tile
+    /// padding — the view's actual row height) + gaps + the container's vertical padding. This is
+    /// the SwiftUI content's minimum height for the list column: the hosting view enforces it on
+    /// the window via Auto Layout, so a panel frame computed below it gets force-grown a beat
+    /// after its own animation — the mid-switch double-stretch. Zero for a single band (no list).
+    static func bandListHeight(bandCount: Int) -> CGFloat {
+        guard bandCount > 1 else { return 0 }
+        let rowHeight = bandIconSize + bandIconTilePadding
+        return CGFloat(bandCount) * rowHeight + CGFloat(bandCount - 1) * bandRowSpacing
+            + 2 * containerPadding
+    }
+
+    /// Window height: the LARGER of the active band's item-row demand and the band-icon list's
+    /// demand, clamped to the min/max bounds. The list term matters with many bands: the icons are
+    /// FIXED-size (they don't compress to fit), so sizing from the item rows alone makes the
+    /// container grow for the list a beat after fitting the rows — the mid-switch stretch jitter.
+    /// Taking the max sizes the container once: band switches only change the height when a band's
+    /// rows genuinely need more room than the list, and never below what the list needs.
+    static func windowHeight(itemCount: Int, bandCount: Int = 1) -> CGFloat {
+        let wanted = max(containerHeight(forItemCount: itemCount), bandListHeight(bandCount: bandCount))
+        return min(max(wanted, minHeight), maxHeight)
     }
 }
 

@@ -43,8 +43,9 @@ final class OverlayController {
     }
 
     func show(rows: [[WindowInfo]], labels: [String], startRow: Int, column: Int,
-              aboveMissionControl: Bool = false) {
+              aboveMissionControl: Bool = false, rowSwitchingPending: Bool = false) {
         model.setRows(rows, labels: labels, startRow: startRow, column: column)
+        model.rowSwitchingPending = rowSwitchingPending
         let panel = self.panel ?? makePanel()
         self.panel = panel
         configure(panel, aboveMissionControl: aboveMissionControl)

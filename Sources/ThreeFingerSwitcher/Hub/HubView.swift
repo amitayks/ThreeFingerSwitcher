@@ -81,6 +81,17 @@ final class HubContext {
     // `InputSourceController`).
     var enabledInputSources: () -> [(id: String, name: String)] = { [] }
 
+    // Setup page — the First Touch wizard entry (Resume while incomplete, Replay after) and the
+    // self-relaunch helper for the Screen Recording grant.
+    var onShowWelcomeTour: () -> Void = {}
+    var firstRunCompleted: () -> Bool = { true }
+    var onRelaunchApp: () -> Void = {}
+
+    // Overview — the one-re-login banner: any gesture relocation still awaiting its re-login,
+    // and the standard log-out keystroke (⇧⌘Q; macOS shows its own confirmation).
+    var relocationsPendingRelogin: () -> Bool = { false }
+    var onLogOutNow: () -> Void = {}
+
     // Setup page — actions.
     var onSetupNativeGesture: () -> Void = {}
     var onRestoreNativeGesture: () -> Void = {}
@@ -106,6 +117,10 @@ final class HubContext {
     var onToggleOpenAtLogin: () -> Void = {}
     var onWriteDiagnostics: () -> Void = {}
     var onCopyFocusLog: () -> Void = {}
+
+    // General page — Danger zone.
+    var onDangerZoneClear: (DangerZoneSelection) -> Void = { _ in }
+    var onRestoreAllGestures: () -> Void = {}
 
     init(settings: AppSettings,
          favorites: FavoritesStore,

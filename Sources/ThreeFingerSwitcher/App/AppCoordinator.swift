@@ -10,6 +10,8 @@ final class AppCoordinator: GestureRecognizerDelegate {
     let settings = AppSettings.shared
     let permissions = PermissionsService()
     let trackpadConfig = TrackpadGestureConfig()
+    /// First Touch wizard progress (persisted stage machine + the legacy-flag bridge).
+    let firstRun = FirstRunStore()
 
     private let mru = MRUTracker()
     private lazy var windowService = WindowService(mru: mru, settings: settings)
@@ -20,6 +22,12 @@ final class AppCoordinator: GestureRecognizerDelegate {
     let spacesRearrange = SpacesRearrangeConfig()
     let verticalGesture = VerticalGestureConfig()
     let fourFingerGesture = FourFingerGestureConfig()
+    /// Persisted pending-re-login markers (audit-session-keyed). Stateless over UserDefaults, so
+    /// this instance and the configs' own instances observe the same state.
+    private let reloginMarkers = ReloginMarkers()
+    /// The ONE write path for trackpad relocations: computes final key values from the full active
+    /// feature set (resolving the shared four-finger keys) and snapshots pristine backups first.
+    private let relocationApplier = RelocationApplier()
     private let scrollTap = ScrollEventTap()
     private var cancellables: Set<AnyCancellable> = []
 
@@ -154,6 +162,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
 
     var onStateChange: (() -> Void)?
 
+    /// The wizard's menu-bar moment: pulses the real status-item mark (wired by
+    /// `StatusItemController`) so the wizard can point at the actual pixel the user returns to.
+    var onMenuBarPulse: (() -> Void)?
+
     /// Live finger count from the most recent touch frame; drives the scroll tap's consume rule
     /// (the switcher owns all three-finger scroll so it never leaks to the background).
     private var currentFingerCount = 0
@@ -174,11 +186,16 @@ final class AppCoordinator: GestureRecognizerDelegate {
         fingerCount >= 3 || ((launcherOpen || switcherOpen) && !canvasActive)
     }
 
+    /// Read-only tap on the touch stream for the wizard's live-hand act (the recognizer path is
+    /// untouched; this only mirrors frames).
+    var onWizardTouchFrame: ((TouchFrame) -> Void)?
+
     init() {
         recognizer.delegate = self
         touchEngine.onFrame = { [weak self] frame in
             self?.currentFingerCount = frame.fingerCount
             self?.recognizer.feed(frame)
+            self?.onWizardTouchFrame?(frame)
         }
         scrollTap.consumePredicate = { [weak self] in
             guard let self else { return false }
@@ -187,7 +204,11 @@ final class AppCoordinator: GestureRecognizerDelegate {
                                             switcherOpen: self.overlay.isVisible,
                                             canvasActive: self.launcherOverlay.canvasActive)
         }
-        thumbnails.onThumbnail = { [weak self] id, image in self?.overlay.model.setThumbnail(image, for: id) }
+        thumbnails.onThumbnail = { [weak self] id, image in
+            self?.overlay.model.setThumbnail(image, for: id)
+            // The wizard's demo strip listens along while it lives (the post-Screen-Recording reveal).
+            self?.wizardModel?.demo.setThumbnail(image, for: id)
+        }
         launcherOverlay.onFire = { [weak self] item, band in self?.launchService.fire(item, inBand: band) }
         launcherOverlay.onTogglePin = { [weak self] item in
             guard case let .clipboardEntry(entry) = item.kind else { return }
@@ -270,6 +291,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
             NSLog("[ThreeFingerSwitcher] off-Space window support disabled (private CGS symbols unavailable); using current-Space only.")
         }
         permissions.refresh()
+        // Sweep stale pending-re-login markers FIRST (a marker from a previous login session means
+        // the re-login happened — the relocation is live), so the apply-on-launch no-ops below and
+        // the effectiveness gates read accurate pending state from the first gesture.
+        reloginMarkers.sweepAtLaunch()
         // Reapply the vertical-gesture relocation before enabling so the recognizer's row-switching
         // gate reflects the effective state from the first gesture.
         applyVerticalGestureOnLaunchIfManaged()
@@ -282,12 +307,12 @@ final class AppCoordinator: GestureRecognizerDelegate {
         refreshKeyboardLanguageBrowserMonitor()
         refreshRowSwitchingGate()
         refreshClipboardMonitor()
-        maybePromptNativeGestureSetup()
         applySpacesRearrangeOnLaunchIfManaged()
-        maybePromptSpacesRearrange()
-        maybePromptVerticalGesture()
-        maybePromptLauncher()
-        if !permissions.allRequiredGranted { showHub(selecting: .setup) }
+        // The First Touch wizard IS the first-run flow: it replaced the four one-shot consent
+        // alerts (didPrompt* — set on the wizard's completion so they can never fire) and the
+        // open-Hub-on-Setup fallback. Resume-aware: any interruption (relaunch, re-login, plain
+        // quit) reopens at the right act.
+        maybeShowFirstTouchWizard()
     }
 
     // MARK: - Enable / disable
@@ -447,6 +472,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
     // MARK: - GestureRecognizerDelegate
 
     func gestureDidActivate() {
+        // While the wizard is on stage it owns the trackpad: its demo strip is the only thing
+        // that responds (the live-hand act mirrors the same frames), so the real overlay would
+        // double the scene. Commits stay inert via the first-run Accessibility gate.
+        guard !wizardOwnsGestures else { return }
         var windows = windowService.snapshot()
         // Inject the configuration Hub as a synthetic switcher entry whenever it is open. The snapshot
         // filters out our own PID (so the overlay panels never leak); the Hub is the one window we add
@@ -459,7 +488,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
         // When the app has Mission Control open, float the overlay above it (otherwise it renders
         // behind the MC windows). The elevated config is scoped to this case in `OverlayController`.
         overlay.show(rows: grid.rows, labels: grid.labels, startRow: grid.startRow, column: 0,
-                     aboveMissionControl: missionControlOpen)
+                     aboveMissionControl: missionControlOpen,
+                     // Opted in but the relocation hasn't survived its re-login yet: the row dots
+                     // dim with a pending glyph so the gated vertical axis explains itself.
+                     rowSwitchingPending: settings.manageVerticalGesture && !isSpaceRowSwitchingEffective)
         prefetchCurrentRow()
     }
 
@@ -525,6 +557,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
     }
 
     func gestureDidTriggerMissionControl(up: Bool) {
+        guard !wizardOwnsGestures else { return }   // no OS overviews over the wizard's stage
         // A fresh three-finger vertical swipe while we own the gesture: open the OS overview
         // ourselves (the native gesture is disabled to a scroll, which the scroll tap consumes).
         MissionControl.trigger(up: up)
@@ -569,7 +602,12 @@ final class AppCoordinator: GestureRecognizerDelegate {
             return
         }
         guard permissions.accessibility == .granted else {
-            permissions.requestAccessibility()
+            // While first-run onboarding is incomplete the wizard owns first contact — the OS
+            // Accessibility prompt must never fire mid-gesture; the commit is simply inert. After
+            // completion this is the safety net for the granted-then-revoked case.
+            if FirstRunMachine.shouldPromptAccessibilityOnCommit(firstRunCompleted: firstRun.isCompleted) {
+                permissions.requestAccessibility()
+            }
             return
         }
         // If Mission Control is open, close it first (so the raise lands on the live desktop, not the
@@ -592,6 +630,11 @@ final class AppCoordinator: GestureRecognizerDelegate {
     // MARK: - GestureRecognizerDelegate (four-finger launcher)
 
     func launcherDidActivate() {
+        // The wizard's stage owns the trackpad — and on the playground act it puts real launcher
+        // intents to work: the embedded tour responds to the user's actual four-finger gestures
+        // (the recognizer only emits these when the relocation is effective, so this is exactly
+        // the post-re-login / replay case).
+        if wizardOwnsGestures { wizardModel?.launcherTourActivate(); return }
         // Defensive: while the AI preview canvas is open the recognizer is in canvas-resolution mode and
         // routes swipes to `launcherCanvasResolve` (down = commit, horizontal = discard), so it does NOT
         // call this. Should it ever reach here, do NOT re-show — that would discard the canvas and reset
@@ -628,11 +671,13 @@ final class AppCoordinator: GestureRecognizerDelegate {
     }
 
     func launcherDidStepItem(_ direction: Int) {
+        if wizardOwnsGestures { wizardModel?.launcherTourStepItem(direction); return }
         guard launcherOverlay.isVisible else { return }
         launcherOverlay.stepHorizontal(direction)   // grid cursor / cross between band list and grid
     }
 
     func launcherDidStepContext(_ direction: Int) {
+        if wizardOwnsGestures { wizardModel?.launcherTourStepContext(direction); return }
         guard launcherOverlay.isVisible else { return }
         launcherOverlay.stepVertical(direction)      // band switch (on the band list) / grid rows
     }
@@ -641,10 +686,12 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// VERTICAL axis. Lets the recognizer use the coarser context-step for vertical band switching and
     /// the finer item-step everywhere else.
     func launcherFocusIsOnBandList() -> Bool {
-        launcherOverlay.isVisible && launcherOverlay.focusIsOnBandList
+        if wizardOwnsGestures { return wizardModel?.launcherTourFocusOnBandList ?? false }
+        return launcherOverlay.isVisible && launcherOverlay.focusIsOnBandList
     }
 
     func launcherDidEnd() {
+        if wizardOwnsGestures { wizardModel?.launcherTourEnd(); return }
         // Lift: the controller fires the armed item (or dismisses if nothing armed). Firing is
         // heterogeneous (app/path/url/shortcut/script/preset); the AX-dependent paths degrade on
         // their own if Accessibility isn't granted, so we don't gate the whole commit on it.
@@ -652,6 +699,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
     }
 
     func launcherDidCancel() {
+        if wizardOwnsGestures { wizardModel?.launcherTourEnd(); return }
         launcherOverlay.cancel()
     }
 
@@ -669,6 +717,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
     }
 
     func launcherEdgeChanged(dx: Int, dy: Int) {
+        guard !wizardOwnsGestures else { return }   // no edge auto-repeat in the wizard's tour
         guard launcherOverlay.isVisible else { return }
         var h = dx, v = dy
         if settings.reverseDirection { h = -h }            // match manual horizontal stepping
@@ -769,8 +818,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
                     guard let self else { return }
                     if on { self.keyboardLanguageService.start() } else { self.keyboardLanguageService.stop() }
                     // Stopping the per-app feature must stop the within-browser poll too (and starting it
-                    // re-arms the poll if the per-site sub-toggle is also on).
-                    self.refreshKeyboardLanguageBrowserMonitor()
+                    // re-arms the poll if the per-site sub-toggle is also on). The EMITTED value is passed
+                    // through: `@Published` fires on willSet, so a property re-read here would still see
+                    // the OLD value — the bug that used to need a quit-and-reopen to start the poll.
+                    self.refreshKeyboardLanguageBrowserMonitor(master: on)
                 }
             }
             .store(in: &cancellables)
@@ -784,8 +835,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
     private func observeKeyboardLanguagePerSiteToggle() {
         settings.$keyboardLanguagePerSiteEnabled
             .dropFirst()
-            .sink { [weak self] _ in
-                MainActor.assumeIsolated { self?.refreshKeyboardLanguageBrowserMonitor() }
+            .sink { [weak self] on in
+                // Pass the EMITTED value through — a property re-read here still sees the OLD value
+                // (`@Published` fires on willSet), which silently kept the poll off until relaunch.
+                MainActor.assumeIsolated { self?.refreshKeyboardLanguageBrowserMonitor(perSite: on) }
             }
             .store(in: &cancellables)
     }
@@ -810,9 +863,12 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// Start the within-browser host-change poll only while BOTH the master keyboard-language toggle and
     /// the per-site sub-toggle are on; otherwise stop it (it then holds no timer and is fully inert). The
     /// per-app activation path is independent of this monitor, so plain app switches keep working whether
-    /// or not the poll runs. Called at launch and from the two relevant toggle observers.
-    private func refreshKeyboardLanguageBrowserMonitor() {
-        if settings.keyboardLanguageEnabled && settings.keyboardLanguagePerSiteEnabled {
+    /// or not the poll runs. Called at launch and from the two relevant toggle observers — which MUST pass
+    /// their emitted value (a re-read inside a `@Published` willSet sink still sees the old value).
+    private func refreshKeyboardLanguageBrowserMonitor(master: Bool? = nil, perSite: Bool? = nil) {
+        let masterOn = master ?? settings.keyboardLanguageEnabled
+        let perSiteOn = perSite ?? settings.keyboardLanguagePerSiteEnabled
+        if masterOn && perSiteOn {
             keyboardLanguageBrowserMonitor.start()
         } else {
             keyboardLanguageBrowserMonitor.stop()
@@ -889,14 +945,20 @@ final class AppCoordinator: GestureRecognizerDelegate {
 
     // MARK: - Native gesture consent
 
-    private let didPromptKey = "didPromptNativeGesture"
-
-    private func maybePromptNativeGestureSetup() {
-        let alreadyPrompted = UserDefaults.standard.bool(forKey: didPromptKey)
-        guard !alreadyPrompted, trackpadConfig.isClaimed else { return }
-        UserDefaults.standard.set(true, forKey: didPromptKey)
-        promptNativeGestureSetup()
+    /// The OTHER gesture features currently active, passed to the applier as value-resolution
+    /// context so the shared four-finger keys land on their combined end-state values (a launcher
+    /// that is on keeps the four-finger keys freed no matter which feature is being applied).
+    private func gestureFeatureContext(excluding excluded: GestureFeatures) -> GestureFeatures {
+        var ctx: GestureFeatures = []
+        if settings.manageVerticalGesture { ctx.insert(.spaceRows) }
+        if settings.enableLauncher { ctx.insert(.launcher) }
+        ctx.subtract(excluded)
+        return ctx
     }
+
+    // The legacy one-shot startup prompts (didPrompt* keys) are retired: the First Touch wizard is
+    // the first-run consent surface, and its completion sets all four keys (FirstRunStore). The
+    // prompt* methods below remain as the Hub Setup page's re-invokable consent flows.
 
     func promptNativeGestureSetup() {
         guard trackpadConfig.isClaimed else {
@@ -917,7 +979,9 @@ final class AppCoordinator: GestureRecognizerDelegate {
         alert.addButton(withTitle: "Not now")
         NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertFirstButtonReturn {
-            let ok = trackpadConfig.disableThreeFingerHorizontal()
+            let result = relocationApplier.apply(requested: .horizontal,
+                                                 context: gestureFeatureContext(excluding: .horizontal))
+            let ok = result.failed.isEmpty
             infoAlert(
                 title: ok ? "Done — restart to finish" : "Couldn't change the setting",
                 text: ok ? "Log out and back in (or restart) so macOS stops claiming the horizontal three-finger swipe."
@@ -939,8 +1003,74 @@ final class AppCoordinator: GestureRecognizerDelegate {
         onStateChange?()
     }
 
+    // MARK: - Self-relaunch (Screen Recording's TCC grant needs a fresh process)
+
+    /// True while a programmatic quit-and-reopen is in flight; quit-time restore behaviors must
+    /// not fire (the user isn't leaving — restoring/prompting would sabotage the relaunch).
+    private(set) var isRelaunching = false
+
+    /// Quit and reopen the app in place. A detached shell waits for this PID to exit, then `open`s
+    /// the bundle (the same wait-then-open shape as `LaunchService`'s quit-and-reopen for launcher
+    /// items). Wizard/Hub state is persisted on write, so the fresh process resumes correctly.
+    func relaunchApp() {
+        guard !isRelaunching else { return }
+        isRelaunching = true
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let bundlePath = Bundle.main.bundleURL.path
+        // Wait for THIS pid to fully exit, give LaunchServices a beat to register the death (an
+        // `open` fired the instant the old instance dies can silently no-op against the dying
+        // record), then open — with one retry. The relauncher detaches via a backgrounded subshell
+        // with its IO severed, so nothing ties it to this process; a breadcrumb log lands in /tmp
+        // for diagnosis if the reopen ever fails.
+        let script = """
+        nohup /bin/sh -c '
+        exec >/tmp/tfs-relaunch.log 2>&1
+        echo "relaunch: waiting for pid \(pid)"
+        while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 0.1; done
+        /bin/sleep 0.4
+        echo "relaunch: opening"
+        /usr/bin/open "\(bundlePath)" || { echo "relaunch: retry"; /bin/sleep 1; /usr/bin/open "\(bundlePath)"; }
+        echo "relaunch: done"
+        ' >/dev/null 2>&1 &
+        """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", script]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()   // only the outer shell (it exits immediately after backgrounding)
+        } catch {
+            isRelaunching = false
+            infoAlert(title: "Couldn't relaunch",
+                      text: "Quit and reopen ThreeFingerSwitcher manually to finish applying the change.")
+            return
+        }
+        NSApp.terminate(nil)
+    }
+
+    /// Whether the in-flight quit is part of a logout/restart/shutdown (the Apple quit event's
+    /// `why?` attribute). A session-end quit must NOT offer the trackpad restore: the re-login it
+    /// leads to is what makes the relocation effective — restoring at that boundary would undo the
+    /// change exactly when it is about to apply (the same rationale as the vertical relocation's
+    /// no-restore-on-quit), and a modal there can stall the logout.
+    static func quitIsSessionEnd() -> Bool {
+        guard let event = NSAppleEventManager.shared().currentAppleEvent else { return false }
+        let why = event.attributeDescriptor(forKeyword: AEKeyword(kAEQuitReason))?.enumCodeValue ?? 0
+        let sessionEnd: [OSType] = [
+            OSType(kAELogOut), OSType(kAEReallyLogOut),
+            OSType(kAERestart), OSType(kAEShowRestartDialog),
+            OSType(kAEShutDown), OSType(kAEShowShutdownDialog)
+        ]
+        return sessionEnd.contains(why)
+    }
+
     /// Called on quit: offer to restore the trackpad setting if we changed it.
     func offerRestoreOnQuit() {
+        guard !isRelaunching else { return }            // programmatic relaunch: the user isn't leaving
+        guard !Self.quitIsSessionEnd() else { return }  // logout/restart: never offer to undo it here
         guard trackpadConfig.hasBackup else { return }
         let alert = NSAlert()
         alert.messageText = "Restore the trackpad setting?"
@@ -954,8 +1084,6 @@ final class AppCoordinator: GestureRecognizerDelegate {
     }
 
     // MARK: - Spaces auto-rearrange
-
-    private let didPromptSpacesKey = "didPromptSpacesRearrange"
 
     /// React to the Settings toggle: enabling applies the setting, disabling restores it. The
     /// initial persisted value is skipped (`dropFirst`); launch-apply is handled in `start()`.
@@ -995,15 +1123,6 @@ final class AppCoordinator: GestureRecognizerDelegate {
         )
     }
 
-    /// First-run consent, mirroring the native-gesture prompt: ask once, only when the setting is
-    /// actually on and the user hasn't already opted in.
-    private func maybePromptSpacesRearrange() {
-        let alreadyPrompted = UserDefaults.standard.bool(forKey: didPromptSpacesKey)
-        guard !alreadyPrompted, !settings.manageSpacesRearrange, spacesRearrange.isAutoRearrangeOn else { return }
-        UserDefaults.standard.set(true, forKey: didPromptSpacesKey)
-        promptSpacesRearrangeSetup()
-    }
-
     func promptSpacesRearrangeSetup() {
         guard spacesRearrange.isAutoRearrangeOn else {
             infoAlert(title: "Already set",
@@ -1030,15 +1149,15 @@ final class AppCoordinator: GestureRecognizerDelegate {
     }
 
     /// Called on quit: if we disabled auto-rearrange this session, restore the original value
-    /// (synchronously, so the Dock restart finishes before the app exits).
+    /// (synchronously, so the Dock restart finishes before the app exits). Skipped during a
+    /// programmatic relaunch — restoring would restart the Dock twice for a quit the user never made.
     func restoreSpacesRearrangeOnQuit() {
+        guard !isRelaunching else { return }
         guard spacesRearrange.changedThisSession else { return }
         _ = spacesRearrange.restore()
     }
 
     // MARK: - Space-row switching (vertical gesture)
-
-    private let didPromptVerticalKey = "didPromptVerticalGesture"
 
     /// Whether vertical Space-row switching is *effective*: the opt-in is on AND the native
     /// three-finger vertical gesture has actually been relocated (freed) and that change has taken
@@ -1102,7 +1221,9 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// Relocate the native three-finger vertical gesture to four fingers; surface a non-fatal
     /// warning if the write failed (e.g. a managed preference). A no-op when already free.
     private func applyVerticalGesture() {
-        guard !verticalGesture.relocateToFourFingers() else { return }
+        let result = relocationApplier.apply(requested: .spaceRows,
+                                             context: gestureFeatureContext(excluding: .spaceRows))
+        guard result.failed.contains(.spaceRows) else { return }
         infoAlert(
             title: "Couldn't change the trackpad setting",
             text: """
@@ -1111,15 +1232,6 @@ final class AppCoordinator: GestureRecognizerDelegate {
             Settings ▸ Trackpad ▸ More Gestures (set Mission Control to “Swipe Up with Four Fingers”).
             """
         )
-    }
-
-    /// First-run consent, mirroring the spaces-rearrange prompt: ask once, only when the gesture is
-    /// actually on three fingers and the user hasn't already opted in.
-    private func maybePromptVerticalGesture() {
-        let alreadyPrompted = UserDefaults.standard.bool(forKey: didPromptVerticalKey)
-        guard !alreadyPrompted, !settings.manageVerticalGesture, verticalGesture.isClaimed else { return }
-        UserDefaults.standard.set(true, forKey: didPromptVerticalKey)
-        promptVerticalGestureSetup()
     }
 
     func promptVerticalGestureSetup() {
@@ -1170,8 +1282,6 @@ final class AppCoordinator: GestureRecognizerDelegate {
 
     // MARK: - Four-finger launcher opt-in
 
-    private let didPromptLauncherKey = "didPromptLauncher"
-
     /// React to the Settings toggle: enabling frees the native four-finger swipes, disabling
     /// restores them. The persisted initial value is skipped (`dropFirst`); launch-apply is handled
     /// in `start()`. Mirrors `observeVerticalGestureToggle`.
@@ -1201,7 +1311,9 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// Free the native four-finger horizontal/vertical swipes; surface a non-fatal warning if the
     /// write failed (e.g. a managed preference). A no-op when already free.
     private func applyLauncherGesture() {
-        guard !fourFingerGesture.freeFourFingerSwipes() else { return }
+        let result = relocationApplier.apply(requested: .launcher,
+                                             context: gestureFeatureContext(excluding: .launcher))
+        guard result.failed.contains(.launcher) else { return }
         infoAlert(
             title: "Couldn't change the trackpad setting",
             text: """
@@ -1210,15 +1322,6 @@ final class AppCoordinator: GestureRecognizerDelegate {
             Trackpad ▸ More Gestures (turn off the four-finger swipe gestures).
             """
         )
-    }
-
-    /// First-run consent, mirroring the vertical-gesture prompt: ask once, only when the four-finger
-    /// gesture is still claimed by the OS and the user hasn't already opted in.
-    private func maybePromptLauncher() {
-        let alreadyPrompted = UserDefaults.standard.bool(forKey: didPromptLauncherKey)
-        guard !alreadyPrompted, !settings.enableLauncher, fourFingerGesture.isClaimed else { return }
-        UserDefaults.standard.set(true, forKey: didPromptLauncherKey)
-        promptLauncherSetup()
     }
 
     func promptLauncherSetup() {
@@ -1269,6 +1372,91 @@ final class AppCoordinator: GestureRecognizerDelegate {
         onStateChange?()
     }
 
+    // MARK: - Danger zone (Hub ▸ General)
+
+    private lazy var appDataReset = AppDataReset()
+
+    /// Restore every app-made gesture/Spaces relocation from its absent-aware backup and turn the
+    /// opt-ins off. Flipping the flags drives the existing observers (restore + marker clear); the
+    /// horizontal relocation has no flag, so its backup is restored directly.
+    /// Returns whether anything was actually restored.
+    @discardableResult
+    func restoreAllNativeGestures(interactive: Bool = true) -> Bool {
+        let hadAnything = trackpadConfig.hasBackup || verticalGesture.hasBackup
+            || fourFingerGesture.hasBackup || spacesRearrange.hasBackup
+            || settings.manageVerticalGesture || settings.enableLauncher || settings.manageSpacesRearrange
+        settings.manageVerticalGesture = false     // observer restores when a backup exists
+        settings.enableLauncher = false            // observer restores when a backup exists
+        settings.manageSpacesRearrange = false     // observer restores when a backup exists
+        if trackpadConfig.hasBackup { _ = trackpadConfig.restore() }
+        refreshRowSwitchingGate()
+        onStateChange?()
+        if interactive {
+            infoAlert(title: hadAnything ? "Gestures restored" : "Nothing to restore",
+                      text: hadAnything
+                        ? "Every trackpad and Spaces setting the app changed was put back from its backup. Log out and back in for the trackpad changes to take effect."
+                        : "No gesture or Spaces relocation backups were found — the system settings are already yours.")
+        }
+        return hadAnything
+    }
+
+    /// Whether any gesture/Spaces backup exists (drives the Danger zone's restore-first note).
+    var anyGestureBackupExists: Bool {
+        trackpadConfig.hasBackup || verticalGesture.hasBackup
+            || fourFingerGesture.hasBackup || spacesRearrange.hasBackup
+    }
+
+    /// The Danger zone's confirmed, selective clear. Ordering is load-bearing (design D1/D3):
+    /// gestures restored BEFORE an App-data wipe (the backups live inside it), monitors stopped
+    /// before deletion, the preferences domain wiped LAST, and an App-data/Permissions clear ends
+    /// in an immediate relaunch so the fresh process reads the cleared state.
+    func dangerZoneClear(_ selection: DangerZoneSelection) {
+        guard !selection.isEmpty else { return }
+
+        var lines: [String] = []
+        if selection.contains(.appData) {
+            lines.append("• App data & settings — preferences, bands, AI commands, keyboard-language memory, clipboard history, project outputs, first-run state.")
+            if anyGestureBackupExists {
+                lines.append("  Gesture relocations will be restored FIRST so their backups aren't lost.")
+            }
+        }
+        if selection.contains(.caches) { lines.append("• Caches.") }
+        if selection.contains(.aiModels) { lines.append("• AI models — the downloaded weights are deleted (re-downloadable); the AI opt-in turns off.") }
+        if selection.contains(.permissions) { lines.append("• Permissions — every granted permission is reset; macOS will prompt again.") }
+        let relaunches = selection.contains(.appData) || selection.contains(.permissions)
+        if relaunches { lines.append("\nThe app will relaunch afterwards.") }
+
+        let alert = NSAlert()
+        alert.messageText = "Clear the selected data?"
+        alert.informativeText = "This cannot be undone.\n\n" + lines.joined(separator: "\n")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Clear")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        // 1. Never strand a relocation: the backups are part of the data being deleted.
+        if selection.contains(.appData), anyGestureBackupExists {
+            restoreAllNativeGestures(interactive: false)
+        }
+        // 2. Quiesce writers so nothing re-creates what's being removed.
+        clipboardMonitor.stop()
+        if selection.contains(.aiModels) || selection.contains(.appData) {
+            settings.aiCommandsEnabled = false   // evicts residency + forgets download progress
+        }
+        // 3. Delete (preferences last, inside `clear`).
+        let outcome = appDataReset.clear(selection)
+        // 4. A cleared identity needs a fresh process (and a data wipe replays the wizard).
+        if relaunches {
+            relaunchApp()
+        } else {
+            let failures = outcome.failures.isEmpty ? "" : "\n\nIssues:\n" + outcome.failures.joined(separator: "\n")
+            infoAlert(title: "Cleared",
+                      text: "Removed: \(outcome.cleared.isEmpty ? "nothing (already clean)" : outcome.cleared.joined(separator: ", "))." + failures)
+            refreshClipboardMonitor()   // restart the recorder if its opt-in is still on
+        }
+    }
+
     /// Menu-bar quick-add: append the frontmost app to a band without opening the Hub (10.2).
     func addFrontAppToBand(_ bandID: UUID) {
         guard let app = NSWorkspace.shared.frontmostApplication,
@@ -1283,6 +1471,254 @@ final class AppCoordinator: GestureRecognizerDelegate {
 
     /// Bands for the status-menu quick-add submenu.
     var favoriteBands: [ContextBand] { favoritesStore.favorites.bands }
+
+    // MARK: - First Touch wizard
+
+    private var wizardWindow: NSWindow?
+    private var wizardModel: FirstTouchWizardModel?
+    private var wizardCloseObserver: NSObjectProtocol?
+    private let lanesToast = LanesLiveToast()
+
+    /// Any trackpad relocation still awaiting its re-login (the persisted markers).
+    private var relocationsStillPending: Bool {
+        trackpadConfig.needsReloginWarning
+            || verticalGesture.needsReloginWarning
+            || fourFingerGesture.needsReloginWarning
+    }
+
+    /// While the wizard is on stage (visible and first-run incomplete) it owns the trackpad: the
+    /// real overlays stay closed and Mission Control isn't synthesized, so the demo is the only
+    /// thing that responds to the user's hand. Replay re-enters this mode deliberately.
+    private var wizardOwnsGestures: Bool {
+        (wizardWindow?.isVisible ?? false) && !firstRun.isCompleted
+    }
+
+    /// The launch gate that replaced the legacy alert stack: migrate existing installs silently,
+    /// surface the one-time lanes-are-live acknowledgment, then resume the wizard if it has acts
+    /// left to play.
+    private func maybeShowFirstTouchWizard() {
+        firstRun.migrateExistingInstallIfNeeded(allRequiredPermissionsGranted: permissions.allRequiredGranted)
+        if firstRun.consumeLanesAcknowledgment(relocationsStillPending: relocationsStillPending) {
+            lanesToast.show()
+        }
+        guard FirstRunMachine.shouldShowAtLaunch(stage: firstRun.stage) else {
+            // Completed installs keep the old safety net: if a required permission has gone
+            // missing (e.g. revoked), open the Hub on Setup rather than failing silently.
+            if !permissions.allRequiredGranted { showHub(selecting: .setup) }
+            return
+        }
+        showFirstTouchWizard()
+    }
+
+    /// Open (or bring forward) the wizard and resume it at the right act. Also the Hub Setup
+    /// page's Resume/Replay entry point.
+    func showFirstTouchWizard() {
+        if wizardWindow == nil {
+            let model = FirstTouchWizardModel(context: makeWizardContext(), store: firstRun)
+            wizardModel = model
+            let host = NSHostingController(rootView: FirstTouchWizardView(model: model))
+            let window = NSWindow(contentViewController: host)
+            window.title = "Welcome"
+            window.styleMask = [.titled, .closable, .fullSizeContentView]
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
+            window.isMovableByWindowBackground = true
+            window.isReleasedWhenClosed = false
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            window.setContentSize(NSSize(width: 960, height: 640))
+            window.center()
+            wizardWindow = window
+            // Closing the window mid-flow is "later": progress is already persisted, but the
+            // model's machinery (attract loop, permission polling, the touch feed) must stop.
+            wizardCloseObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification, object: window, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.wizardModel?.suspend() }
+            }
+        }
+        let firstPresentation = !(wizardWindow?.isVisible ?? true)
+        wizardModel?.resume()
+        if firstPresentation, let window = wizardWindow {
+            presentWizardWithRise(window)
+        } else {
+            present(wizardWindow)
+        }
+    }
+
+    /// The stage's own entrance: the wizard window rises 14 pt and fades in over an easeOut beat —
+    /// the first frame of the performance is already motion, not a pop. (Window-level AppKit
+    /// animation; the SwiftUI acts choreograph everything inside.)
+    private func presentWizardWithRise(_ window: NSWindow) {
+        NSApp.activate(ignoringOtherApps: true)
+        window.center()
+        let target = window.frame
+        window.setFrame(target.offsetBy(dx: 0, dy: -14), display: false)
+        window.alphaValue = 0
+        window.makeKeyAndOrderFront(nil)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.45
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            window.animator().alphaValue = 1
+            window.animator().setFrame(target, display: true)
+        }
+    }
+
+    /// Replay from the Hub: the same machine from the top; acts render their done states from live
+    /// detection and never re-write a setting without a fresh user action.
+    func replayFirstTouchWizard() {
+        firstRun.beginReplay()
+        showFirstTouchWizard()
+    }
+
+    private func closeWizard() {
+        wizardModel?.suspend()
+        onWizardTouchFrame = nil
+        if let wizardCloseObserver {
+            NotificationCenter.default.removeObserver(wizardCloseObserver)
+            self.wizardCloseObserver = nil
+        }
+        let window = wizardWindow
+        wizardWindow = nil
+        wizardModel = nil
+        guard let window else { return }
+        guard window.isVisible else {
+            window.orderOut(nil)
+            window.close()
+            return
+        }
+        // The exhale: the curtain's last frame drifts up and fades — the performance ends the way
+        // every act moved, never on a cut.
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.3
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            window.animator().alphaValue = 0
+            window.animator().setFrame(window.frame.offsetBy(dx: 0, dy: 10), display: true)
+        }, completionHandler: {
+            window.orderOut(nil)
+            window.close()
+        })
+    }
+
+    private func makeWizardContext() -> WizardContext {
+        let ctx = WizardContext(settings: settings, permissions: permissions)
+        ctx.requestAccessibility = { [weak self] in self?.permissions.requestAccessibility() }
+        ctx.requestScreenRecording = { [weak self] in self?.permissions.requestScreenRecording() }
+        ctx.relaunchNow = { [weak self] in self?.relaunchApp() }
+        ctx.realWindowRows = { [weak self] in
+            guard let self else { return [] }
+            // The demo upgrade: the user's actual windows, current Space first. One row is enough.
+            let snapshot = self.windowService.snapshot()
+            let current = snapshot.filter(\.isOnCurrentSpace)
+            return [current.isEmpty ? snapshot : current]
+        }
+        ctx.seedThumbnails = { [weak self] model in
+            guard let self else { return }
+            // The fan-out into the demo strip is wired once in init; this kicks the capture.
+            // PRODUCTION semantics, deliberately: the switcher's hard-won rule is "never render a
+            // degraded frame — last clean observation or the icon" (robust-offspace-window-fidelity;
+            // the tilted set-aside proxy is what every capture API returns for a parked window, and
+            // the HW-capture alternative was tried and reverted — garbage on Tahoe). So the reveal
+            // live-captures every cleanly-presented window and leaves parked/set-aside ones as
+            // icon+title — exactly how the real switcher renders them until first visit. Two
+            // delayed sweeps retry the cards still missing an image (SCK warms up around launch,
+            // and Space switches mid-wizard make more windows cleanly capturable).
+            let windows = model.windows
+            self.thumbnails.seed(into: model, ids: windows.map(\.id))
+            self.thumbnails.prefetch(windows)
+            for delay in [0.7, 2.0] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self, let demo = self.wizardModel?.demo else { return }
+                    let missing = windows.filter { demo.thumbnails[$0.id] == nil }
+                    guard !missing.isEmpty else { return }
+                    self.thumbnails.seed(into: demo, ids: missing.map(\.id))
+                    self.thumbnails.prefetch(missing)
+                }
+            }
+        }
+        ctx.trackpadClaimed = { [weak self] in self?.trackpadConfig.isClaimed ?? false }
+        ctx.spacesAutoRearrangeOn = { [weak self] in self?.spacesRearrange.isAutoRearrangeOn ?? false }
+        ctx.applyLanes = { [weak self] choices in self?.applyLanesFromWizard(choices) ?? LanesApplyOutcome() }
+        ctx.relocationsPending = { [weak self] in self?.relocationsStillPending ?? false }
+        ctx.logOutNow = { [weak self] in self?.sendLogOutKeystroke() }
+        // The tour's fixed composition (WizardTourBands): the flame band of every app across the
+        // user's bands, the display band of the twelve window actions, plus the AI band when AI is
+        // on and the Clipboard band when history is on (sample entries while the store is empty).
+        ctx.launcherBands = { [weak self] clipboardOn, aiOn in
+            guard let self else { return [] }
+            let clipboard: ContextBand? = clipboardOn ? {
+                let entries = self.clipboardStore.recentWindow(limit: self.settings.clipboardRecentWindow)
+                return ClipboardBandBuilder.build(
+                    from: entries.isEmpty ? WizardSampleContent.clipboardEntries() : entries)
+            }() : nil
+            return WizardTourBands.compose(userBands: self.favoritesStore.favorites.bands,
+                                           aiOn: aiOn,
+                                           seededAIBand: AIBand.seededBand,
+                                           clipboardBand: clipboard)
+        }
+        ctx.launcherLive = { [weak self] in self?.isLauncherEffective ?? false }
+        // The playground lane toggle's OFF side — the wizard's quiet sibling of the Setup page's
+        // restore (no modal; the act's row caption reflects the result).
+        ctx.restoreLauncherLane = { [weak self] in
+            guard let self else { return }
+            if self.fourFingerGesture.hasBackup { _ = self.fourFingerGesture.restore() }
+            self.settings.enableLauncher = false
+            self.refreshRowSwitchingGate()
+            self.onStateChange?()
+        }
+        ctx.isOpenAtLogin = { [weak self] in self?.isOpenAtLogin ?? false }
+        ctx.toggleOpenAtLogin = { [weak self] in self?.toggleOpenAtLogin() }
+        ctx.finish = { [weak self] in
+            guard let self else { return }
+            self.firstRun.complete(relocationsStillPending: self.relocationsStillPending)
+            self.closeWizard()
+            self.onStateChange?()
+        }
+        ctx.subscribeTouch = { [weak self] handler in self?.onWizardTouchFrame = handler }
+        ctx.unsubscribeTouch = { [weak self] in self?.onWizardTouchFrame = nil }
+        ctx.pulseMenuBarMark = { [weak self] in self?.onMenuBarPulse?() }
+        return ctx
+    }
+
+    /// The wizard's single combined apply: one pristine-backup write for everything chosen, then
+    /// the opt-in flags (whose observers' re-applies are no-ops — the keys already read freed, so
+    /// nothing re-arms the pending markers). Spaces order applies instantly via its own config.
+    private func applyLanesFromWizard(_ choices: LaneChoices) -> LanesApplyOutcome {
+        var outcome = LanesApplyOutcome()
+        var requested: GestureFeatures = trackpadConfig.isClaimed ? .horizontal : []
+        if choices.spaceRows { requested.insert(.spaceRows) }
+        if choices.launcher { requested.insert(.launcher) }
+        if !requested.isEmpty {
+            let result = relocationApplier.apply(requested: requested, context: [])
+            outcome.failed = result.failed
+            outcome.appliedAny = !result.applied.isEmpty
+        }
+        if choices.spaceRows, !outcome.failed.contains(.spaceRows) { settings.manageVerticalGesture = true }
+        if choices.launcher, !outcome.failed.contains(.launcher) { settings.enableLauncher = true }
+        if choices.fixedSpaces, spacesRearrange.isAutoRearrangeOn {
+            let ok = spacesRearrange.disableAutoRearrange()
+            outcome.spacesFailed = !ok
+            if ok { settings.manageSpacesRearrange = true }   // observer's re-apply is a no-op
+        }
+        refreshRowSwitchingGate()
+        onStateChange?()
+        return outcome
+    }
+
+    /// Trigger the OS log-out via the standard ⇧⌘Q keystroke (uses the already-held Accessibility
+    /// permission; macOS shows its own confirmation). Without Accessibility this is a no-op — the
+    /// act's caption points at the Apple menu as the manual path.
+    private func sendLogOutKeystroke() {
+        guard AXIsProcessTrusted() else { return }
+        let source = CGEventSource(stateID: .combinedSessionState)
+        let flags: CGEventFlags = [.maskCommand, .maskShift]
+        guard let down = CGEvent(keyboardEventSource: source, virtualKey: 12, keyDown: true),   // Q
+              let up = CGEvent(keyboardEventSource: source, virtualKey: 12, keyDown: false) else { return }
+        down.flags = flags
+        up.flags = flags
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+    }
 
     // MARK: - Configuration Hub
 
@@ -1327,6 +1763,16 @@ final class AppCoordinator: GestureRecognizerDelegate {
         // Keyboard Language — the picker's source list (forwarded from the service's controller seam so
         // the page never imports Carbon).
         ctx.enabledInputSources = { [weak self] in self?.keyboardLanguageService.controllerEnabledSources() ?? [] }
+        // Setup — the welcome tour entry (resume while incomplete, replay after) + self-relaunch.
+        ctx.onShowWelcomeTour = { [weak self] in
+            guard let self else { return }
+            if self.firstRun.isCompleted { self.replayFirstTouchWizard() } else { self.showFirstTouchWizard() }
+        }
+        ctx.firstRunCompleted = { [weak self] in self?.firstRun.isCompleted ?? true }
+        ctx.onRelaunchApp = { [weak self] in self?.relaunchApp() }
+        // Overview — the one-re-login banner.
+        ctx.relocationsPendingRelogin = { [weak self] in self?.relocationsStillPending ?? false }
+        ctx.onLogOutNow = { [weak self] in self?.sendLogOutKeystroke() }
         // Setup — actions.
         ctx.onSetupNativeGesture = { [weak self] in self?.promptNativeGestureSetup() }
         ctx.onRestoreNativeGesture = { [weak self] in self?.restoreNativeGestureSetting() }
@@ -1350,6 +1796,9 @@ final class AppCoordinator: GestureRecognizerDelegate {
         ctx.onToggleOpenAtLogin = { [weak self] in self?.toggleOpenAtLogin() }
         ctx.onWriteDiagnostics = { [weak self] in self?.writeDiagnostics() }
         ctx.onCopyFocusLog = { [weak self] in self?.copyFocusLog() }
+        // Danger zone.
+        ctx.onDangerZoneClear = { [weak self] selection in self?.dangerZoneClear(selection) }
+        ctx.onRestoreAllGestures = { [weak self] in self?.restoreAllNativeGestures() }
         return ctx
     }
 

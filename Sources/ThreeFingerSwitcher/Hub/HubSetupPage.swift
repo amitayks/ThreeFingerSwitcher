@@ -10,6 +10,13 @@ struct SetupPage: View {
     /// The native-gesture/restore state is read via plain closures over non-observable config objects
     /// (TrackpadGestureConfig etc.), so toggling this after an action forces the cards to re-read them.
     @State private var refresh = false
+    /// Snapshots of the two trackpad-domain reads. These closures shell out to /usr/bin/defaults
+    /// and block on waitUntilExit, which pumps a NESTED run loop — calling them from `body` can
+    /// re-enter the AppKit update cycle mid-render and segfault (and the permission poll re-renders
+    /// this page every second). They run only from event handlers: appear, post-action, app-active.
+    @State private var trackpadClaimed = false
+    @State private var spacesAutoRearrangeOn = false
+    @State private var gestureStateLoaded = false
 
     init(context: HubContext) {
         self.context = context
@@ -18,40 +25,70 @@ struct SetupPage: View {
     }
 
     /// Run a gesture/restore action, then nudge `refresh` so the (non-observable) live-state cards re-read.
-    private func act(_ action: () -> Void) { action(); refresh.toggle() }
+    private func act(_ action: () -> Void) { action(); rereadGestureState(); refresh.toggle() }
+
+    /// Re-read the process-backed trackpad/Spaces state (event-time only — never from body).
+    private func rereadGestureState() {
+        trackpadClaimed = context.trackpadClaimed()
+        spacesAutoRearrangeOn = context.spacesAutoRearrangeOn()
+        gestureStateLoaded = true
+    }
 
     var body: some View {
         HubPage(HubDestination.setup.title,
                 subtitle: "Grant the permissions below, then free the gestures you want to use.") {
             let _ = refresh   // re-evaluate the closure-driven cards after an action
-            HubSection("Permissions") {
+            HubSection("Welcome tour") {
+                HStack {
+                    Label(context.firstRunCompleted()
+                            ? "Replay the guided welcome tour anytime."
+                            : "The welcome tour isn't finished — pick up where you left off.",
+                          systemImage: context.firstRunCompleted() ? "play.circle" : "arrow.uturn.forward.circle")
+                        .foregroundStyle(context.firstRunCompleted() ? Color.secondary : Color.orange)
+                    Spacer()
+                    Button(context.firstRunCompleted() ? "Replay the welcome tour…" : "Resume the welcome tour…") {
+                        act(context.onShowWelcomeTour)
+                    }
+                }
+            }
+            HubSection("Permissions",
+                       footnote: "Status updates live while this page is open.") {
                 permissionRow(title: "Accessibility (required)",
                               detail: "Enumerate and raise windows.",
                               status: permissions.accessibility,
                               action: permissions.requestAccessibility)
                 Divider()
                 permissionRow(title: "Screen Recording (required for thumbnails)",
-                              detail: "Capture window thumbnails. Without it, cards show app icons only.",
+                              detail: "Capture window thumbnails. Without it, cards show app icons only. The grant takes effect after the app reopens — use Relaunch once you've granted it.",
                               status: permissions.screenRecording,
                               action: permissions.requestScreenRecording)
+                if permissions.screenRecording != .granted {
+                    HStack {
+                        Spacer()
+                        Button("Relaunch app", action: context.onRelaunchApp)
+                            .help("Quit and reopen so a Screen Recording grant takes effect. The Hub reopens where you left it.")
+                    }
+                }
                 Divider()
                 permissionRow(title: "Input Monitoring (optional — usually not needed)",
                               detail: "The trackpad read does not require this. Safe to skip; the app may not appear in this list at all.",
                               status: permissions.inputMonitoring,
                               optional: true,
                               action: permissions.requestInputMonitoring)
-                Divider()
-                HStack {
-                    Button("Refresh status", action: context.onRefreshPermissions)
-                    Spacer()
-                    if permissions.allRequiredGranted {
+                if permissions.allRequiredGranted {
+                    Divider()
+                    HStack {
+                        Spacer()
                         Label("Ready", systemImage: "checkmark.seal.fill").foregroundStyle(.green)
                     }
                 }
             }
 
             HubSection("Native gesture") {
-                if context.trackpadClaimed() {
+                if !gestureStateLoaded {
+                    Label("Checking the trackpad setting…", systemImage: "ellipsis.circle")
+                        .foregroundStyle(.secondary)
+                } else if trackpadClaimed {
                     Label("The horizontal three-finger swipe is currently used by macOS to switch full-screen apps.", systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
                     Button("Free the three-finger horizontal swipe…") { act(context.onSetupNativeGesture) }
@@ -68,7 +105,10 @@ struct SetupPage: View {
             }
 
             HubSection("Spaces") {
-                if context.spacesAutoRearrangeOn() {
+                if !gestureStateLoaded {
+                    Label("Checking the Spaces setting…", systemImage: "ellipsis.circle")
+                        .foregroundStyle(.secondary)
+                } else if spacesAutoRearrangeOn {
                     Label("macOS rearranges Spaces by most recent use, so the switcher's row order keeps shifting.", systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
                     Button("Keep Spaces in a fixed order…") { act(context.onKeepSpacesFixed) }
@@ -112,7 +152,15 @@ struct SetupPage: View {
                 }
             }
         }
-        .onAppear { context.onRefreshPermissions() }
+        // Live status while visible: the refcounted poll (plus a didBecomeActive refresh) replaces
+        // the old refresh-on-appear-only behavior, finally honoring the spec's live-status scenario.
+        // The trackpad/Spaces snapshots re-read on appear and whenever the app comes back to front
+        // (returning from System Settings) — event-time, never per-render.
+        .onAppear { permissions.startPolling(); rereadGestureState() }
+        .onDisappear { permissions.stopPolling() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            rereadGestureState()
+        }
     }
 
     @ViewBuilder

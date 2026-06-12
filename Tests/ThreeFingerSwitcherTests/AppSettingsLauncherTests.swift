@@ -44,7 +44,7 @@ final class AppSettingsLauncherTests: XCTestCase {
     }
 
     func testDwellDefaultIsBriefNotAFullSecond() {
-        XCTAssertEqual(AppSettings.Defaults.dwellToArmDuration, 0.5, accuracy: eps)
+        XCTAssertEqual(AppSettings.Defaults.dwellToArmDuration, 0.3, accuracy: eps)
         XCTAssertLessThan(AppSettings.Defaults.dwellToArmDuration, 1.0, "dwell must be brief but deliberate")
     }
 

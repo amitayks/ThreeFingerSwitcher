@@ -15,6 +15,9 @@ struct OverviewPage: View {
 
     var body: some View {
         HubPage("Overview", subtitle: "Turn features on or off, then open one to configure it.") {
+            if context.relocationsPendingRelogin() {
+                reloginBanner
+            }
             HubSection {
                 featureRow(.switcher, isOn: $settings.enabled,
                            subtitle: "Switch windows with a three-finger horizontal swipe.")
@@ -33,6 +36,28 @@ struct OverviewPage: View {
                 Divider()
                 featureRow(.keyboardLanguage, isOn: $settings.keyboardLanguageEnabled,
                            subtitle: "Remember and auto-switch the keyboard language per app.")
+            }
+        }
+    }
+
+    /// The one-re-login banner: a gesture relocation has been applied but macOS hands the lanes
+    /// over only at the next login — the same honest state the wizard's re-login act and the
+    /// overlay's dimmed row dots show, surfaced where every feature toggle lives.
+    private var reloginBanner: some View {
+        HubSection {
+            HStack(spacing: 12) {
+                Image(systemName: "arrow.clockwise.circle.fill")
+                    .font(.system(size: 18))
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("One log-out finishes your gesture setup")
+                        .font(.body).fontWeight(.medium)
+                    Text("macOS hands trackpad gestures over at login — the claimed lanes go live the next time you log in. Log Out sends the standard ⇧⌘Q; macOS asks to confirm.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 12)
+                Button("Log Out Now…") { context.onLogOutNow() }
             }
         }
     }
