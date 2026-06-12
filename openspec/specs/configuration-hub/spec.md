@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define the single, unified configuration **Hub** window that is the only surface for configuring every feature: an Overview landing page of master toggles, grouped-sidebar navigation (Content → Bands; Features → Switcher/Spaces/Launcher/Clipboard/AI; System → Setup/General), per-feature pages that preserve all tunables and persistence, a Setup page for permissions and native-gesture opt-ins, a Bands page that edits only authored bands, and a Liquid-Glass/material presentation consistent with the runtime overlays. All former configuration surfaces (Settings, Favorites editor, Setup/Onboarding, AI-command editor) fold into this one window.
+Define the single, unified configuration **Hub** window that is the only surface for configuring every feature: an Overview landing page of master toggles, grouped-sidebar navigation (Content → Bands; Features → Switcher/Launcher/Clipboard/AI; System → Setup/General), per-feature pages that preserve all tunables and persistence, a Setup page for permissions and native-gesture opt-ins, a Bands page that edits only authored bands, and a Liquid-Glass/material presentation consistent with the runtime overlays. All former configuration surfaces (Settings, Favorites editor, Setup/Onboarding, AI-command editor) fold into this one window.
 
 ## Requirements
 
@@ -43,11 +43,12 @@ The Hub SHALL present an **Overview** landing page that shows every feature's ma
 - **THEN** the Hub navigates to that feature's detail page
 
 ### Requirement: Grouped sidebar navigation
-The Hub SHALL organize its pages in a sidebar grouped as: an **Overview** entry; a **Content** group containing **Bands**; a **Features** group containing **Switcher**, **Spaces**, **Launcher**, **Clipboard**, and **AI**; and a **System** group containing **Setup** and **General**. Selecting a sidebar entry SHALL show that page in the detail area. A disabled feature SHALL keep its page reachable (its controls shown disabled) so it can be re-enabled.
+The Hub SHALL organize its pages in a sidebar grouped as: an **Overview** entry; a **Content** group containing **Bands**; a **Features** group containing **Switcher**, **Launcher**, **Clipboard**, and **AI**; and a **System** group containing **Setup** and **General**. Selecting a sidebar entry SHALL show that page in the detail area. A disabled feature SHALL keep its page reachable (its controls shown disabled) so it can be re-enabled. Space-row switching is a sub-feature of the Switcher and SHALL appear as sections on the **Switcher** page (Space-row switching and Fixed order) rather than as its own sidebar destination.
 
 #### Scenario: Sidebar groups
 - **WHEN** the user opens the Hub
-- **THEN** the sidebar shows Overview, a Content group with Bands, a Features group with Switcher/Spaces/Launcher/Clipboard/AI, and a System group with Setup/General
+- **THEN** the sidebar shows Overview, a Content group with Bands, a Features group with Switcher/Launcher/Clipboard/AI, and a System group with Setup/General
+- **AND** Space-row switching appears as sections on the Switcher page, not as its own sidebar entry
 
 #### Scenario: Disabled feature page still reachable
 - **WHEN** a feature is turned off

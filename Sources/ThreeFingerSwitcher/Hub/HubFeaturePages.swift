@@ -11,7 +11,7 @@ struct SwitcherPage: View {
 
     var body: some View {
         HubPage(HubDestination.switcher.title,
-                subtitle: "Switch windows with a three-finger horizontal swipe.") {
+                subtitle: "Switch windows with a three-finger horizontal swipe — and Spaces by sliding up/down.") {
             HubSection {
                 ToggleRow(title: "Enable the window switcher", isOn: $settings.enabled)
             }
@@ -35,18 +35,8 @@ struct SwitcherPage: View {
                 Toggle("Require exactly three fingers", isOn: $settings.requireExactlyThree)
                 Toggle("Live preview of the highlighted window", isOn: $settings.livePreviewEnabled)
             }
-        }
-    }
-}
-
-// MARK: - Spaces
-
-struct SpacesPage: View {
-    @ObservedObject var settings: AppSettings
-
-    var body: some View {
-        HubPage(HubDestination.spaces.title,
-                subtitle: "Move between Spaces while the switcher is open.") {
+            // Space-row switching — a sub-feature of the switcher: slide up/down while it is open to move
+            // between Spaces. Re-homed here from the former standalone Spaces page.
             HubSection("Space-row switching",
                        footnote: "Slide three fingers up/down while the switcher is open to move between Spaces. To free that gesture, this moves Mission Control / App Exposé to four-finger up/down (they keep working there). Changes a system setting that stays applied until you turn this off; a logout/restart is required for it to take effect.") {
                 ToggleRow(title: "Switch Spaces by sliding up/down", isOn: $settings.manageVerticalGesture)

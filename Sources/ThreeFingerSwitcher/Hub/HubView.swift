@@ -2,11 +2,12 @@ import SwiftUI
 import AppKit
 
 /// The pages of the configuration Hub, as sidebar destinations. One window, grouped navigation:
-/// Overview · Content(Bands) · Features(Switcher/Spaces/Launcher/Clipboard/AI) · System(Setup/General).
+/// Overview · Content(Bands) · Features(Switcher/Launcher/Clipboard/AI) · System(Setup/General).
+/// Space-row switching is a sub-feature of the Switcher and lives on the Switcher page (no own destination).
 enum HubDestination: Hashable, CaseIterable {
     case overview
     case bands
-    case switcher, spaces, launcher, clipboard, ai, keyboardLanguage
+    case switcher, launcher, clipboard, ai, keyboardLanguage
     case setup, general
 
     var title: String {
@@ -14,7 +15,6 @@ enum HubDestination: Hashable, CaseIterable {
         case .overview: return "Overview"
         case .bands: return "Bands"
         case .switcher: return "Window Switcher"
-        case .spaces: return "Spaces"
         case .launcher: return "Launcher"
         case .clipboard: return "Clipboard"
         case .ai: return "AI Commands"
@@ -40,7 +40,6 @@ enum HubDestination: Hashable, CaseIterable {
         case .overview: return "square.grid.2x2"
         case .bands: return "rectangle.3.group"
         case .switcher: return "arrow.left.arrow.right"
-        case .spaces: return "rectangle.split.3x1"
         case .launcher: return "square.grid.3x3.fill"
         case .clipboard: return "doc.on.clipboard"
         case .ai: return "sparkles"
@@ -164,7 +163,7 @@ struct HubView: View {
                 row(.bands)
             }
             Section("Features") {
-                row(.switcher); row(.spaces); row(.launcher); row(.clipboard); row(.ai); row(.keyboardLanguage)
+                row(.switcher); row(.launcher); row(.clipboard); row(.ai); row(.keyboardLanguage)
             }
             Section("System") {
                 row(.setup); row(.general)
@@ -185,7 +184,6 @@ struct HubView: View {
         case .overview: OverviewPage(context: context, nav: nav)
         case .bands: BandsPage(context: context)
         case .switcher: SwitcherPage(settings: context.settings)
-        case .spaces: SpacesPage(settings: context.settings)
         case .launcher: LauncherPage(settings: context.settings)
         case .clipboard: ClipboardPage(context: context)
         case .ai: AIPage(context: context)

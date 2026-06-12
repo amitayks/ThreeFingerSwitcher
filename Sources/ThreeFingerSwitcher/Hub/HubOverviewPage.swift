@@ -20,10 +20,7 @@ struct OverviewPage: View {
             }
             HubSection {
                 featureRow(.switcher, isOn: $settings.enabled,
-                           subtitle: "Switch windows with a three-finger horizontal swipe.")
-                Divider()
-                featureRow(.spaces, isOn: $settings.manageVerticalGesture,
-                           subtitle: "Switch Spaces by sliding up/down while the switcher is open.")
+                           subtitle: "Switch windows with three fingers; switch Spaces by sliding up/down.")
                 Divider()
                 featureRow(.launcher, isOn: $settings.enableLauncher,
                            subtitle: "Open a launcher of apps, scripts, and commands with four fingers.")

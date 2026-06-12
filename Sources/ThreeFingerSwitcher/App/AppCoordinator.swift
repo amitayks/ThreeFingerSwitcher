@@ -370,7 +370,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
         settings.$enabled
             .dropFirst()
             .sink { [weak self] on in
-                MainActor.assumeIsolated {
+                // Defer off the `willSet` emission so the master toggle updates in place immediately;
+                // enabling/disabling starts or tears down the touch engine + taps, which otherwise stalled
+                // the SwiftUI render until the page was rebuilt. See observeSpacesRearrangeToggle.
+                DispatchQueue.main.async {
                     guard let self, !self.applyingEnabledToggle else { return }
                     self.applyingEnabledToggle = true
                     if on { self.enable() } else { self.disable() }
@@ -1159,7 +1162,12 @@ final class AppCoordinator: GestureRecognizerDelegate {
         settings.$manageSpacesRearrange
             .dropFirst()
             .sink { [weak self] enabled in
-                MainActor.assumeIsolated { self?.handleSpacesRearrangeToggle(enabled) }
+                // Apply on the NEXT main-loop turn, not inside this `@Published` `willSet` emission: the
+                // system work (a Dock restart, plus a modal alert on failure) is blocking, and running it
+                // synchronously here stalled the SwiftUI update the bound toggle had just triggered — so
+                // the row only refreshed once the page was rebuilt (e.g. navigating away and back).
+                // Deferring lets the toggle re-render in place first; the change then applies a beat later.
+                DispatchQueue.main.async { self?.handleSpacesRearrangeToggle(enabled) }
             }
             .store(in: &cancellables)
     }
@@ -1267,7 +1275,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
         settings.$manageVerticalGesture
             .dropFirst()
             .sink { [weak self] enabled in
-                MainActor.assumeIsolated { self?.handleVerticalGestureToggle(enabled) }
+                // Defer off the `willSet` emission so the bound toggle updates in place immediately; the
+                // relocation rewrite (and a modal alert on failure) is blocking and otherwise stalled the
+                // SwiftUI render until the page was rebuilt. See observeSpacesRearrangeToggle.
+                DispatchQueue.main.async { self?.handleVerticalGestureToggle(enabled) }
             }
             .store(in: &cancellables)
     }
@@ -1357,7 +1368,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
         settings.$enableLauncher
             .dropFirst()
             .sink { [weak self] enabled in
-                MainActor.assumeIsolated { self?.handleLauncherToggle(enabled) }
+                // Defer off the `willSet` emission so the bound toggle updates in place immediately; the
+                // four-finger relocation rewrite (and a modal alert on failure) is blocking and otherwise
+                // stalled the SwiftUI render until the page was rebuilt. See observeSpacesRearrangeToggle.
+                DispatchQueue.main.async { self?.handleLauncherToggle(enabled) }
             }
             .store(in: &cancellables)
     }
