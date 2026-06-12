@@ -43,11 +43,11 @@ The Hub SHALL present an **Overview** landing page that shows every feature's ma
 - **THEN** the Hub navigates to that feature's detail page
 
 ### Requirement: Grouped sidebar navigation
-The Hub SHALL organize its pages in a sidebar grouped as: an **Overview** entry; a **Content** group containing **Bands**; a **Features** group containing **Switcher**, **Launcher**, **Clipboard**, and **AI**; and a **System** group containing **Setup** and **General**. Selecting a sidebar entry SHALL show that page in the detail area. A disabled feature SHALL keep its page reachable (its controls shown disabled) so it can be re-enabled. Space-row switching is a sub-feature of the Switcher and SHALL appear as sections on the **Switcher** page (Space-row switching and Fixed order) rather than as its own sidebar destination.
+The Hub SHALL organize its pages in a sidebar grouped as: an **Overview** entry; a **Content** group containing **Bands**; a **Features** group containing **Switcher**, **Launcher**, **Clipboard**, and **AI**; and a **System** group containing **Setup** and **General**. The sidebar SHALL be a compact icon-only rail (each destination shown as its icon, with its name as a tooltip, the groups separated by dividers) to conserve horizontal space, and SHALL tint the selected destination. The sidebar SHALL provide a button to expand it to show icon + label and collapse it back to icons, transitioning smoothly (animated). Each destination's full row (not merely its glyph) SHALL be the click target. Selecting a sidebar entry SHALL show that page in the detail area. A disabled feature SHALL keep its page reachable (its controls shown disabled) so it can be re-enabled. Space-row switching is a sub-feature of the Switcher and SHALL appear as sections on the **Switcher** page (Space-row switching and Fixed order) rather than as its own sidebar destination.
 
 #### Scenario: Sidebar groups
 - **WHEN** the user opens the Hub
-- **THEN** the sidebar shows Overview, a Content group with Bands, a Features group with Switcher/Launcher/Clipboard/AI, and a System group with Setup/General
+- **THEN** the sidebar shows Overview, a Content group with Bands, a Features group with Switcher/Launcher/Clipboard/AI, and a System group with Setup/General, as a compact icon-only rail with names as tooltips
 - **AND** Space-row switching appears as sections on the Switcher page, not as its own sidebar entry
 
 #### Scenario: Disabled feature page still reachable

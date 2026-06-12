@@ -18,7 +18,7 @@ The system SHALL provide a band/item editing canvas as the Hub's **Bands** page 
 - **THEN** the launcher reflects the change
 
 ### Requirement: Source items by type via a browsing sidebar
-The Bands page SHALL provide a source picker that lists item-source categories by type (applications, shortcuts, paths, URLs, presets, scripts, **AI command**). Browse-style categories (applications, shortcuts, actions, AI command, presets) SHALL open a scrollable browseable list of candidates; selecting a candidate SHALL add it to the currently targeted context band. Immediate-add categories — **URLs**, **Scripts**, and **Files & Folders** — SHALL add an item directly rather than presenting a fill-in-first form: choosing URLs or Scripts SHALL add a blank item of that kind; choosing Files & Folders SHALL prompt for a path and then add the item. In all cases the value-bearing fields (a link's URL/open-with/window, a script's body, a file's path) SHALL be edited in the item panel after adding — not in the source picker. The newly added item SHALL be selected, and the editor SHALL place the keyboard focus on its first relevant field (the URL field for a link, the body for a script, the name for a file) for fast entry. The picker SHALL provide a way to return from a browse list to the category index.
+The Bands page SHALL provide a source picker that lists item-source categories by type (applications, shortcuts, paths, URLs, presets, scripts, **AI command**). The source picker SHALL appear inline under the expanded band in the bands column — the expanded band is the add target — and everything chosen SHALL be added directly into that band. Browse-style categories (applications, shortcuts, actions, AI command, presets) SHALL open a scrollable browseable list of candidates; selecting a candidate SHALL add it to the currently targeted context band. Immediate-add categories — **URLs**, **Scripts**, and **Files & Folders** — SHALL add an item directly rather than presenting a fill-in-first form: choosing URLs or Scripts SHALL add a blank item of that kind; choosing Files & Folders SHALL prompt for a path and then add the item. In all cases the value-bearing fields (a link's URL/open-with/window, a script's body, a file's path) SHALL be edited in the item panel after adding — not in the source picker. The newly added item SHALL be selected, and the editor SHALL place the keyboard focus on its first relevant field (the URL field for a link, the body for a script, the name for a file) for fast entry. The picker SHALL provide a way to return from a browse list to the category index.
 
 #### Scenario: Browse applications
 - **WHEN** the user opens the Applications category in the source picker
@@ -65,7 +65,7 @@ The Bands page SHALL let the user author and edit an AI command **inline**, as a
 - **THEN** they do so on the Bands page, and no standalone AI-command editor window or sheet exists
 
 ### Requirement: Arrange items by context band on the canvas
-The editor canvas SHALL present the context bands as the user will swipe them, allowing: reordering items within a band by drag, reordering bands by drag, removing an item, creating a new band, and choosing which band is the active add target. The canvas SHALL be the same structure the launcher navigates.
+The editor canvas SHALL present the context bands as the user will swipe them, allowing: reordering items within a band by drag, reordering bands by drag, removing an item, creating a new band, and choosing which band is the active add target. The canvas SHALL be the same structure the launcher navigates. The canvas SHALL use two columns: a merged **bands column** and an always-visible **items column**. The bands column SHALL list the bands; clicking a band SHALL select it (its items appear in the items column) AND expose that band's source picker inline under its row, while the selected band's settings (icon, color, default app strategy) SHALL be pinned at the bottom of the same column. Re-clicking the selected band SHALL deselect it entirely — no band highlighted, its sources and settings hidden, and the items column showing its empty/placeholder state — the same clean state as first opening the Hub (no band SHALL be auto-selected on open). Clicking another band SHALL switch the selection and expose that band's sources. While a band is selected, the items column SHALL show its items grid (and the selected item's editor) — the items are not hidden behind a disclosure.
 
 #### Scenario: Reorder within a band
 - **WHEN** the user drags an item to a new position within its band
@@ -74,6 +74,18 @@ The editor canvas SHALL present the context bands as the user will swipe them, a
 #### Scenario: Reorder bands
 - **WHEN** the user drags a band to a new position
 - **THEN** the stored band order updates to match
+
+#### Scenario: Clicking a band exposes its sources inline; items stay visible
+- **WHEN** the user clicks a band in the bands column
+- **THEN** that band's source picker appears inline under its row, its settings appear pinned at the bottom of the column, and its items appear in the always-visible items column
+
+#### Scenario: Re-clicking the selected band deselects it
+- **WHEN** the user clicks the currently selected band
+- **THEN** the band is deselected (nothing highlighted), its sources and settings hide, and the items column returns to its empty state — matching first-open
+
+#### Scenario: Nothing is selected on first open
+- **WHEN** the Hub's Bands page is first opened
+- **THEN** no band is highlighted and no band's sources or settings are shown
 
 #### Scenario: Remove an item
 - **WHEN** the user removes an item from a band

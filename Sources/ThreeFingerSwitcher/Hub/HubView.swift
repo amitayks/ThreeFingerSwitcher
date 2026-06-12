@@ -139,6 +139,8 @@ final class HubContext {
 struct HubView: View {
     let context: HubContext
     @ObservedObject var nav: HubNavigation
+    /// Icon-only rail vs. expanded (icon + label). Toggled by the rail's header button, animated.
+    @State private var sidebarExpanded = false
 
     init(context: HubContext, nav: HubNavigation) {
         self.context = context
@@ -148,34 +150,84 @@ struct HubView: View {
     var body: some View {
         NavigationSplitView {
             sidebar
-                .navigationSplitViewColumnWidth(min: 200, ideal: 220, max: 280)
+                .navigationSplitViewColumnWidth(sidebarExpanded ? 210 : 52)
         } detail: {
             detail
                 .frame(minWidth: 540, minHeight: 480)
         }
-        .frame(minWidth: 940, minHeight: 580)
+        .frame(minWidth: 820, minHeight: 580)
     }
 
+    /// A rail of destinations that collapses to icons-only (names as tooltips) to save horizontal space,
+    /// or expands to icon + label via the header button. Grouped by thin dividers in the same
+    /// Overview · Content · Features · System order, with the selected destination tinted.
     private var sidebar: some View {
-        List(selection: $nav.selection) {
-            row(.overview)
-            Section("Content") {
-                row(.bands)
+        VStack(spacing: 0) {
+            HStack {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.22)) { sidebarExpanded.toggle() }
+                } label: {
+                    Image(systemName: "sidebar.leading")
+                        .font(.system(size: 15, weight: .medium))
+                        .frame(width: 26, height: 30)
+                        .padding(.horizontal, 6)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help(sidebarExpanded ? "Collapse sidebar" : "Expand sidebar")
+                if sidebarExpanded { Spacer() }
             }
-            Section("Features") {
-                row(.switcher); row(.launcher); row(.clipboard); row(.ai); row(.keyboardLanguage)
+            .padding(.horizontal, 6).padding(.top, 6)
+
+            ScrollView {
+                VStack(spacing: 4) {
+                    railButton(.overview)
+                    railDivider
+                    railButton(.bands)
+                    railDivider
+                    railButton(.switcher); railButton(.launcher); railButton(.clipboard); railButton(.ai); railButton(.keyboardLanguage)
+                    railDivider
+                    railButton(.setup); railButton(.general)
+                }
+                .padding(.vertical, 8).padding(.horizontal, 6)
+                .frame(maxWidth: .infinity)
             }
-            Section("System") {
-                row(.setup); row(.general)
-            }
+            .scrollIndicators(.hidden)
         }
-        .listStyle(.sidebar)
         .navigationTitle("ThreeFingerSwitcher")
     }
 
-    private func row(_ destination: HubDestination) -> some View {
-        Label(destination.sidebarTitle, systemImage: destination.systemImage)
-            .tag(destination)
+    private var railDivider: some View {
+        Divider().padding(.horizontal, 8).padding(.vertical, 2)
+    }
+
+    private func railButton(_ destination: HubDestination) -> some View {
+        let selected = (nav.selection ?? .overview) == destination
+        return Button { nav.selection = destination } label: {
+            HStack(spacing: 10) {
+                Image(systemName: destination.systemImage)
+                    .font(.system(size: 16, weight: .medium))
+                    .frame(width: 26, height: 26)
+                if sidebarExpanded {
+                    Text(destination.sidebarTitle).font(.body).lineLimit(1).fixedSize()
+                    Spacer(minLength: 0)
+                }
+            }
+            .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+            .padding(.vertical, 5)
+            .padding(.horizontal, 6)
+            // Collapsed: the background hugs the icon (a tidy square); expanded: it fills the row. The
+            // outer leading frame keeps the icon at a CONSISTENT x in both states, so expanding slides
+            // the label in without the icon jumping sideways.
+            .frame(maxWidth: sidebarExpanded ? .infinity : nil, alignment: .leading)
+            .background(selected ? Color.accentColor.opacity(0.15) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 8))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())   // the WHOLE row is the hit target, not just the glyph
+        }
+        .buttonStyle(.plain)
+        .help(destination.title)
     }
 
     @ViewBuilder

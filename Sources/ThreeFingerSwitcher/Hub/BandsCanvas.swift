@@ -19,27 +19,25 @@ struct BandsCanvas: View {
 
     var body: some View {
         HSplitView {
-            SourcesSidebar(store: store, targetBandID: activeBandID,
-                           selectedItemID: $selectedItemID, autoFocusItemID: $autoFocusItemID)
-                .frame(minWidth: 200, idealWidth: 230, maxWidth: 300)
+            // One merged column: bands list → click a band to expose its source picker inline, with the
+            // band's settings pinned at the bottom.
+            BandsColumn(store: store, selectedBandID: $selectedBandID,
+                        selectedItemID: $selectedItemID, autoFocusItemID: $autoFocusItemID)
+                .frame(minWidth: 240, idealWidth: 300, maxWidth: 380)
 
-            BandsPane(store: store, selectedBandID: $selectedBandID)
-                .frame(minWidth: 220, idealWidth: 270, maxWidth: 340)
-
+            // The selected band's items — always visible in their own column.
             ItemsPane(store: store, bandID: activeBandID,
                       selectedItemID: $selectedItemID, autoFocusItemID: $autoFocusItemID)
-                .frame(minWidth: 300, idealWidth: 440, maxWidth: .infinity)
+                .frame(minWidth: 320, idealWidth: 460, maxWidth: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onAppear {
-            if selectedBandID == nil { selectedBandID = store.favorites.bands.first?.id }
-        }
     }
 
-    /// The effective add target: the selection if still valid, else the first band.
+    /// The active band — the current selection if it still exists, else none (no auto-fallback, so nothing
+    /// is highlighted on first open or after deselecting).
     private var activeBandID: UUID? {
-        if let id = selectedBandID, store.favorites.bands.contains(where: { $0.id == id }) { return id }
-        return store.favorites.bands.first?.id
+        guard let id = selectedBandID, store.favorites.bands.contains(where: { $0.id == id }) else { return nil }
+        return id
     }
 }
 
@@ -69,53 +67,39 @@ private enum SourceCategory: String, CaseIterable, Identifiable {
     }
 }
 
-private struct SourcesSidebar: View {
+/// The per-band item-source picker, shown inline under an expanded band: a category index (Applications,
+/// Shortcuts, Files & Folders, URLs, Scripts, Actions, AI Command, Presets) that drills into a candidate
+/// browser, or — for URLs/Scripts/Files — adds an item immediately. Everything it adds goes straight into
+/// `targetBandID`. The browser drill-in is height-bounded so its own list scrolls (not the bands column).
+private struct SourcePicker: View {
     @ObservedObject var store: FavoritesStore
-    let targetBandID: UUID?
+    let targetBandID: UUID
     @Binding var selectedItemID: UUID?
     @Binding var autoFocusItemID: UUID?
     @State private var category: SourceCategory?
 
-    private var targetBand: ContextBand? {
-        store.favorites.bands.first { $0.id == targetBandID }
-    }
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            header
-            Divider()
-            if targetBandID == nil {
-                ContentUnavailable("Create a band first", systemImage: "tray", caption: "Add a band on the canvas, then pick items to drop into it.")
-            } else if let category {
-                categoryBrowser(category)
-            } else {
-                categoryIndex
-            }
+        if let category {
+            categoryBrowser(category)
+        } else {
+            categoryIndex
         }
-        .background(.background)
-    }
-
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Add to").font(.caption).foregroundStyle(.secondary)
-            if let band = targetBand {
-                BandIconView(band: band, size: 24)
-            } else {
-                Text("—").font(.headline)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
     }
 
     private var categoryIndex: some View {
-        List(SourceCategory.allCases) { cat in
-            Button { activate(cat) } label: {
-                Label(cat.rawValue, systemImage: cat.symbol)
+        VStack(spacing: 0) {
+            ForEach(SourceCategory.allCases) { cat in
+                Button { activate(cat) } label: {
+                    Label(cat.rawValue, systemImage: cat.symbol)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16).padding(.vertical, 8)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                if cat != SourceCategory.allCases.last { Divider().padding(.leading, 16) }
             }
-            .buttonStyle(.plain)
         }
-        .listStyle(.inset)
+        .padding(.vertical, 4)
     }
 
     /// URLs / Scripts / Files&Folders add an item immediately and open it for editing in the item panel
@@ -146,22 +130,24 @@ private struct SourcesSidebar: View {
                 .buttonStyle(.plain)
                 .padding(.horizontal, 12).padding(.vertical, 8)
             Divider()
-            switch cat {
-            case .apps:      AppBrowser { add($0) }
-            case .shortcuts: ShortcutBrowser { add($0) }
-            case .actions:   ActionBrowser { add($0) }
-            case .aiCommands: AICommandSource(store: store) { add($0) }
-            case .presets:   PresetComposer(store: store) { add($0) }
-            // Immediate-add sources never drill in (handled by `activate`); never reached.
-            case .urls, .scripts, .paths: EmptyView()
+            Group {
+                switch cat {
+                case .apps:      AppBrowser { add($0) }
+                case .shortcuts: ShortcutBrowser { add($0) }
+                case .actions:   ActionBrowser { add($0) }
+                case .aiCommands: AICommandSource(store: store) { add($0) }
+                case .presets:   PresetComposer(store: store) { add($0) }
+                // Immediate-add sources never drill in (handled by `activate`); never reached.
+                case .urls, .scripts, .paths: EmptyView()
+                }
             }
+            .frame(height: 320)   // bound the inner browser so IT scrolls, not the outer bands column
         }
     }
 
     private func add(_ item: LaunchItem, focus: Bool = false) {
-        guard let id = targetBandID else { return }
-        store.addItem(item, toBand: id)
-        selectedItemID = item.id   // auto-select the freshly added line so its inspector shows
+        store.addItem(item, toBand: targetBandID)
+        selectedItemID = item.id   // select the freshly added item so its inspector shows in the items column
         if focus { autoFocusItemID = item.id }   // and land the cursor on its first field
     }
 }
@@ -396,20 +382,25 @@ private struct PresetComposer: View {
 
 // MARK: - Bands pane (list on top, band editor below)
 
-private struct BandsPane: View {
+/// The merged bands + sources column. Lists the bands; clicking one selects it (its items show in the
+/// items column, always visible) AND expands the source picker (Applications / URLs / Scripts / …)
+/// inline under that band, so adding goes straight into it. The selected band's settings are pinned at the
+/// bottom of this same column. Re-clicking the band collapses its sources; clicking another switches.
+private struct BandsColumn: View {
     @ObservedObject var store: FavoritesStore
     @Binding var selectedBandID: UUID?
+    @Binding var selectedItemID: UUID?
+    @Binding var autoFocusItemID: UUID?
+    @State private var draggingBand: UUID?
 
     private var selectedBand: ContextBand? { store.favorites.bands.first { $0.id == selectedBandID } }
 
     var body: some View {
         VStack(spacing: 0) {
-            List(selection: $selectedBandID) {
-                ForEach(store.favorites.bands) { band in
-                    BandRow(band: band) { deleteBand(band) }
-                        .tag(band.id)
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(store.favorites.bands) { band in bandRow(band) }
                 }
-                .onMove { store.moveBands(fromOffsets: $0, toOffset: $1) }
             }
             Divider()
             HStack {
@@ -418,7 +409,7 @@ private struct BandsPane: View {
             }
             .buttonStyle(.borderless)
             .padding(8)
-            // The band editor lives directly below the band list.
+            // The selected band's settings live at the bottom of this same column.
             if let band = selectedBand {
                 Divider()
                 BandInspector(store: store, band: band).id(band.id)
@@ -426,37 +417,50 @@ private struct BandsPane: View {
         }
     }
 
+    @ViewBuilder
+    private func bandRow(_ band: ContextBand) -> some View {
+        let selected = selectedBandID == band.id
+        VStack(spacing: 0) {
+            BandRow(band: band) { deleteBand(band) }
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(selected ? Color.accentColor.opacity(0.16) : Color.clear)
+                .contentShape(Rectangle())
+                .onTapGesture { tap(band) }
+                .onDrag { draggingBand = band.id; return NSItemProvider(object: band.id.uuidString as NSString) }
+                .onDrop(of: [.text], delegate: BandReorderDrop(target: band.id, store: store, dragging: $draggingBand))
+            if selectedBandID == band.id {
+                Divider()
+                SourcePicker(store: store, targetBandID: band.id,
+                             selectedItemID: $selectedItemID, autoFocusItemID: $autoFocusItemID)
+                    .id(band.id)   // fresh category-drill state per band
+            }
+            Divider()
+        }
+    }
+
+    private func tap(_ band: ContextBand) {
+        // Re-tapping the selected band deselects it (no highlight, no sources, empty items column — the
+        // same clean state as first opening the Hub); tapping another switches.
+        selectedBandID = (selectedBandID == band.id) ? nil : band.id
+        selectedItemID = nil
+    }
+
     private func addBand() {
         let hue = Double(store.favorites.bands.count) * 0.16
         let color = ItemColor(NSColor(hue: hue.truncatingRemainder(dividingBy: 1), saturation: 0.5, brightness: 0.85, alpha: 1))
-        selectedBandID = store.addBand(color: color)
+        let id = store.addBand(color: color)
+        selectedBandID = id        // select + open the new band so its sources are ready
+        selectedItemID = nil
     }
 
     private func deleteBand(_ band: ContextBand) {
         let wasSelected = selectedBandID == band.id
         store.removeBand(band.id)
-        if wasSelected { selectedBandID = store.favorites.bands.first?.id }
+        if wasSelected { selectedBandID = nil; selectedItemID = nil }   // deselect — no auto-highlight
     }
 }
 
-private struct BandRow: View {
-    let band: ContextBand
-    let onDelete: () -> Void
-    var body: some View {
-        HStack(spacing: 10) {
-            BandIconView(band: band, size: 20)
-            Spacer()
-            Text("\(band.items.count)").font(.caption).foregroundStyle(.secondary)
-            Button(action: onDelete) { Image(systemName: "trash") }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.secondary)
-                .help("Delete band")
-        }
-        .contentShape(Rectangle())
-    }
-}
-
-// MARK: - Items pane (grid on top, item editor below)
+// MARK: - Items pane (grid + item editor — always visible for the selected band)
 
 private struct ItemsPane: View {
     @ObservedObject var store: FavoritesStore
@@ -520,6 +524,41 @@ private struct ItemsPane: View {
         if selectedItemID == item.id { selectedItemID = nil }
     }
 }
+
+/// Drag-reorder for band header rows (mirrors `ItemReorderDrop`). An item's id never matches a band, so
+/// the two drag sessions can't cross-contaminate.
+private struct BandReorderDrop: DropDelegate {
+    let target: UUID
+    let store: FavoritesStore
+    @Binding var dragging: UUID?
+    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+    func dropEntered(info: DropInfo) {
+        guard let dragging, dragging != target,
+              let from = store.favorites.bands.firstIndex(where: { $0.id == dragging }),
+              let to = store.favorites.bands.firstIndex(where: { $0.id == target }) else { return }
+        store.moveBands(fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
+    }
+    func performDrop(info: DropInfo) -> Bool { dragging = nil; return true }
+}
+
+private struct BandRow: View {
+    let band: ContextBand
+    let onDelete: () -> Void
+    var body: some View {
+        HStack(spacing: 10) {
+            BandIconView(band: band, size: 20)
+            Spacer()
+            Text("\(band.items.count)").font(.caption).foregroundStyle(.secondary)
+            Button(action: onDelete) { Image(systemName: "trash") }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help("Delete band")
+        }
+        .contentShape(Rectangle())
+    }
+}
+
+// MARK: - Item grid cell
 
 /// One grid cell: icon + label. When selected it highlights and shows a trash badge on top; a second
 /// click on the cell (or a click on the badge) deletes it.
