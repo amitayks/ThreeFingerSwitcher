@@ -75,9 +75,19 @@ Each app item SHALL resolve its strategy as its own explicit override if set, ot
 ### Requirement: Fire paths, URLs, shortcuts, and scripts
 The system SHALL open path items (file/folder) and URL items via the system opener, run shortcut items via Shortcuts.app, and execute script items (shell, AppleScript, or a script file). Consequential kinds (scripts and presets) SHALL surface a success or failure notification after firing.
 
+A URL item SHALL open with its chosen handler application when one is set (else the system default). When the item requests a new window, the system SHALL attempt to open the link in a new window of that app on a best-effort basis (common browsers) and SHALL fall back to a normal open if that is not possible, so a link always opens. When it requests reuse (the default), the system SHALL open the link normally (reusing the app's existing window).
+
 #### Scenario: Path opens
 - **WHEN** a path item is fired
 - **THEN** the file or folder opens in its default handler
+
+#### Scenario: URL opens with the chosen app
+- **WHEN** a URL item with an "open with" handler set is fired
+- **THEN** the link opens in that application rather than the system default
+
+#### Scenario: New-window preference is best-effort with a safe fallback
+- **WHEN** a URL item requesting a new window is fired and the handler can open one
+- **THEN** the link opens in a new window; otherwise it falls back to a normal open so the link still opens
 
 #### Scenario: Shortcut runs
 - **WHEN** a shortcut item is fired

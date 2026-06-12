@@ -14,16 +14,20 @@ struct BandsCanvas: View {
 
     @State private var selectedBandID: UUID?
     @State private var selectedItemID: UUID?
+    /// Set to a just-added item's id so its inspector lands the cursor on the first field for fast entry.
+    @State private var autoFocusItemID: UUID?
 
     var body: some View {
         HSplitView {
-            SourcesSidebar(store: store, targetBandID: activeBandID, selectedItemID: $selectedItemID)
+            SourcesSidebar(store: store, targetBandID: activeBandID,
+                           selectedItemID: $selectedItemID, autoFocusItemID: $autoFocusItemID)
                 .frame(minWidth: 200, idealWidth: 230, maxWidth: 300)
 
             BandsPane(store: store, selectedBandID: $selectedBandID)
                 .frame(minWidth: 220, idealWidth: 270, maxWidth: 340)
 
-            ItemsPane(store: store, bandID: activeBandID, selectedItemID: $selectedItemID)
+            ItemsPane(store: store, bandID: activeBandID,
+                      selectedItemID: $selectedItemID, autoFocusItemID: $autoFocusItemID)
                 .frame(minWidth: 300, idealWidth: 440, maxWidth: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -69,6 +73,7 @@ private struct SourcesSidebar: View {
     @ObservedObject var store: FavoritesStore
     let targetBandID: UUID?
     @Binding var selectedItemID: UUID?
+    @Binding var autoFocusItemID: UUID?
     @State private var category: SourceCategory?
 
     private var targetBand: ContextBand? {
@@ -105,12 +110,33 @@ private struct SourcesSidebar: View {
 
     private var categoryIndex: some View {
         List(SourceCategory.allCases) { cat in
-            Button { category = cat } label: {
+            Button { activate(cat) } label: {
                 Label(cat.rawValue, systemImage: cat.symbol)
             }
             .buttonStyle(.plain)
         }
         .listStyle(.inset)
+    }
+
+    /// URLs / Scripts / Files&Folders add an item immediately and open it for editing in the item panel
+    /// (Files pick a path first, since a file item needs one); the rest drill into a browser of candidates.
+    private func activate(_ cat: SourceCategory) {
+        switch cat {
+        case .urls:    add(.newLink(), focus: true)
+        case .scripts: add(.newScript(), focus: true)
+        case .paths:   choosePath()
+        default:       category = cat
+        }
+    }
+
+    private func choosePath() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            add(LaunchItem(title: url.lastPathComponent, icon: .fileIcon, kind: .path(url)), focus: true)
+        }
     }
 
     @ViewBuilder
@@ -123,20 +149,20 @@ private struct SourcesSidebar: View {
             switch cat {
             case .apps:      AppBrowser { add($0) }
             case .shortcuts: ShortcutBrowser { add($0) }
-            case .paths:     PathPicker { add($0) }
-            case .urls:      URLForm { add($0) }
-            case .scripts:   ScriptForm { add($0) }
             case .actions:   ActionBrowser { add($0) }
             case .aiCommands: AICommandSource(store: store) { add($0) }
             case .presets:   PresetComposer(store: store) { add($0) }
+            // Immediate-add sources never drill in (handled by `activate`); never reached.
+            case .urls, .scripts, .paths: EmptyView()
             }
         }
     }
 
-    private func add(_ item: LaunchItem) {
+    private func add(_ item: LaunchItem, focus: Bool = false) {
         guard let id = targetBandID else { return }
         store.addItem(item, toBand: id)
         selectedItemID = item.id   // auto-select the freshly added line so its inspector shows
+        if focus { autoFocusItemID = item.id }   // and land the cursor on its first field
     }
 }
 
@@ -203,114 +229,38 @@ private struct ShortcutBrowser: View {
     }
 }
 
-private struct PathPicker: View {
-    let onPick: (LaunchItem) -> Void
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Pick a file or folder to open in its default app.").font(.caption).foregroundStyle(.secondary)
-            Button("Choose File or Folder…") { choose() }
-            Spacer()
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-    }
+/// Normalize a typed address into a URL, defaulting a bare host to `https://`. `nil` when empty/invalid.
+private func normalizedURL(_ s: String) -> URL? {
+    let trimmed = s.trimmingCharacters(in: .whitespaces)
+    guard !trimmed.isEmpty else { return nil }
+    let withScheme = trimmed.contains("://") || trimmed.contains(":") ? trimmed : "https://\(trimmed)"
+    return URL(string: withScheme)
+}
 
-    private func choose() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
-            onPick(LaunchItem(title: url.lastPathComponent, icon: .fileIcon, kind: .path(url)))
-        }
+/// The placeholder URL a freshly-added, not-yet-filled link carries (the URL field shows it as empty).
+private let blankLinkURL = URL(string: "about:blank")!
+
+private extension LaunchItem {
+    /// A blank link to drop into a band and edit in the item panel (URL / open-with / window).
+    static func newLink() -> LaunchItem {
+        LaunchItem(title: "", icon: .sfSymbol("link"), kind: .url(blankLinkURL))
+    }
+    /// A blank shell script to drop into a band and edit in the item panel.
+    static func newScript() -> LaunchItem {
+        LaunchItem(title: "", icon: .sfSymbol("terminal.fill"), kind: .script(.shell("")))
     }
 }
 
-private struct URLForm: View {
-    let onPick: (LaunchItem) -> Void
-    @State private var name = ""
-    @State private var address = ""
-    @State private var icon: ItemIcon = .sfSymbol("link")
-    @State private var tint: ItemColor?
-
-    var body: some View {
-        Form {
-            TextField("Name", text: $name)
-            TextField("URL (https://… or app scheme)", text: $address)
-            AppearanceEditor(icon: $icon, tint: $tint, naturalIcon: nil)
-            Button("Add URL") {
-                guard let url = normalizedURL(address) else { return }
-                let title = name.isEmpty ? (url.host ?? address) : name
-                onPick(LaunchItem(title: title, icon: icon, tint: tint, kind: .url(url)))
-                name = ""; address = ""; icon = .sfSymbol("link"); tint = nil
-            }
-            .disabled(normalizedURL(address) == nil)
+/// The three script-body shapes, for the inspector's Type picker.
+private enum ScriptKind: String, CaseIterable, Identifiable {
+    case shell = "Shell", appleScript = "AppleScript", file = "Script file"
+    var id: String { rawValue }
+    init(_ body: ScriptBody) {
+        switch body {
+        case .shell: self = .shell
+        case .appleScript: self = .appleScript
+        case .file: self = .file
         }
-        .formStyle(.grouped)
-    }
-
-    private func normalizedURL(_ s: String) -> URL? {
-        let trimmed = s.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return nil }
-        let withScheme = trimmed.contains("://") || trimmed.contains(":") ? trimmed : "https://\(trimmed)"
-        return URL(string: withScheme)
-    }
-}
-
-private struct ScriptForm: View {
-    let onPick: (LaunchItem) -> Void
-    private enum Kind: String, CaseIterable, Identifiable { case shell = "Shell", appleScript = "AppleScript", file = "Script file"; var id: String { rawValue } }
-    @State private var name = ""
-    @State private var kind: Kind = .shell
-    @State private var code = ""
-    @State private var fileURL: URL?
-    @State private var icon: ItemIcon = .sfSymbol("terminal.fill")
-    @State private var tint: ItemColor?
-
-    var body: some View {
-        Form {
-            TextField("Name", text: $name)
-            Picker("Type", selection: $kind) { ForEach(Kind.allCases) { Text($0.rawValue).tag($0) } }
-            switch kind {
-            case .shell, .appleScript:
-                TextEditor(text: $code).frame(minHeight: 120).font(.system(.body, design: .monospaced))
-                    .border(.quaternary)
-            case .file:
-                HStack {
-                    Text(fileURL?.lastPathComponent ?? "No file chosen").foregroundStyle(.secondary).lineLimit(1)
-                    Spacer()
-                    Button("Choose…") { chooseFile() }
-                }
-            }
-            AppearanceEditor(icon: $icon, tint: $tint, naturalIcon: nil)
-            Button("Add Script") { add() }.disabled(!canAdd)
-        }
-        .formStyle(.grouped)
-    }
-
-    private var canAdd: Bool {
-        guard !name.isEmpty else { return false }
-        switch kind {
-        case .shell, .appleScript: return !code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        case .file: return fileURL != nil
-        }
-    }
-
-    private func chooseFile() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK { fileURL = panel.url }
-    }
-
-    private func add() {
-        let body: ScriptBody
-        switch kind {
-        case .shell: body = .shell(code)
-        case .appleScript: body = .appleScript(code)
-        case .file: guard let fileURL else { return }; body = .file(fileURL)
-        }
-        onPick(LaunchItem(title: name, icon: icon, tint: tint, kind: .script(body)))
-        name = ""; code = ""; fileURL = nil; icon = .sfSymbol("terminal.fill"); tint = nil
     }
 }
 
@@ -512,6 +462,7 @@ private struct ItemsPane: View {
     @ObservedObject var store: FavoritesStore
     let bandID: UUID?
     @Binding var selectedItemID: UUID?
+    @Binding var autoFocusItemID: UUID?
     @State private var dragging: UUID?
 
     private var band: ContextBand? { store.favorites.bands.first { $0.id == bandID } }
@@ -524,7 +475,8 @@ private struct ItemsPane: View {
                 grid(band)
                 if let itemID = selectedItemID, let item = band.items.first(where: { $0.id == itemID }) {
                     Divider()
-                    ItemInspector(store: store, bandID: band.id, item: item).id(item.id)
+                    ItemInspector(store: store, bandID: band.id, item: item,
+                                  autoFocusItemID: $autoFocusItemID).id(item.id)
                 }
             }
         } else {
@@ -662,16 +614,44 @@ private struct ItemInspector: View {
     @ObservedObject var store: FavoritesStore
     let bandID: UUID
     let item: LaunchItem
+    @Binding var autoFocusItemID: UUID?
     @State private var title: String
     @State private var prompt: String
+    /// Local edit buffer for the link address (a `.url` stores a `URL`, so we commit only when it parses).
+    @State private var address: String
+    /// Local edit buffer for an inline script body (shell / AppleScript).
+    @State private var scriptCode: String
+    /// Installed apps for the link "Open with" picker (loaded once on appear).
+    @State private var installedApps: [AppCandidate] = []
+    @FocusState private var focus: Field?
+    private enum Field: Hashable { case name, url, script }
 
-    init(store: FavoritesStore, bandID: UUID, item: LaunchItem) {
+    init(store: FavoritesStore, bandID: UUID, item: LaunchItem, autoFocusItemID: Binding<UUID?>) {
         self.store = store; self.bandID = bandID; self.item = item
+        _autoFocusItemID = autoFocusItemID
         _title = State(initialValue: item.title)
         if case let .aiCommand(cmd) = item.kind {
             _prompt = State(initialValue: cmd.promptTemplate)
         } else {
             _prompt = State(initialValue: "")
+        }
+        if case let .url(u, _, _) = item.kind, u != blankLinkURL {
+            _address = State(initialValue: u.absoluteString)
+        } else {
+            _address = State(initialValue: "")
+        }
+        if case let .script(body) = item.kind {
+            _scriptCode = State(initialValue: Self.inlineScriptText(body))
+        } else {
+            _scriptCode = State(initialValue: "")
+        }
+    }
+
+    /// The editable text of an inline script body (empty for a file-backed script).
+    private static func inlineScriptText(_ body: ScriptBody) -> String {
+        switch body {
+        case .shell(let s), .appleScript(let s): return s
+        case .file: return ""
         }
     }
 
@@ -684,6 +664,7 @@ private struct ItemInspector: View {
     private var standardForm: some View {
         Form {
             TextField("Name", text: $title)
+                .focused($focus, equals: .name)
                 .onChange(of: title) { store.updateItem(item.id, inBand: bandID) { $0.title = title } }
             AppearanceEditor(
                 icon: Binding(get: { item.icon },
@@ -691,6 +672,15 @@ private struct ItemInspector: View {
                 tint: Binding(get: { item.tint },
                               set: { t in store.updateItem(item.id, inBand: bandID) { $0.tint = t } }),
                 naturalIcon: naturalIcon(for: item.kind))
+            if case let .url(_, _, newWindow) = item.kind {
+                urlEditor(newWindow: newWindow ?? false)
+            }
+            if case .path(let pathURL) = item.kind {
+                pathEditor(pathURL)
+            }
+            if case .script(let body) = item.kind {
+                scriptEditor(body)
+            }
             if case let .app(bundleURL, strategy) = item.kind {
                 HStack {
                     Text("Application")
@@ -719,10 +709,132 @@ private struct ItemInspector: View {
         }
         .formStyle(.grouped)
         .frame(height: inspectorHeight)
+        .task { if installedApps.isEmpty { installedApps = await loadInstalledApps() } }
+        .onAppear {
+            guard autoFocusItemID == item.id else { return }
+            autoFocusItemID = nil   // consume the one-shot focus request for this freshly-added item
+            switch item.kind {
+            case .url:    focus = .url
+            case .script: focus = .script
+            default:      focus = .name
+            }
+        }
+    }
+
+    // MARK: Per-kind value editors (link / file / script)
+
+    /// Link editor: the address, which app opens it, and whether it opens a new window or reuses one.
+    @ViewBuilder
+    private func urlEditor(newWindow: Bool) -> some View {
+        TextField("URL", text: $address, prompt: Text("https://… or app scheme"))
+            .focused($focus, equals: .url)
+            .onChange(of: address) { setURLAddress(address) }
+        Picker("Open with", selection: Binding(get: { currentHandler }, set: { setURLHandler($0) })) {
+            Text("System default").tag(URL?.none)
+            ForEach(installedApps) { app in Text(app.name).tag(URL?.some(app.url)) }
+        }
+        Picker("Window", selection: Binding(get: { newWindow }, set: { setURLNewWindow($0) })) {
+            Text("Reuse existing window").tag(false)
+            Text("New window").tag(true)
+        }
+        .pickerStyle(.radioGroup)
+        if newWindow {
+            Text("New window works in common browsers; others open normally.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    /// File/folder editor: the path, re-pickable.
+    @ViewBuilder
+    private func pathEditor(_ pathURL: URL) -> some View {
+        HStack {
+            Text("Path")
+            Spacer()
+            Text(pathURL.path).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            Button("Choose…") { choosePath(current: pathURL) }
+        }
+    }
+
+    /// Script editor: the body type, plus an inline code editor or a file chooser.
+    @ViewBuilder
+    private func scriptEditor(_ body: ScriptBody) -> some View {
+        Picker("Type", selection: Binding(get: { ScriptKind(body) }, set: { setScriptKind($0) })) {
+            ForEach(ScriptKind.allCases) { Text($0.rawValue).tag($0) }
+        }
+        if case let .file(fileURL) = body {
+            HStack {
+                Text(fileURL.lastPathComponent).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                Spacer()
+                Button("Choose…") { chooseScriptFile() }
+            }
+        } else {
+            TextEditor(text: $scriptCode)
+                .frame(minHeight: 100).font(.system(.body, design: .monospaced)).border(.quaternary)
+                .focused($focus, equals: .script)
+                .onChange(of: scriptCode) { setScriptCode(scriptCode) }
+        }
+    }
+
+    private var currentHandler: URL? {
+        if case let .url(_, h, _) = item.kind { return h }
+        return nil
+    }
+
+    private func setURLAddress(_ s: String) {
+        guard case let .url(_, h, n) = item.kind else { return }
+        store.updateItem(item.id, inBand: bandID) { $0.kind = .url(normalizedURL(s) ?? blankLinkURL, handler: h, newWindow: n) }
+    }
+    private func setURLHandler(_ handler: URL?) {
+        guard case let .url(u, _, n) = item.kind else { return }
+        store.updateItem(item.id, inBand: bandID) { $0.kind = .url(u, handler: handler, newWindow: n) }
+    }
+    private func setURLNewWindow(_ newWindow: Bool) {
+        guard case let .url(u, h, _) = item.kind else { return }
+        store.updateItem(item.id, inBand: bandID) { $0.kind = .url(u, handler: h, newWindow: newWindow) }
+    }
+
+    private func choosePath(current: URL) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false
+        panel.directoryURL = current.deletingLastPathComponent()
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let renaming = title.isEmpty || title == current.lastPathComponent
+        if renaming { title = url.lastPathComponent }
+        store.updateItem(item.id, inBand: bandID) {
+            $0.kind = .path(url)
+            if renaming { $0.title = url.lastPathComponent }
+        }
+    }
+
+    private func setScriptKind(_ kind: ScriptKind) {
+        switch kind {
+        case .shell:       store.updateItem(item.id, inBand: bandID) { $0.kind = .script(.shell(scriptCode)) }
+        case .appleScript: store.updateItem(item.id, inBand: bandID) { $0.kind = .script(.appleScript(scriptCode)) }
+        case .file:        chooseScriptFile()   // sets `.file(url)` on pick; stays put on cancel
+        }
+    }
+    private func setScriptCode(_ code: String) {
+        switch item.kind {
+        case .script(.shell):       store.updateItem(item.id, inBand: bandID) { $0.kind = .script(.shell(code)) }
+        case .script(.appleScript): store.updateItem(item.id, inBand: bandID) { $0.kind = .script(.appleScript(code)) }
+        default: break
+        }
+    }
+    private func chooseScriptFile() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        store.updateItem(item.id, inBand: bandID) { $0.kind = .script(.file(url)) }
     }
 
     private var inspectorHeight: CGFloat {
         if item.isAppKind { return 340 }
+        switch item.kind {
+        case .url:    return 340
+        case .script: return 360
+        case .path:   return 250
+        default:      break
+        }
         if case let .action(action, _, _) = item.kind {
             if action.isValueAdjustable { return 310 }
             if action.supportsClipboardDestination { return 280 }

@@ -167,8 +167,11 @@ enum LaunchItemKind: Codable, Equatable {
     case app(bundleURL: URL, strategy: AppStrategy?)
     /// A file or folder, opened in its default handler.
     case path(URL)
-    /// A URL (https or an app scheme).
-    case url(URL)
+    /// A URL (https or an app scheme). `handler` is an optional app to open it WITH (nil = system
+    /// default); `newWindow == true` requests a new window (best-effort, common browsers) vs reusing
+    /// the existing one. Both are **Optional** so pre-feature `.url(URL)` records still decode (the
+    /// synthesized decoder uses `decodeIfPresent` → nil), exactly like `.action`'s later values.
+    case url(URL, handler: URL? = nil, newWindow: Bool? = nil)
     /// A Shortcuts.app shortcut, run by name.
     case shortcut(name: String)
     /// A script (shell / AppleScript / file).

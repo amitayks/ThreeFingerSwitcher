@@ -7,11 +7,15 @@ Define the data model for launch items and context bands: the heterogeneous item
 ## Requirements
 
 ### Requirement: Heterogeneous launch-item kinds
-The system SHALL model a launch item as exactly one of: an application, a filesystem path, a URL, a Shortcuts.app shortcut, a script (shell, AppleScript, or a script file), or a preset (an ordered composite of other launch items). Each item SHALL carry a stable identity, a user-editable title, an icon, and a color tint.
+The system SHALL model a launch item as exactly one of: an application, a filesystem path, a URL, a Shortcuts.app shortcut, a script (shell, AppleScript, or a script file), or a preset (an ordered composite of other launch items). Each item SHALL carry a stable identity, a user-editable title, an icon, and a color tint. A URL item MAY additionally carry an optional handler application to open it with (else the system default) and an optional new-window preference (else reuse the existing window). Both URL fields SHALL be optional and default such that a record written before they existed decodes unchanged (no schema bump).
 
 #### Scenario: Each kind is representable
 - **WHEN** the user creates an app, a path, a URL, a shortcut, a script, or a preset item
 - **THEN** the model stores that kind with its title, icon, and tint
+
+#### Scenario: A URL carries an optional handler and window preference
+- **WHEN** the user sets a link's "open with" app and/or its new-window preference
+- **THEN** the model stores them on the URL item, and a legacy URL item without them still decodes with both defaulting to nil
 
 #### Scenario: Preset references other items
 - **WHEN** the user creates a preset from several existing items

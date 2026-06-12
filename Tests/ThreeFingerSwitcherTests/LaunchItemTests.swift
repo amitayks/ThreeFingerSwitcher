@@ -74,6 +74,38 @@ final class LaunchItemTests: XCTestCase {
         }
     }
 
+    /// A link's new "open with" handler and "new window" flag survive Codable.
+    func testURLItemWithHandlerAndWindowRoundTrips() throws {
+        let handler = URL(fileURLWithPath: "/Applications/Google Chrome.app")
+        let item = LaunchItem(title: "Docs", icon: .sfSymbol("link"),
+                              kind: .url(URL(string: "https://example.com")!, handler: handler, newWindow: true))
+        let data = try JSONEncoder().encode(item)
+        let back = try JSONDecoder().decode(LaunchItem.self, from: data)
+        XCTAssertEqual(back, item, "a link's open-with handler and new-window flag survive Codable")
+    }
+
+    /// Back-compat: a pre-feature `.url` record (no `handler` / `newWindow` keys) still decodes, with both
+    /// new fields defaulting to nil — so existing saved bands keep working. Mirrors `.action`'s later
+    /// optional values. The legacy shape is produced by stripping the new keys from a real encoding (so
+    /// the test doesn't hard-code the synthesized key names).
+    func testLegacyURLItemWithoutHandlerOrWindowDecodes() throws {
+        let item = LaunchItem(title: "Old", icon: .sfSymbol("link"), kind: .url(URL(string: "https://old.example")!))
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(item)) as? [String: Any])
+        var kind = try XCTUnwrap(json["kind"] as? [String: Any])
+        var payload = try XCTUnwrap(kind["url"] as? [String: Any])
+        payload.removeValue(forKey: "handler")
+        payload.removeValue(forKey: "newWindow")
+        kind["url"] = payload
+        json["kind"] = kind
+        let stripped = try JSONSerialization.data(withJSONObject: json)
+
+        let decoded = try JSONDecoder().decode(LaunchItem.self, from: stripped)
+        guard case let .url(url, handler, newWindow) = decoded.kind else { return XCTFail("kind is .url") }
+        XCTAssertEqual(url.absoluteString, "https://old.example")
+        XCTAssertNil(handler, "a legacy .url decodes with no open-with handler")
+        XCTAssertNil(newWindow, "a legacy .url decodes with no new-window flag")
+    }
+
     /// The synthetic `.aiCommand` kind round-trips through Codable (it shares the launcher plumbing),
     /// even though it is never written into the persisted Favorites record (it's built fresh on open).
     func testAICommandKindEncodesAndDecodes() throws {

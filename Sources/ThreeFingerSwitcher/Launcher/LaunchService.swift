@@ -58,8 +58,8 @@ final class LaunchService {
             fireApp(item, strategy: Self.resolvedStrategy(for: item, bandDefault: band.defaultAppStrategy) ?? .smart)
         case .path(let url):
             NSWorkspace.shared.open(url)
-        case .url(let url):
-            NSWorkspace.shared.open(url)
+        case .url(let url, let handler, let newWindow):
+            openURL(url, handler: handler, newWindow: newWindow ?? false)
         case .shortcut(let name):
             runShortcut(named: name, title: item.title)
         case .script(let body):
@@ -292,6 +292,69 @@ final class LaunchService {
         guard let trash = try? fm.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: nil, create: false),
               let items = try? fm.contentsOfDirectory(at: trash, includingPropertiesForKeys: nil) else { return }
         for item in items { try? fm.removeItem(at: item) }
+    }
+
+    // MARK: - URL / link opening
+
+    /// Open a link, honoring its optional handler app (which browser/app opens it) and its new-window
+    /// preference. With no handler it uses the system default. "New window" is best-effort via
+    /// AppleScript for common browsers (Safari makes a new document; Chromium makes a new window) and
+    /// falls back to a normal open when that fails (unknown app, Automation denied) — so a link always
+    /// opens. Controlling another app for the new-window path may prompt for Automation access once.
+    private func openURL(_ url: URL, handler: URL?, newWindow: Bool) {
+        if newWindow, let appName = Self.handlerAppName(handler: handler, for: url) {
+            let script = Self.newWindowScript(url: url, appName: appName)
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                p.arguments = ["-e", script]
+                let started = (try? p.run()) != nil
+                if started { p.waitUntilExit() }
+                if !started || p.terminationStatus != 0 {
+                    DispatchQueue.main.async { self?.plainOpen(url, handler: handler) }
+                }
+            }
+            return
+        }
+        plainOpen(url, handler: handler)
+    }
+
+    /// Open `url` reusing the app's existing window: with the chosen handler app, or the system default.
+    private func plainOpen(_ url: URL, handler: URL?) {
+        guard let handler else { NSWorkspace.shared.open(url); return }
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = true
+        NSWorkspace.shared.open([url], withApplicationAt: handler, configuration: config, completionHandler: nil)
+    }
+
+    /// The AppleScript application name for the link's handler (the chosen app, else the system default
+    /// for the URL). `nil` when none resolves — the caller then skips the new-window path.
+    private static func handlerAppName(handler: URL?, for url: URL) -> String? {
+        let appURL = handler ?? NSWorkspace.shared.urlForApplication(toOpen: url)
+        return appURL?.deletingPathExtension().lastPathComponent
+    }
+
+    /// A new-window AppleScript covering Safari (`make new document`) and Chromium browsers (`make new
+    /// window` + set the active tab's URL). Other apps raise an error → the caller falls back to a plain
+    /// open. URL/name are escaped for the AppleScript string literal.
+    private static func newWindowScript(url: URL, appName: String) -> String {
+        func esc(_ s: String) -> String {
+            s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        }
+        let u = esc(url.absoluteString), a = esc(appName)
+        return """
+        tell application "\(a)"
+            activate
+            try
+                make new document with properties {URL:"\(u)"}
+            on error
+                make new window
+                try
+                    set URL of active tab of front window to "\(u)"
+                end try
+            end try
+        end tell
+        """
     }
 
     private func runDetached(_ executable: String, _ args: [String]) {
