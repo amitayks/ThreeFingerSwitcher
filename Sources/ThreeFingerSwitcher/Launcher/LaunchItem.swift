@@ -190,6 +190,13 @@ enum LaunchItemKind: Codable, Equatable {
     /// built at launcher-open from `ClipboardStore`, never created in the editor and never written
     /// into the persisted `Favorites` record. Firing it pastes the entry into the captured front app.
     case clipboardEntry(ClipboardEntry)
+    /// A filesystem entry shown in the synthetic Files band. **Synthetic and ephemeral** (like
+    /// `.clipboardEntry`, not like the persisted `.aiCommand`): built at launcher-open by
+    /// `FilesBandBuilder` from a live directory listing, never created in the editor and never written
+    /// into the persisted `Favorites` record. The Files band resolves a chosen entry through its own
+    /// drill-down / open path (folders descend, files open in their default handler) rather than the
+    /// generic `LaunchService.fire`, so firing one here is a no-op.
+    case fileEntry(FileEntry)
     /// A configured AI command. **Persisted, first-class band item** (configuration-hub fold-in):
     /// authored on the Hub's Bands page like any other item and stored inside the `Favorites` record,
     /// so it can live in ANY band and move between bands. Its display fields (`title`/`icon`/`tint`)
@@ -216,8 +223,9 @@ struct LaunchItem: Codable, Equatable, Identifiable {
         switch kind {
         case .script, .preset: return true
         // `.aiCommand` reports its own success/failure through the executor's canvas state, not the
-        // launcher's fire notification, so it is not "consequential" in this sense.
-        case .app, .path, .url, .shortcut, .action, .clipboardEntry, .aiCommand: return false
+        // launcher's fire notification, so it is not "consequential" in this sense. `.fileEntry`
+        // never flows through `fire` (the Files band resolves it via its own open path).
+        case .app, .path, .url, .shortcut, .action, .clipboardEntry, .aiCommand, .fileEntry: return false
         }
     }
 }

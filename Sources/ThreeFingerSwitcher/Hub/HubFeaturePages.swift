@@ -59,6 +59,9 @@ struct SwitcherPage: View {
 
 struct LauncherPage: View {
     @ObservedObject var settings: AppSettings
+    /// Live trackpad-frame subscription for the positional-zones preview (from `HubContext`).
+    var subscribeTouch: (@escaping (TouchFrame) -> Void) -> Void = { _ in }
+    var unsubscribeTouch: () -> Void = {}
 
     var body: some View {
         HubPage(HubDestination.launcher.title,
@@ -69,19 +72,58 @@ struct LauncherPage: View {
             HubSection("Tuning") {
                 LabeledSlider(title: "Activation threshold", value: $settings.launcherActivationThreshold,
                               range: 0.01...0.15, format: "%.3f",
-                              help: "How far you must slide horizontally before the launcher appears.")
-                    .disabled(!settings.enableLauncher)
-                LabeledSlider(title: "Item-step distance (one item per…)", value: $settings.launcherStepDistance,
-                              range: 0.02...0.20, format: "%.3f",
-                              help: "Finger travel to move the selection by one item — horizontally between items in a band, and vertically between grid rows and the band headers.")
-                    .disabled(!settings.enableLauncher)
-                LabeledSlider(title: "Band-switch distance (one band per…)", value: $settings.launcherContextStepDistance,
-                              range: 0.05...0.30, format: "%.3f",
-                              help: "Horizontal finger travel on the band-headers row needed to switch to the next band. Independent of the item step — raise it to make band switching more deliberate without slowing item movement.")
+                              help: "How far you must slide horizontally before the launcher appears (the opening fling).")
                     .disabled(!settings.enableLauncher)
                 LabeledSlider(title: "Dwell-to-arm (seconds)", value: $settings.dwellToArmDuration,
                               range: 0.2...1.5, format: "%.2f",
                               help: "How long to rest on an item before it arms; then lift to fire. A quick scrub-and-lift never fires.")
+                    .disabled(!settings.enableLauncher)
+            }
+            HubSection("Positional feel",
+                       footnote: "Where your fingers land is the center. A **padding box** around it tracks your position in steps (move out → step out, move back → step back). Leave the box — or reach the **edge band** near the trackpad border — and it accelerates along a smooth curve; a small move back snaps the center to your finger and stops. Rest two fingers on the trackpad and adjust the sliders to watch the box + edge band resize. Applies to the launcher grid and the in-launcher Finder's list scrubbing (folder depth stays a deliberate swipe).") {
+                PositionalTrackpadPreview(settings: settings,
+                                          subscribe: subscribeTouch,
+                                          unsubscribe: unsubscribeTouch)
+            }
+            HubSection("Step & padding (zone sizes)") {
+                LabeledSlider(title: "Padding size (how far before it accelerates)", value: $settings.positionalPaddingRadius,
+                              range: 0.5...6.0, format: "%.2f",
+                              help: "The size of the step box around your fingers. Bigger = more room to step precisely before the margin starts accelerating. (The box in the preview.)")
+                    .disabled(!settings.enableLauncher)
+                LabeledSlider(title: "Item step (offset to move one item)", value: $settings.launcherStepDistance,
+                              range: 0.20...1.00, format: "%.2f",
+                              help: "How far you move to step one item inside the padding box (the selection tracks your position).")
+                    .disabled(!settings.enableLauncher)
+                LabeledSlider(title: "Band step (offset to switch one band)", value: $settings.launcherContextStepDistance,
+                              range: 0.50...2.00, format: "%.2f",
+                              help: "The coarser per-step distance for switching bands on the band list — keep it above the item step.")
+                    .disabled(!settings.enableLauncher)
+                LabeledSlider(title: "Edge margin (border band that accelerates)", value: $settings.positionalEdgeMargin,
+                              range: 0.0...0.25, format: "%.2f",
+                              help: "A fixed band along the trackpad border that always accelerates, even before the box edge — the padding squeezes against it near the edges. 0 = box only. (The border band in the preview.)")
+                    .disabled(!settings.enableLauncher)
+                LabeledSlider(title: "Footprint sensitivity", value: $settings.positionalFootprintFactor,
+                              range: 0.5...3.0, format: "%.2f",
+                              help: "How many finger-widths of travel the box spans. Larger = a bigger physical move per step, and a bigger box in the preview as you spread your fingers.")
+                    .disabled(!settings.enableLauncher)
+            }
+            HubSection("Ease (hold-to-repeat curve)",
+                       footnote: "When you hold a nudge: the first step is immediate, the second after the delay, then the interval eases down to the fastest over the ramp time — never an abrupt jump.") {
+                LabeledSlider(title: "First repeat delay (seconds)", value: $settings.positionalInitialRepeatDelay,
+                              range: 0.05...0.60, format: "%.2f",
+                              help: "Pause before auto-repeat kicks in when you hold a nudge (the first step is immediate).")
+                    .disabled(!settings.enableLauncher)
+                LabeledSlider(title: "Fastest repeat (seconds)", value: $settings.positionalRepeatFloor,
+                              range: 0.01...0.20, format: "%.3f",
+                              help: "The fastest the auto-repeat accelerates to while you keep holding.")
+                    .disabled(!settings.enableLauncher)
+                LabeledSlider(title: "Acceleration ramp (seconds, how long the ease lasts)", value: $settings.positionalRepeatRampTime,
+                              range: 0.3...3.0, format: "%.2f",
+                              help: "How long the held nudge takes to ease from the first-repeat delay down to the fastest repeat.")
+                    .disabled(!settings.enableLauncher)
+                LabeledSlider(title: "Back-off to stop (move back to re-center)", value: $settings.positionalReArmBackoff,
+                              range: 0.05...0.50, format: "%.2f",
+                              help: "While auto-repeating, a small move BACK by this much snaps the center onto your finger and stops the acceleration. Smaller = a tinier back-move stops it (but too small and ordinary hold-jitter can stop it). 0.05 is very sensitive.")
                     .disabled(!settings.enableLauncher)
             }
         }

@@ -23,6 +23,12 @@ final class LauncherOverlayController {
     /// gesture recognizer into canvas-resolution mode, so a fresh four-finger swipe resolves the canvas
     /// (horizontal = discard, down = apply) instead of opening the launcher again.
     var onCanvasStateChanged: ((Bool) -> Void)?
+    /// Called when the Files band becomes the active band (`true`) / stops being it (`false`) — mirrors
+    /// `onCanvasStateChanged`. The coordinator uses it to put the gesture recognizer into the sustained
+    /// Files-drill mode (`filesDrillActive`), so horizontal travel drills the directory tree and a
+    /// resolving lift opens / Open-Withs the highlighted entry instead of stepping the grid. Flipped on
+    /// every band change (show / vertical band switch / horizontal escape) and cleared on `hide`.
+    var onFilesColumnStateChanged: ((Bool) -> Void)?
     /// The executor whose observable streaming state the preview canvas binds to. Injected by the
     /// coordinator before `show`; the panel's `LauncherView` is built with it (the panel is recreated
     /// fresh on every `show`, so a late-set executor is picked up on the next open).
@@ -38,14 +44,22 @@ final class LauncherOverlayController {
     /// charge and the real charge are one implementation.
     private let dwellDriver = DwellArmDriver()
 
-    // Edge-triggered auto-repeat state (per axis: −1 / 0 / +1; horizontal steps items/bands, vertical
-    // steps rows). A single timer advances both axes each tick.
+    // Held-in-zone auto-repeat state (per axis: −1 / 0 / +1; horizontal steps items/bands, vertical
+    // steps rows). Driven by the recognizer's positional held-zone signal (change `positional-navigation`,
+    // D3/D4), not a physical trackpad edge. A single timer advances both axes; its cadence follows the
+    // eased dwell curve (`RepeatCadence`).
     private var edgeTimer: DispatchSourceTimer?
     private var edgeDX = 0
     private var edgeDY = 0
-    private var edgeTicks = 0
-    /// Acceleration sensitivity (≥1); higher accelerates faster. Set from settings on `show`.
-    var edgeAcceleration: Double = 1.0
+    /// Seconds the current held offset has dwelt (accumulated scheduled intervals) — drives the eased
+    /// auto-repeat curve. Reset when the held direction changes or auto-repeat stops.
+    private var edgeDwellElapsed: Double = 0
+    /// Eased auto-repeat tunables (change `positional-navigation`, D4), pushed from settings on `show`:
+    /// the first step is immediate (the recognizer's outer-crossing), the second after `repeatInitialDelay`,
+    /// then the interval eases toward `repeatFloor` over `repeatRampTime` of dwell.
+    var repeatInitialDelay: Double = 0.22
+    var repeatFloor: Double = 0.03
+    var repeatRampTime: Double = 1.2
     /// Deliberate horizontal steps required before a clipboard pin / previous-band action fires. Set
     /// from settings on `show`; pushed into the model so pinning isn't twitchy.
     var clipboardPinSteps: Int = 3
@@ -53,7 +67,8 @@ final class LauncherOverlayController {
     // MARK: - Show / navigate
 
     func show(bands: [ContextBand], startBand: Int, startColumn: Int, dwell: Double,
-              clipboardBandIndex: Int? = nil) {
+              clipboardBandIndex: Int? = nil,
+              filesBandIndex: Int? = nil, filesColumn: FilesColumnController? = nil) {
         self.bands = bands
         self.dwell = dwell
         model.dwell = dwell
@@ -65,12 +80,55 @@ final class LauncherOverlayController {
                        icons: bands.map(\.resolvedIcon),
                        startBand: startBand,
                        column: startColumn,
-                       clipboardBandIndex: clipboardBandIndex)
+                       clipboardBandIndex: clipboardBandIndex,
+                       filesBandIndex: filesBandIndex,
+                       filesColumn: filesColumn)
         let panel = self.panel ?? makePanel()
         self.panel = panel
         layout(panel)
         panel.orderFrontRegardless()
         manageDwell()
+        // Publish the initial drill state. It engages only once focus is in the file column
+        // (`filesDrillEngaged`): a SINGLE-band Files launcher lands on `.grid` (no band rail), so the drill
+        // arms up front and the first horizontal swipe drills; a MULTI-band launcher lands on the band rail
+        // (`.bands`), so the drill stays OFF until a horizontal step crosses in — a lift on the Files icon
+        // dismisses like any other band (refinement 1).
+        syncFilesDrillState()
+        // Publish the initial search-focus state (false on open) so the panel starts non-key; a top-of-column
+        // overflow later flips it key-interactive (refinement 5).
+        syncFilesSearchInteractive()
+    }
+
+    /// Re-publish whether the Files directory **drill** is engaged so the coordinator can flip the
+    /// recognizer's sustained Files-drill mode (`filesDrillActive`). The drill engages only once focus has
+    /// crossed INTO the file column (`model.filesDrillEngaged` = Files current AND `focus == .grid`), NOT
+    /// merely when the Files band is current: while the highlight rests on the Files band ICON (`.bands`) the
+    /// band behaves like any other — a horizontal step crosses in, a vertical step switches bands, and a
+    /// lift DISMISSES the launcher (refinement 1). So this is re-synced after every step (focus can cross
+    /// without a band change), not only on band switches. Idempotent for the coordinator (it just sets a
+    /// flag); tracks the last published value so a navigation that doesn't cross the engaged boundary doesn't
+    /// churn the recognizer.
+    private var filesDrillPublished = false
+    private func syncFilesDrillState() {
+        let active = model.filesDrillEngaged
+        guard active != filesDrillPublished else { return }
+        filesDrillPublished = active
+        onFilesColumnStateChanged?(active)
+    }
+
+    /// Mirror the model's `filesSearchFocused` onto the panel's key state (refinement 5): when a top-of-
+    /// column overflow focuses the Files search field the panel must go **key-interactive** (like the AI
+    /// canvas) so keystrokes land in the field; when a step-down un-focuses it the panel resigns key again.
+    /// The panel stays NON-ACTIVATING throughout — becoming key never activates this app (the captured front
+    /// app keeps focus), and the drill gesture is recognized off the multitouch device, not window events.
+    /// Tracks the last published value so it only flips on a real change. Called after every step path
+    /// (where `filesSearchFocused` can change) and on show.
+    private var filesSearchInteractivePublished = false
+    private func syncFilesSearchInteractive() {
+        let focused = model.filesSearchFocused
+        guard focused != filesSearchInteractivePublished else { return }
+        filesSearchInteractivePublished = focused
+        setFilesSearchInteractive(focused)
     }
 
     /// Whether the cursor is on the left band-title list (where *vertical* travel switches bands). Lets
@@ -93,7 +151,14 @@ final class LauncherOverlayController {
         }
         let bandBefore = model.currentBand
         model.stepHorizontal(dir)
-        if model.currentBand != bandBefore, let panel { layout(panel, animated: true) }
+        if model.currentBand != bandBefore { if let panel { layout(panel, animated: true) } }
+        // Re-sync the drill state on EVERY step: a horizontal step can cross focus `.bands` → `.grid`
+        // (engaging the Files drill) WITHOUT changing the band, so this can't be gated on a band change
+        // (refinement 1). Idempotent — a no-op when the engaged state didn't change.
+        syncFilesDrillState()
+        // A LEFT-at-roots escape to the band rail clears any search focus; keep the panel's key state in
+        // sync (idempotent — a no-op when nothing changed) (refinement 5).
+        syncFilesSearchInteractive()
         manageDwell()
     }
 
@@ -107,8 +172,60 @@ final class LauncherOverlayController {
         // across bands (clamped to the taller pane within min/max), so this is just an animated re-fit.
         let bandBefore = model.currentBand
         model.stepVertical(dir)
-        if model.currentBand != bandBefore, let panel { layout(panel, animated: true) }
+        if model.currentBand != bandBefore { if let panel { layout(panel, animated: true) } }
+        // A vertical step on the band rail switches bands (possibly off Files), which changes the engaged
+        // state; re-sync unconditionally (idempotent) rather than only on a band change (refinement 1).
+        syncFilesDrillState()
+        // A vertical step in the Files column may focus/un-focus the search field (and a band switch clears
+        // it); keep the panel's key state in sync either way (refinement 5).
+        syncFilesSearchInteractive()
         manageDwell()
+    }
+
+    // MARK: - Files band (the recognizer's sustained Files-drill routes here)
+
+    /// One depth step while the Files band is current (the recognizer's `filesDepth`): RIGHT (`dir > 0`)
+    /// descends into the highlighted folder, LEFT ascends (or, at the roots list, escapes to the band
+    /// list). The direction is already reverse-adjusted upstream, exactly like grid/clipboard horizontal
+    /// travel; the model routes it to the directory drill because the Files band is current. Unlike a grid
+    /// step this does NOT dwell-to-arm — a Files entry resolves on the drill's lift (`filesOpen` /
+    /// `filesOpenWith`), not by charging an arm ring. A descend / ascend never changes the active band
+    /// (still the Files band), so the panel size is stable across drilling — no re-fit needed.
+    ///
+    /// The one focus change here is the LEFT-at-roots ESCAPE: it crosses the cursor to the band rail
+    /// (`focus == .bands`), which **disengages** the drill (`filesDrillEngaged` flips false). Re-sync so the
+    /// recognizer leaves `filesDrillActive` the instant we land on the band icon — a lift there must then
+    /// DISMISS the launcher, not open the highlighted entry (refinement 1).
+    func filesDepth(_ dir: Int) {
+        guard model.currentBandIsFiles else { return }
+        model.stepHorizontal(dir)
+        syncFilesDrillState()
+        // A LEFT-at-roots escape (the one focus change here) crosses to the band rail and clears search
+        // focus; mirror that onto the panel's key state so the field resigns (refinement 5).
+        syncFilesSearchInteractive()
+    }
+
+    /// One highlight step while the Files band is current (the recognizer's `filesHighlight`): UP
+    /// (`dir > 0`) moves toward the top, DOWN toward the bottom (reverse-adjusted upstream). An up-step at
+    /// the top of the column overflows into a focus-search request inside the model; a down-step un-focuses
+    /// the search field (refinement 5). No dwell-to-arm (see `filesDepth`). The fixed container height
+    /// (refinement 3) is stable across rows — the list scrolls inside to follow the highlight — so no panel
+    /// re-fit is needed. The drill is re-synced anyway (idempotent), matching the other step paths.
+    func filesHighlight(_ dir: Int) {
+        guard model.currentBandIsFiles else { return }
+        model.stepVertical(dir)
+        syncFilesDrillState()
+        // A top-of-column up-overflow focuses the search field, a down-step un-focuses it — mirror that onto
+        // the panel's key state so keystrokes land in (and leave) the field (refinement 5).
+        syncFilesSearchInteractive()
+    }
+
+    /// The current Files highlight the recognizer's resolving lift acts on (open / Open-With), read off the
+    /// navigator. Nil when the Files band isn't current or the column is empty (the coordinator then has
+    /// nothing to open).
+    var filesHighlightedEntry: FileEntry? {
+        guard model.currentBandIsFiles else { return nil }
+        return model.filesColumn?.highlightedEntry
     }
 
     /// Deliberate horizontal travel within the canvas accumulates toward one discard (mirrors the
@@ -147,6 +264,19 @@ final class LauncherOverlayController {
         // DOWN = apply (`launcherCanvasResolve` → `discardCanvas` / `resolveCanvasCommit`) — not by
         // lifting. Leaving the canvas up lets the user swipe to decide (a stray lift never loses it).
         if model.canvasActive { return true }
+
+        // Files DRILL: a lift is owned by the recognizer's Files-drill resolution (`filesOpen` /
+        // `filesOpenWith` / `filesDiscard`), which holds the defusable open with the panel STILL VISIBLE
+        // (mirroring the AI canvas's order-out exception, design D7). Should a lift reach here while the drill
+        // is engaged (focus IN the column), do NOT hide-before-fire — that would tear the navigator down
+        // mid-resolution and reset the drill. Leave the panel up; the drill path resolves it.
+        //
+        // Gate on `filesDrillEngaged` (Files current AND focus `.grid`), NOT on `currentBandIsFiles`: while the
+        // highlight rests on the Files band ICON (`.bands`) the drill is OFF, the recognizer routes the lift
+        // here through the normal launcher end path, and the band must behave like any other — a lift DISMISSES
+        // (refinement 1). The band icon never arms (`manageDwell` disarms on `.bands`), so falling through
+        // hits the unarmed `hide(); return false` below: a clean dismiss.
+        if model.filesDrillEngaged { return true }
 
         guard model.armed,
               bands.indices.contains(model.currentBand),
@@ -222,6 +352,25 @@ final class LauncherOverlayController {
         model.exitCanvas()
         model.disarm()
         if wasCanvas { onCanvasStateChanged?(false) }   // → recognizer leaves canvas-resolution mode
+        // Leave the Files-drill mode too: the overlay is going away, so the recognizer must return to the
+        // normal launcher latch (a fresh four-finger swipe re-opens the launcher, not a stale drill).
+        if filesDrillPublished { filesDrillPublished = false; onFilesColumnStateChanged?(false) }
+        // Reset the search-interactive latch (the panel is destroyed below; the next `show` recreates it
+        // non-key + pass-through). No panel flip needed here — the window is about to be torn down.
+        filesSearchInteractivePublished = false
+        // TODO(files-band, tasks 11.2/11.3 — recede-on-leave exit): the Files navigator currently closes
+        // hard (the snap below) rather than receding its content out. Animating the BubbleMorph out before
+        // the panel goes away is intentionally NOT done here, because it would conflict with two invariants:
+        //  (1) the ghost-panel teardown below MUST be synchronous — deferring `orderOut`/`close` behind an
+        //      exit animation re-opens the verified ghost-on-Space-switch bug (a Next-Space ⌃→ processes
+        //      before a delayed close flushes), the regression this method is explicitly guarding; and
+        //  (2) it needs a handshake that does not exist yet — a published `closing` flag on `LauncherModel`
+        //      for `FilesBandView` to drive its BubbleMorph exit off, plus a completion callback to tear the
+        //      panel down only after the morph settles. `FilesBandView` is authored in the parallel View
+        //      change, so there is nothing to coordinate the exit with today.
+        // When that seam lands, route a *resolving lift* (which already keeps the band visible per Stage 2)
+        // and a recede-on-leave through that flag and tear down in the completion, leaving the synchronous
+        // close below as the fallback for the ghost-critical Space-switch paths.
         // Destroy the panel, don't just orderOut. The panel is `.canJoinAllSpaces`, and an orderOut'd
         // all-Spaces panel leaves a rendered GHOST on the Space you switch to (verified: a Space-switch
         // action left the launcher visible on the destination even though isVisible was already false).
@@ -240,31 +389,27 @@ final class LauncherOverlayController {
     /// re-showing the grid from scratch.
     var canvasActive: Bool { model.canvasActive }
 
-    // MARK: - Edge-triggered auto-repeat
-
-    /// Pure: the auto-repeat interval for a given tick — ramps from ~0.18s down toward a 0.03s floor
-    /// as ticks accumulate (faster with higher `acceleration`), so stepping speeds up at the edge.
-    nonisolated static func edgeInterval(tick: Int, acceleration: Double) -> Double {
-        let base = 0.18, minInterval = 0.03
-        let ramp = Double(tick) * 0.06 * max(0.5, acceleration)
-        return max(minInterval, base / (1 + ramp))
-    }
+    // MARK: - Held-in-zone auto-repeat (eased dwell curve)
 
     /// Auto-repeat stepping while a contact is held at a trackpad edge. `dx`/`dy` are −1 / 0 / +1 per
     /// axis (vertical switches bands on the band list / steps grid rows; horizontal crosses between the
     /// band list and the grid, then steps items). Horizontal is suppressed in the Clipboard band (there
-    /// horizontal is the deliberate pin / cross-to-band-list action). When
-    /// both axes are zero the timer stops. A step that doesn't move the selection (clamped at an end)
-    /// does NOT reset the dwell, so holding at a dead edge still lets the current item arm and fire.
+    /// horizontal is the deliberate pin / cross-to-band-list action) AND in the Files band (there
+    /// horizontal *drills* the directory tree — descend/ascend a level — so an edge auto-repeat would
+    /// make the depth run away at the edge, stepping through folders the user can't see settle; each
+    /// drill is a deliberate, discrete swipe, never an auto-fired one). Vertical auto-repeat is kept in
+    /// both (it scrubs the current list / steps rows). When both axes are zero the timer stops. A step
+    /// that doesn't move the selection (clamped at an end) does NOT reset the dwell, so holding at a dead
+    /// edge still lets the current item arm and fire.
     func setEdgeAutoScroll(dx: Int, dy: Int) {
         // No grid auto-scroll while the canvas is open (it isn't grid-navigable); horizontal is the
         // discard swipe, handled by the recognizer's canvas resolution, not the edge timer.
         if model.canvasActive { endEdgeAutoScroll(); return }
-        let hx = model.currentBandIsClipboard ? 0 : dx
+        let hx = (model.currentBandIsClipboard || model.currentBandIsFiles) ? 0 : dx
         guard hx != edgeDX || dy != edgeDY else { return }
         edgeDX = hx
         edgeDY = dy
-        edgeTicks = 0   // restart the acceleration ramp when the edge direction changes
+        edgeDwellElapsed = 0   // restart the eased acceleration curve when the held direction changes
         if edgeDX == 0, edgeDY == 0 {
             endEdgeAutoScroll()
         } else if edgeTimer == nil {
@@ -276,13 +421,13 @@ final class LauncherOverlayController {
         }
     }
 
-    /// Stop auto-repeat (contact left every edge, or lifted).
+    /// Stop auto-repeat (the offset returned to center, or the contact lifted).
     func endEdgeAutoScroll() {
         edgeTimer?.cancel()
         edgeTimer = nil
         edgeDX = 0
         edgeDY = 0
-        edgeTicks = 0
+        edgeDwellElapsed = 0
     }
 
     private func edgeTick() {
@@ -291,16 +436,31 @@ final class LauncherOverlayController {
         if edgeDY != 0 { model.stepVertical(edgeDY) }
         let moved = model.currentBand != beforeBand || model.selectedIndex != beforeIndex || model.focus != beforeFocus
         if moved {
-            if model.currentBand != beforeBand, let panel { layout(panel, animated: true) }
+            if model.currentBand != beforeBand { if let panel { layout(panel, animated: true) } }
+            // Re-sync the drill on a band OR focus change (auto-repeat can cross focus `.bands` ⇄ `.grid`
+            // just like a manual step) — idempotent, so harmless when nothing relevant changed (refinement 1).
+            if model.currentBand != beforeBand || model.focus != beforeFocus { syncFilesDrillState() }
+            // Vertical edge auto-repeat scrubs the Files list; a top-of-column overflow focuses search (and a
+            // down-step un-focuses it), so keep the panel's key state in sync as it scrubs (refinement 5).
+            syncFilesSearchInteractive()
             manageDwell()   // a real move resets the dwell (so auto-repeat never arms mid-scroll)
         }
-        edgeTicks += 1
         rescheduleEdge()
     }
 
+    /// Schedule the next auto-repeat tick along the eased dwell curve (change `positional-navigation`,
+    /// D4): the interval shortens from `repeatInitialDelay` toward `repeatFloor` as the held offset
+    /// dwells. `edgeDwellElapsed` accumulates the scheduled intervals so the curve advances by real
+    /// elapsed time. The first schedule (dwell = 0) waits `repeatInitialDelay` — the immediate first
+    /// step already fired from the recognizer's outer-threshold crossing.
     private func rescheduleEdge() {
         guard let timer = edgeTimer else { return }
-        timer.schedule(deadline: .now() + Self.edgeInterval(tick: edgeTicks, acceleration: edgeAcceleration))
+        let interval = RepeatCadence.interval(dwellElapsed: edgeDwellElapsed,
+                                              initialDelay: repeatInitialDelay,
+                                              floor: repeatFloor,
+                                              rampTime: repeatRampTime)
+        timer.schedule(deadline: .now() + interval)
+        edgeDwellElapsed += interval
     }
 
     /// After any navigation step: arm the selected app (restart dwell) when the cursor is on a grid
@@ -351,6 +511,27 @@ final class LauncherOverlayController {
         if on { panel.makeKeyAndOrderFront(nil) }
     }
 
+    /// Make the panel key-capable while the Files search field is focused so keystrokes land in it
+    /// (refinement 5) — the keyboard analogue of `setCanvasInteractive`, driven by `model.filesSearchFocused`
+    /// via `syncFilesSearchInteractive`. Unlike the canvas this does NOT flip `ignoresMouseEvents`: the
+    /// Files navigator is gesture-driven (the drill needs the panel to keep ignoring the mouse), and a key
+    /// window routes keystrokes to its first responder regardless of mouse hit-testing — so only the key
+    /// state changes. On → become key so SwiftUI's `@FocusState` can make the `TextField` first responder;
+    /// off → resign key-capability and drop the first responder so the field loses focus (the highlight
+    /// clears). Becoming key never activates this app (the panel is `.nonactivatingPanel`), so the captured
+    /// front app stays frontmost. Reset implicitly on `hide()` (the panel is destroyed + recreated per open).
+    private func setFilesSearchInteractive(_ on: Bool) {
+        guard let panel else { return }
+        panel.keyInteractive = on
+        if on {
+            panel.makeKeyAndOrderFront(nil)
+        } else {
+            // Drop the field's first responder so it loses focus; with `keyInteractive` now false the panel
+            // can no longer become key, so the next event cycle treats it as the non-key gesture overlay again.
+            panel.makeFirstResponder(nil)
+        }
+    }
+
     private func makePanel() -> SwitcherPanel {
         let panel = SwitcherPanel(
             contentRect: NSRect(x: 0, y: 0, width: 800, height: SwitcherLayout.panelHeight),
@@ -393,25 +574,46 @@ final class LauncherOverlayController {
             width = min(ClipboardBandLayout.containerWidth, frame.width - SwitcherLayout.sideMargin * 2)
             height = min(ClipboardBandLayout.containerHeight, frame.height - 100)
         } else {
-            // Content pane width: the Clipboard band's master-detail width, else the icon-grid width.
-            let contentWidth = model.currentBandIsClipboard
-                ? ClipboardBandLayout.containerWidth
-                : LauncherGridLayout.containerWidth
+            // Content pane width: the Clipboard band's master-detail width, the Files band's bounded
+            // column-navigator width (the FIXED Clipboard-sized container — refinement 3, constant at any
+            // depth and any column setting), else the icon-grid width.
+            let contentWidth: CGFloat
+            if model.currentBandIsClipboard {
+                contentWidth = ClipboardBandLayout.containerWidth
+            } else if model.currentBandIsFiles {
+                // A FIXED container equal to the Clipboard band's exact width — it never resizes on crossing
+                // in or changing depth; the current-folder list scrolls inside instead (refinement 3).
+                contentWidth = FilesBandLayout.containerWidth
+            } else {
+                contentWidth = LauncherGridLayout.containerWidth
+            }
             // The left band column (only when there's a choice of bands) is a fixed-width icon strip.
             let bandColumn = model.bandCount > 1 ? LauncherGridLayout.bandColumnWidth : 0
             width = min(bandColumn + contentWidth, frame.width - SwitcherLayout.sideMargin * 2)
 
             // Height is the LARGER of the active band's content demand — the icon grid's item rows,
-            // or the Clipboard band's taller detail pane — and the band-icon list's demand, clamped
-            // to the window's min/max. The list term matters with many bands: its icons are
-            // fixed-size, so sizing from the content alone re-stretches the container a beat after
-            // each band switch (fit the rows, then grow for the list — the mid-move jitter). One
-            // max() computation sizes the frame once per switch, stable across short bands.
+            // the Clipboard band's taller detail pane, or the Files navigator's row-count height — and
+            // the band-icon list's demand, clamped to the window's min/max. The list term matters with
+            // many bands: its icons are fixed-size, so sizing from the content alone re-stretches the
+            // container a beat after each band switch (fit the rows, then grow for the list — the
+            // mid-move jitter). One max() computation sizes the frame once per switch, stable across
+            // short bands.
             let bandListWanted = LauncherGridLayout.bandListHeight(bandCount: model.bandCount)
-            let wanted = model.currentBandIsClipboard
-                ? min(max(max(ClipboardBandLayout.containerHeight, bandListWanted), LauncherGridLayout.minHeight),
-                      LauncherGridLayout.maxHeight)
-                : LauncherGridLayout.windowHeight(itemCount: model.items.count, bandCount: model.bandCount)
+            let wanted: CGFloat
+            if model.currentBandIsClipboard {
+                wanted = min(max(max(ClipboardBandLayout.containerHeight, bandListWanted), LauncherGridLayout.minHeight),
+                             LauncherGridLayout.maxHeight)
+            } else if model.currentBandIsFiles {
+                // A FIXED container height equal to the Clipboard band's exact height — no per-density and
+                // no per-depth variation (refinement 3). A folder taller than the fixed row area scrolls
+                // inside (the view follows the highlight); the frame never grows for it. Still take the max
+                // with the band-icon list so a tall band rail isn't clipped, clamped to the window bounds.
+                let filesWanted = FilesBandLayout.containerHeight
+                wanted = min(max(max(filesWanted, bandListWanted), LauncherGridLayout.minHeight),
+                             LauncherGridLayout.maxHeight)
+            } else {
+                wanted = LauncherGridLayout.windowHeight(itemCount: model.items.count, bandCount: model.bandCount)
+            }
             height = min(wanted, frame.height - 100)
         }
 

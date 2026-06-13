@@ -13,6 +13,10 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/Kyome22/OpenMultitouchSupport.git", from: "4.0.0"),
+        // The shared device-link packages (wire contract / mirror store / pairing crypto), extracted to a
+        // standalone cross-platform package (macOS + iOS, no MLX) so the iOS companion app can consume the
+        // same code. Core depends on DeviceLinkProtocol from here.
+        .package(path: "../DeviceLinkKit"),
         // The MLX/Gemma 4 runtime. Pulls mlx-swift / swift-transformers / mlx-swift-lm transitively.
         // Building anything that links this needs `xcodebuild` (Metal shaders) — see GemmaRuntime target.
         // PINNED to an exact revision (not `branch: "main"`): the upstream `main` drifts and has shipped
@@ -29,7 +33,11 @@ let package = Package(
         .target(
             name: "ThreeFingerSwitcherCore",
             dependencies: [
-                .product(name: "OpenMultitouchSupport", package: "OpenMultitouchSupport")
+                .product(name: "OpenMultitouchSupport", package: "OpenMultitouchSupport"),
+                // The shared wire contract — used by the device-link inbound adapter (LinkItem → ClipboardEntry).
+                .product(name: "DeviceLinkProtocol", package: "DeviceLinkKit"),
+                // The shared pairing crypto — used by the Mac QR pairing (PairingExchange / QR payload).
+                .product(name: "DeviceLinkPairing", package: "DeviceLinkKit")
             ],
             path: "Sources/ThreeFingerSwitcher",
             swiftSettings: [
@@ -65,7 +73,12 @@ let package = Package(
         ),
         .testTarget(
             name: "ThreeFingerSwitcherTests",
-            dependencies: ["ThreeFingerSwitcherCore"],
+            dependencies: [
+                "ThreeFingerSwitcherCore",
+                // The adapter/connection/QR tests import the wire contract + pairing crypto directly.
+                .product(name: "DeviceLinkProtocol", package: "DeviceLinkKit"),
+                .product(name: "DeviceLinkPairing", package: "DeviceLinkKit")
+            ],
             path: "Tests/ThreeFingerSwitcherTests",
             swiftSettings: [
                 .swiftLanguageMode(.v5)

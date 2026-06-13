@@ -28,6 +28,9 @@ struct OverviewPage: View {
                 featureRow(.clipboard, isOn: $settings.keepClipboardHistory,
                            subtitle: "Keep a history of what you copy, in the launcher's Clipboard band.")
                 Divider()
+                featureRow(.files, isOn: $settings.filesBandEnabled,
+                           subtitle: "Pilot your local folders, preview, and open files — a Files band in the launcher.")
+                Divider()
                 featureRow(.ai, isOn: $settings.aiCommandsEnabled,
                            subtitle: "Run on-device AI commands on your selection, clipboard, or screen.")
                 Divider()

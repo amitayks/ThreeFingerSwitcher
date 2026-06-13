@@ -37,5 +37,15 @@
     <!-- Shown when a "new contact" AI command first creates a contact card (Contacts, lazy first-use). -->
     <key>NSContactsUsageDescription</key>
     <string>Creates a contact card from text when you run a "new contact" AI command.</string>
+    <!-- Shown when the device link first advertises/connects on the local network (Bonjour). -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Connects directly to your paired iPhone on your local network to move clipboard items and files between your devices.</string>
+    <!-- The device-link Bonjour service types: the data link AND the QR pairing channel.
+         BOTH must be declared or the OS denies advertising/browsing them (NoAuth / -65555). -->
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_tfslink._tcp</string>
+        <string>_tfspair._tcp</string>
+    </array>
 </dict>
 </plist>

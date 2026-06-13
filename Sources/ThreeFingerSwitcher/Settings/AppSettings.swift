@@ -1,6 +1,65 @@
 import Foundation
 import Combine
 
+// MARK: - Files-band tunable enums
+
+/// Which entry field the Files-band column sorts on. The list's secondary tiebreak (a stable name
+/// compare) lives in the lister, so this only names the primary key. Persisted by `rawValue`.
+enum FilesSortField: String, Codable, CaseIterable, Identifiable {
+    case name   // case-insensitive display name
+    case date   // last content-modification date
+    case kind   // coarse `FileKind`, then name
+    var id: String { rawValue }
+}
+
+/// Ascending vs. descending for the Files-band sort. Kept separate from the field so any field can
+/// be flipped without multiplying the field enum. Persisted by `rawValue`.
+enum FilesSortDirection: String, Codable, CaseIterable, Identifiable {
+    case ascending
+    case descending
+    var id: String { rawValue }
+}
+
+/// Row height / padding of the Files-band current column — how tightly rows pack. Persisted by
+/// `rawValue`; the concrete point metrics for each case live in the view layer.
+enum FilesDensity: String, Codable, CaseIterable, Identifiable {
+    case compact
+    case comfortable
+    case spacious
+    var id: String { rawValue }
+}
+
+/// Whether a Files-band row leads with the file's plain type icon or a live QuickLook preview
+/// thumbnail. (The dedicated preview pane is separate; this governs the per-row leading glyph.)
+/// Persisted by `rawValue`.
+enum FilesIconStyle: String, Codable, CaseIterable, Identifiable {
+    case icon      // the file/folder type icon (cheap, no QuickLook)
+    case preview   // a QuickLook thumbnail when one is available, icon fallback
+    var id: String { rawValue }
+}
+
+/// The default-open action committed for a highlighted **file** (a folder always opens as a Finder
+/// window per the spec, regardless of this). `defaultApp` opens in the system default app;
+/// `openWith` lands on the Open-With chooser instead of launching immediately. Persisted by `rawValue`.
+enum FilesDefaultOpen: String, Codable, CaseIterable, Identifiable {
+    case defaultApp   // open in the file's default application
+    case openWith     // present the Open-With chooser instead of launching
+    var id: String { rawValue }
+}
+
+/// Which secondary metadata a Files-band row shows beside its name. An `OptionSet` (mirroring
+/// `DangerZoneSelection`) so several can show at once; persisted as the `Int` `rawValue`.
+struct FilesRowMetadata: OptionSet, Equatable {
+    let rawValue: Int
+
+    /// Show the last-modified date.
+    static let date = FilesRowMetadata(rawValue: 1 << 0)
+    /// Show the coarse kind label (e.g. "Folder", "Image").
+    static let kind = FilesRowMetadata(rawValue: 1 << 1)
+    /// Show the file size (folders show item count in the view layer).
+    static let size = FilesRowMetadata(rawValue: 1 << 2)
+}
+
 /// Tunable parameters for the gesture, persisted in UserDefaults and applied live.
 /// All distance values are in *normalized* trackpad units (0..1 across the surface),
 /// since OpenMultitouchSupport reports normalized positions.
@@ -67,15 +126,60 @@ final class AppSettings: ObservableObject {
     /// Normalized horizontal centroid travel required to show the launcher (four-finger).
     @Published var launcherActivationThreshold: Double { didSet { persist(launcherActivationThreshold, Keys.launcherActivationThreshold) } }
 
-    /// Normalized travel that advances the launcher selection by one item — horizontal between items
-    /// in a band, and vertical between grid rows and the band-headers row. (Band switching uses the
-    /// separate `launcherContextStepDistance`.)
+    /// The positional **outer threshold** for *item* movement (change `positional-navigation`, D7):
+    /// the normalized centroid offset from the anchored center (≈1 at full footprint deflection) that
+    /// crosses to emit one item-step. Repurposed from the old odometer "one item per N travel" knob;
+    /// now expressed in offset units, not accumulated travel.
     @Published var launcherStepDistance: Double { didSet { persist(launcherStepDistance, Keys.launcherStepDistance) } }
 
-    /// Normalized horizontal travel on the band-headers row that switches one band. Independent of the
-    /// item step so band switching can be made deliberate without slowing item movement; defaults
-    /// larger than the item step.
+    /// The positional **outer threshold** for *band* switching (change `positional-navigation`, D7):
+    /// the vertical offset on the band list that switches one band. Coarser than the item threshold so
+    /// band switching stays deliberate without slowing item movement.
     @Published var launcherContextStepDistance: Double { didSet { persist(launcherContextStepDistance, Keys.launcherContextStepDistance) } }
+
+    /// The positional **inner deadzone** (change `positional-navigation`): returning the offset inside
+    /// this (toward center) re-arms an axis, so a quick out-and-back is exactly one step. `< the item
+    /// and band outer thresholds`.
+    @Published var positionalInnerDeadzone: Double { didSet { persist(positionalInnerDeadzone, Keys.positionalInnerDeadzone) } }
+
+    /// How many footprint-widths of centroid travel reach full deflection (change `positional-navigation`,
+    /// D2). Larger = a bigger physical move is needed for the same offset.
+    @Published var positionalFootprintFactor: Double { didSet { persist(positionalFootprintFactor, Keys.positionalFootprintFactor) } }
+
+    /// The fixed full-deflection distance used when the fingers' footprint is unavailable / degenerate
+    /// (test frames, a single contact) — the fallback scale for the anchored offset (change
+    /// `positional-navigation`, D2).
+    @Published var positionalFallbackScale: Double { didSet { persist(positionalFallbackScale, Keys.positionalFallbackScale) } }
+
+    /// Seconds before the *second* auto-repeat step once an offset is held (the first step fires
+    /// immediately on the outer-threshold crossing). The eased curve then shortens the interval from
+    /// here toward `positionalRepeatFloor` (change `positional-navigation`, D4).
+    @Published var positionalInitialRepeatDelay: Double { didSet { persist(positionalInitialRepeatDelay, Keys.positionalInitialRepeatDelay) } }
+
+    /// The fastest auto-repeat interval the eased curve approaches while an offset is held (change
+    /// `positional-navigation`, D4).
+    @Published var positionalRepeatFloor: Double { didSet { persist(positionalRepeatFloor, Keys.positionalRepeatFloor) } }
+
+    /// Dwell duration over which the auto-repeat interval eases from the initial delay down to the
+    /// floor — the "accelerate along a curve, not slow→fast in no time" ramp (change
+    /// `positional-navigation`, D4).
+    @Published var positionalRepeatRampTime: Double { didSet { persist(positionalRepeatRampTime, Keys.positionalRepeatRampTime) } }
+
+    /// How far the offset may retreat from its furthest held point (offset units) before the center snaps
+    /// onto the finger and auto-repeat stops — the "small move back re-centers and stops the acceleration"
+    /// refinement. Must sit above natural hold jitter or a steady hold can't sustain auto-repeat; lower it
+    /// for a more sensitive stop. `0` disables it (re-arm only via the deadzone).
+    @Published var positionalReArmBackoff: Double { didSet { persist(positionalReArmBackoff, Keys.positionalReArmBackoff) } }
+
+    /// The launcher **padding-box** half-size, in offset units (the "make the padding bigger/smaller"
+    /// control). Inside the box the selection position-tracks your finger in steps (center locked); leaving
+    /// it accelerates. Bigger = more room to step before acceleration.
+    @Published var positionalPaddingRadius: Double { didSet { persist(positionalPaddingRadius, Keys.positionalPaddingRadius) } }
+
+    /// The fixed **edge-margin band** width near the trackpad border (absolute normalized units). Pushing
+    /// the fingers into this band accelerates even before the padding box's radius is reached — the
+    /// always-present "min margin" the padding squeezes against near the edges. `0` = box radius only.
+    @Published var positionalEdgeMargin: Double { didSet { persist(positionalEdgeMargin, Keys.positionalEdgeMargin) } }
 
     /// Seconds the selection must rest on an item before it arms (then a lift fires it). Brief but
     /// deliberate — a quick scrub-and-lift never fires.
@@ -97,6 +201,12 @@ final class AppSettings: ObservableObject {
     /// gesture opt-ins this relocates no native gesture, needs no re-login, and requests no new
     /// permission — it only enables local recording + the synthetic band. Default OFF (privacy).
     @Published var keepClipboardHistory: Bool { didSet { defaults.set(keepClipboardHistory, forKey: Keys.keepClipboardHistory) } }
+
+    /// Opt-in to the device link (iPhone↔Mac clipboard/file bridge). Like the clipboard opt-in it
+    /// relocates no native gesture, needs no re-login, and has no `is…Effective` gate — it just starts/
+    /// stops the receive/send service. Default OFF (privacy; it opens a local-network listener). Adds the
+    /// macOS Local Network prompt the first time the service advertises/connects.
+    @Published var enableDeviceLink: Bool { didSet { defaults.set(enableDeviceLink, forKey: Keys.enableDeviceLink) } }
 
     /// Temporarily stop recording without disabling the feature (the band still shows what's stored).
     @Published var clipboardPaused: Bool { didSet { defaults.set(clipboardPaused, forKey: Keys.clipboardPaused) } }
@@ -150,6 +260,124 @@ final class AppSettings: ObservableObject {
     /// Let the on-device model reason before answering (thinking is filtered from the result). Default
     /// ON; gated behind the AI opt-in like the other AI prefs.
     @Published var aiReasoningEnabled: Bool { didSet { defaults.set(aiReasoningEnabled, forKey: Keys.aiReasoningEnabled) } }
+
+    // MARK: - Files band (opt-in; default OFF)
+
+    /// Opt-in to the launcher's Files band — a local-only Finder-mimic column navigator. Like the
+    /// clipboard opt-in (and unlike the gesture opt-ins) this relocates no native gesture, needs no
+    /// re-login, and requests no new permission; it reads the local filesystem on demand. There is NO
+    /// `is…Effective` gate — the flip takes effect immediately: ON injects the band on the next launcher
+    /// open, OFF removes it. Default OFF. Older settings have no key and decode with the opt-in OFF.
+    @Published var filesBandEnabled: Bool { didSet { defaults.set(filesBandEnabled, forKey: Keys.filesBandEnabled) } }
+
+    /// The user-configured **local** root folders the Files band opens onto (its entry column), as
+    /// standardized absolute paths in display order. Stored as `[String]` paths (mirroring
+    /// `clipboardExcludedApps`) because `AppSettings` persists only plist-native primitives and there is
+    /// no security-scoped-bookmark precedent in this app; the Hub roots editor rejects network/iCloud
+    /// locations at the boundary. Empty by default (the Hub seeds a sensible set on first configuration).
+    @Published var filesRoots: [String] { didSet { defaults.set(filesRoots, forKey: Keys.filesRoots) } }
+
+    /// Per-root remembered deepest location: a `root path → last deepest path` map so each root restores
+    /// where the user left off (spec: "A root remembers where you left off"). Stored as a `[String: String]`
+    /// exactly like `aiCommandLanguages`; orphan keys (a removed root) are harmless and pruned
+    /// opportunistically. Use `rememberedLocation(forRoot:)` / `rememberLocation(_:forRoot:)`.
+    @Published var filesRememberedLocations: [String: String] { didSet { defaults.set(filesRememberedLocations, forKey: Keys.filesRememberedLocations) } }
+
+    /// Whether the Files band reopens **displaying the last folder you were in** rather than the roots
+    /// list. When ON (default) the band opens straight onto the remembered deepest location of a configured
+    /// root — restored AT OPEN, so the main column already shows that folder while the highlight is still on
+    /// the band icon, and crossing into the column lands you exactly there with no jump. When OFF the band
+    /// opens fresh on the roots list. The per-root remembered map (`filesRememberedLocations`) keeps tracking
+    /// either way; this toggle only governs whether init consults it. Older settings decode with it ON.
+    @Published var filesRememberLocation: Bool { didSet { defaults.set(filesRememberLocation, forKey: Keys.filesRememberLocation) } }
+
+    /// Width of the Files band's current-list column, in points. Drives the bounded overlay width together
+    /// with the thin ancestor icon-rail and the preview pane.
+    @Published var filesColumnWidth: Double { didSet { persist(filesColumnWidth, Keys.filesColumnWidth) } }
+
+    /// How tightly the current column's rows pack (row height / padding). Persisted by `rawValue`.
+    @Published var filesDensity: FilesDensity { didSet { defaults.set(filesDensity.rawValue, forKey: Keys.filesDensity) } }
+
+    /// The Files band's accent tint, stored as a `#RRGGBB` hex string (plist-native, single-property —
+    /// matching how `AppSettings` persists every other setting; the band builder/view resolve it to the
+    /// codebase's `ItemColor`/SwiftUI `Color` at their boundary). A synthetic band, so this is the one
+    /// place its tint is configured (it has no entry in the authored bands store).
+    @Published var filesBandTint: String { didSet { defaults.set(filesBandTint, forKey: Keys.filesBandTint) } }
+
+    /// Whether a row leads with the plain type icon or a live QuickLook preview thumbnail. Persisted by
+    /// `rawValue`.
+    @Published var filesIconStyle: FilesIconStyle { didSet { defaults.set(filesIconStyle.rawValue, forKey: Keys.filesIconStyle) } }
+
+    /// Primary sort key for a listed folder's entries. Persisted by `rawValue`; applied live by re-listing.
+    @Published var filesSortField: FilesSortField { didSet { defaults.set(filesSortField.rawValue, forKey: Keys.filesSortField) } }
+
+    /// Ascending vs. descending for `filesSortField`. Persisted by `rawValue`.
+    @Published var filesSortDirection: FilesSortDirection { didSet { defaults.set(filesSortDirection.rawValue, forKey: Keys.filesSortDirection) } }
+
+    /// The default-open action committed for a highlighted **file** (a folder always opens as a Finder
+    /// window regardless). Persisted by `rawValue`.
+    @Published var filesDefaultOpen: FilesDefaultOpen { didSet { defaults.set(filesDefaultOpen.rawValue, forKey: Keys.filesDefaultOpen) } }
+
+    /// Which secondary metadata each row shows beside its name (date / kind / size — any combination).
+    /// An `OptionSet` persisted as its `Int` `rawValue` (mirrors `DangerZoneSelection`).
+    @Published var filesRowMetadata: FilesRowMetadata { didSet { defaults.set(filesRowMetadata.rawValue, forKey: Keys.filesRowMetadata) } }
+
+    /// The remembered deepest path last navigated to inside `rootPath`, or nil if none has been recorded
+    /// yet (cold start, or the root was just added).
+    func rememberedLocation(forRoot rootPath: String) -> String? { filesRememberedLocations[rootPath] }
+
+    /// Remember `path` as the deepest location inside `rootPath` (written when the user leaves the band or
+    /// changes depth), so re-entering that root restores it.
+    func rememberLocation(_ path: String, forRoot rootPath: String) {
+        filesRememberedLocations[rootPath] = path
+    }
+
+    /// Best-effort orphan cleanup: drop remembered-location entries whose root is no longer configured.
+    /// A no-op when nothing is orphaned (so it doesn't churn UserDefaults needlessly).
+    func pruneRememberedLocations(keepingRoots liveRoots: Set<String>) {
+        let kept = filesRememberedLocations.filter { liveRoots.contains($0.key) }
+        if kept.count != filesRememberedLocations.count { filesRememberedLocations = kept }
+    }
+
+    // MARK: - Built-in media player (opt-in; default OFF)
+
+    /// Opt-in to playing media files from the Files band in the built-in player. Like the clipboard /
+    /// device-link / Files opt-ins (and unlike the gesture opt-ins) it relocates no native gesture, needs
+    /// no re-login, and requests no new permission; there is NO `is…Effective` gate — the flip takes
+    /// effect immediately. When OFF, opening a media file behaves exactly as before (system default app).
+    /// Default OFF. Older settings have no key and decode with the opt-in OFF.
+    @Published var useBuiltInPlayer: Bool { didSet { defaults.set(useBuiltInPlayer, forKey: Keys.useBuiltInPlayer) } }
+
+    /// Per-media-kind default-open: when the opt-in is on, whether the built-in player handles video /
+    /// audio / images respectively (each defaults ON). A disabled kind falls through to the system app.
+    @Published var builtInPlayerHandlesVideo: Bool { didSet { defaults.set(builtInPlayerHandlesVideo, forKey: Keys.builtInPlayerHandlesVideo) } }
+    @Published var builtInPlayerHandlesAudio: Bool { didSet { defaults.set(builtInPlayerHandlesAudio, forKey: Keys.builtInPlayerHandlesAudio) } }
+    @Published var builtInPlayerHandlesImage: Bool { didSet { defaults.set(builtInPlayerHandlesImage, forKey: Keys.builtInPlayerHandlesImage) } }
+
+    /// The default playback engine (AVFoundation or libmpv). AVFoundation is the default; libmpv is the
+    /// alternative, also auto-offered when AVFoundation can't decode a file. Persisted by `rawValue`.
+    @Published var playerDefaultEngine: PlaybackEngineKind { didSet { defaults.set(playerDefaultEngine.rawValue, forKey: Keys.playerDefaultEngine) } }
+
+    /// Seconds per seek step (one two-finger out-and-back); auto-repeat issues more while held.
+    @Published var playerSeekStep: Double { didSet { persist(playerSeekStep, Keys.playerSeekStep) } }
+
+    /// Volume delta per step, in 0…1 units.
+    @Published var playerVolumeStep: Double { didSet { persist(playerVolumeStep, Keys.playerVolumeStep) } }
+
+    /// Resume a reopened file only when the saved position is at least this many seconds in (else start).
+    @Published var playerResumeThreshold: Double { didSet { persist(playerResumeThreshold, Keys.playerResumeThreshold) } }
+
+    /// Treat a saved position within this many seconds of the end as "finished" → start fresh.
+    @Published var playerNearEndMargin: Double { didSet { persist(playerNearEndMargin, Keys.playerNearEndMargin) } }
+
+    /// Whether the built-in player handles `kind` (the opt-in must also be on; checked by the caller).
+    func builtInPlayerHandles(_ kind: MediaKind) -> Bool {
+        switch kind {
+        case .video: return builtInPlayerHandlesVideo
+        case .audio: return builtInPlayerHandlesAudio
+        case .image: return builtInPlayerHandlesImage
+        }
+    }
 
     // MARK: - Per-app keyboard language (opt-in; default OFF)
 
@@ -224,10 +452,20 @@ final class AppSettings: ObservableObject {
         launcherActivationThreshold = defaults.object(forKey: Keys.launcherActivationThreshold) as? Double ?? Defaults.launcherActivationThreshold
         launcherStepDistance = defaults.object(forKey: Keys.launcherStepDistance) as? Double ?? Defaults.launcherStepDistance
         launcherContextStepDistance = defaults.object(forKey: Keys.launcherContextStepDistance) as? Double ?? Defaults.launcherContextStepDistance
+        positionalInnerDeadzone = defaults.object(forKey: Keys.positionalInnerDeadzone) as? Double ?? Defaults.positionalInnerDeadzone
+        positionalFootprintFactor = defaults.object(forKey: Keys.positionalFootprintFactor) as? Double ?? Defaults.positionalFootprintFactor
+        positionalFallbackScale = defaults.object(forKey: Keys.positionalFallbackScale) as? Double ?? Defaults.positionalFallbackScale
+        positionalInitialRepeatDelay = defaults.object(forKey: Keys.positionalInitialRepeatDelay) as? Double ?? Defaults.positionalInitialRepeatDelay
+        positionalRepeatFloor = defaults.object(forKey: Keys.positionalRepeatFloor) as? Double ?? Defaults.positionalRepeatFloor
+        positionalRepeatRampTime = defaults.object(forKey: Keys.positionalRepeatRampTime) as? Double ?? Defaults.positionalRepeatRampTime
+        positionalReArmBackoff = defaults.object(forKey: Keys.positionalReArmBackoff) as? Double ?? Defaults.positionalReArmBackoff
+        positionalPaddingRadius = defaults.object(forKey: Keys.positionalPaddingRadius) as? Double ?? Defaults.positionalPaddingRadius
+        positionalEdgeMargin = defaults.object(forKey: Keys.positionalEdgeMargin) as? Double ?? Defaults.positionalEdgeMargin
         dwellToArmDuration = defaults.object(forKey: Keys.dwellToArmDuration) as? Double ?? Defaults.dwellToArmDuration
         showDiagnostics = defaults.object(forKey: Keys.showDiagnostics) as? Bool ?? Defaults.showDiagnostics
         livePreviewEnabled = defaults.object(forKey: Keys.livePreviewEnabled) as? Bool ?? Defaults.livePreviewEnabled
         keepClipboardHistory = defaults.object(forKey: Keys.keepClipboardHistory) as? Bool ?? Defaults.keepClipboardHistory
+        enableDeviceLink = defaults.object(forKey: Keys.enableDeviceLink) as? Bool ?? Defaults.enableDeviceLink
         clipboardPaused = defaults.object(forKey: Keys.clipboardPaused) as? Bool ?? Defaults.clipboardPaused
         clipboardRecentWindow = defaults.object(forKey: Keys.clipboardRecentWindow) as? Int ?? Defaults.clipboardRecentWindow
         clipboardMaxCount = defaults.object(forKey: Keys.clipboardMaxCount) as? Int ?? Defaults.clipboardMaxCount
@@ -241,6 +479,27 @@ final class AppSettings: ObservableObject {
         aiSelectedModelID = defaults.object(forKey: Keys.aiSelectedModelID) as? String ?? Defaults.aiSelectedModelID
         aiCommandLanguages = defaults.object(forKey: Keys.aiCommandLanguages) as? [String: String] ?? Defaults.aiCommandLanguages
         aiReasoningEnabled = defaults.object(forKey: Keys.aiReasoningEnabled) as? Bool ?? Defaults.aiReasoningEnabled
+        filesBandEnabled = defaults.object(forKey: Keys.filesBandEnabled) as? Bool ?? Defaults.filesBandEnabled
+        filesRoots = defaults.object(forKey: Keys.filesRoots) as? [String] ?? Defaults.filesRoots
+        filesRememberedLocations = defaults.object(forKey: Keys.filesRememberedLocations) as? [String: String] ?? Defaults.filesRememberedLocations
+        filesRememberLocation = defaults.object(forKey: Keys.filesRememberLocation) as? Bool ?? Defaults.filesRememberLocation
+        filesColumnWidth = defaults.object(forKey: Keys.filesColumnWidth) as? Double ?? Defaults.filesColumnWidth
+        filesDensity = (defaults.object(forKey: Keys.filesDensity) as? String).flatMap(FilesDensity.init(rawValue:)) ?? Defaults.filesDensity
+        filesBandTint = defaults.object(forKey: Keys.filesBandTint) as? String ?? Defaults.filesBandTint
+        filesIconStyle = (defaults.object(forKey: Keys.filesIconStyle) as? String).flatMap(FilesIconStyle.init(rawValue:)) ?? Defaults.filesIconStyle
+        filesSortField = (defaults.object(forKey: Keys.filesSortField) as? String).flatMap(FilesSortField.init(rawValue:)) ?? Defaults.filesSortField
+        filesSortDirection = (defaults.object(forKey: Keys.filesSortDirection) as? String).flatMap(FilesSortDirection.init(rawValue:)) ?? Defaults.filesSortDirection
+        filesDefaultOpen = (defaults.object(forKey: Keys.filesDefaultOpen) as? String).flatMap(FilesDefaultOpen.init(rawValue:)) ?? Defaults.filesDefaultOpen
+        filesRowMetadata = (defaults.object(forKey: Keys.filesRowMetadata) as? Int).map(FilesRowMetadata.init(rawValue:)) ?? Defaults.filesRowMetadata
+        useBuiltInPlayer = defaults.object(forKey: Keys.useBuiltInPlayer) as? Bool ?? Defaults.useBuiltInPlayer
+        builtInPlayerHandlesVideo = defaults.object(forKey: Keys.builtInPlayerHandlesVideo) as? Bool ?? Defaults.builtInPlayerHandlesVideo
+        builtInPlayerHandlesAudio = defaults.object(forKey: Keys.builtInPlayerHandlesAudio) as? Bool ?? Defaults.builtInPlayerHandlesAudio
+        builtInPlayerHandlesImage = defaults.object(forKey: Keys.builtInPlayerHandlesImage) as? Bool ?? Defaults.builtInPlayerHandlesImage
+        playerDefaultEngine = (defaults.object(forKey: Keys.playerDefaultEngine) as? String).flatMap(PlaybackEngineKind.init(rawValue:)) ?? Defaults.playerDefaultEngine
+        playerSeekStep = defaults.object(forKey: Keys.playerSeekStep) as? Double ?? Defaults.playerSeekStep
+        playerVolumeStep = defaults.object(forKey: Keys.playerVolumeStep) as? Double ?? Defaults.playerVolumeStep
+        playerResumeThreshold = defaults.object(forKey: Keys.playerResumeThreshold) as? Double ?? Defaults.playerResumeThreshold
+        playerNearEndMargin = defaults.object(forKey: Keys.playerNearEndMargin) as? Double ?? Defaults.playerNearEndMargin
         keyboardLanguageEnabled = defaults.object(forKey: Keys.keyboardLanguageEnabled) as? Bool ?? Defaults.keyboardLanguageEnabled
         keyboardLanguageDefaultSourceID = defaults.object(forKey: Keys.keyboardLanguageDefaultSourceID) as? String ?? Defaults.keyboardLanguageDefaultSourceID
         keyboardLanguagePerSiteEnabled = defaults.object(forKey: Keys.keyboardLanguagePerSiteEnabled) as? Bool ?? Defaults.keyboardLanguagePerSiteEnabled
@@ -263,6 +522,15 @@ final class AppSettings: ObservableObject {
         launcherActivationThreshold = Defaults.launcherActivationThreshold
         launcherStepDistance = Defaults.launcherStepDistance
         launcherContextStepDistance = Defaults.launcherContextStepDistance
+        positionalInnerDeadzone = Defaults.positionalInnerDeadzone
+        positionalFootprintFactor = Defaults.positionalFootprintFactor
+        positionalFallbackScale = Defaults.positionalFallbackScale
+        positionalInitialRepeatDelay = Defaults.positionalInitialRepeatDelay
+        positionalRepeatFloor = Defaults.positionalRepeatFloor
+        positionalRepeatRampTime = Defaults.positionalRepeatRampTime
+        positionalReArmBackoff = Defaults.positionalReArmBackoff
+        positionalPaddingRadius = Defaults.positionalPaddingRadius
+        positionalEdgeMargin = Defaults.positionalEdgeMargin
         dwellToArmDuration = Defaults.dwellToArmDuration
         showDiagnostics = Defaults.showDiagnostics
         livePreviewEnabled = Defaults.livePreviewEnabled
@@ -275,6 +543,28 @@ final class AppSettings: ObservableObject {
         clipboardPollInterval = Defaults.clipboardPollInterval
         clipboardEdgeAcceleration = Defaults.clipboardEdgeAcceleration
         clipboardPinDistance = Defaults.clipboardPinDistance
+        // Files appearance/behavior tunables reset; `filesBandEnabled` (the opt-in), the configured roots,
+        // and the remembered-location map are a user choice (like the clipboard opt-in/exclusion list) and
+        // are intentionally NOT reset.
+        filesColumnWidth = Defaults.filesColumnWidth
+        filesDensity = Defaults.filesDensity
+        filesBandTint = Defaults.filesBandTint
+        filesIconStyle = Defaults.filesIconStyle
+        filesSortField = Defaults.filesSortField
+        filesSortDirection = Defaults.filesSortDirection
+        filesDefaultOpen = Defaults.filesDefaultOpen
+        filesRowMetadata = Defaults.filesRowMetadata
+        filesRememberLocation = Defaults.filesRememberLocation   // a behavior tunable (back to default ON); the remembered map itself is preserved above
+        // Player tunables reset; `useBuiltInPlayer` (the opt-in) is a deliberate user choice and is
+        // intentionally NOT reset, mirroring the launcher / clipboard / files opt-in handling.
+        builtInPlayerHandlesVideo = Defaults.builtInPlayerHandlesVideo
+        builtInPlayerHandlesAudio = Defaults.builtInPlayerHandlesAudio
+        builtInPlayerHandlesImage = Defaults.builtInPlayerHandlesImage
+        playerDefaultEngine = Defaults.playerDefaultEngine
+        playerSeekStep = Defaults.playerSeekStep
+        playerVolumeStep = Defaults.playerVolumeStep
+        playerResumeThreshold = Defaults.playerResumeThreshold
+        playerNearEndMargin = Defaults.playerNearEndMargin
         // `aiCommandsEnabled` (a consent-gated opt-in that allows a multi-gigabyte download) and the
         // selected-model pin are a deliberate user choice, so they're intentionally NOT reset — mirrors
         // the launcher / clipboard opt-in handling.
@@ -304,12 +594,23 @@ final class AppSettings: ObservableObject {
         static let manageVerticalGesture = false   // opt-in; relocates Mission Control to four fingers
         static let enableLauncher = false          // opt-in; frees four-finger native gestures
         static let launcherActivationThreshold = 0.01   // same feather-light trigger as the switcher
-        static let launcherStepDistance = 0.04     // one item per ~4%; items are larger, fewer targets
-        static let launcherContextStepDistance = 0.09   // ~2.2× the item step; deliberate band switching
+        static let launcherStepDistance = 0.50     // item OUTER threshold (offset units, ≈half deflection)
+        static let launcherContextStepDistance = 0.85   // band OUTER threshold; coarser → deliberate band switch
+        // Positional navigation model (change `positional-navigation`).
+        static let positionalInnerDeadzone = 0.22       // re-arm zone; < the item/band outer thresholds
+        static let positionalFootprintFactor = 1.2      // footprint-widths of travel for full deflection
+        static let positionalFallbackScale = 0.12       // fixed deflection distance when no footprint
+        static let positionalInitialRepeatDelay = 0.22  // gap before the 2nd step (1st fires immediately)
+        static let positionalRepeatFloor = 0.03         // fastest auto-repeat interval the curve approaches
+        static let positionalRepeatRampTime = 1.2       // dwell seconds to ease from initial delay → floor
+        static let positionalReArmBackoff = 0.25        // offset retreat that snaps center to finger & stops accel
+        static let positionalPaddingRadius = 2.5        // padding-box half-size (offset units) before the margin
+        static let positionalEdgeMargin = 0.10          // fixed border band (normalized) that always accelerates
         static let dwellToArmDuration = 0.3        // quick tick; the charge stays readable
         static let showDiagnostics = false         // troubleshooting tools hidden from the menu by default
         static let livePreviewEnabled = true       // show the in-flight preview while scrubbing (default ON)
         static let keepClipboardHistory = false    // opt-in; records copied content locally (privacy)
+        static let enableDeviceLink = false        // opt-in; opens a local-network link to the phone (privacy)
         static let clipboardPaused = false
         static let clipboardRecentWindow = 30      // entries shown in the band (pinned float to top)
         static let clipboardMaxCount = 200         // stored-entry cap (pinned exempt)
@@ -323,6 +624,27 @@ final class AppSettings: ObservableObject {
         static let aiSelectedModelID: String? = nil  // nil = registry default model
         static let aiCommandLanguages: [String: String] = [:]  // per-command remembered runtime language
         static let aiReasoningEnabled = true       // let the model think (filtered out of the result); gated by the AI opt-in
+        static let filesBandEnabled = false        // opt-in; injects the local-only Files band (no re-login, no new permission)
+        static let filesRoots: [String] = []       // configured local root folders (the Hub seeds a default set)
+        static let filesRememberedLocations: [String: String] = [:]   // root path → last deepest path
+        static let filesRememberLocation = true    // reopen displaying the last folder (restored at open), not the roots list
+        static let filesColumnWidth = 260.0        // points; current-list column width (bounded overlay)
+        static let filesDensity: FilesDensity = .comfortable
+        static let filesBandTint = "#3B82C4"       // a calm blue, distinct from the clipboard band's amber
+        static let filesIconStyle: FilesIconStyle = .icon   // cheap type icon by default (no QuickLook churn)
+        static let filesSortField: FilesSortField = .name
+        static let filesSortDirection: FilesSortDirection = .ascending
+        static let filesDefaultOpen: FilesDefaultOpen = .defaultApp
+        static let filesRowMetadata: FilesRowMetadata = .date   // show the modified date beside the name
+        static let useBuiltInPlayer = false        // opt-in; plays media from the Files band in the built-in player
+        static let builtInPlayerHandlesVideo = true
+        static let builtInPlayerHandlesAudio = true
+        static let builtInPlayerHandlesImage = true
+        static let playerDefaultEngine: PlaybackEngineKind = .avFoundation   // AVFoundation default; libmpv the alternative
+        static let playerSeekStep = 10.0           // seconds per seek step (hold auto-repeats)
+        static let playerVolumeStep = 0.05         // 5% volume per step
+        static let playerResumeThreshold = 5.0     // resume only past 5s in
+        static let playerNearEndMargin = 10.0      // within 10s of the end → start fresh
         static let keyboardLanguageEnabled = false // opt-in; gates per-app input-source learn/apply (no re-login)
         static let keyboardLanguageDefaultSourceID = ""  // "" = no global default (pure learn-as-you-go)
         // Per-host memory inside browsers rides along by default when the keyboard-language master
@@ -351,10 +673,20 @@ final class AppSettings: ObservableObject {
         static let launcherActivationThreshold = "launcherActivationThreshold"
         static let launcherStepDistance = "launcherStepDistance"
         static let launcherContextStepDistance = "launcherContextStepDistance"
+        static let positionalInnerDeadzone = "positionalInnerDeadzone"
+        static let positionalFootprintFactor = "positionalFootprintFactor"
+        static let positionalFallbackScale = "positionalFallbackScale"
+        static let positionalInitialRepeatDelay = "positionalInitialRepeatDelay"
+        static let positionalRepeatFloor = "positionalRepeatFloor"
+        static let positionalRepeatRampTime = "positionalRepeatRampTime"
+        static let positionalReArmBackoff = "positionalReArmBackoff"
+        static let positionalPaddingRadius = "positionalPaddingRadius"
+        static let positionalEdgeMargin = "positionalEdgeMargin"
         static let dwellToArmDuration = "dwellToArmDuration"
         static let showDiagnostics = "showDiagnostics"
         static let livePreviewEnabled = "livePreviewEnabled"
         static let keepClipboardHistory = "keepClipboardHistory"
+        static let enableDeviceLink = "enableDeviceLink"
         static let clipboardPaused = "clipboardPaused"
         static let clipboardRecentWindow = "clipboardRecentWindow"
         static let clipboardMaxCount = "clipboardMaxCount"
@@ -368,6 +700,27 @@ final class AppSettings: ObservableObject {
         static let aiSelectedModelID = "aiSelectedModelID"
         static let aiCommandLanguages = "aiCommandLanguages"
         static let aiReasoningEnabled = "aiReasoningEnabled"
+        static let filesBandEnabled = "filesBandEnabled"
+        static let filesRoots = "filesRoots"
+        static let filesRememberedLocations = "filesRememberedLocations"
+        static let filesRememberLocation = "filesRememberLocation"
+        static let filesColumnWidth = "filesColumnWidth"
+        static let filesDensity = "filesDensity"
+        static let filesBandTint = "filesBandTint"
+        static let filesIconStyle = "filesIconStyle"
+        static let filesSortField = "filesSortField"
+        static let filesSortDirection = "filesSortDirection"
+        static let filesDefaultOpen = "filesDefaultOpen"
+        static let filesRowMetadata = "filesRowMetadata"
+        static let useBuiltInPlayer = "useBuiltInPlayer"
+        static let builtInPlayerHandlesVideo = "builtInPlayerHandlesVideo"
+        static let builtInPlayerHandlesAudio = "builtInPlayerHandlesAudio"
+        static let builtInPlayerHandlesImage = "builtInPlayerHandlesImage"
+        static let playerDefaultEngine = "playerDefaultEngine"
+        static let playerSeekStep = "playerSeekStep"
+        static let playerVolumeStep = "playerVolumeStep"
+        static let playerResumeThreshold = "playerResumeThreshold"
+        static let playerNearEndMargin = "playerNearEndMargin"
         static let keyboardLanguageEnabled = "keyboardLanguageEnabled"
         static let keyboardLanguageDefaultSourceID = "keyboardLanguageDefaultSourceID"
         static let keyboardLanguagePerSiteEnabled = "keyboardLanguagePerSiteEnabled"

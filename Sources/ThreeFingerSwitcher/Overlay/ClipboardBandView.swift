@@ -90,6 +90,9 @@ struct ClipboardBandView: View {
                 .truncationMode(.tail)
                 .foregroundStyle(selected ? .primary : .secondary)
             Spacer(minLength: 4)
+            if let entry = clipboardEntry(item), entry.isPeer {
+                ProvenanceChip(deviceName: entry.peerDeviceName, color: color)
+            }
             if model.isPinned(item) {
                 Image(systemName: "pin.fill").font(.system(size: 10)).foregroundStyle(color)
             }
@@ -97,6 +100,12 @@ struct ClipboardBandView: View {
         .padding(.horizontal, 10)
         .frame(height: ClipboardBandLayout.keyRowHeight)
         // Selection highlight is a single sliding overlay (see `highlight`), not a per-row background.
+    }
+
+    /// The `ClipboardEntry` behind a band item, if this is a clipboard cell.
+    private func clipboardEntry(_ item: LaunchItem) -> ClipboardEntry? {
+        guard case let .clipboardEntry(entry) = item.kind else { return nil }
+        return entry
     }
 
     @ViewBuilder
@@ -199,7 +208,11 @@ struct ClipboardValueView: View {
 
 /// Async QuickLook content preview for a file entry — the actual rendered content (PDF page, document
 /// thumbnail, etc.), not just the file's icon. Falls back to the Finder icon if QuickLook has nothing.
-private struct FilePreview: View {
+///
+/// `internal` (not `private`) so the **Files band** preview pane reuses the exact same QuickLook→icon
+/// surface for a highlighted file (design D9 — "reuse the open/preview surface"); the Clipboard band's
+/// file value preview embeds it identically.
+struct FilePreview: View {
     let url: URL
     @State private var image: NSImage?
 
@@ -224,6 +237,30 @@ private struct FilePreview: View {
         } else {
             image = NSWorkspace.shared.icon(forFile: url.path)
         }
+    }
+}
+
+/// A small, unobtrusive "from \<device\>" marker on a Clipboard-band row whose entry arrived over the
+/// device link. Shows the device name when known, else a generic phone glyph. Does not alter the row's
+/// key text or value preview (per the provenance spec).
+private struct ProvenanceChip: View {
+    let deviceName: String?
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "iphone").font(.system(size: 9))
+            if let deviceName, !deviceName.isEmpty {
+                Text(deviceName).font(.system(size: 9, weight: .medium)).lineLimit(1)
+            }
+        }
+        .foregroundStyle(color)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 1)
+        .background(
+            Capsule(style: .continuous).fill(color.opacity(0.14))
+        )
+        .accessibilityLabel(deviceName.map { "from \($0)" } ?? "from a paired device")
     }
 }
 

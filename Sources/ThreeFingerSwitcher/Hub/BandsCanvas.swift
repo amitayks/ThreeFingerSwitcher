@@ -1281,7 +1281,7 @@ private func naturalIcon(for kind: LaunchItemKind) -> ItemIcon? {
     switch kind {
     case .app: return .appDefault
     case .path: return .fileIcon
-    case .url, .shortcut, .script, .action, .preset, .clipboardEntry, .aiCommand: return nil
+    case .url, .shortcut, .script, .action, .preset, .clipboardEntry, .fileEntry, .aiCommand: return nil
     }
 }
 
@@ -1537,6 +1537,7 @@ private func kindLabel(_ kind: LaunchItemKind) -> String {
     case .action: return "Action"
     case .preset: return "Preset"
     case .clipboardEntry: return "Clipboard"
+    case .fileEntry: return "File Entry"
     case .aiCommand: return "AI Command"
     }
 }

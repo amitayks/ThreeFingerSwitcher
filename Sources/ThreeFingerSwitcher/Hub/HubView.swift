@@ -7,7 +7,8 @@ import AppKit
 enum HubDestination: Hashable, CaseIterable {
     case overview
     case bands
-    case switcher, launcher, clipboard, ai, keyboardLanguage
+    case switcher, launcher, clipboard, files, ai, keyboardLanguage
+    case devices
     case setup, general
 
     var title: String {
@@ -17,8 +18,10 @@ enum HubDestination: Hashable, CaseIterable {
         case .switcher: return "Window Switcher"
         case .launcher: return "Launcher"
         case .clipboard: return "Clipboard"
+        case .files: return "Files"
         case .ai: return "AI Commands"
         case .keyboardLanguage: return "Keyboard Language"
+        case .devices: return "Devices"
         case .setup: return "Setup & Permissions"
         case .general: return "General"
         }
@@ -42,8 +45,10 @@ enum HubDestination: Hashable, CaseIterable {
         case .switcher: return "arrow.left.arrow.right"
         case .launcher: return "square.grid.3x3.fill"
         case .clipboard: return "doc.on.clipboard"
+        case .files: return "folder"
         case .ai: return "sparkles"
         case .keyboardLanguage: return "globe"
+        case .devices: return "iphone.and.arrow.forward"
         case .setup: return "gearshape.2"
         case .general: return "slider.horizontal.3"
         }
@@ -68,6 +73,12 @@ final class HubContext {
     let clipboard: ClipboardStore
     let models: ModelManager
     let permissions: PermissionsService
+
+    // Launcher feature page — the live trackpad preview of the positional zones. Subscribe while the
+    // preview is on screen (it reuses the running TouchEngine's frames — no second listener, no new
+    // permission); unsubscribe when it disappears.
+    var subscribeTrackpadTouch: (@escaping (TouchFrame) -> Void) -> Void = { _ in }
+    var unsubscribeTrackpadTouch: () -> Void = {}
 
     // Clipboard feature page.
     var onClearClipboard: (_ includingPinned: Bool) -> Void = { _ in }
@@ -120,6 +131,13 @@ final class HubContext {
     // General page — Danger zone.
     var onDangerZoneClear: (DangerZoneSelection) -> Void = { _ in }
     var onRestoreAllGestures: () -> Void = {}
+
+    // Devices page (device link).
+    var pairedDevices: () -> [PairedDevice] = { [] }
+    var onForgetDevice: (String) -> Void = { _ in }
+    var onSendLatestToDevices: () -> Void = {}
+    /// QR pairing host coordinator (show a code + accept a scanner). Observed by the Devices page.
+    var pairingCoordinator: MacPairingCoordinator?
 
     init(settings: AppSettings,
          favorites: FavoritesStore,
@@ -186,7 +204,7 @@ struct HubView: View {
                     railDivider
                     railButton(.bands)
                     railDivider
-                    railButton(.switcher); railButton(.launcher); railButton(.clipboard); railButton(.ai); railButton(.keyboardLanguage)
+                    railButton(.switcher); railButton(.launcher); railButton(.clipboard); railButton(.files); railButton(.ai); railButton(.keyboardLanguage); railButton(.devices)
                     railDivider
                     railButton(.setup); railButton(.general)
                 }
@@ -236,10 +254,14 @@ struct HubView: View {
         case .overview: OverviewPage(context: context, nav: nav)
         case .bands: BandsPage(context: context)
         case .switcher: SwitcherPage(settings: context.settings)
-        case .launcher: LauncherPage(settings: context.settings)
+        case .launcher: LauncherPage(settings: context.settings,
+                                     subscribeTouch: context.subscribeTrackpadTouch,
+                                     unsubscribeTouch: context.unsubscribeTrackpadTouch)
         case .clipboard: ClipboardPage(context: context)
+        case .files: FilesPage(context: context)
         case .ai: AIPage(context: context)
         case .keyboardLanguage: KeyboardLanguagePage(context: context)
+        case .devices: DevicesPage(context: context)
         case .setup: SetupPage(context: context)
         case .general: GeneralPage(context: context)
         }

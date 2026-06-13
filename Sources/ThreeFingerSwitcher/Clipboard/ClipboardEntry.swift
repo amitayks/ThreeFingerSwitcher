@@ -50,6 +50,15 @@ extension ClipboardPayload: Codable {
     }
 }
 
+/// Where an entry came from — a *device* provenance, distinct from `sourceApp` (the app that made a
+/// local copy). Additive and backward-compatible: it is optional on `ClipboardEntry`, so an index
+/// persisted before this existed loads with `origin == nil` (treated as local). Local pasteboard
+/// capture leaves it unset; an item received over the device link is stamped `.peer`.
+enum ClipboardOrigin: Codable, Equatable {
+    case local
+    case peer(deviceName: String?)
+}
+
 /// A single recorded clipboard item: stable identity + when/where it was copied + the kind + the
 /// representations needed for a faithful re-paste + a derived single-line `key` for the list column.
 struct ClipboardEntry: Codable, Equatable, Identifiable {
@@ -69,6 +78,9 @@ struct ClipboardEntry: Codable, Equatable, Identifiable {
     /// Stable content fingerprint used for de-duplication (two copies with the same fingerprint are
     /// the same entry). Derived from the canonical representation at capture time.
     var fingerprint: String
+    /// Device provenance. Optional + additive: `nil` (absent in legacy indexes) and `.local` both mean
+    /// "captured on this Mac"; `.peer` means it arrived over the device link. See `isPeer`.
+    var origin: ClipboardOrigin?
 
     init(id: UUID = UUID(),
          capturedAt: Date,
@@ -77,7 +89,8 @@ struct ClipboardEntry: Codable, Equatable, Identifiable {
          sourceApp: String? = nil,
          pinned: Bool = false,
          representations: [String: ClipboardPayload],
-         fingerprint: String) {
+         fingerprint: String,
+         origin: ClipboardOrigin? = nil) {
         self.id = id
         self.capturedAt = capturedAt
         self.kind = kind
@@ -86,6 +99,20 @@ struct ClipboardEntry: Codable, Equatable, Identifiable {
         self.pinned = pinned
         self.representations = representations
         self.fingerprint = fingerprint
+        self.origin = origin
+    }
+
+    /// The originating device name when this came from a paired device, else nil. Reads `nil`/`.local`
+    /// origin as not-a-peer (centralizes the "absent == local" convention).
+    var peerDeviceName: String? {
+        if case let .peer(name) = origin { return name }
+        return nil
+    }
+
+    /// True when this entry was received from a paired device (not a local copy).
+    var isPeer: Bool {
+        if case .peer = origin { return true }
+        return false
     }
 
     // MARK: Convenience accessors (used by the preview + paste paths)

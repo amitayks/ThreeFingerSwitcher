@@ -51,6 +51,51 @@ protocol GestureRecognizerDelegate: AnyObject {
     /// DOWN swipe applies the result ("bring it into the document"). Emitted once per gesture, only
     /// while `launcherCanvasResolutionActive`.
     func launcherCanvasResolve(dx: Int, dy: Int)
+
+    // MARK: Files-drill intents (emitted only while `filesDrillActive`; the controller drives entry/exit).
+    // The recognizer emits pure intents — directory navigation, preview, search-field focus (an up-step
+    // while already at the top of the list), arm, and fire all live in the model/controller, not here.
+    // Default no-op implementations are provided below so non-Files conformers compile unchanged.
+
+    /// While the Files column navigator is open, horizontal travel past one item-step steps the depth
+    /// (descend / ascend), already direction-adjusted (`+1` / `-1`). The controller maps it to descend
+    /// the current folder / ascend to the parent.
+    func filesDepth(_ direction: Int)
+    /// Vertical travel past one item-step moves the highlighted entry, already direction-adjusted
+    /// (`+1` / `-1`). An up-step while already clamped at the top of the list is interpreted by the
+    /// controller/model as focus-search; the recognizer just keeps emitting steps.
+    func filesHighlight(_ direction: Int)
+    /// The resolving lift with no added finger: open the highlighted entry (default action). One-shot.
+    func filesOpen()
+    /// The resolving lift after a relative +1 finger was added: Open-With the highlighted entry. One-shot.
+    func filesOpenWith()
+    /// A fresh deliberate four-finger horizontal swipe-away while drilled: discard (defuse a held open /
+    /// dismiss the navigator). One-shot.
+    func filesDiscard()
+
+    // MARK: Player transport intents (emitted only while `playerActive`; the controller drives entry/exit).
+    // The built-in media player owns the trackpad while open — a third sustained modal sub-state mirroring
+    // the Files drill, but PERSISTENT (a lift ends one scrub, it does not leave the player). Default no-op
+    // implementations are provided below so non-player conformers compile unchanged.
+
+    /// Two-finger horizontal step (`+1` / `-1`, direction-adjusted): seek one step (the controller scales
+    /// it to seconds + auto-repeats off the held-zone signal). Fast-forward / rewind.
+    func playerSeek(_ direction: Int)
+    /// Two-finger vertical step (`+1` / `-1`, direction-adjusted): change volume one step — OR, while the
+    /// action menu is open, move the menu highlight (the controller routes it).
+    func playerVolume(_ direction: Int)
+    /// A two-finger tap (contact + lift with no navigation excursion): toggle play/pause.
+    func playerTogglePlayPause()
+    /// A relative +1 finger (one more than the navigation baseline): raise the action menu.
+    func playerActionMenu()
+    /// A resolving lift while the action menu is open: select the highlighted row (the Open-With pattern).
+    func playerSelectMenuItem()
+    /// A four-finger gesture: dismiss the player (persist + leave). One-shot.
+    func playerDismiss()
+    /// The per-axis held-in-zone sign (−1 / 0 / +1) for the player, emitted when it changes so the
+    /// controller drives eased auto-repeat. BOTH axes auto-repeat (seek and volume), unlike the Files/
+    /// Clipboard surfaces that suppress horizontal auto-repeat.
+    func playerHeldZoneChanged(dx: Int, dy: Int)
 }
 
 extension GestureRecognizerDelegate {
@@ -62,6 +107,18 @@ extension GestureRecognizerDelegate {
     func launcherEdgeChanged(dx: Int, dy: Int) {}
     func launcherFocusIsOnBandList() -> Bool { false }
     func launcherCanvasResolve(dx: Int, dy: Int) {}
+    func filesDepth(_ direction: Int) {}
+    func filesHighlight(_ direction: Int) {}
+    func filesOpen() {}
+    func filesOpenWith() {}
+    func filesDiscard() {}
+    func playerSeek(_ direction: Int) {}
+    func playerVolume(_ direction: Int) {}
+    func playerTogglePlayPause() {}
+    func playerActionMenu() {}
+    func playerSelectMenuItem() {}
+    func playerDismiss() {}
+    func playerHeldZoneChanged(dx: Int, dy: Int) {}
 }
 
 /// Multi-finger scrub state machine. The active finger count is **latched at gesture start**:
@@ -108,6 +165,67 @@ final class GestureRecognizer {
     private var canvasResResolved = false
     private var canvasResStart: CGPoint = .zero
 
+    /// While true (the Files column navigator is open), every frame routes to `trackFilesDrill` and the
+    /// normal finger-count latch is bypassed — a fresh contact during the drill never opens the switcher
+    /// or a second launcher. The controller flips it from the navigator's open/close state (mirroring
+    /// `launcherCanvasResolutionActive`). Setting it `true` re-seeds a fresh drill session; while `false`
+    /// (the default + all non-Files use) everything below is byte-identical to before.
+    var filesDrillActive = false {
+        didSet { if filesDrillActive && !oldValue { resetDrill() } }
+    }
+    /// Whether the current drill session has seeded its baseline yet (a fresh contact seeds it). Cleared
+    /// on entry and on a true lift so the next contact re-seeds the origin.
+    private var drillStarted = false
+    /// Set once the session has resolved (open / open-with / discard). The resolution is **one-shot** for
+    /// the whole session: while set, no further intent is emitted, so a stray re-lift is a no-op. Cleared
+    /// only when the controller re-enters the sub-state.
+    private var drillResolved = false
+    /// Set once a relative +1 finger (a contact above the current relaxed baseline) is seen, so the
+    /// resolving lift emits Open-With instead of a plain Open. Latched for the session.
+    private var pendingOpenWith = false
+    /// Relaxed contact baseline of the drill, re-baselined on every contact-count change (the gesture
+    /// lives while ≥2 remain, so the user may relax fingers). A count rising ABOVE this is the relative
+    /// +1 Open-With morph (D4) — not an absolute three.
+    private var drillContacts = 0
+    /// Reference origin for the drill, re-baselined (with the accumulators cleared) on every contact-count
+    /// change so a leaving or landing finger's centroid shift emits no spurious step.
+    private var drillStart = CGPoint.zero
+    private var drillLast = CGPoint.zero
+    private var drillAccumX: CGFloat = 0   // horizontal → depth steps
+    private var drillAccumY: CGFloat = 0   // vertical → highlight steps
+
+    /// While true (the built-in media player is open), every frame routes to `trackPlayer` and the normal
+    /// finger-count latch is bypassed — a fresh contact during playback never opens the switcher or the
+    /// launcher (so a three-finger count is the player's action menu, NOT the window switcher). The player
+    /// controller flips it from the player's open/close state (mirroring `filesDrillActive`). Setting it
+    /// `true` seeds a fresh session; while `false` (the default + all non-player use) everything is
+    /// byte-identical to before.
+    var playerActive = false {
+        didSet { if playerActive && !oldValue { resetPlayer() } }
+    }
+    /// Set by the controller while the player's action menu is open: a resolving lift then SELECTS the
+    /// highlighted row (the Open-With scrubbable-picker pattern) and `playerVolume` steps are the menu's
+    /// (the controller routes them), rather than a tap toggling play/pause or volume changing.
+    var playerMenuOpen = false
+    /// Whether the current player scrub session has seeded its baseline yet (a fresh contact seeds it).
+    private var playerStarted = false
+    /// Relaxed contact baseline of the player scrub, re-baselined on every contact-count change. A count
+    /// rising to baseline+1 is the action-menu morph; baseline+2 (or ≥4) dismisses.
+    private var playerContacts = 0
+    /// Whether the current contact session moved past the axis-detect threshold (so a lift is a scrub-end,
+    /// not a tap). Reset when a fresh contact seeds. A tap = contact + lift with no movement → play/pause.
+    private var playerMoved = false
+    /// The centroid where the current player contact session seeded (for the tap-vs-scrub test).
+    private var playerSeedCentroid = CGPoint.zero
+    /// Player held-in-zone state per axis (−1 / 0 / +1), kept separate from the launcher/files `edgeDX/DY`.
+    private var playerEdgeDX = 0
+    private var playerEdgeDY = 0
+    /// The anchored-positional navigator for the player's transport (change `positional-navigation`, D1).
+    /// Same model as the launcher/files; BOTH axes auto-repeat (seek + volume). Re-anchored on entry /
+    /// contact-count change; rebuilt from settings when a fresh session seeds.
+    private var playerNav = PositionalNavigator(footprintFactor: 1.2, fallbackScale: 0.12,
+                                                inner: 0.22, outer: 0.5)
+
     private enum Axis { case undetermined, horizontal, vertical }
     private enum State { case idle, tracking }
     private enum Mode { case switcher, launcher }
@@ -124,15 +242,24 @@ final class GestureRecognizer {
     /// Live contact count of the latched launcher gesture, used to detect contact-count changes so
     /// the step origin can be re-baselined (the centroid shifts as fingers leave). Seeded at begin.
     private var launcherContacts = 0
-    /// Edge-hold state for scroll acceleration, per axis (−1 / 0 / +1): `edgeDX +1` = right edge,
-    /// `edgeDY +1` = top edge. Emitted to the delegate when either changes.
+    /// Held-in-zone state for auto-repeat, per axis (−1 / 0 / +1): `+1` = offset held beyond the outer
+    /// threshold on the high side (right / up), `−1` = low side. Emitted to the delegate (still via
+    /// `launcherEdgeChanged`, repurposed) when either changes; the controller drives the eased repeat
+    /// off it. Replaces the old physical-trackpad-edge detection (change `positional-navigation`, D3).
     private var edgeDX = 0
     private var edgeDY = 0
-    /// Normalized distance from a trackpad edge within which a held contact triggers auto-repeat, with
-    /// hysteresis (enter < exit) so micro-jitter at the boundary doesn't flap the hold on/off. The
-    /// enter zone is generous because a multi-finger centroid can't physically reach the very edge.
-    private let edgeEnterZone: CGFloat = 0.16
-    private let edgeExitZone: CGFloat = 0.24
+    /// The anchored-positional navigator for the launcher's post-activation navigation (change
+    /// `positional-navigation`, D1). (Re)anchored at activation and on every contact-count change; fed
+    /// the centroid each frame to yield item/context steps + held-zone signs. Rebuilt from settings at
+    /// `beginLauncher` so a tunable change between opens applies on the next gesture.
+    private var launcherNav = PositionalNavigator(footprintFactor: 1.2, fallbackScale: 0.12,
+                                                  inner: 0.22, outer: 0.5)
+    /// The anchored-positional navigator for the Files drill (change `positional-navigation`, D1). Same
+    /// model as the launcher: out-and-back = one step, held = auto-repeat. Horizontal (depth) is emitted
+    /// as a deliberate discrete step with NO auto-repeat (descend/ascend must settle); vertical (highlight)
+    /// out-and-backs and auto-repeats via the held-zone signal. Re-anchored on entry / contact-count change.
+    private var filesNav = PositionalNavigator(footprintFactor: 1.2, fallbackScale: 0.12,
+                                               inner: 0.22, outer: 0.5)
     /// Live contact count of the switcher gesture *after activation*, used the same way as
     /// `launcherContacts`: once the overlay is up the user may relax three fingers to two, and the
     /// centroid shifts as the finger leaves — so on a count change we re-baseline the step origin.
@@ -150,6 +277,11 @@ final class GestureRecognizer {
     /// Control / App Exposé — larger than axis detection so it isn't twitchy.
     private let missionControlThreshold: CGFloat = 0.10
 
+    /// Deliberate travel (normalized) before a fresh TWO-finger swipe resolves the AI canvas (change
+    /// `positional-navigation`, D5). Deliberately **larger than incidental two-finger scrolling** so
+    /// reading/scrolling the canvas is never mistaken for a commit/discard.
+    private let canvasResolveThreshold: CGFloat = 0.12
+
     init(settings: AppSettings) {
         self.settings = settings
     }
@@ -160,6 +292,20 @@ final class GestureRecognizer {
         // flag is off (the default + all normal use), everything below is byte-identical to before.
         if launcherCanvasResolutionActive {
             trackCanvasResolution(frame)
+            return
+        }
+        // While the Files column navigator is open, route every frame to the sustained drill tracker
+        // BEFORE the idle re-latch below, so a fresh contact during drill-in never opens the switcher or
+        // a second launcher on top of the navigator. Off by default → byte-identical to before.
+        if filesDrillActive {
+            trackFilesDrill(frame)
+            return
+        }
+        // While the built-in player is open it OWNS the trackpad: every frame routes to the player
+        // tracker before the idle re-latch, so a fresh contact during playback never opens the switcher
+        // (a three-finger count is the player's action menu) or the launcher. Off by default → unchanged.
+        if playerActive {
+            trackPlayer(frame)
             return
         }
         let switcherTarget = settings.requireExactlyThree ? (frame.fingerCount == 3) : (frame.fingerCount >= 3)
@@ -195,12 +341,13 @@ final class GestureRecognizer {
         }
     }
 
-    /// One-shot canvas-resolution tracking (see `launcherCanvasResolutionActive`). A fresh four-finger
-    /// swipe past the activation threshold reports a single `launcherCanvasResolve`: vertical-dominant →
+    /// One-shot canvas-resolution tracking (see `launcherCanvasResolutionActive`). A fresh **two-finger**
+    /// swipe past `canvasResolveThreshold` reports a single `launcherCanvasResolve`: vertical-dominant →
     /// `dy` (`+1` up, `-1` down; down applies, up is ignored upstream), else horizontal → `dx` (discard).
-    /// Relaxing to ≥2 fingers after the four-finger start is allowed, matching the launcher's latch feel.
-    /// Runs INSTEAD of the normal state machine while the canvas is open, so it never opens the launcher
-    /// or switcher; it self-resets on lift.
+    /// Two-finger resolution (change `positional-navigation`, D5) aligns the grammar — 4 fingers open /
+    /// dismiss the platform, 2 fingers act within it — and the threshold sits ABOVE incidental scrolling so
+    /// reading the canvas never resolves it. Runs INSTEAD of the normal state machine while the canvas is
+    /// open, so it never opens the launcher or switcher; it self-resets on lift.
     private func trackCanvasResolution(_ frame: TouchFrame) {
         let count = frame.fingerCount
         if count == 0 {                       // lift → ready for the next resolution gesture
@@ -209,7 +356,7 @@ final class GestureRecognizer {
             return
         }
         if !canvasResStarted {
-            guard count >= 4 else { return }  // require a fresh four-finger contact to begin
+            guard count >= 2 else { return }  // require a fresh (≥) two-finger contact to begin
             canvasResStarted = true
             canvasResResolved = false
             canvasResStart = frame.centroid
@@ -218,7 +365,7 @@ final class GestureRecognizer {
         guard !canvasResResolved, count >= 2 else { return }
         let dx = frame.centroid.x - canvasResStart.x
         let dy = frame.centroid.y - canvasResStart.y
-        let threshold = CGFloat(settings.launcherActivationThreshold)
+        let threshold = canvasResolveThreshold
         guard abs(dx) >= threshold || abs(dy) >= threshold else { return }
         canvasResResolved = true
         let ratio = CGFloat(settings.axisLockRatio)
@@ -415,6 +562,19 @@ final class GestureRecognizer {
         triggeredMissionControl = false
         launcherContacts = frame.fingerCount   // 4 at begin; tracked so a drop re-baselines the origin
         edgeDX = 0; edgeDY = 0
+        // Rebuild the positional navigator from current settings (a tunable change between opens applies
+        // here). It is anchored at activation, not begin — the opening fling moves the centroid, so the
+        // navigation center is the post-fling resting position.
+        // Position-tracking padding box: inside the box the selection follows the finger's position in
+        // steps (center locked); leaving the box (or hitting the edge band) accelerates. Per-axis step /
+        // radius / edge-margin are set per-feed (the band axis uses a coarser step on the band list).
+        launcherNav = PositionalNavigator(
+            footprintFactor: CGFloat(settings.positionalFootprintFactor),
+            fallbackScale: CGFloat(settings.positionalFallbackScale),
+            x: AxisZone(mode: .positionTracking),
+            y: AxisZone(mode: .positionTracking))
+        launcherNav.edgeMargin = CGFloat(settings.positionalEdgeMargin)
+        launcherNav.reArmBackoff = CGFloat(settings.positionalReArmBackoff)
     }
 
     private func trackLauncher(_ frame: TouchFrame) {
@@ -438,6 +598,10 @@ final class GestureRecognizer {
                 lastCentroid = frame.centroid
                 stepAccumulator = 0
                 stepAccumulatorY = 0
+                // Post-activation navigation is positional: re-anchor the joystick center/scale at the
+                // new posture so the centroid shift from a leaving/landing finger emits no step (the
+                // re-anchor also resets the per-axis arm/zone state, clearing any held auto-repeat).
+                if activated { launcherNav.reanchor(center: frame.centroid, spread: frame.footprintSpread) }
             }
             updateLauncher(frame)
         } else {
@@ -456,13 +620,14 @@ final class GestureRecognizer {
         let dx = c.x - startCentroid.x
 
         if !activated {
-            // Activate on deliberate horizontal travel. Pre-activation vertical is reserved (idle
-            // four-finger vertical does nothing in v1), so only |Δx| arms the launcher.
+            // Activate on deliberate horizontal travel (the opening fling is UNCHANGED — odometer, not
+            // positional). Pre-activation vertical is reserved (idle four-finger vertical does nothing in
+            // v1), so only |Δx| arms the launcher. On activation, anchor the positional navigator at the
+            // post-fling resting centroid so navigation offset is measured from where the hand settled.
             if abs(dx) >= CGFloat(settings.launcherActivationThreshold) {
                 activated = true
-                stepAccumulator = 0
-                stepAccumulatorY = 0
                 lastCentroid = c
+                launcherNav.reanchor(center: c, spread: frame.footprintSpread)
                 delegate?.launcherDidActivate()
             } else {
                 lastCentroid = c
@@ -470,49 +635,37 @@ final class GestureRecognizer {
             return
         }
 
-        // Active: the launcher owns both axes (the freed four-finger scroll is consumed by the scroll
-        // tap). Horizontal moves the item cursor and crosses between the band list and the grid; vertical
-        // switches bands (on the band list) or steps between grid rows (in the grid) — both with carry.
-        // The threshold tracks the *action*, not the axis: switching bands (VERTICAL on the band list)
-        // uses the coarser context-step so it can be made deliberate independently; all item movement —
-        // horizontal in the grid and vertical between grid rows — uses the finer item-step. So raising
-        // the context-step slows band switching without touching item movement.
-        stepAccumulator += (c.x - lastCentroid.x)
-        stepAccumulatorY += (c.y - lastCentroid.y)
+        // Active: navigation is ANCHORED-POSITIONAL (change `positional-navigation`). The offset of the
+        // centroid from the anchored center (footprint-scaled) is classified per axis into one discrete
+        // step on each out-and-back across the outer threshold, plus a held-zone sign while an offset is
+        // held (the controller turns that into eased auto-repeat). The threshold tracks the *action*:
+        // band switching (VERTICAL on the band list) uses the coarser context outer-threshold so it stays
+        // deliberate; all item movement uses the finer item outer-threshold.
         lastCentroid = c
-
-        let itemStep = CGFloat(max(settings.launcherStepDistance, 0.005))
         let onBandList = delegate?.launcherFocusIsOnBandList() ?? false
-        let horizStep = itemStep
-        let vertStep = onBandList ? CGFloat(max(settings.launcherContextStepDistance, 0.02)) : itemStep
-        while stepAccumulator >= horizStep { stepAccumulator -= horizStep; emitItemStep(forward: true) }
-        while stepAccumulator <= -horizStep { stepAccumulator += horizStep; emitItemStep(forward: false) }
+        let itemStep = CGFloat(max(settings.launcherStepDistance, 0.02))
+        let bandStep = CGFloat(max(settings.launcherContextStepDistance, 0.02))
+        // The padding box radius (how far you can step before the margin accelerates). Floor it above the
+        // step so the box always holds at least one step.
+        let radius = CGFloat(max(settings.positionalPaddingRadius, max(itemStep, bandStep) + 0.05))
+        launcherNav.x.step = itemStep; launcherNav.x.radius = radius
+        launcherNav.y.step = onBandList ? bandStep : itemStep; launcherNav.y.radius = radius
 
-        while stepAccumulatorY >= vertStep { stepAccumulatorY -= vertStep; emitContextStep(up: true) }
-        while stepAccumulatorY <= -vertStep { stepAccumulatorY += vertStep; emitContextStep(up: false) }
-
-        updateEdges(c)
+        let out = launcherNav.feed(centroid: c)
+        // Position-tracking can move several steps in one frame (a fast sweep) — emit the whole delta.
+        if out.stepX != 0 { for _ in 0..<abs(out.stepX) { emitItemStep(forward: out.stepX > 0) } }
+        if out.stepY != 0 { for _ in 0..<abs(out.stepY) { emitContextStep(up: out.stepY > 0) } }
+        updateHeldZones(dx: out.heldX, dy: out.heldY)
     }
 
-    /// Track whether the controlling contact is held at a trackpad edge on each axis (with hysteresis),
-    /// emitting `launcherEdgeChanged` only when the per-axis state changes. The controller decides what
-    /// to auto-repeat (and clamps when there's nowhere to go).
-    private func updateEdges(_ c: CGPoint) {
-        let dx = edgeAxis(c.x, current: edgeDX)
-        let dy = edgeAxis(c.y, current: edgeDY)
+    /// Emit the per-axis HELD-IN-ZONE sign (offset held beyond the outer threshold) when it changes, so
+    /// the controller drives eased auto-repeat off it. Repurposes `launcherEdgeChanged` from physical-edge
+    /// detection to positional held-zone (change `positional-navigation`, D3). Raw signs — the coordinator
+    /// applies the reverse-direction settings, exactly as it did for the old edge state.
+    private func updateHeldZones(dx: Int, dy: Int) {
         guard dx != edgeDX || dy != edgeDY else { return }
         edgeDX = dx; edgeDY = dy
         delegate?.launcherEdgeChanged(dx: dx, dy: dy)
-    }
-
-    /// Per-axis edge direction with hysteresis: enter an edge at `edgeEnterZone`, leave it only past
-    /// `edgeExitZone`, so jitter at the boundary doesn't flap. `+1` = high edge, `-1` = low edge.
-    private func edgeAxis(_ v: CGFloat, current: Int) -> Int {
-        if current > 0 { return v >= 1 - edgeExitZone ? 1 : (v <= edgeEnterZone ? -1 : 0) }
-        if current < 0 { return v <= edgeExitZone ? -1 : (v >= 1 - edgeEnterZone ? 1 : 0) }
-        if v >= 1 - edgeEnterZone { return 1 }
-        if v <= edgeEnterZone { return -1 }
-        return 0
     }
 
     private func clearEdges() {
@@ -551,5 +704,305 @@ final class GestureRecognizer {
         axis = .undetermined
         activated = false
         if wasActivated { delegate?.launcherDidCancel() }
+    }
+
+    // MARK: - Files drill (sustained modal sub-state; bypasses the latch while the navigator is open)
+
+    /// Re-seed a fresh drill session. Called when the controller ENTERS the sub-state (the `didSet`
+    /// false→true edge); the next contact re-baselines the origin. A truly one-shot resolution means
+    /// `drillResolved` survives a lift WITHIN a session and only clears here, on the next entry.
+    private func resetDrill() {
+        drillStarted = false
+        drillResolved = false
+        pendingOpenWith = false
+        drillContacts = 0
+        belowTargetFrames = 0
+        drillAccumX = 0
+        drillAccumY = 0
+        clearEdges()   // no held auto-repeat carried into a fresh drill session
+    }
+
+    /// Re-arm the SAME drill session for a fresh resolution **without** toggling `filesDrillActive`. After
+    /// the +1-finger lift resolved the drill (`filesOpenWith`, one-shot — `drillResolved` latched), the
+    /// Open-With picker opens and needs fresh gesture input to scrub it: this clears the one-shot resolution
+    /// latch and re-seeds the drill scalars (exactly as a fresh entry would) so the next contact re-baselines
+    /// and navigation resumes. It is NOT a re-entry — `filesDrillActive` stays true throughout — so the
+    /// controller drives it explicitly right after entering the picker (mirroring how a re-entry would seed,
+    /// but in place). The lift that opens the picker has already raised the fingers, so seeding from scratch
+    /// here is correct: the picker is scrubbed by a brand-new gesture.
+    func rearmDrill() {
+        resetDrill()
+    }
+
+    /// Sustained drill tracking (see `filesDrillActive`). Unlike the one-shot canvas tracker this lives
+    /// for the whole session while ≥2 contacts remain, emitting many depth/highlight steps. The origin is
+    /// re-baselined (and carry cleared) on EVERY contact-count change so a leaving/landing finger emits no
+    /// phantom step. Navigation (depth/highlight) happens at the relaxed posture (≤3 contacts); a FULL
+    /// four-finger contact is the resolution-arming posture — a deliberate horizontal swipe-away there is a
+    /// discard, a plain lift is an open (Open-With if a relative +1 finger was added). The resolving lift
+    /// (count below two, with the standard below-target debounce) is a ONE-SHOT resolution; a stray re-lift
+    /// after that emits nothing.
+    private func trackFilesDrill(_ frame: TouchFrame) {
+        let count = frame.fingerCount
+
+        if count >= 2 {
+            belowTargetFrames = 0
+            if !drillStarted {
+                drillStarted = true
+                drillContacts = count
+                drillStart = frame.centroid       // baseline for the 4-finger discard swipe
+                drillLast = frame.centroid
+                configureFilesNav()
+                filesNav.reanchor(center: frame.centroid, spread: frame.footprintSpread)
+                return
+            }
+            // A contact-count change shifts the centroid as fingers leave or land. Re-anchor the positional
+            // center so the jump emits no step (and stop any held auto-repeat across the re-baseline); a
+            // count rising ABOVE the relaxed baseline is the relative +1 Open-With morph (latched for the
+            // lift). The baseline then follows the count. While resolved, the whole session is inert.
+            if count != drillContacts {
+                if count > drillContacts && !drillResolved { pendingOpenWith = true }
+                drillContacts = count
+                drillStart = frame.centroid
+                drillLast = frame.centroid
+                filesNav.reanchor(center: frame.centroid, spread: frame.footprintSpread)
+                clearEdges()
+                return
+            }
+            guard !drillResolved else { return }
+            updateFilesDrill(frame)
+        } else {
+            // Below two contacts ("lift"): a real lift reports 0 immediately; an edge flicker dips to 1 for
+            // a frame or two. Resolve on a true lift or a sustained drop (the same debounce as the launcher).
+            belowTargetFrames += 1
+            if count == 0 || belowTargetFrames >= 2 {
+                resolveFilesDrillLift()
+            }
+        }
+    }
+
+    private func updateFilesDrill(_ frame: TouchFrame) {
+        let c = frame.centroid
+
+        // A full four-finger contact is the resolution-arming posture (the +1 morph past the navigation
+        // postures). It does NOT navigate — instead a fresh deliberate horizontal swipe-away past the
+        // activation threshold is a one-shot DISCARD (mirroring the canvas-resolution swipe). A plain lift
+        // from here resolves Open-With (the +1 latch). Measuring from the re-baselined `drillStart` (set
+        // when the 4th finger landed) means a small depth-sized nudge won't trip it; a deliberate sweep will.
+        if drillContacts >= 4 {
+            let dx = c.x - drillStart.x
+            let dy = c.y - drillStart.y
+            let threshold = CGFloat(settings.launcherActivationThreshold)
+            let ratio = CGFloat(settings.axisLockRatio)
+            if abs(dx) >= threshold && abs(dx) >= ratio * abs(dy) {
+                drillResolved = true
+                delegate?.filesDiscard()
+            }
+            drillLast = c
+            return
+        }
+
+        // Relaxed navigation posture (≥2, ≤3 contacts): ANCHORED-POSITIONAL (change `positional-navigation`),
+        // matching the launcher. HIGHLIGHT (vertical) position-tracks the finger inside the padding box and
+        // accelerates at the margin (box edge / trackpad edge band), with pull-back-recenter. DEPTH
+        // (horizontal) stays a DELIBERATE out-and-back — one folder descend/ascend per swipe, never
+        // auto-drilling (it's a stack push/pop, not a cursor).
+        drillLast = c
+        let inner = CGFloat(max(settings.positionalInnerDeadzone, 0.01))
+        let depthOuter = CGFloat(max(settings.launcherStepDistance, inner + 0.02))
+        filesNav.x.inner = inner; filesNav.x.outer = depthOuter          // depth: out-and-back thresholds
+        let highlightStep = CGFloat(max(settings.launcherStepDistance, 0.02))
+        let radius = CGFloat(max(settings.positionalPaddingRadius, highlightStep + 0.05))
+        filesNav.y.step = highlightStep; filesNav.y.radius = radius      // highlight: position-tracking box
+
+        let out = filesNav.feed(centroid: c)
+        // Depth: one step per out-and-back (stepX is ±1). Highlight: position-tracking can move several
+        // rows in one frame — emit the whole delta.
+        if out.stepX != 0 { emitDrillDepth(forward: out.stepX > 0) }
+        if out.stepY != 0 { for _ in 0..<abs(out.stepY) { emitDrillHighlight(up: out.stepY > 0) } }
+        // Vertical highlight auto-repeats while held; horizontal depth never auto-repeats (held dx = 0).
+        updateHeldZones(dx: 0, dy: out.heldY)
+    }
+
+    /// Rebuild the Files-drill positional navigator from current settings (called when a fresh drill
+    /// session seeds), so a tunable change applies on the next drill. Anchored separately by the caller.
+    ///
+    /// Matches the launcher's model on the HIGHLIGHT axis (vertical = position-tracking + margin accel +
+    /// pull-back-recenter), while keeping DEPTH (horizontal = descend/ascend) a DELIBERATE out-and-back —
+    /// depth is a folder-stack push/pop, not a cursor, so it must step one level at a time and never
+    /// auto-drill (CLAUDE.md landmine). Per-axis params are set per-feed.
+    private func configureFilesNav() {
+        filesNav = PositionalNavigator(
+            footprintFactor: CGFloat(settings.positionalFootprintFactor),
+            fallbackScale: CGFloat(settings.positionalFallbackScale),
+            x: AxisZone(mode: .outAndBack),       // depth: deliberate, one folder per swipe
+            y: AxisZone(mode: .positionTracking)) // highlight: tracks the finger like the launcher
+        filesNav.edgeMargin = CGFloat(settings.positionalEdgeMargin)
+        filesNav.reArmBackoff = CGFloat(settings.positionalReArmBackoff)
+    }
+
+    /// The resolving lift: a one-shot Open-With (if a relative +1 finger was added) or plain Open. A lift
+    /// after the session already resolved (e.g. a stray re-lift, or a four-finger discard) emits nothing.
+    private func resolveFilesDrillLift() {
+        clearEdges()   // the lift stops any held highlight auto-repeat
+        guard !drillResolved else {
+            drillStarted = false
+            return
+        }
+        // Only resolve a session that actually started (a sub-threshold flicker before any contact does
+        // nothing); seeding requires a real ≥2-finger contact.
+        if drillStarted {
+            drillResolved = true
+            if pendingOpenWith {
+                delegate?.filesOpenWith()
+            } else {
+                delegate?.filesOpen()
+            }
+        }
+        drillStarted = false
+    }
+
+    private func emitDrillDepth(forward: Bool) {
+        var dir = forward ? 1 : -1
+        if settings.reverseDirection { dir = -dir }
+        delegate?.filesDepth(dir)
+    }
+
+    private func emitDrillHighlight(up: Bool) {
+        var dir = up ? 1 : -1
+        if settings.reverseVerticalDirection { dir = -dir }
+        delegate?.filesHighlight(dir)
+    }
+
+    // MARK: - Player (sustained modal sub-state; bypasses the latch while the player is open)
+
+    /// Seed a fresh player session. Called when the controller ENTERS the sub-state (the `didSet` false→
+    /// true edge); the next contact baselines the origin. Unlike the Files drill the player is PERSISTENT
+    /// — a lift ends one scrub but stays in the player — so there is no session-wide one-shot "resolved".
+    private func resetPlayer() {
+        playerStarted = false
+        playerMenuOpen = false
+        playerContacts = 0
+        playerMoved = false
+        belowTargetFrames = 0
+        clearPlayerHeldZones()
+    }
+
+    /// Sustained player tracking (see `playerActive`). Navigation (seek/volume) happens at the relaxed
+    /// posture; a relative +1 finger raises the action menu; a four-finger gesture dismisses; a lift with
+    /// no movement is a play/pause tap (or, while the menu is open, selects the highlighted row). The origin
+    /// is re-anchored on every contact-count change so a leaving/landing finger emits no phantom step.
+    private func trackPlayer(_ frame: TouchFrame) {
+        let count = frame.fingerCount
+
+        if count >= 2 {
+            belowTargetFrames = 0
+            if !playerStarted {
+                playerStarted = true
+                playerContacts = count
+                playerMoved = false
+                playerSeedCentroid = frame.centroid
+                configurePlayerNav()
+                playerNav.reanchor(center: frame.centroid, spread: frame.footprintSpread)
+                return
+            }
+            if count != playerContacts {
+                // A rising count is an intent (menu / dismiss); a falling count is just a relax. Detect the
+                // intent BEFORE re-baselining (mirrors the Files +1 Open-With latch), then re-anchor the
+                // positional center so the centroid jump from the changed contacts emits no phantom step.
+                if count > playerContacts {
+                    if count >= 4 || count >= playerContacts + 2 {
+                        delegate?.playerDismiss()
+                    } else {
+                        delegate?.playerActionMenu()
+                    }
+                }
+                playerContacts = count
+                playerSeedCentroid = frame.centroid
+                playerNav.reanchor(center: frame.centroid, spread: frame.footprintSpread)
+                clearPlayerHeldZones()
+                return
+            }
+            updatePlayer(frame)
+        } else {
+            // Below two contacts ("lift"): same below-target debounce as the launcher/files. A lift ends the
+            // scrub but stays in the player; if nothing moved it's a tap (toggle), or selects an open menu.
+            belowTargetFrames += 1
+            if count == 0 || belowTargetFrames >= 2 {
+                resolvePlayerLift()
+            }
+        }
+    }
+
+    private func updatePlayer(_ frame: TouchFrame) {
+        let c = frame.centroid
+        // Tap-vs-scrub: any travel past the axis-detect threshold marks this contact a scrub (so the lift
+        // is not a play/pause tap). A true tap barely moves.
+        if abs(c.x - playerSeedCentroid.x) >= axisDetectThreshold ||
+           abs(c.y - playerSeedCentroid.y) >= axisDetectThreshold {
+            playerMoved = true
+        }
+
+        let inner = CGFloat(max(settings.positionalInnerDeadzone, 0.01))
+        let outer = CGFloat(max(settings.launcherStepDistance, inner + 0.02))
+        playerNav.x.inner = inner; playerNav.x.outer = outer
+        playerNav.y.inner = inner; playerNav.y.outer = outer
+
+        let out = playerNav.feed(centroid: c)
+        if out.stepX != 0 { emitPlayerSeek(forward: out.stepX > 0) }
+        if out.stepY != 0 { emitPlayerVolume(up: out.stepY > 0) }
+        // BOTH axes auto-repeat (seek + volume), unlike the depth/pin surfaces.
+        updatePlayerHeldZones(dx: out.heldX, dy: out.heldY)
+    }
+
+    /// A resolving lift in the player. While the action menu is open, it SELECTS the highlighted row;
+    /// otherwise a no-movement contact is a play/pause TAP (a scrub-end is a no-op — the player persists).
+    /// Resets `playerStarted` so the next contact seeds a fresh scrub session.
+    private func resolvePlayerLift() {
+        clearPlayerHeldZones()
+        if playerStarted {
+            if playerMenuOpen {
+                delegate?.playerSelectMenuItem()
+            } else if !playerMoved {
+                delegate?.playerTogglePlayPause()
+            }
+        }
+        playerStarted = false
+        playerMoved = false
+    }
+
+    /// Rebuild the player positional navigator from current settings (called when a fresh session seeds),
+    /// so a tunable change applies on the next session. Anchored separately by the caller.
+    private func configurePlayerNav() {
+        playerNav = PositionalNavigator(
+            footprintFactor: CGFloat(settings.positionalFootprintFactor),
+            fallbackScale: CGFloat(settings.positionalFallbackScale),
+            inner: CGFloat(settings.positionalInnerDeadzone),
+            outer: CGFloat(settings.launcherStepDistance))
+        playerNav.reArmBackoff = CGFloat(settings.positionalReArmBackoff)
+    }
+
+    private func updatePlayerHeldZones(dx: Int, dy: Int) {
+        guard dx != playerEdgeDX || dy != playerEdgeDY else { return }
+        playerEdgeDX = dx; playerEdgeDY = dy
+        delegate?.playerHeldZoneChanged(dx: dx, dy: dy)
+    }
+
+    private func clearPlayerHeldZones() {
+        guard playerEdgeDX != 0 || playerEdgeDY != 0 else { return }
+        playerEdgeDX = 0; playerEdgeDY = 0
+        delegate?.playerHeldZoneChanged(dx: 0, dy: 0)
+    }
+
+    private func emitPlayerSeek(forward: Bool) {
+        var dir = forward ? 1 : -1
+        if settings.reverseDirection { dir = -dir }
+        delegate?.playerSeek(dir)
+    }
+
+    private func emitPlayerVolume(up: Bool) {
+        var dir = up ? 1 : -1
+        if settings.reverseVerticalDirection { dir = -dir }
+        delegate?.playerVolume(dir)
     }
 }

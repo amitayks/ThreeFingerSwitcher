@@ -103,3 +103,101 @@ enum ClipboardBandLayout {
     static let tabsHeight = LauncherGridLayout.tabsHeight
     static let padding = LauncherGridLayout.containerPadding
 }
+
+/// Metrics for the Files band's bounded column-navigator (design D6): a thin **ancestor icon rail**,
+/// the **current list** column, one **preview** pane, and a full-width **breadcrumb bar** at the bottom.
+/// Both `FilesBandView` (which lays the regions out) and the panel sizer in `LauncherOverlayController`
+/// read THIS one enum, so the rendered surface and the `NSWindow` frame can never drift (the same
+/// contract `ClipboardBandLayout` gives the Clipboard band).
+///
+/// **Fixed container (refinement 3).** The container is the EXACT size of the Clipboard band's container
+/// (`ClipboardBandLayout.containerWidth` × `containerHeight`) — a constant, with **no per-depth and no
+/// per-density variation**. Crossing into the band or changing depth never resizes or moves the panel on
+/// screen; instead the current-folder list **scrolls** (a `ScrollViewReader`, driven by the vertical
+/// edge-auto-repeat) when it is taller than the fixed row area. The three columns lay out *within* that
+/// fixed width — the rail and current list are fixed widths, and the preview FILLS the remainder (the same
+/// fixed-key-column-then-fill split `ClipboardBandLayout` uses), so they always sum to `containerWidth`.
+enum FilesBandLayout {
+    /// Width of the collapsed ancestor **icon rail** on the left — just wide enough for one tile +
+    /// breathing room (the Hub-sidebar / launcher-band-strip idiom, narrowed because it only holds the
+    /// path's folder icons, never labels). Zero ancestors (the roots list) still reserves it so the
+    /// current column doesn't jump sideways on the first descend.
+    static let ancestorRailWidth: CGFloat = 56
+    /// Fixed tile size for an ancestor rail icon (the rail's glyphs are leaf icons, so they are NOT
+    /// bubble-morphed; the rail itself can be).
+    static let ancestorIconSize: CGFloat = 30
+    /// Vertical gap between ancestor rail icons.
+    static let ancestorRowSpacing: CGFloat = 10
+
+    /// Width of the **current list** column inside the FIXED container — seeded from
+    /// `AppSettings.Defaults.filesColumnWidth` (~260pt). Within the fixed Clipboard-sized launcher container
+    /// this is a CONSTANT (the preview fills the remainder); the per-user `AppSettings.filesColumnWidth`
+    /// "live column width" tuning is the *panel-width* variant that refinement 3 drops — so the in-launcher
+    /// navigator uses THIS constant, not the live setting, keeping the three-pane split summing to
+    /// `containerWidth` exactly at any column setting.
+    static let currentColumnWidth: CGFloat = CGFloat(AppSettings.Defaults.filesColumnWidth)
+
+    /// Width of the **preview** pane on the right (file QuickLook / folder-contents peek): the remainder of
+    /// the fixed container after the rail, the current list, the two dividers, and the outer padding — the
+    /// same fixed-column-then-fill split `ClipboardBandLayout` gives its value preview. Wider than the
+    /// current column (the container is the roomy Clipboard width), so a document preview reads comfortably.
+    /// Computed from the constants, so rail + current + preview + dividers + padding == `containerWidth`.
+    static var previewWidth: CGFloat {
+        containerWidth - ancestorRailWidth - currentColumnWidth - 2 * dividerWidth - 2 * padding
+    }
+
+    /// Internal padding around the whole navigator (shared with the grid/clipboard container padding so
+    /// the three band surfaces frame identically).
+    static let padding = LauncherGridLayout.containerPadding
+    /// Width consumed by each `Divider()` between the three regions (rail | current | preview).
+    static let dividerWidth: CGFloat = 1
+
+    /// Height of the top type-to-filter **search field** row (its content + vertical padding) inside the
+    /// current list. Subtracted (with the breadcrumb bar) from `containerHeight` to leave the scrollable
+    /// row area, so the view knows how tall the scroll region is.
+    static let searchFieldHeight: CGFloat = 34
+
+    /// Height of the full-width **breadcrumb bar** pinned at the BOTTOM, spanning all three columns
+    /// (refinement 4): it shows the path to the currently-highlighted item and updates live as the highlight
+    /// moves. A fixed strip subtracted from `containerHeight` so it never eats the scroll area.
+    static let breadcrumbBarHeight: CGFloat = 30
+
+    /// Per-row height for the current list at the given density. The concrete point metrics for each
+    /// `FilesDensity` case live here (the enum's doc-comment defers them to "the view layer"): a tight
+    /// pack, a default, and a roomier row.
+    static func rowHeight(for density: FilesDensity) -> CGFloat {
+        switch density {
+        case .compact:     return 32
+        case .comfortable: return 40
+        case .spacious:    return 48
+        }
+    }
+
+    /// The container width — the **exact** Clipboard container width (refinement 3): a fixed constant, with
+    /// no per-depth and no per-column variation, so crossing in / changing depth never resizes or moves the
+    /// panel. The interior split (rail + current list + preview + dividers + padding) sums to exactly this.
+    static var containerWidth: CGFloat { ClipboardBandLayout.containerWidth }
+
+    /// The container height — the **exact** Clipboard container height (refinement 3): a fixed constant, with
+    /// no per-density variation. A folder taller than the fixed `rowAreaHeight` scrolls inside; the frame
+    /// never grows for it.
+    static var containerHeight: CGFloat { ClipboardBandLayout.containerHeight }
+
+    /// Height of the **scrollable current-folder row area** (refinement 3): the fixed container height minus
+    /// the top search field, the bottom breadcrumb bar, and the outer top/bottom padding — so the view knows
+    /// how tall the scroll region is. The view scrolls the current list within this region (a
+    /// `ScrollViewReader` following the highlight) when the folder has more rows than fit; the container
+    /// itself stays the fixed `containerHeight`. Density-independent (it's container minus chrome); the number
+    /// of rows that fit is `floor(rowAreaHeight / rowHeight(for: density))`, so density changes only how many
+    /// rows show before it scrolls, never the container.
+    static var rowAreaHeight: CGFloat {
+        containerHeight - searchFieldHeight - breadcrumbBarHeight - 2 * padding
+    }
+
+    /// How many current-list rows fit the fixed `rowAreaHeight` at `density` before the list must scroll —
+    /// `floor(rowAreaHeight / rowHeight)`, at least one. The view uses this to decide when to begin scrolling
+    /// the list to keep the highlighted row visible (refinement 3).
+    static func visibleRowCount(for density: FilesDensity) -> Int {
+        max(1, Int(rowAreaHeight / rowHeight(for: density)))
+    }
+}

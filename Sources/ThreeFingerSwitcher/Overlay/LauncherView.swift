@@ -41,9 +41,12 @@ struct LauncherView: View {
                     if model.bandCount > 1 {
                         bandList
                     }
-                    // The right pane: the Clipboard band's master-detail, else the icon grid.
+                    // The right pane, in band-priority order: the Clipboard band's master-detail, then
+                    // the Files band's column navigator, else the icon grid (the default fallback).
                     if model.currentBandIsClipboard {
                         ClipboardBandView(model: model)
+                    } else if model.currentBandIsFiles {
+                        FilesBandView(model: model)
                     } else {
                         grid
                     }

@@ -192,4 +192,42 @@ final class LauncherModelTests: XCTestCase {
         XCTAssertEqual(LauncherGridLayout.windowHeight(itemCount: 3, bandCount: 1),
                        LauncherGridLayout.windowHeight(itemCount: 3), "default matches the no-list case")
     }
+
+    // MARK: - Files band layout = the Clipboard container's EXACT dimensions (refinement 3)
+
+    func testFilesBandContainerEqualsClipboardDimensionsExactly() {
+        // The Files navigator's container is a FIXED size equal to the Clipboard band's — so it never
+        // resizes or moves when crossing in or changing depth (the list scrolls inside instead).
+        XCTAssertEqual(FilesBandLayout.containerWidth, ClipboardBandLayout.containerWidth,
+                       "the Files container width is the Clipboard width, exactly")
+        XCTAssertEqual(FilesBandLayout.containerHeight, ClipboardBandLayout.containerHeight,
+                       "the Files container height is the Clipboard height, exactly")
+    }
+
+    func testFilesBandInteriorPanesSumToTheFixedContainerWidth() {
+        // rail + current list + preview + the two dividers + the outer padding == the fixed container width,
+        // so the three panes lay out WITHIN the fixed width with no overflow and no dead space.
+        let sum = FilesBandLayout.ancestorRailWidth
+            + FilesBandLayout.currentColumnWidth
+            + FilesBandLayout.previewWidth
+            + 2 * FilesBandLayout.dividerWidth
+            + 2 * FilesBandLayout.padding
+        XCTAssertEqual(sum, FilesBandLayout.containerWidth, accuracy: 0.01,
+                       "the three-pane split fills the fixed container exactly")
+        XCTAssertGreaterThan(FilesBandLayout.previewWidth, FilesBandLayout.currentColumnWidth,
+                             "the preview fills the roomy remainder — wider than the current list")
+    }
+
+    func testFilesBandRowAreaIsContainerMinusChrome() {
+        // The scrollable row area is the fixed container height minus the search field, the breadcrumb bar,
+        // and the outer padding — and a denser row fits MORE rows in that same fixed area (the container
+        // never grows for density; only how many rows show before it scrolls changes).
+        XCTAssertEqual(FilesBandLayout.rowAreaHeight,
+                       FilesBandLayout.containerHeight - FilesBandLayout.searchFieldHeight
+                        - FilesBandLayout.breadcrumbBarHeight - 2 * FilesBandLayout.padding,
+                       accuracy: 0.01)
+        XCTAssertGreaterThan(FilesBandLayout.visibleRowCount(for: .compact),
+                             FilesBandLayout.visibleRowCount(for: .spacious),
+                             "a tighter row packs more rows into the same fixed row area")
+    }
 }

@@ -70,6 +70,11 @@ final class LaunchService {
             firePreset(item, inBand: band)
         case .clipboardEntry(let entry):
             pasteEntry(entry)
+        case .fileEntry:
+            // No-op: the synthetic Files band resolves a chosen entry through its OWN drill-down /
+            // open path (folders descend in place; files open via `FileOpenService`), not the generic
+            // fire — so a `.fileEntry` item never lands here in practice, and firing one is harmless.
+            break
         case .aiCommand(let command):
             // Hand off to the executor (which streams into the overlay's preview canvas). Unlike every
             // other kind, this does NOT complete or dismiss on the lift — a fresh four-finger DOWN swipe

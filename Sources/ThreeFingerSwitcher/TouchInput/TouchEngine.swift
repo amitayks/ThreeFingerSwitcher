@@ -35,6 +35,62 @@ struct TouchFrame {
         self.centroidVelocity = velocity
         self.time = time
     }
+
+    /// Test-only convenience: build a frame from explicit normalized contact positions, so the
+    /// positional model's footprint scaling can be exercised without fabricating `OMSTouchData`.
+    /// The centroid is the mean of the points; `footprintSpread` is derived from them.
+    init(testContactPoints points: [CGPoint], velocity: CGVector = .zero, time: CFTimeInterval = 0) {
+        self.contacts = []
+        self.testPoints = points
+        self.fingerCount = points.count
+        if points.isEmpty {
+            self.centroid = .zero
+        } else {
+            let n = CGFloat(points.count)
+            self.centroid = CGPoint(x: points.map(\.x).reduce(0, +) / n,
+                                    y: points.map(\.y).reduce(0, +) / n)
+        }
+        self.centroidVelocity = velocity
+        self.time = time
+    }
+
+    /// Test-only contact positions (set by `init(testContactPoints:)`); empty in real frames, which
+    /// carry their per-contact positions in `contacts`. Lets `footprintSpread` work in both worlds.
+    private var testPoints: [CGPoint] = []
+
+    /// The per-contact normalized positions (0..1, OMS coords with y increasing upward), for drawing the
+    /// fingertips in the Hub's live trackpad preview without importing the multitouch package. Empty for a
+    /// count-only test frame; reads the injected points for an `init(testContactPoints:)` frame.
+    var normalizedContactPoints: [CGPoint] {
+        if !contacts.isEmpty {
+            return contacts.map { CGPoint(x: CGFloat($0.position.x), y: CGFloat($0.position.y)) }
+        }
+        return testPoints
+    }
+
+    /// The fingers' landing **footprint** — the mean distance of the contacts from the centroid, in
+    /// normalized trackpad units — or `nil` when no per-contact positions are available (e.g. a
+    /// `TouchFrame(testFingerCount:)` frame, which carries only a count + centroid). The anchored
+    /// positional model scales deflection by this so the same physical nudge means the same thing
+    /// regardless of where (or how splayed) the hand landed; callers apply a fixed fallback when it is
+    /// `nil` or near-zero (a single/degenerate contact). Real frames read `contacts[].position`;
+    /// `init(testContactPoints:)` frames read the injected points.
+    var footprintSpread: CGFloat? {
+        let points: [CGPoint]
+        if !contacts.isEmpty {
+            points = contacts.map { CGPoint(x: CGFloat($0.position.x), y: CGFloat($0.position.y)) }
+        } else if !testPoints.isEmpty {
+            points = testPoints
+        } else {
+            return nil
+        }
+        guard points.count > 1 else { return 0 }   // a single contact has no spread → caller's fallback
+        let c = centroid
+        let total = points.reduce(CGFloat(0)) { acc, p in
+            acc + hypot(p.x - c.x, p.y - c.y)
+        }
+        return total / CGFloat(points.count)
+    }
 }
 
 /// Wraps OpenMultitouchSupport: starts/stops the passive read and forwards processed

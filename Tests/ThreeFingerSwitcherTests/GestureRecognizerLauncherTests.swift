@@ -57,17 +57,32 @@ private final class LauncherMockDelegate: GestureRecognizerDelegate {
 @MainActor
 final class GestureRecognizerLauncherTests: XCTestCase {
 
+    // Positional navigation (change `positional-navigation`): the launcher is now **position-tracking**
+    // inside a **padding box** — the selection index follows the finger's offset (`round(offset/step)`,
+    // both directions, center locked) until the offset leaves the box (`|offset| ≥ paddingRadius`) or the
+    // centroid enters the fixed **edge-margin band**, where it accelerates (held sign). Test frames carry
+    // no footprint, so the offset uses `positionalFallbackScale` — with fallbackScale 0.1, offset =
+    // travel / 0.1. With itemStep 0.5 → one item step per 0.05 of travel; paddingRadius 2.0 → the box edge
+    // is at 0.20 of travel; bandStep 1.0 → one band step per 0.10 of travel.
     private func makeSettings(
         launcherActivationThreshold: Double = 0.045,
-        launcherStepDistance: Double = 0.05,
-        launcherContextStepDistance: Double = 0.10,
+        itemStep: Double = 0.5,
+        bandStep: Double = 1.0,
+        paddingRadius: Double = 2.0,
+        edgeMargin: Double = 0.10,
+        fallbackScale: Double = 0.1,
+        reArmBackoff: Double = 0.0,
         requireExactlyThree: Bool = true
     ) -> AppSettings {
         let defaults = UserDefaults(suiteName: "ThreeFingerSwitcherTests.\(UUID().uuidString)")!
         let settings = AppSettings(defaults: defaults)
         settings.launcherActivationThreshold = launcherActivationThreshold
-        settings.launcherStepDistance = launcherStepDistance
-        settings.launcherContextStepDistance = launcherContextStepDistance
+        settings.launcherStepDistance = itemStep              // item position-step (offset per step)
+        settings.launcherContextStepDistance = bandStep       // band position-step (coarser)
+        settings.positionalPaddingRadius = paddingRadius      // box half-size → margin beyond it
+        settings.positionalEdgeMargin = edgeMargin            // fixed border band (accelerate)
+        settings.positionalFallbackScale = fallbackScale      // no footprint in test frames → fallback
+        settings.positionalReArmBackoff = reArmBackoff        // off by default so stepping tests are clean
         settings.activationThreshold = 0.045
         settings.stepDistance = 0.05
         settings.requireExactlyThree = requireExactlyThree
@@ -105,100 +120,127 @@ final class GestureRecognizerLauncherTests: XCTestCase {
         XCTAssertTrue(d.events.isEmpty)
     }
 
-    func test_itemStepping_horizontalTravel() {
-        let (rec, d) = makeRecognizer(makeSettings(launcherStepDistance: 0.05), launcher: true)
+    func test_itemStepping_positionTracksFinger() {
+        // Position-tracking: the selection FOLLOWS the finger's offset in steps. Pushing to offset +1.5
+        // (3 item-steps) emits 3 steps at once; holding there emits no more (index already matches).
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
         feed(rec, x: 0.10, y: 0.50, fingers: 4)   // begin
-        feed(rec, x: 0.16, y: 0.50, fingers: 4)   // activate (lastCentroid x=0.16)
-        feed(rec, x: 0.311, y: 0.50, fingers: 4)  // +0.151 → 3 item steps
+        feed(rec, x: 0.16, y: 0.50, fingers: 4)   // activate → anchor (0.16, 0.50)
+        feed(rec, x: 0.31, y: 0.50, fingers: 4)   // offset x +1.5 → index 3 → +3 steps
+        XCTAssertEqual(d.lItems, [1, 1, 1], "the cursor tracks the finger's position in the box")
+        feed(rec, x: 0.31, y: 0.50, fingers: 4)   // unchanged position → no further steps
         XCTAssertEqual(d.lItems, [1, 1, 1])
     }
 
+    func test_itemStepping_movingBackStepsBack() {
+        // Moving back toward center steps the selection back (position-tracking is bidirectional).
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
+        feed(rec, x: 0.10, y: 0.50, fingers: 4)   // begin
+        feed(rec, x: 0.16, y: 0.50, fingers: 4)   // activate → anchor (0.16, 0.50)
+        feed(rec, x: 0.31, y: 0.50, fingers: 4)   // offset +1.5 → index 3 → +3
+        feed(rec, x: 0.16, y: 0.50, fingers: 4)   // back to center → index 0 → −3
+        XCTAssertEqual(d.lItems, [1, 1, 1, -1, -1, -1])
+    }
+
     func test_verticalStepping_inGrid_usesItemStep() {
-        // In the grid (NOT on the band list), vertical travel steps grid rows at the fine ITEM-step
-        // threshold — band switching is no longer the vertical axis here, so the coarser context/band
-        // threshold does not apply. (`onBandList` defaults to false → the grid case.)
-        let (rec, d) = makeRecognizer(makeSettings(launcherStepDistance: 0.05,
-                                                   launcherContextStepDistance: 0.10), launcher: true)
+        // In the grid (NOT the band list), vertical uses the fine item step: offset +0.6 → one row step.
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
         feed(rec, x: 0.20, y: 0.50, fingers: 4)   // begin
-        feed(rec, x: 0.26, y: 0.50, fingers: 4)   // activate
-        feed(rec, x: 0.26, y: 0.651, fingers: 4)  // dy +0.151 at the 0.05 item step → 3 vertical steps
-        XCTAssertEqual(d.lContexts, [1, 1, 1], "grid rows step at the item-step, not the band threshold")
+        feed(rec, x: 0.26, y: 0.50, fingers: 4)   // activate → anchor (0.26, 0.50)
+        feed(rec, x: 0.26, y: 0.56, fingers: 4)   // dy offset +0.6 → round(0.6/0.5)=1 → one row step
+        XCTAssertEqual(d.lContexts, [1], "grid rows step at the item step")
         XCTAssertTrue(d.lItems.isEmpty, "pure vertical emits no horizontal steps")
     }
 
-    func test_bandSwitch_onBandList_usesBandThreshold_onVertical() {
-        // On the band list, VERTICAL travel switches bands at the coarser context/band step, so the same
-        // vertical travel yields fewer steps than the fine item-step — the band gate moved to the
-        // vertical axis. Band switching is reported via `launcherDidStepContext` (→ `lContexts`).
-        let (rec, d) = makeRecognizer(makeSettings(launcherStepDistance: 0.05,
-                                                   launcherContextStepDistance: 0.10), launcher: true)
+    func test_bandSwitch_onBandList_usesCoarserBandStep_onVertical() {
+        // On the band list, VERTICAL uses the coarser band step: an offset that would step a grid row
+        // (0.4 → item index 1) does NOT switch a band yet (0.4 → band index 0); it needs more offset.
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
         d.onBandList = true
         feed(rec, x: 0.20, y: 0.50, fingers: 4)   // begin
-        feed(rec, x: 0.26, y: 0.50, fingers: 4)   // activate (dx 0.06 ≥ 0.045)
-        feed(rec, x: 0.26, y: 0.701, fingers: 4)  // dy +0.201 at the 0.10 band step → 2 steps
-        XCTAssertEqual(d.lContexts, [1, 1], "band switching on the band list steps at the band threshold")
+        feed(rec, x: 0.26, y: 0.50, fingers: 4)   // activate → anchor (0.26, 0.50)
+        feed(rec, x: 0.26, y: 0.54, fingers: 4)   // dy offset +0.4 → band index round(0.4/1.0)=0 → none
+        XCTAssertTrue(d.lContexts.isEmpty, "below the band step: no band switch")
+        feed(rec, x: 0.26, y: 0.56, fingers: 4)   // dy offset +0.6 → band index 1 → one band switch
+        XCTAssertEqual(d.lContexts, [1], "band switching uses the coarser band step")
         XCTAssertTrue(d.lItems.isEmpty, "pure vertical emits no horizontal item steps")
-        // The same +0.201 vertical travel in the grid (item step 0.05) would be 4 steps — see the
-        // in-grid vertical-stepping test.
     }
 
     func test_horizontal_onBandList_usesItemStep() {
-        // On the band list, HORIZONTAL travel (crossing toward the grid / item movement) is always the
-        // fine item-step, never the coarse band gate — only the vertical axis carries the band gate.
-        let (rec, d) = makeRecognizer(makeSettings(launcherStepDistance: 0.05,
-                                                   launcherContextStepDistance: 0.10), launcher: true)
+        // On the band list, HORIZONTAL (crossing toward the grid) is always the fine item step.
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
         d.onBandList = true
         feed(rec, x: 0.10, y: 0.50, fingers: 4)   // begin
-        feed(rec, x: 0.16, y: 0.50, fingers: 4)   // activate
-        feed(rec, x: 0.311, y: 0.50, fingers: 4)  // dx +0.151 at the 0.05 item step → 3 item steps
-        XCTAssertEqual(d.lItems, [1, 1, 1], "horizontal is the fine item-step even on the band list")
+        feed(rec, x: 0.16, y: 0.50, fingers: 4)   // activate → anchor (0.16, 0.50)
+        feed(rec, x: 0.22, y: 0.50, fingers: 4)   // dx offset +0.6 → item index 1 → one item step
+        XCTAssertEqual(d.lItems, [1], "horizontal is the fine item step even on the band list")
         XCTAssertTrue(d.lContexts.isEmpty, "pure horizontal emits no vertical/band steps")
     }
 
-    // MARK: - Edge-hold for auto-repeat (2D)
+    // MARK: - Margin acceleration (held-in-zone, 2D)
+    //
+    // Leaving the padding box (`|offset| ≥ paddingRadius`, here offset 2.0 = 0.20 of travel) — or entering
+    // the edge band — accelerates: the recognizer reports a held sign via `launcherEdgeChanged` and the
+    // controller auto-repeats. Each test relaxes to two fingers FIRST (re-anchoring the center there) and
+    // only THEN pushes to the margin, so the re-anchor doesn't cancel the held signal.
 
-    func test_bottomEdge_holdsDown_thenReleasesOnLeave() {
+    func test_holdDown_thenReleasesOnReturnToBox() {
         let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
         feed(rec, x: 0.50, y: 0.50, fingers: 4)   // begin
         feed(rec, x: 0.56, y: 0.50, fingers: 4)   // activate
-        feed(rec, x: 0.56, y: 0.10, fingers: 2)   // centroid near the BOTTOM edge (y ≤ enter zone)
-        XCTAssertEqual(d.lastEdge.map { [$0.0, $0.1] }, [0, -1], "bottom edge: dy = −1, dx = 0")
-        feed(rec, x: 0.56, y: 0.50, fingers: 2)   // back to centre → no edge
+        feed(rec, x: 0.56, y: 0.50, fingers: 2)   // relax to two → re-anchor at (0.56, 0.50)
+        feed(rec, x: 0.56, y: 0.28, fingers: 2)   // hold DOWN: dy offset −2.2 ≥ box radius → held (0, −1)
+        XCTAssertEqual(d.lastEdge.map { [$0.0, $0.1] }, [0, -1], "held down: dy = −1, dx = 0")
+        feed(rec, x: 0.56, y: 0.50, fingers: 2)   // back into the box → released
         XCTAssertEqual(d.lastEdge.map { [$0.0, $0.1] }, [0, 0])
     }
 
-    func test_topEdge_holdsUp() {
+    func test_holdUp() {
         let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
         feed(rec, x: 0.50, y: 0.50, fingers: 4)
         feed(rec, x: 0.56, y: 0.50, fingers: 4)   // activate
-        feed(rec, x: 0.56, y: 0.90, fingers: 2)   // TOP edge (y ≥ 1 − enter zone)
-        XCTAssertEqual(d.lastEdge.map { [$0.0, $0.1] }, [0, 1], "top edge: dy = +1")
+        feed(rec, x: 0.56, y: 0.50, fingers: 2)   // relax → re-anchor
+        feed(rec, x: 0.56, y: 0.72, fingers: 2)   // hold UP: dy offset +2.2 ≥ radius → held (0, +1)
+        XCTAssertEqual(d.lastEdge.map { [$0.0, $0.1] }, [0, 1], "held up: dy = +1")
     }
 
-    func test_rightEdge_holdsRight() {
+    func test_holdRight() {
         let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
         feed(rec, x: 0.50, y: 0.50, fingers: 4)
         feed(rec, x: 0.56, y: 0.50, fingers: 4)   // activate
-        feed(rec, x: 0.90, y: 0.50, fingers: 2)   // RIGHT edge (x ≥ 1 − enter zone)
-        XCTAssertEqual(d.lastEdge.map { [$0.0, $0.1] }, [1, 0], "right edge: dx = +1")
+        feed(rec, x: 0.56, y: 0.50, fingers: 2)   // relax → re-anchor
+        feed(rec, x: 0.78, y: 0.50, fingers: 2)   // hold RIGHT: dx offset +2.2 ≥ radius → held (+1, 0)
+        XCTAssertEqual(d.lastEdge.map { [$0.0, $0.1] }, [1, 0], "held right: dx = +1")
     }
 
-    func test_corner_holdsBothAxes() {
+    func test_holdCorner_bothAxes() {
         let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
         feed(rec, x: 0.50, y: 0.50, fingers: 4)
         feed(rec, x: 0.56, y: 0.50, fingers: 4)   // activate
-        feed(rec, x: 0.08, y: 0.92, fingers: 2)   // bottom-left… x low (−1), y high (+1)
+        feed(rec, x: 0.56, y: 0.50, fingers: 2)   // relax → re-anchor at (0.56, 0.50)
+        feed(rec, x: 0.34, y: 0.72, fingers: 2)   // x offset −2.2, y offset +2.2 → held (−1, +1)
         XCTAssertEqual(d.lastEdge.map { [$0.0, $0.1] }, [-1, 1], "a corner reports both axes")
     }
 
-    func test_edge_isEmittedOnce_whileHeld() {
+    func test_edgeBand_acceleratesNearBorderInsideTheBox() {
+        // The fixed edge band accelerates even when the offset is still inside the box radius.
+        let (rec, d) = makeRecognizer(makeSettings(paddingRadius: 5.0), launcher: true)  // box won't trigger
+        feed(rec, x: 0.80, y: 0.50, fingers: 4)   // begin
+        feed(rec, x: 0.86, y: 0.50, fingers: 4)   // activate → anchor (0.86, 0.50)
+        feed(rec, x: 0.86, y: 0.50, fingers: 2)   // relax → re-anchor at (0.86, 0.50)
+        feed(rec, x: 0.92, y: 0.50, fingers: 2)   // offset +0.6 (in box) BUT centroid 0.92 ≥ 0.90 edge band
+        XCTAssertEqual(d.lastEdge.map { [$0.0, $0.1] }, [1, 0], "near the border → accelerate via the edge band")
+    }
+
+    func test_held_isEmittedOnce_whileHeld() {
         let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
         feed(rec, x: 0.50, y: 0.50, fingers: 4)
         feed(rec, x: 0.56, y: 0.50, fingers: 4)   // activate
-        feed(rec, x: 0.56, y: 0.10, fingers: 2)   // enter bottom edge → one emit
-        feed(rec, x: 0.56, y: 0.08, fingers: 2)   // still within exit zone → no re-emit
-        feed(rec, x: 0.56, y: 0.12, fingers: 2)   // still within exit zone → no re-emit
-        XCTAssertEqual(d.edges.count, 1, "edge state is emitted only when it changes")
+        feed(rec, x: 0.56, y: 0.50, fingers: 2)   // relax → re-anchor
+        feed(rec, x: 0.56, y: 0.28, fingers: 2)   // into the margin (down) → one emit
+        feed(rec, x: 0.56, y: 0.26, fingers: 2)   // further into the margin → no re-emit
+        feed(rec, x: 0.56, y: 0.29, fingers: 2)   // still in the margin → no re-emit (reArmBackoff off)
+        XCTAssertEqual(d.edges.count, 1, "held state is emitted only when it changes")
         XCTAssertEqual(d.edges.first.map { [$0.0, $0.1] }, [0, -1])
     }
 
@@ -284,18 +326,18 @@ final class GestureRecognizerLauncherTests: XCTestCase {
         XCTAssertEqual(d.lEndCount, 0)
     }
 
-    func test_centroidShiftOnCountChange_emitsNoStep_thenStepsAfterBaseline() {
-        // A leaving finger moves the centroid; without re-baselining that jump would fire spurious
-        // steps. Assert zero steps from the count change, then normal steps from later movement.
-        let (rec, d) = makeRecognizer(makeSettings(launcherStepDistance: 0.05,
-                                                   launcherContextStepDistance: 0.10), launcher: true)
+    func test_centroidShiftOnCountChange_emitsNoStep_thenStepsAfterReanchor() {
+        // A leaving finger moves the centroid; without re-anchoring that jump would read as a huge offset
+        // and fire spurious steps. Assert zero steps from the count change (the positional center
+        // re-anchors at the new posture), then a normal step from a push off the new center.
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
         feed(rec, x: 0.20, y: 0.50, fingers: 4)   // begin
-        feed(rec, x: 0.26, y: 0.50, fingers: 4)   // activate
-        feed(rec, x: 0.60, y: 0.80, fingers: 2)   // drop to two AND large centroid jump → no step
+        feed(rec, x: 0.26, y: 0.50, fingers: 4)   // activate → anchor (0.26, 0.50)
+        feed(rec, x: 0.60, y: 0.80, fingers: 2)   // drop to two AND large jump → re-anchor, no step
         XCTAssertTrue(d.lItems.isEmpty, "centroid jump from a finger leaving emits no item step")
         XCTAssertTrue(d.lContexts.isEmpty, "centroid jump from a finger leaving emits no context step")
-        feed(rec, x: 0.751, y: 0.80, fingers: 2)  // +0.151 from the new baseline → 3 item steps
-        XCTAssertEqual(d.lItems, [1, 1, 1])
+        feed(rec, x: 0.66, y: 0.80, fingers: 2)   // dx offset +0.6 from the NEW center → one item step
+        XCTAssertEqual(d.lItems, [1])
         XCTAssertTrue(d.lContexts.isEmpty)
     }
 
@@ -310,26 +352,30 @@ final class GestureRecognizerLauncherTests: XCTestCase {
         XCTAssertEqual(d.lCancelCount, 0)
     }
 
-    // MARK: - Canvas-resolution mode (a fresh four-finger swipe resolves the open AI canvas)
+    // MARK: - Canvas-resolution mode (a fresh TWO-finger swipe resolves the open AI canvas)
+    //
+    // Change `positional-navigation`, D5: the canvas resolves on two fingers (4 = open/dismiss the
+    // platform, 2 = act within it), and the resolve excursion threshold (0.12) sits ABOVE incidental
+    // scrolling so reading the canvas never resolves it.
 
     func test_canvasResolution_horizontal_emitsDiscard() {
-        // While the canvas is open a fresh four-finger HORIZONTAL swipe past the threshold resolves it
-        // as a discard: dx != 0, dy == 0. No launcher/switcher intents are emitted.
+        // While the canvas is open a fresh two-finger HORIZONTAL swipe past the resolve threshold resolves
+        // it as a discard: dx != 0, dy == 0. No launcher/switcher intents are emitted.
         let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
         rec.launcherCanvasResolutionActive = true
-        feed(rec, x: 0.50, y: 0.50, fingers: 4)   // fresh four-finger contact (canvas resolution begin)
-        feed(rec, x: 0.62, y: 0.50, fingers: 4)   // dx +0.12 (clearly horizontal) ≥ 0.045 → discard
+        feed(rec, x: 0.50, y: 0.50, fingers: 2)   // fresh two-finger contact (canvas resolution begin)
+        feed(rec, x: 0.64, y: 0.50, fingers: 2)   // dx +0.14 (clearly horizontal) ≥ 0.12 → discard
         XCTAssertEqual(d.canvasResolves.map { [$0.0, $0.1] }, [[1, 0]], "horizontal → discard (dx=+1)")
         XCTAssertEqual(d.lActivateCount, 0, "resolution mode never opens the launcher")
         XCTAssertFalse(d.didSwitcherActivate)
     }
 
     func test_canvasResolution_down_emitsApply() {
-        // A DOWN swipe (y decreases in OMS coords) resolves as apply: dy = −1 ("bring it to the document").
+        // A two-finger DOWN swipe (y decreases in OMS coords) resolves as apply: dy = −1.
         let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
         rec.launcherCanvasResolutionActive = true
-        feed(rec, x: 0.50, y: 0.50, fingers: 4)   // begin
-        feed(rec, x: 0.50, y: 0.38, fingers: 4)   // dy −0.12 (clearly vertical, downward) → apply
+        feed(rec, x: 0.50, y: 0.50, fingers: 2)   // begin
+        feed(rec, x: 0.50, y: 0.36, fingers: 2)   // dy −0.14 (clearly vertical, downward) ≥ 0.12 → apply
         XCTAssertEqual(d.canvasResolves.map { [$0.0, $0.1] }, [[0, -1]], "down → apply (dy=−1)")
     }
 
@@ -338,17 +384,19 @@ final class GestureRecognizerLauncherTests: XCTestCase {
         // still reports it so the wiring is exercised. Only the sign matters here.
         let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
         rec.launcherCanvasResolutionActive = true
-        feed(rec, x: 0.50, y: 0.50, fingers: 4)   // begin
-        feed(rec, x: 0.50, y: 0.62, fingers: 4)   // dy +0.12 (upward) → dy=+1
+        feed(rec, x: 0.50, y: 0.50, fingers: 2)   // begin
+        feed(rec, x: 0.50, y: 0.64, fingers: 2)   // dy +0.14 (upward) → dy=+1
         XCTAssertEqual(d.canvasResolves.map { [$0.0, $0.1] }, [[0, 1]], "up → dy=+1 (ignored upstream)")
     }
 
-    func test_canvasResolution_subThreshold_emitsNothing() {
+    func test_canvasResolution_scrollBelowThresholdDoesNotResolve() {
+        // The resolve excursion threshold (0.12) is ABOVE incidental scrolling: a small two-finger motion
+        // (reading/scrolling the canvas) must NOT be mistaken for a commit/discard.
         let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
         rec.launcherCanvasResolutionActive = true
-        feed(rec, x: 0.50, y: 0.50, fingers: 4)   // begin
-        feed(rec, x: 0.52, y: 0.51, fingers: 4)   // dx 0.02 / dy 0.01 both < 0.045 → nothing
-        XCTAssertTrue(d.canvasResolves.isEmpty, "a sub-threshold swipe never resolves")
+        feed(rec, x: 0.50, y: 0.50, fingers: 2)   // begin
+        feed(rec, x: 0.54, y: 0.56, fingers: 2)   // dx 0.04 / dy 0.06 both < 0.12 → scroll, not resolve
+        XCTAssertTrue(d.canvasResolves.isEmpty, "a sub-threshold (scroll) motion never resolves")
         XCTAssertTrue(d.events.isEmpty)
     }
 
@@ -357,33 +405,32 @@ final class GestureRecognizerLauncherTests: XCTestCase {
         // resolution). A lift re-arms it for the next swipe.
         let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
         rec.launcherCanvasResolutionActive = true
-        feed(rec, x: 0.50, y: 0.50, fingers: 4)   // begin
-        feed(rec, x: 0.62, y: 0.50, fingers: 4)   // resolve discard
-        feed(rec, x: 0.74, y: 0.50, fingers: 4)   // more travel — must NOT re-emit
-        feed(rec, x: 0.50, y: 0.30, fingers: 4)   // even a vertical excursion — still no re-emit
+        feed(rec, x: 0.50, y: 0.50, fingers: 2)   // begin
+        feed(rec, x: 0.64, y: 0.50, fingers: 2)   // resolve discard
+        feed(rec, x: 0.78, y: 0.50, fingers: 2)   // more travel — must NOT re-emit
+        feed(rec, x: 0.50, y: 0.30, fingers: 2)   // even a vertical excursion — still no re-emit
         XCTAssertEqual(d.canvasResolves.count, 1, "exactly one resolution per gesture")
     }
 
-    func test_canvasResolution_requiresFreshFourFingerStart() {
-        // A swipe that begins with fewer than four fingers must not resolve — the gesture has to start
-        // from a deliberate four-finger contact, mirroring how the launcher itself is opened.
+    func test_canvasResolution_twoFingerStartResolves() {
+        // Two fingers resolve the canvas (change `positional-navigation`, D5 — 2 = act within the platform).
         let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
         rec.launcherCanvasResolutionActive = true
-        feed(rec, x: 0.50, y: 0.50, fingers: 2)   // only two fingers down — no begin
-        feed(rec, x: 0.62, y: 0.50, fingers: 2)   // travel — must NOT resolve
-        XCTAssertTrue(d.canvasResolves.isEmpty, "resolution requires a fresh four-finger start")
+        feed(rec, x: 0.50, y: 0.50, fingers: 2)   // a fresh two-finger contact begins resolution
+        feed(rec, x: 0.64, y: 0.50, fingers: 2)   // dx +0.14 ≥ 0.12 → discard
+        XCTAssertEqual(d.canvasResolves.map { [$0.0, $0.1] }, [[1, 0]], "two fingers resolve the canvas")
     }
 
     func test_canvasResolution_liftReArmsForNextSwipe() {
-        // After a resolution + lift, a second fresh four-finger swipe resolves again (the model would
+        // After a resolution + lift, a second fresh two-finger swipe resolves again (the model would
         // normally have closed the canvas, but the recognizer's one-shot must reset on lift regardless).
         let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
         rec.launcherCanvasResolutionActive = true
-        feed(rec, x: 0.50, y: 0.50, fingers: 4)   // begin
-        feed(rec, x: 0.62, y: 0.50, fingers: 4)   // resolve #1 (discard)
-        feed(rec, x: 0.62, y: 0.50, fingers: 0)   // lift → re-arm
-        feed(rec, x: 0.50, y: 0.50, fingers: 4)   // begin again
-        feed(rec, x: 0.50, y: 0.38, fingers: 4)   // resolve #2 (down → apply)
+        feed(rec, x: 0.50, y: 0.50, fingers: 2)   // begin
+        feed(rec, x: 0.64, y: 0.50, fingers: 2)   // resolve #1 (discard)
+        feed(rec, x: 0.64, y: 0.50, fingers: 0)   // lift → re-arm
+        feed(rec, x: 0.50, y: 0.50, fingers: 2)   // begin again
+        feed(rec, x: 0.50, y: 0.36, fingers: 2)   // resolve #2 (down → apply)
         XCTAssertEqual(d.canvasResolves.map { [$0.0, $0.1] }, [[1, 0], [0, -1]], "lift re-arms resolution")
     }
 

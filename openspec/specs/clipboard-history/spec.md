@@ -3,9 +3,7 @@
 ## Purpose
 
 Define the opt-in clipboard history feature: a background recorder that snapshots the general pasteboard, faithful multi-representation capture, privacy controls (concealed content, excluded apps, pause, clear), de-duplication and retention caps, versioned on-disk storage separate from favorites, the synthetic Clipboard launcher band, the deferred-reorder pin model, and paste-on-fire into the captured front app.
-
 ## Requirements
-
 ### Requirement: Opt-in clipboard recording
 
 The system SHALL record clipboard history only while a "Keep clipboard history" opt-in is enabled, and the opt-in SHALL default to OFF. While enabled, the recorder SHALL detect new copies by polling the general pasteboard's change counter (macOS provides no change event) at a tunable interval and snapshot the pasteboard each time the counter advances. While disabled, the recorder SHALL NOT run, SHALL NOT read clipboard contents, and no Clipboard band SHALL be shown. Enabling or disabling the opt-in SHALL take effect without relaunching the app and SHALL NOT request any new permission (reading the general pasteboard needs none).
@@ -135,3 +133,26 @@ To paste usefully into apps that do not accept the rich type, the system SHALL a
 #### Scenario: Stale file reference fails gracefully
 - **WHEN** a fired file entry references a file that no longer exists
 - **THEN** the paste does nothing harmful and the app does not crash
+
+### Requirement: Entry provenance
+A `ClipboardEntry` SHALL carry an optional provenance describing where it came from — a device origin distinct from the existing app `sourceApp`. The provenance SHALL be additive and backward-compatible: an entry persisted before this field existed SHALL load successfully with provenance treated as local, and entries created by local pasteboard capture SHALL NOT set a peer origin. The provenance SHALL distinguish a local copy from one received from a paired device (and, for a paired device, MAY carry that device's name).
+
+#### Scenario: Legacy entries load as local
+- **WHEN** a persisted history index written before the provenance field existed is loaded
+- **THEN** every entry loads successfully and is treated as local provenance (no decode failure)
+
+#### Scenario: Local capture is not marked peer
+- **WHEN** an entry is created from local pasteboard capture
+- **THEN** its provenance is not a peer origin
+
+### Requirement: Clipboard band shows peer provenance
+The Clipboard band SHALL visually mark an entry whose provenance is a paired device, so the user can distinguish a mirrored item from a local copy. The marker SHALL identify the source device when its name is known and SHALL be unobtrusive (it does not change the entry's key text or value preview).
+
+#### Scenario: Peer entry shows a source chip
+- **WHEN** the Clipboard band renders an entry whose provenance is a paired device named "iPhone"
+- **THEN** the entry shows a small "from iPhone" marker alongside its key
+
+#### Scenario: Local entry shows no chip
+- **WHEN** the Clipboard band renders a locally-captured entry
+- **THEN** no provenance marker is shown
+
