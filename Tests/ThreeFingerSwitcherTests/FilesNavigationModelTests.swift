@@ -4,8 +4,9 @@ import Foundation
 
 /// Tests the PURE `FilesNavigationModel` column state machine (change: files-band, tasks 2.3–2.5): the
 /// ancestors/current/highlight stack, descend pushes / ascend pops / back-out-to-roots, per-root
-/// remembered-location restore, stable path-ids across a re-list, preview-target for file vs folder, the
-/// live search filter, and the top-of-list clamp-overflow → focus-search signal.
+/// remembered-location restore (gated by the restore-last-location toggle, at init AND on re-entry into a
+/// root), stable path-ids across a re-list, and preview-target for file vs folder. (Type-to-filter search
+/// was removed — the navigator is pure-trackpad — so there is no search filter or focus-search signal.)
 ///
 /// Determinism: the model never touches `FileManager` — every folder's contents come from an injected
 /// fixture lister, so the whole machine is exercised without a filesystem or a running app (mirroring
@@ -127,13 +128,16 @@ final class FilesNavigationModelTests: XCTestCase {
         XCTAssertEqual(model.highlightedEntry?.name, "photo.png")
     }
 
-    // MARK: - Remembered-location restore
+    // MARK: - Remembered-location restore (gated by the toggle, on RE-ENTRY into a root)
 
-    func testReEnteringARootRestoresTheDeepestLocation() {
-        // Pre-seed Home's remembered deepest as /Home/Docs/Sub (as if a prior session left off there).
+    func testReEnteringARootRestoresTheDeepestLocationWhenRestoreOn() {
+        // Pre-seed Home's remembered deepest as /Home/Docs/Sub. With restore ON the band opens there (init);
+        // ascend all the way back to the roots list, then RE-ENTER /Home — `enterRoot` restores it again.
         let remembered = [URL(fileURLWithPath: "/Home"): URL(fileURLWithPath: "/Home/Docs/Sub")]
-        var model = standardModel(remembered: remembered)
-        model.descend()                 // enter /Home → restore straight to /Home/Docs/Sub
+        var model = standardModel(remembered: remembered, restoreLastLocation: true)
+        model.ascend(); model.ascend(); model.ascend()   // /Home/Docs/Sub → … → roots
+        XCTAssertEqual(model.current, .roots)
+        model.descend()                 // re-enter /Home → restore straight to /Home/Docs/Sub
         XCTAssertEqual(model.current, .folder(URL(fileURLWithPath: "/Home/Docs/Sub")))
         XCTAssertEqual(model.visibleEntries.map { $0.name }, ["deep.txt"])
         XCTAssertEqual(model.ancestors,
@@ -141,16 +145,17 @@ final class FilesNavigationModelTests: XCTestCase {
                        "the ancestor chain is rebuilt so ascend walks back up correctly")
     }
 
-    func testRestoredDepthAscendsBackUpTheRebuiltChain() {
+    func testDescendIntoARootIgnoresRememberedWhenRestoreOff() {
+        // The bug fix: with restore OFF the band opens on the roots list AND descending into a root lands on
+        // the root's TOP level — it must NOT jump to the remembered deep folder (the toggle was off).
         let remembered = [URL(fileURLWithPath: "/Home"): URL(fileURLWithPath: "/Home/Docs/Sub")]
-        var model = standardModel(remembered: remembered)
-        model.descend()                 // → /Home/Docs/Sub (restored)
-        model.ascend()                  // → /Home/Docs
-        XCTAssertEqual(model.current, .folder(URL(fileURLWithPath: "/Home/Docs")))
-        model.ascend()                  // → /Home
-        XCTAssertEqual(model.current, .folder(URL(fileURLWithPath: "/Home")))
-        model.ascend()                  // → roots
-        XCTAssertEqual(model.current, .roots)
+        var model = standardModel(remembered: remembered, restoreLastLocation: false)
+        XCTAssertEqual(model.current, .roots, "restore off → opens on the roots list")
+        model.descend()                 // enter /Home → land on the TOP level, not /Home/Docs/Sub
+        XCTAssertEqual(model.current, .folder(URL(fileURLWithPath: "/Home")),
+                       "restore off → descending into a root never jumps to the remembered folder")
+        XCTAssertEqual(model.ancestors, [])
+        XCTAssertEqual(model.visibleEntries.map { $0.name }, ["Docs", "photo.png"])
     }
 
     func testNavigatingRecordsTheDeepestLocationForPersistence() {
@@ -178,9 +183,10 @@ final class FilesNavigationModelTests: XCTestCase {
     }
 
     func testStaleRememberedLocationOutsideTheRootIsIgnored() {
-        // A remembered path that is NOT under the root must not be restored (e.g. the root moved).
+        // A remembered path that is NOT under the root must not be restored (e.g. the root moved) even with
+        // restore ON: enterRoot skips it and lands on the top level.
         let remembered = [URL(fileURLWithPath: "/Home"): URL(fileURLWithPath: "/Elsewhere/x")]
-        var model = standardModel(remembered: remembered)
+        var model = standardModel(remembered: remembered, restoreLastLocation: true)
         model.descend()                 // enter /Home → land on the top level, not the stale path
         XCTAssertEqual(model.current, .folder(URL(fileURLWithPath: "/Home")))
         XCTAssertEqual(model.ancestors, [])
@@ -223,51 +229,18 @@ final class FilesNavigationModelTests: XCTestCase {
     }
 
     func testPreviewTargetIsNilOnAnEmptyColumn() {
-        // Sub has only one file; filter to nothing to make the column empty.
-        var model = standardModel()
-        model.descend(); model.descend()   // → /Home/Docs
-        model.setSearchQuery("zzz-no-match")
+        // Descend into an empty folder so the current column has no entries → no preview target.
+        let tree: [String: [FileEntry]] = [
+            "/R": [fileEntry("/R/Empty", isDirectory: true, kind: .folder)],
+            "/R/Empty": [],
+        ]
+        var model = FilesNavigationModel(roots: [URL(fileURLWithPath: "/R")], lister: lister(tree))
+        model.descend()                 // → /R (highlight Empty)
+        model.descend()                 // → /R/Empty (empty column)
         XCTAssertNil(model.previewTarget)
     }
 
-    // MARK: - Search filter
-
-    func testSearchFiltersTheCurrentColumn() {
-        var model = standardModel()
-        model.descend()                 // → /Home  (Docs, photo.png)
-        model.setSearchQuery("ph")      // case-insensitive substring on the name
-        XCTAssertEqual(model.visibleEntries.map { $0.name }, ["photo.png"])
-        XCTAssertEqual(model.highlightedIndex, 0)
-        XCTAssertEqual(model.highlightedEntry?.name, "photo.png")
-    }
-
-    func testClearingTheSearchRestoresTheFullList() {
-        var model = standardModel()
-        model.descend()
-        model.setSearchQuery("ph")
-        XCTAssertEqual(model.visibleEntries.count, 1)
-        model.clearSearch()
-        XCTAssertEqual(model.visibleEntries.map { $0.name }, ["Docs", "photo.png"])
-    }
-
-    func testSearchReclampsTheHighlightIntoTheShorterList() {
-        var model = standardModel()
-        model.descend()                 // → /Home (2 rows)
-        model.highlightDown()           // highlight index 1 (photo.png)
-        XCTAssertEqual(model.highlightedIndex, 1)
-        model.setSearchQuery("Docs")    // now a single row → highlight must clamp to 0
-        XCTAssertEqual(model.highlightedIndex, 0)
-        XCTAssertEqual(model.highlightedEntry?.name, "Docs")
-    }
-
-    func testSearchIsCaseInsensitive() {
-        var model = standardModel()
-        model.descend()
-        model.setSearchQuery("DOCS")
-        XCTAssertEqual(model.visibleEntries.map { $0.name }, ["Docs"])
-    }
-
-    // MARK: - Highlight stepping + clamp-overflow → focus-search
+    // MARK: - Highlight stepping (clamps both ends; no search overflow)
 
     func testHighlightDownAndUpStepWithinBounds() {
         var model = standardModel()
@@ -279,44 +252,15 @@ final class FilesNavigationModelTests: XCTestCase {
         XCTAssertEqual(model.highlightedIndex, 1)
         model.highlightUp()
         XCTAssertEqual(model.highlightedIndex, 0)
-        XCTAssertFalse(model.focusSearchRequested, "in-bounds stepping never asks for search")
     }
 
-    func testHighlightUpAtTheTopRaisesFocusSearch() {
+    func testHighlightUpAtTheTopClamps() {
         var model = standardModel()
         model.descend()                 // → /Home, highlight at index 0
-        XCTAssertFalse(model.focusSearchRequested)
-        model.highlightUp()             // overflow past the top
+        model.highlightUp()             // up at the top → clamp, no overflow, no side effect
         XCTAssertEqual(model.highlightedIndex, 0, "the highlight stays clamped at the top")
-        XCTAssertTrue(model.focusSearchRequested, "an up-step at index 0 means: focus search")
-    }
-
-    func testFocusSearchRequestIsOneShotAndClearable() {
-        var model = standardModel()
-        model.descend()
-        model.highlightUp()
-        XCTAssertTrue(model.focusSearchRequested)
-        model.clearFocusSearchRequest()
-        XCTAssertFalse(model.focusSearchRequested, "the controller consumes the one-shot request")
-    }
-
-    func testADownStepClearsAPendingFocusSearchRequest() {
-        var model = standardModel()
-        model.descend()
-        model.highlightUp()             // raise it
-        XCTAssertTrue(model.focusSearchRequested)
-        model.highlightDown()           // a normal move resolves the overflow intent
-        XCTAssertFalse(model.focusSearchRequested)
-        XCTAssertEqual(model.highlightedIndex, 1)
-    }
-
-    func testTypingASearchClearsAPendingFocusSearchRequest() {
-        var model = standardModel()
-        model.descend()
-        model.highlightUp()             // overflow → focus search
-        XCTAssertTrue(model.focusSearchRequested)
-        model.setSearchQuery("D")       // the user actually typed — request fulfilled
-        XCTAssertFalse(model.focusSearchRequested)
+        model.highlightUp()             // and again — still a no-op
+        XCTAssertEqual(model.highlightedIndex, 0)
     }
 
     // MARK: - Restore-at-init (refinement 2: the band OPENS displaying the last folder)
@@ -423,57 +367,16 @@ final class FilesNavigationModelTests: XCTestCase {
     }
 
     func testBreadcrumbStopsAtTheCurrentFolderWhenTheColumnIsEmpty() {
-        var model = standardModel()
-        model.descend()                 // → /Home
-        model.setSearchQuery("zzz-no-match")   // filters to nothing → no highlighted entry
+        // An empty folder → nothing highlighted, so the path stops at the current folder.
+        let tree: [String: [FileEntry]] = [
+            "/R": [fileEntry("/R/Empty", isDirectory: true, kind: .folder)],
+            "/R/Empty": [],
+        ]
+        var model = FilesNavigationModel(roots: [URL(fileURLWithPath: "/R")], lister: lister(tree))
+        model.descend()                 // → /R
+        model.descend()                 // → /R/Empty (empty column)
         XCTAssertNil(model.highlightedEntry)
-        XCTAssertEqual(model.breadcrumb.map { $0.name }, ["Home"],
+        XCTAssertEqual(model.breadcrumb.map { $0.name }, ["R", "Empty"],
                        "with nothing highlighted the path stops at the current folder")
-    }
-
-    // MARK: - Per-visit query clearing (refinement 5a)
-
-    func testSearchQueryClearsOnDescend() {
-        var model = standardModel()
-        model.descend()                 // → /Home
-        model.setSearchQuery("Doc")     // filter, then descend into the surviving folder
-        XCTAssertEqual(model.visibleEntries.map { $0.name }, ["Docs"])
-        model.descend()                 // → /Home/Docs
-        XCTAssertEqual(model.searchQuery, "", "descending into a folder starts with an empty query")
-        XCTAssertEqual(model.visibleEntries.map { $0.name }, ["Sub", "a.txt"])
-    }
-
-    func testSearchQueryClearsOnAscend() {
-        var model = standardModel()
-        model.descend()                 // → /Home
-        model.descend()                 // → /Home/Docs
-        model.setSearchQuery("Sub")     // filter in /Home/Docs
-        XCTAssertEqual(model.visibleEntries.map { $0.name }, ["Sub"])
-        model.ascend()                  // → /Home
-        XCTAssertEqual(model.searchQuery, "", "ascending clears the query")
-        XCTAssertEqual(model.visibleEntries.map { $0.name }, ["Docs", "photo.png"])
-    }
-
-    func testReturningToAFolderStartsWithAnEmptyQuery() {
-        // Per-visit: a query is NOT restored when you come back to a folder you just left (descend then ascend).
-        var model = standardModel()
-        model.descend()                 // → /Home
-        model.setSearchQuery("Doc")     // filter /Home, highlight survives as Docs
-        model.descend()                 // → /Home/Docs (query cleared on the way in)
-        XCTAssertEqual(model.searchQuery, "")
-        model.ascend()                  // → /Home again, immediately
-        XCTAssertEqual(model.searchQuery, "", "returning to /Home does NOT restore the prior 'Doc' query")
-        XCTAssertEqual(model.visibleEntries.map { $0.name }, ["Docs", "photo.png"],
-                       "the full list is shown again, not the filtered one")
-    }
-
-    func testSearchQueryClearsWhenBackingOutToTheRootsList() {
-        var model = standardModel()
-        model.descend()                 // → /Home
-        model.setSearchQuery("Doc")
-        model.ascend()                  // back-out to the roots list
-        XCTAssertEqual(model.current, .roots)
-        XCTAssertEqual(model.searchQuery, "", "backing out to roots clears the query")
-        XCTAssertEqual(model.visibleEntries.map { $0.name }, ["Home", "Work"])
     }
 }

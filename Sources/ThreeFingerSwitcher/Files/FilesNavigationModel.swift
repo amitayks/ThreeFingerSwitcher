@@ -11,8 +11,8 @@ struct FilesBreadcrumbComponent: Equatable {
 }
 
 /// The Files band's **pure** column-navigation state machine (design D6 / spec "Column navigation
-/// model"). It owns the ancestors stack, the current folder, the highlighted entry, the live search
-/// query, and the per-root remembered locations — and **nothing else**: it never touches `FileManager`.
+/// model"). It owns the ancestors stack, the current folder, the highlighted entry, and the per-root
+/// remembered locations — and **nothing else**: it never touches `FileManager`.
 ///
 /// Determinism by injection: the only way it learns a folder's contents is the injected `lister`
 /// closure (the live app wires that to `DirectoryLister`; a test wires a fixture). Because every input is
@@ -67,24 +67,22 @@ struct FilesNavigationModel {
     /// contents). The unfiltered backing list; the view shows `visibleEntries`.
     private(set) var entries: [FileEntry] = []
 
-    /// The highlighted row's index **into `visibleEntries`** (the search-filtered list), clamped to it.
-    /// `0` on an empty column.
+    /// The highlighted row's index into `visibleEntries`, clamped to it. `0` on an empty column.
     private(set) var highlightedIndex: Int = 0
-
-    /// The live search query filtering the current column (spec "live search query"). Empty = no filter.
-    /// Setting it re-clamps the highlight into the new `visibleEntries`.
-    private(set) var searchQuery: String = ""
 
     /// Per-root remembered **deepest** location: `root → last folder visited within it`. Injected in (the
     /// caller restores it from persistence) and surfaced out via `rememberedLocations` so the caller can
     /// persist it again — the model itself never persists. Keyed by standardized root URL.
     private var remembered: [URL: URL] = [:]
 
-    /// Raised when a highlight-up step arrives while already at the top of the column (index 0) — the
-    /// recognizer keeps emitting up-steps and this model decides that overflow means *focus the search
-    /// field* (design D5, "very up → search is a model clamp-overflow"). One-shot: the controller reads
-    /// it and calls `clearFocusSearchRequest()`. Never set by anything but a clamped up-step.
-    private(set) var focusSearchRequested: Bool = false
+    /// Whether restoring the per-root remembered deepest location is enabled (the Hub "remember and reopen
+    /// the last folder" toggle). When ON, the band both **opens** on the remembered folder (the `init`
+    /// landing) AND, on a later descend into a root from the roots list, jumps straight to that root's
+    /// remembered deepest location (`enterRoot`). When OFF, the band opens on the roots list and descending
+    /// into a root lands on the root's **top level** — never the remembered folder. Tracking the deepest
+    /// location continues regardless (so flipping the toggle back ON restores correctly); only *using* it to
+    /// land is gated by this flag.
+    private let restoreLastLocation: Bool
 
     // MARK: - Init
 
@@ -110,6 +108,7 @@ struct FilesNavigationModel {
          lister: @escaping (URL) -> [FileEntry]) {
         self.roots = roots.map { $0.standardizedFileURL }
         self.lister = lister
+        self.restoreLastLocation = restoreLastLocation
         var standardizedRemembered: [URL: URL] = [:]
         for (root, location) in remembered {
             standardizedRemembered[root.standardizedFileURL] = location.standardizedFileURL
@@ -127,13 +126,10 @@ struct FilesNavigationModel {
 
     // MARK: - Derived view state
 
-    /// The entries actually shown, after applying `searchQuery` (spec "filters the current column"). An
-    /// empty query returns every entry unchanged. The match is a localized, case-insensitive substring on
-    /// the display name — clearing the query restores the full list.
-    var visibleEntries: [FileEntry] {
-        guard !searchQuery.isEmpty else { return entries }
-        return entries.filter { $0.name.localizedCaseInsensitiveContains(searchQuery) }
-    }
+    /// The entries shown in the current column. Kept as a distinct accessor — the view, controller, and
+    /// band builder all read the column through this name — though with type-to-filter search removed it
+    /// now mirrors `entries` directly (the column is never filtered).
+    var visibleEntries: [FileEntry] { entries }
 
     /// The highlighted entry within `visibleEntries`, or `nil` when the column is empty.
     var highlightedEntry: FileEntry? {
@@ -199,8 +195,8 @@ struct FilesNavigationModel {
 
     /// Descend into the highlighted **folder**: push the prior current folder onto `ancestors` and make
     /// the highlighted folder current, listing its contents (spec). A no-op when nothing is highlighted or
-    /// the highlight is a file (files open; they don't descend). Descending always clears the search and
-    /// resets the highlight to the top of the new column.
+    /// the highlight is a file (files open; they don't descend). Descending always resets the highlight to
+    /// the top of the new column.
     ///
     /// From the **roots list**, descending into a root makes that root the current folder with an *empty*
     /// ancestor stack (a root is the base of its own column, not an ancestor) — and if that root has a
@@ -221,8 +217,8 @@ struct FilesNavigationModel {
     }
 
     /// Ascend one level (spec): pop the deepest ancestor back to current, or — at a root's top level (no
-    /// ancestors) — return to the roots list. A no-op on the roots list itself. Clears the search and
-    /// resets the highlight, and re-highlights the folder we came up from so the column doesn't feel lost.
+    /// ancestors) — return to the roots list. A no-op on the roots list itself. Resets the highlight and
+    /// re-highlights the folder we came up from so the column doesn't feel lost.
     mutating func ascend() {
         switch current {
         case .roots:
@@ -240,48 +236,19 @@ struct FilesNavigationModel {
     // MARK: - Highlight transitions (vertical axis)
 
     /// Move the highlight **down** one row (toward higher indices), clamped at the last visible row. A
-    /// no-op (but harmless) on an empty column. Clears any pending focus-search request — a down-step is
-    /// a normal move, not an overflow.
+    /// no-op (but harmless) on an empty column.
     mutating func highlightDown() {
-        focusSearchRequested = false
         let count = visibleEntries.count
         guard count > 0 else { highlightedIndex = 0; return }
         highlightedIndex = min(highlightedIndex + 1, count - 1)
     }
 
-    /// Move the highlight **up** one row (toward index 0). If already at the top (index 0), this is the
-    /// CLAMP-OVERFLOW: the highlight stays put and `focusSearchRequested` latches — the recognizer keeps
-    /// emitting up-steps past the top, and the model reads that as "focus the search field" (design D5).
+    /// Move the highlight **up** one row (toward index 0), clamped at the top. An up-step while already at
+    /// index 0 is a no-op — the highlight simply stays on the top row. (There is no type-to-filter search to
+    /// overflow into; the navigator stays pure-trackpad.)
     mutating func highlightUp() {
-        if highlightedIndex <= 0 {
-            highlightedIndex = 0
-            // Overflow past the top → focus search (only meaningful while there is a column to search,
-            // but the latch itself is set unconditionally so an empty column can still summon search).
-            focusSearchRequested = true
-            return
-        }
-        highlightedIndex -= 1
+        highlightedIndex = max(highlightedIndex - 1, 0)
     }
-
-    /// Consume the one-shot focus-search request (the controller calls this after acting on it), so a
-    /// single overflow focuses the field exactly once rather than re-firing every frame.
-    mutating func clearFocusSearchRequest() { focusSearchRequested = false }
-
-    // MARK: - Search
-
-    /// Apply a live search query filtering the current column (spec). Clearing it (empty string) restores
-    /// the full list. The highlight is re-clamped into the new `visibleEntries` (so a now-shorter list
-    /// doesn't leave the highlight off the end), and the focus-search latch is cleared (typing resolves
-    /// the very thing the overflow asked for).
-    mutating func setSearchQuery(_ query: String) {
-        searchQuery = query
-        focusSearchRequested = false
-        clampHighlight()
-    }
-
-    /// Clear the search query (restore the full current column). Convenience for the view's "step-down
-    /// returns to the list" path.
-    mutating func clearSearch() { setSearchQuery("") }
 
     // MARK: - Re-feed (async-listing bridge)
 
@@ -290,8 +257,8 @@ struct FilesNavigationModel {
     /// (off-main), but this model is synchronous and only re-reads on a move; when a late listing lands in
     /// the controller's cache (which backs the live `lister`), the controller calls this to pull the now-warm
     /// contents into the current column. The highlight is **preserved** (re-clamped, not reset) so a row the
-    /// user is already on doesn't jump when its folder finishes loading; the search filter and location are
-    /// untouched. A no-op-shaped read at `.roots` (the roots column is synthesized, not listed).
+    /// user is already on doesn't jump when its folder finishes loading; the location is untouched. A
+    /// no-op-shaped read at `.roots` (the roots column is synthesized, not listed).
     mutating func reloadCurrentColumn() {
         reloadCurrentColumn(resetHighlight: false)
     }
@@ -299,20 +266,18 @@ struct FilesNavigationModel {
     // MARK: - Private: column (re)loading
 
     /// Make `folder` the current column and list it, optionally re-highlighting a known child (used on
-    /// ascend so the folder we came up from is selected). Clears the search.
+    /// ascend so the folder we came up from is selected).
     private mutating func setCurrentFolder(_ folder: URL, highlighting child: URL? = nil) {
         current = .folder(folder)
-        searchQuery = ""
         reloadCurrentColumn(resetHighlight: child == nil)
         if let child { highlight(url: child) }
     }
 
     /// Return to the roots list (back-out-to-roots), optionally re-highlighting the root we came up from.
-    /// Clears ancestors and the search.
+    /// Clears ancestors.
     private mutating func returnToRoots(highlighting child: URL? = nil) {
         ancestors = []
         current = .roots
-        searchQuery = ""
         reloadCurrentColumn(resetHighlight: child == nil)
         if let child { highlight(url: child) }
     }
@@ -348,13 +313,16 @@ struct FilesNavigationModel {
         return best
     }
 
-    /// Enter `root` from the roots list, restoring its remembered deepest location when one exists and is
-    /// still a descendant of the root (spec "restore where you left off"); otherwise land on the root's
-    /// top level. Reconstructs the ancestor stack for the restored depth so ascending walks back up
-    /// correctly.
+    /// Enter `root` from the roots list. When `restoreLastLocation` is ON, restore its remembered deepest
+    /// location if one exists and is still a descendant of the root (spec "restore where you left off"),
+    /// reconstructing the ancestor stack so ascending walks back up correctly; otherwise — and **always**
+    /// when the toggle is OFF — land on the root's **top level**. Gating on `restoreLastLocation` here (not
+    /// just at `init`) is what keeps the toggle honest: with it off, descending into a root must NOT jump to
+    /// the last-visited folder (the deepest-location map is still tracked for when the toggle is turned on).
     private mutating func enterRoot(_ root: URL) {
         ancestors = []
-        if let deepest = remembered[root], deepest != root, isDescendant(deepest, of: root) {
+        if restoreLastLocation,
+           let deepest = remembered[root], deepest != root, isDescendant(deepest, of: root) {
             // Rebuild ancestors = [root, …intermediate folders…] up to (but excluding) `deepest`.
             ancestors = intermediateFolders(from: root, to: deepest)
             setCurrentFolder(deepest)

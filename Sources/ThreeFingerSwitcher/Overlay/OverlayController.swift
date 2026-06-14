@@ -111,9 +111,9 @@ final class OverlayController {
 
 /// NSPanel subclass that refuses key/main so it can never steal focus — EXCEPT when `keyInteractive`
 /// is set, which the launcher flips on for the AI "unavailable" canvas so its Enable/Download/model
-/// controls are clickable, AND for the Files band's focused search field so its keystrokes land
-/// (refinement 5). Being a `.nonactivatingPanel`, becoming key there does not activate the app (the
-/// captured front app stays frontmost); the flag is reset/destroyed when the canvas / navigator dismisses.
+/// controls are clickable. Being a `.nonactivatingPanel`, becoming key there does not activate the app (the
+/// captured front app stays frontmost); the flag is reset/destroyed when the canvas dismisses. (The Files
+/// navigator never needs this — it is purely gesture-driven and stays non-key throughout.)
 final class SwitcherPanel: NSPanel {
     /// When true, the panel may become key so hosted controls (buttons/picker) receive clicks.
     var keyInteractive = false

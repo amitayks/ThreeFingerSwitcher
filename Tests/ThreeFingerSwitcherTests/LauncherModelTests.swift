@@ -219,11 +219,11 @@ final class LauncherModelTests: XCTestCase {
     }
 
     func testFilesBandRowAreaIsContainerMinusChrome() {
-        // The scrollable row area is the fixed container height minus the search field, the breadcrumb bar,
-        // and the outer padding — and a denser row fits MORE rows in that same fixed area (the container
-        // never grows for density; only how many rows show before it scrolls changes).
+        // The scrollable row area is the fixed container height minus the breadcrumb bar and the outer
+        // padding — and a denser row fits MORE rows in that same fixed area (the container never grows for
+        // density; only how many rows show before it scrolls changes).
         XCTAssertEqual(FilesBandLayout.rowAreaHeight,
-                       FilesBandLayout.containerHeight - FilesBandLayout.searchFieldHeight
+                       FilesBandLayout.containerHeight
                         - FilesBandLayout.breadcrumbBarHeight - 2 * FilesBandLayout.padding,
                        accuracy: 0.01)
         XCTAssertGreaterThan(FilesBandLayout.visibleRowCount(for: .compact),

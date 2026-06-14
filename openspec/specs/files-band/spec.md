@@ -1,5 +1,8 @@
-## ADDED Requirements
+# files-band Specification
 
+## Purpose
+TBD - created by archiving change files-band. Update Purpose after archive.
+## Requirements
 ### Requirement: Opt-in Files band injected into the launcher
 
 The app SHALL provide a **Files band** as an opt-in (default **off**) that, when enabled, is injected into the four-finger launcher as a **synthetic band** — appended at launcher-open time like the Clipboard band and **never persisted** into the authored favorites. Enabling the Files band SHALL NOT relocate any native gesture, SHALL NOT require a re-login, and SHALL NOT request any new permission; it reads the local filesystem on demand. The opt-in SHALL take effect immediately (no `is…Effective` gate): toggling it on injects the band on the next launcher open, toggling it off removes it.
@@ -18,15 +21,24 @@ The app SHALL provide a **Files band** as an opt-in (default **off**) that, when
 
 ### Requirement: Configured roots with remembered locations
 
-The Files band SHALL open onto a set of **user-configured local root folders** (its entry column). Each root SHALL remember the **deepest location** the user last navigated to within it, and re-entering that root SHALL restore that location. Navigating fully out (ascending past a root's top level) SHALL return to the roots list. Roots SHALL reference **local** folders only.
+The Files band SHALL open onto a set of **user-configured local root folders** (its entry column). Each root SHALL track the **deepest location** the user last navigated to within it. A **"remember and reopen the last folder" toggle** (default ON) SHALL govern whether that remembered location is *used to land*:
+
+- When the toggle is **ON**, the band SHALL **open displaying** the remembered deepest folder (restored at open, with its ancestor chain reconstructed so ascending walks back up), and **re-entering a root** (descending into it from the roots list) SHALL restore that root's remembered location.
+- When the toggle is **OFF**, the band SHALL **open on the roots list**, and descending into a root SHALL land on that root's **top level** — it SHALL NOT jump to the remembered location. The deepest-location *tracking* SHALL continue regardless of the toggle, so turning it back ON restores correctly.
+
+The displayed column and the navigation state SHALL always agree (no visual/state desync): what the band shows on open is exactly where horizontal navigation begins. Navigating fully out (ascending past a root's top level) SHALL return to the roots list. Roots SHALL reference **local** folders only.
 
 #### Scenario: Entry shows the configured roots
-- **WHEN** the user lands on the Files band
+- **WHEN** the user lands on the Files band with the remember toggle OFF
 - **THEN** the current column lists the configured root folders
 
-#### Scenario: A root remembers where you left off
-- **WHEN** the user descends several levels inside a root, leaves the band, and later re-enters that root
+#### Scenario: A root remembers where you left off (toggle ON)
+- **WHEN** the remember toggle is ON and the user descends several levels inside a root, leaves the band, and later re-enters that root
 - **THEN** the navigator restores the folder the user was last in within that root
+
+#### Scenario: Toggle OFF never jumps to the last-visited folder
+- **WHEN** the remember toggle is OFF and the user descends into a root from the roots list
+- **THEN** the navigator lands on that root's top level, not the previously-visited deeper folder
 
 #### Scenario: Backing out returns to the roots list
 - **WHEN** the user ascends from a root's top level
@@ -131,3 +143,4 @@ The Files band v1 SHALL be **navigation and open only**: it SHALL NOT move, rena
 #### Scenario: No destructive operations are exposed
 - **WHEN** the user navigates the Files band
 - **THEN** no available action moves, renames, deletes, or otherwise mutates any file or folder
+

@@ -16,7 +16,7 @@ Constraint inherited from the app: the overlay panel is **non-activating** and m
 **Goals:**
 - Reach, preview, open, and Open-With any **local** file by trackpad, from inside the launcher, without visiting Finder or touching a mouse.
 - A bounded-width **column navigator** (icon-rail ancestors + one current list + one live preview) that scales to any depth.
-- A complete, closed **drill-in grammar** (horizontal = depth, vertical = highlight, +1-finger = Open-With, very-up = search, four-finger swipe = discard) layered cleanly on the existing recognizer via a modal bypass.
+- A complete, closed **drill-in grammar** (horizontal = depth, vertical = highlight, +1-finger = Open-With, four-finger swipe = discard) layered cleanly on the existing recognizer via a modal bypass. *(Amended: the original "very-up = search" was removed — see D5.)*
 - A **bubble-morph** presentation where nothing ever pops; the hero move is the current list collapsing into / blooming out of its ancestor icon.
 - A pure, **testable** navigation core (`swift test`), with the MLX split untouched.
 
@@ -40,8 +40,8 @@ Add `filesDrillActive` to the recognizer and a **second early short-circuit** at
 ### D4 — Open-With trigger is a *relative* +1 finger, not an absolute three
 Because the launcher lives while ≥2 contacts remain (you relax four → two), "+1 finger" must mean **a contact was added above the current relaxed baseline** (`count > drillContacts`), not "exactly three." A user holding three the whole time would otherwise false-trigger. *Alternative:* key off absolute count 3. Rejected — ambiguous against the relax-to-two baseline.
 
-### D5 — "Very up → search" is a controller/model clamp-overflow, not a recognizer feature
-The recognizer reads only finger count + centroid; it has no notion of "the highlight is at row 0." It keeps emitting `highlight(+1)`; the controller/model interprets an up-step **while already clamped at the top** as focus-search. *Alternative:* teach the recognizer about list bounds. Rejected — it would couple the recognizer to view state it can't see.
+### D5 — Type-to-filter search REMOVED (amendment); top-of-list up just clamps
+*Originally:* a top-of-column up "very up" clamp-overflow focused a type-to-filter search field (a controller/model decision, since the recognizer has no notion of "row 0"). **This was removed post-implementation:** the search field broke the app's "pure trackpad, no keypresses" model, required the overlay panel to become key-interactive (a focus-vacuum landmine), and went unused. The recognizer still emits `highlight(+1)` past the top; the model now simply **clamps** the highlight at index 0 with no side effect. The Files navigator is pure-trackpad and the panel never becomes key. *(The recognizer was never coupled to list bounds — that part of the original decision still holds.)*
 
 ### D6 — Horizontal is the depth axis; layout is icon-rail + current + preview (not full Miller columns)
 The user chose horizontal-in/out over lift-to-descend, and a **bounded** layout (ancestors collapse to a thin icon rail; only the current list and one preview are full-size) over classic Miller columns. This reuses the app's existing icon-rail idiom (Hub sidebar, launcher band strip) and keeps overlay width constant at any depth. The preview is *where you're going* (folder → contents peek), so descending = promoting the preview to current. *Alternatives:* lift-to-descend single column (simpler, but leaves "ascend" homeless) and full Miller columns (unbounded width). Both rejected.
@@ -59,12 +59,12 @@ Add `Overlay/BubbleMorph.swift`: a `ViewModifier` doing `scaleEffect(0.02 → 1,
 - **Open-With enumeration (new):** `NSWorkspace.urlsForApplications(toOpen: url)`; default app via `urlForApplication(toOpen:)`; map to the existing `AppCandidate`.
 
 ### D10 — Capability decomposition mirrors Clipboard's
-`files-band` (new) owns the **domain**: opt-in/injection, roots + remembered locations, on-demand listing, the navigation state machine, open/Open-With/defuse, and error mapping. `launcher-overlay` (delta) owns the **view/interaction**: layout, depth/highlight nav, preview, search focus, swipe-to-resolve, bubble-morph. `gesture-recognition` (delta) owns the recognizer **mechanism**. `configuration-hub` (delta) owns the **Files page**. This matches how Clipboard splits across `clipboard-history` (data) and `launcher-overlay` (view).
+`files-band` (new) owns the **domain**: opt-in/injection, roots + remembered locations, on-demand listing, the navigation state machine, open/Open-With/defuse, and error mapping. `launcher-overlay` (delta) owns the **view/interaction**: layout, depth/highlight nav, preview, swipe-to-resolve, bubble-morph. `gesture-recognition` (delta) owns the recognizer **mechanism**. `configuration-hub` (delta) owns the **Files page**. This matches how Clipboard splits across `clipboard-history` (data) and `launcher-overlay` (view).
 
 ## Risks / Trade-offs
 
 - **Eyes-on, not blind muscle memory.** The Files band is read-and-pilot, unlike the positional launcher → *Mitigation:* it's an explicit opt-in and a visually distinct surface (column navigator, not a grid); the two modes never masquerade as each other.
-- **Type-to-filter breaks "pure trackpad."** → *Mitigation:* the relaxation is **strictly scoped** to the search field; every other interaction stays trackpad-only, and the exception is called out in the spec.
+- **Type-to-filter breaks "pure trackpad."** → *Resolved by removal (amendment):* search was cut entirely; the navigator is trackpad-only with no exception, so this risk no longer applies.
 - **Scroll-tap vs. a real scroll view.** While the overlay is visible the session scroll tap swallows two-finger scroll → *Mitigation:* the current list is navigated by **gesture stepping + edge auto-repeat** (gesture-scrolled), so no carve-out is needed; only if a genuine `ScrollView` is introduced do we add a `filesDrillActive` carve-out **and** flip the panel key-interactive (mirroring the AI path).
 - **Panel-resize / spring clock desync.** AppKit frame resize and the SwiftUI spring run on different clocks → *Mitigation:* size the panel to the depth's **final** frame up-front; the bubble morphs *inside* the settled frame.
 - **Defuse cannot un-ring the bell.** Once an app has actually launched, discard can't cancel it → *Mitigation:* honest scope — defuse cancels only the **pending** open within the fuse/held window; it never kills a running app. Documented as a limit, not a bug.
@@ -80,6 +80,6 @@ Purely **additive** and **opt-in (default off)** — no data migration, no schem
 
 - **Default seed roots** — ship a sensible default set (e.g. Home, Desktop, Downloads, Documents) or start empty and prompt? Leaning: seed a small default, fully editable on the Files page.
 - **Folder default-open semantics** — confirmed: default open of a folder = a Finder window; *descending* is the horizontal gesture (the two are distinct). Revisit only if it feels redundant in the hand.
-- **Search scope** — current folder only (chosen for v1) vs. recursive subtree (future). Recursive search would need an async, cancellable walk and is deferred.
+- ~~**Search scope**~~ — moot: type-to-filter search was removed entirely (see D5 / the amendment). The navigator is pure-trackpad.
 - **Very-large folders** — does a single `contentsOfDirectory` read stay within budget for huge directories, or do we need windowed loading + a "…more" affordance? Resolve during implementation against real directories.
 - **Bubble-morph anchor per surface** — columns may want `.leading`/`.trailing` (bud from the attachment edge) rather than `.center`; pick per surface during view build.

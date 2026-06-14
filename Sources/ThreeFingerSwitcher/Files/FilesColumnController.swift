@@ -133,11 +133,6 @@ final class FilesColumnController {
     /// live as the highlight / folder changes.
     var breadcrumb: [FilesBreadcrumbComponent] { navigation.breadcrumb }
 
-    /// One-shot: the model latched a top-of-column clamp-overflow into a focus-search request. The owner
-    /// reads it after an up-step and clears it via `clearFocusSearchRequest()`.
-    var focusSearchRequested: Bool { navigation.focusSearchRequested }
-    func clearFocusSearchRequest() { navigation.clearFocusSearchRequest() }
-
     // MARK: - Driving the column (the owner routes the recognizer here)
 
     /// Descend into the highlighted folder (horizontal, descend-direction). Warms the new column / preview
@@ -156,8 +151,8 @@ final class FilesColumnController {
         warmPreviewTargetIfNeeded()
     }
 
-    /// Move the highlight up one row; on a top-of-column overflow the model latches `focusSearchRequested`.
-    /// Warms the new highlight's preview folder-peek if needed.
+    /// Move the highlight up one row (clamped at the top). Warms the new highlight's preview folder-peek if
+    /// needed.
     func highlightUp() {
         navigation.highlightUp()
         warmPreviewTargetIfNeeded()
@@ -168,15 +163,6 @@ final class FilesColumnController {
         navigation.highlightDown()
         warmPreviewTargetIfNeeded()
     }
-
-    /// Apply a live search query (the view's search field). Re-clamps the highlight in the model.
-    func setSearchQuery(_ query: String) {
-        navigation.setSearchQuery(query)
-        warmPreviewTargetIfNeeded()
-    }
-
-    /// Clear the search query.
-    func clearSearch() { setSearchQuery("") }
 
     // MARK: - Cache feeding (the async bridge)
 

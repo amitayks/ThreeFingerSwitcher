@@ -8,9 +8,9 @@
 
 - [x] 2.1 Define a `FileEntry` value type: stable id **derived from the absolute path**, name, isDirectory, modDate, type/kind (AppKit-free where possible).
 - [x] 2.2 Implement a `DirectoryLister`: async `contentsOfDirectory(at:includingPropertiesForKeys:[.isDirectoryKey,.contentModificationDateKey,.isRegularFileKey])` on a detached `userInitiated` task; **local-only**; returns `[FileEntry]` sorted by the configured order; map FileManager errors into the shared error taxonomy at the boundary.
-- [x] 2.3 Implement `FilesNavigationModel` (pure stack): ancestors + current folder + highlighted index; `descend`/`ascend` transitions; roots entry and back-out-to-roots; per-root remembered-location restore; preview-target derivation (file→self, folder→its contents); top-of-list clamp-overflow → a focus-search signal.
-- [x] 2.4 Implement the live **search filter** (filter the current folder's entries by query; clearing restores the full list).
-- [x] 2.5 Unit tests: descend pushes ancestor / ascend pops / back-out-to-roots; remembered-location restore; stable-id stability across re-list; preview-target for file vs folder; search filter + clamp-overflow signal.
+- [x] 2.3 Implement `FilesNavigationModel` (pure stack): ancestors + current folder + highlighted index; `descend`/`ascend` transitions; roots entry and back-out-to-roots; per-root remembered-location restore **gated by `restoreLastLocation` at init AND in `enterRoot`** (toggle OFF lands on the root top, never the remembered folder — bug fix); preview-target derivation (file→self, folder→its contents); top-of-list up simply clamps.
+- [x] ~~2.4 Implement the live **search filter**~~ — **REMOVED** (amendment): type-to-filter search is gone; the navigator is pure-trackpad.
+- [x] 2.5 Unit tests: descend pushes ancestor / ascend pops / back-out-to-roots; remembered-location restore on re-entry (toggle ON) and the no-jump regression (toggle OFF); stable-id stability across re-list; preview-target for file vs folder; top-of-list up clamps.
 
 ## 3. File open / Open-With service — Core seam + workspace boundary
 
@@ -31,14 +31,14 @@
 ## 6. LauncherModel gating + column navigation
 
 - [x] 6.1 Add `filesBandIndex: Int?` + `currentBandIsFiles` to `LauncherModel`; extend `setBands(...)` to accept/store it; make `currentColumns` return 1 for the Files band.
-- [x] 6.2 Route Files-band navigation in `stepHorizontal`/`stepVertical`: horizontal → depth (descend/ascend through `FilesNavigationModel`, then rebuild current items à la `applyCurrentBand`); vertical → highlight; integrate the top-of-list clamp-overflow → focus-search; apply the same `reverseDirection`/`reverseVerticalDirection` settings.
+- [x] 6.2 Route Files-band navigation in `stepHorizontal`/`stepVertical`: horizontal → depth (descend/ascend through `FilesNavigationModel`, then rebuild current items à la `applyCurrentBand`); vertical → highlight (top-of-list up clamps — no search); apply the same `reverseDirection`/`reverseVerticalDirection` settings.
 - [x] 6.3 Hold the `FilesNavigationModel` state in/alongside `LauncherModel` and rebuild the band's `items` from the current column on every depth change.
 
 ## 7. Recognizer drill-in sub-state
 
 - [x] 7.1 Add `filesDrillActive` + private baseline scalars to `GestureRecognizer`; add the **second** early short-circuit at the very top of `feed()` (immediately after the canvas check, line 161) routing to a new sustained `trackFilesDrill(frame)`.
 - [x] 7.2 Implement `trackFilesDrill`: alive while `count >= 2`; **re-baseline** origin + carry on every contact-count change (copy 435-441); emit depth (horizontal) / highlight (vertical) with direction-reversal; detect **relative +1 finger** (`count > drillContacts`) → pending Open-With latch; fresh four-finger horizontal swipe → discard; one-shot resolution on lift (`belowTargetFrames >= 2` debounce): plain lift → open, +1-latched lift → open-with.
-- [x] 7.3 Add delegate methods `filesDepth`/`filesHighlight`/`filesOpen`/`filesOpenWith`/`filesDiscard` (and focus-search handled in model/controller) to `GestureRecognizerDelegate` with default no-op extensions.
+- [x] 7.3 Add delegate methods `filesDepth`/`filesHighlight`/`filesOpen`/`filesOpenWith`/`filesDiscard` to `GestureRecognizerDelegate` with default no-op extensions.
 - [x] 7.4 Unit tests: depth/highlight emission; relative +1-finger detection incl. baseline 3→4; re-baseline suppresses phantom steps on relax/add; one-shot resolution (stray re-lift = no-op); four-finger horizontal discard.
 
 ## 8. AppCoordinator wiring + injection
@@ -59,7 +59,7 @@
 - [x] 10.2 Promote the private `FilePreview` (`ClipboardBandView.swift:202-228`) to internal; embed it for files (QuickLook, icon fallback); add the folder-contents **peek** for folder highlights.
 - [x] 10.3 Single **sliding** selection highlight (clone `RowHighlight`/`SelectionSquare`) — never per-row; bubble only row content / structural changes.
 - [x] 10.4 Depth transition: collapse-current-into-ancestor-icon / bloom-icon-into-current via `.id(depth)` + scale transition (the `SwitcherView` idiom, scaling not sliding).
-- [x] 10.5 The type-to-filter **search field** (focused via clamp-overflow), keyboard input, live filter, step-down returns to the list.
+- [x] ~~10.5 The type-to-filter **search field**~~ — **REMOVED** (amendment): no search field, no `@FocusState`, no key-interactive panel flip; an up-step at the top of the column clamps.
 - [x] 10.6 The **Open-With** menu surface (bubble-morph), driven by the held Open-With resolution.
 - [x] 10.7 Wire `FilesBandView` into `LauncherView.body` before the grid fallback (order: canvas → clipboard → files → grid).
 - [x] 10.8 Fill with the availability-gated `glassEffect(.regular[.tint], in:)` / `.ultraThinMaterial` idiom (clone `bandIconBackground`/`HubGlass`).
@@ -69,7 +69,7 @@
 - [x] 11.1 Add a `FilesBandLayout` (or reuse) in `LauncherGridLayout`; branch `layout(...)` (397-415) on `currentBandIsFiles` to size the panel to the depth's **final** frame.
 - [x] 11.2 Add the held-state lifecycle: on a resolving lift keep the panel **visible** (the `.aiCommand` exception in `end()`); enter/exit flips `onFilesColumnStateChanged`.
 - [ ] 11.3 Animated teardown for the receding exit: animate `shown = false` then **delay** `panel.close()`.
-- [x] 11.4 Suppress **horizontal** edge auto-repeat for the Files band in `setEdgeAutoScroll` (263) so depth can't run away; keep vertical auto-repeat.
+- [x] 11.4 ~~Suppress **horizontal** edge auto-repeat for the Files band~~ — **REVERSED** (depth-parity refinement): `setEdgeAutoScroll` now keeps horizontal auto-repeat for the Files band (only Clipboard suppresses it), so holding depth at the border auto-drills the tree — full launcher parity, per the user's request. Depth is also position-tracking (not out-and-back) in `configureFilesNav`/`updateFilesDrill`.
 - [x] 11.5 Only if a real `ScrollView` is introduced: add a `filesDrillActive` carve-out to `shouldConsumeScroll` + flip the panel key-interactive; otherwise keep it gesture-only.
 
 ## 12. Hub — Files page
@@ -84,4 +84,4 @@
 - [x] 13.1 `swift build` + `swift test` green — the existing 614 tests plus the new navigation / open-service / recognizer tests.
 - [x] 13.2 `xcodebuild` compile-check the MLX-linked app target (the new files must compile in the app; the MLX split is untouched).
 - [x] 13.3 Update `README.md` (B1 repo map + the 30-second feature brief) and `CLAUDE.md` landmines (the files-drill modal sub-state, the first-spring/bubble-morph rule, the relative +1-finger rule, the defuse-never-kills-a-running-app rule).
-- [x] 13.4 Hand the user a manual in-app smoke checklist (stable-signed build): land on Files band → descend/ascend → preview → open → Open-With → discard mid-open → search → bubble-morph feel.
+- [x] 13.4 Hand the user a manual in-app smoke checklist (stable-signed build): land on Files band → descend/ascend → preview → open → Open-With → discard mid-open → remember-last-folder toggle on/off → bubble-morph feel.

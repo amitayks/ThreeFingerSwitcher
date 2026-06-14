@@ -4,8 +4,8 @@ import Foundation
 
 /// Tests the Files-band *integration* into `LauncherModel` (change: files-band, tasks 6.1–6.3): the
 /// `currentBandIsFiles` gating, horizontal drilling (descend / ascend) reprojecting the band's items,
-/// vertical highlight motion with the up-overflow → published focus-search signal, remembered-location
-/// persistence on a depth change, and the descending sort's folders-first preservation — plus the
+/// vertical highlight motion (clamping at the top — no search), remembered-location persistence and the
+/// restore-on-re-entry toggle, and the descending sort's folders-first preservation — plus the
 /// `FilesColumnController`'s sync-model ⇄ cache bridge in isolation.
 ///
 /// Determinism: every test drives a `FilesColumnController` over a **fully-seeded fixture cache** (the
@@ -190,68 +190,18 @@ final class FilesColumnRoutingTests: XCTestCase {
         XCTAssertEqual(model.selectedIndex, 0, "at the top of the restored column")
     }
 
-    // MARK: - Search-focus state (refinement 5)
+    // MARK: - Top-of-column up clamps (no search to overflow into)
 
-    /// A top-of-column up-overflow sets the published `filesSearchFocused` (the controller flips the panel
-    /// key-interactive on it) in addition to bumping the one-shot focus token.
-    func testTopOverflowSetsFilesSearchFocused() {
+    /// An up-step at the top of the column is a pure clamp now: the highlight stays put and nothing else
+    /// happens (no search field to focus, no depth change).
+    func testUpAtTopOfColumnClamps() {
         let controller = makeController()
         let model = makeModelWithFilesBand(controller: controller)
         enterFilesGrid(model)
         model.stepHorizontal(1)                       // → Home, highlight at the top (index 0)
-        XCTAssertFalse(model.filesSearchFocused)
-        model.stepVertical(1)                         // up while already at the top → overflow → focus search
-        XCTAssertTrue(model.filesSearchFocused, "the overflow focuses the search field")
-    }
-
-    /// Stepping DOWN moves the highlight back into the list AND clears the search focus — both can no longer
-    /// be highlighted at once (the bug refinement 5 fixes).
-    func testStepDownClearsFilesSearchFocused() {
-        let controller = makeController()
-        let model = makeModelWithFilesBand(controller: controller)
-        enterFilesGrid(model)
-        model.stepHorizontal(1)                       // → Home (2 entries), top
-        model.stepVertical(1)                         // overflow → search focused
-        XCTAssertTrue(model.filesSearchFocused)
-        model.stepVertical(-1)                        // DOWN → highlight into the list, search un-focused
-        XCTAssertFalse(model.filesSearchFocused, "a down-step un-focuses the search field")
-        XCTAssertEqual(model.selectedIndex, 1, "and the highlight moved into the list")
-    }
-
-    /// Switching bands clears any Files search focus (it belongs to the Files column).
-    func testBandSwitchClearsFilesSearchFocused() {
-        let controller = makeController()
-        let model = makeModelWithFilesBand(controller: controller)
-        enterFilesGrid(model)
-        model.stepHorizontal(1)                       // → Home, top
-        model.stepVertical(1)                         // overflow → search focused
-        XCTAssertTrue(model.filesSearchFocused)
-        // Escape back to the rail, then switch off the Files band.
-        model.stepHorizontal(-1)                      // ascend Home → back to roots (still .grid)
-        model.stepHorizontal(-1)                      // at roots, LEFT crosses to the band rail
-        XCTAssertEqual(model.focus, .bands)
-        model.stepVertical(1)                         // previous band (off Files)
-        XCTAssertFalse(model.filesSearchFocused, "a band switch dropped the search focus")
-    }
-
-    /// `setBands` resets the search-focus flag (a fresh launcher open never inherits a stale focus).
-    func testSetBandsClearsFilesSearchFocused() {
-        let controller = makeController()
-        let model = makeModelWithFilesBand(controller: controller)
-        enterFilesGrid(model)
-        model.stepHorizontal(1)
-        model.stepVertical(1)                         // overflow → search focused
-        XCTAssertTrue(model.filesSearchFocused)
-        // Re-seed the bands (a fresh open): the flag resets.
-        let controller2 = makeController()
-        let filesItems = FilesBandBuilder.build(currentColumn: controller2.visibleEntries).items
-        model.setBands([[LaunchItem(title: "A0", icon: .appDefault,
-                                    kind: .app(bundleURL: URL(fileURLWithPath: "/Applications/A0.app"), strategy: nil))],
-                        filesItems],
-                       names: ["Dev", FilesBandBuilder.name],
-                       colors: [ItemColor(red: 0, green: 0, blue: 1), FilesBandBuilder.color],
-                       startBand: 1, column: 0, filesBandIndex: 1, filesColumn: controller2)
-        XCTAssertFalse(model.filesSearchFocused, "setBands cleared the search-focus flag")
+        model.stepVertical(1)                         // up while already at the top → clamp, no-op
+        XCTAssertEqual(model.selectedIndex, 0, "the highlight stays put on a top-of-column up-step")
+        XCTAssertEqual(controller.current, .folder(homeRoot), "no depth change, no side effect")
     }
 
     // MARK: - Horizontal drill (descend / ascend) reprojects the band
@@ -337,33 +287,6 @@ final class FilesColumnRoutingTests: XCTestCase {
         XCTAssertEqual(model.selectedIndex, 1, "down clamps at the last row")
     }
 
-    // MARK: - Clamp-overflow surfaces the published focus-search signal
-
-    func testUpOverflowAtTopBumpsFocusSearchToken() {
-        let controller = makeController()
-        let model = makeModelWithFilesBand(controller: controller)
-        enterFilesGrid(model)
-        model.stepHorizontal(1)               // → Home, highlight at index 0 (top of column)
-        let before = model.filesFocusSearchToken
-        model.stepVertical(1)                 // up while already at the top → clamp-overflow → focus search
-        XCTAssertEqual(model.selectedIndex, 0, "the highlight stays put on overflow")
-        XCTAssertEqual(model.filesFocusSearchToken, before + 1,
-                       "the published focus-search signal is bumped exactly once")
-        XCTAssertFalse(controller.focusSearchRequested, "the one-shot latch was cleared after surfacing")
-    }
-
-    func testNonOverflowUpDoesNotBumpFocusSearchToken() {
-        let controller = makeController()
-        let model = makeModelWithFilesBand(controller: controller)
-        enterFilesGrid(model)
-        model.stepHorizontal(1)               // → Home
-        model.stepVertical(-1)                // down to index 1 first (not at the top)
-        let before = model.filesFocusSearchToken
-        model.stepVertical(1)                 // up from index 1 → a normal move, no overflow
-        XCTAssertEqual(model.selectedIndex, 0)
-        XCTAssertEqual(model.filesFocusSearchToken, before, "a non-overflow up-step doesn't signal search")
-    }
-
     // MARK: - Remembered-location persistence on a depth change
 
     func testDepthChangePersistsRememberedLocation() {
@@ -393,14 +316,34 @@ final class FilesColumnRoutingTests: XCTestCase {
         XCTAssertTrue(recorded.isEmpty, "crossing back to the band list is not a depth change")
     }
 
-    func testRememberedLocationRestoresOnReentry() {
-        // Cold-start the controller with a remembered deepest location for /Home and verify it restores.
-        let controller = makeController(remembered: [homeRoot: URL(fileURLWithPath: "/Home/Docs")])
-        let model = makeModelWithFilesBand(controller: controller)
-        enterFilesGrid(model)
-        model.stepHorizontal(1)               // entering Home restores straight to the remembered /Home/Docs
+    func testReentryRestoresRememberedLocationWhenRestoreOn() {
+        // Restore ON: the controller opens deep (/Home/Docs); ascend back to roots, then re-descend into Home
+        // → `enterRoot` restores the remembered /Home/Docs again.
+        let controller = FilesColumnController(roots: [homeRoot, workRoot],
+                                               remembered: [homeRoot: URL(fileURLWithPath: "/Home/Docs")],
+                                               sortOrder: .name,
+                                               sortDirection: .ascending,
+                                               restoreLastLocation: true,
+                                               seededCache: standardTree())
+        XCTAssertEqual(controller.current, .folder(URL(fileURLWithPath: "/Home/Docs")), "opens restored")
+        controller.ascend(); controller.ascend()      // /Home/Docs → /Home → roots
+        XCTAssertEqual(controller.current, .roots)
+        controller.descend()                          // re-enter Home → restores /Home/Docs
         XCTAssertEqual(controller.current, .folder(URL(fileURLWithPath: "/Home/Docs")))
-        XCTAssertEqual(model.items.map(\.title), ["Sub", "a.txt"])
+        XCTAssertEqual(controller.visibleEntries.map(\.name), ["Sub", "a.txt"])
+    }
+
+    func testReentryDoesNotRestoreWhenRestoreOff() {
+        // The bug fix at the integration layer: restore OFF opens on the roots list, and descending into a
+        // root from the band lands on the root's TOP level — never the remembered deep folder.
+        let controller = makeController(remembered: [homeRoot: URL(fileURLWithPath: "/Home/Docs")])  // restore off
+        let model = makeModelWithFilesBand(controller: controller)
+        XCTAssertEqual(controller.current, .roots, "restore off → opens on roots")
+        enterFilesGrid(model)
+        model.stepHorizontal(1)               // descend into Home → lands on the TOP, not the remembered /Home/Docs
+        XCTAssertEqual(controller.current, .folder(homeRoot),
+                       "restore off → descending into a root never jumps to the last-visited folder")
+        XCTAssertEqual(model.items.map(\.title), ["Docs", "photo.png"])
     }
 
     // MARK: - Descending sort preserves folders-first

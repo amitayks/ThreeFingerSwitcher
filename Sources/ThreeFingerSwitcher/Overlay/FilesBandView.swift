@@ -9,8 +9,7 @@ import Foundation
 ///    (`model.filesColumn.navigation.ancestors`), deepest nearest the current list, so the path is
 ///    legible without ever widening the overlay;
 /// 2. the **current-folder list** — the full vertical list of `model.filesColumn.visibleEntries`, each
-///    row a kind glyph + name + the metadata `AppSettings.filesRowMetadata` selects, with a search field
-///    pinned at the top; and
+///    row a kind glyph + name + the metadata `AppSettings.filesRowMetadata` selects; and
 /// 3. a **live preview** pane — a QuickLook content preview for a highlighted file (reusing the Clipboard
 ///    band's `FilePreview`) or a peek of a highlighted folder's contents.
 ///
@@ -27,27 +26,15 @@ import Foundation
 /// never bubble-morphed.
 ///
 /// The overlay panel is **non-activating** (it never becomes key/main on its own); these animations are
-/// display-only. The search field uses SwiftUI first-responder (`@FocusState`) the same way the AI canvas
-/// flips the panel key-interactive for its controls — keyboard focus only resolves once the panel is made
-/// key (a `LauncherOverlayController` concern), but the view-side focus wiring lives here.
+/// display-only. The navigator is **purely gesture-driven** — there is no keyboard focus and the panel never
+/// needs to become key (unlike the AI canvas), so every interaction is a trackpad intent routed in by the
+/// recognizer's Files-drill sub-state.
 struct FilesBandView: View {
     @ObservedObject var model: LauncherModel
     /// Live appearance/behaviour tunables (column width, density, tint, row metadata, icon style). The
     /// overlay layer reads the shared singleton (matching `LauncherOverlayController`'s panel sizer and the
     /// AI canvas's `@ObservedObject` settings), so a tweak in the Hub re-renders the open navigator.
     @ObservedObject var settings: AppSettings = .shared
-
-    /// Mirror of the search field's text so the `TextField` is editable and so each keystroke re-evaluates
-    /// `body` — which re-reads `controller.visibleEntries` after `setSearchQuery` has filtered it. The
-    /// controller (a plain class, not an `ObservableObject`) doesn't republish on its own, so this `@State`
-    /// is what drives the live-filter re-render.
-    @State private var query: String = ""
-    /// First-responder for the search field. Driven ONE-WAY from the model's `filesSearchFocused` (refinement
-    /// 5) — set true on a top-of-column clamp-overflow up-step and false when a step-down moves the highlight
-    /// back into the list — so it can never drift from the model the way a locally-toggled flag would. It only
-    /// flips the `TextField`'s first-responder (so the made-key panel routes keystrokes here); the field's
-    /// *highlighted appearance* reads `model.filesSearchFocused` directly, never this.
-    @FocusState private var searchFocused: Bool
 
     /// Whether the failure row's raw "Show details" disclosure is expanded (collapsed by default — detail is
     /// opt-in, never shown inline; mirrors `ModelDetailView.showingDetails`). The raw OS/workspace text lives
@@ -76,22 +63,6 @@ struct FilesBandView: View {
         // never an app-modal alert (spec: failures are observable, never silent; bounded + non-blocking). It
         // buds in over the column (the navigator stays usable behind it) and recedes on Dismiss / a fresh open.
         .overlay(alignment: .bottom) { failureRow }
-        // Mirror the field's first-responder onto the MODEL's `filesSearchFocused` (refinement 5), not a
-        // local token that can drift: the model sets it TRUE on a top-of-column clamp-overflow and FALSE when
-        // a step-down moves the highlight back into the list, and the controller flips the panel key-interactive
-        // on the same signal — so the field first-responds while focused and resigns (un-highlighting) on the
-        // step-down. The appearance reads `filesSearchFocused` directly (see `searchField`); this only keeps the
-        // `@FocusState` in lockstep so the made-key panel actually routes keystrokes here.
-        .onChange(of: model.filesSearchFocused) { _, focused in
-            if searchFocused != focused { searchFocused = focused }
-        }
-        // Keep the field's text mirror in sync with the controller's own query (refinement 5a): the per-visit
-        // clear — `searchQuery` is reset to "" on every descend/ascend in `FilesNavigationModel` — flows back
-        // here, so returning to a folder (even immediately) shows an EMPTY field, never a stale query. A
-        // gesture-driven clear or a fresh launcher open lands here the same way.
-        .onChange(of: controller?.navigation.searchQuery ?? "") { _, q in
-            if q != query { query = q }
-        }
     }
 
     // MARK: - Layout: (rail | current list | preview) over a full-width breadcrumb bar
@@ -137,7 +108,7 @@ struct FilesBandView: View {
         // than imposing an outer frame here. `LauncherOverlayController` already sizes the panel to the
         // CONSTANT `FilesBandLayout` dims (Clipboard-equal, no per-depth / per-density variation) and
         // `LauncherView` insets it by the shared container padding; the three fixed-width columns
-        // (rail + current + preview + dividers) and the search/row-area/breadcrumb heights are computed from
+        // (rail + current + preview + dividers) and the row-area/breadcrumb heights are computed from
         // those same constants to sum to the available area, so the surface and the window frame can't drift.
         // The container never resizes on crossing in or changing depth — the current list scrolls inside.
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -177,10 +148,6 @@ struct FilesBandView: View {
     private func currentList(_ controller: FilesColumnController) -> some View {
         let entries = controller.visibleEntries
         VStack(spacing: 0) {
-            searchField
-                .padding(.horizontal, 8)
-                .padding(.bottom, 6)
-
             // The current-folder rows SCROLL inside the fixed container (refinement 3): a `ScrollViewReader`
             // + a vertical `ScrollView` (cloned from `ClipboardBandView.keyList`) so a folder taller than the
             // fixed row area scrolls to keep the highlight visible, driven by the same vertical edge-auto-
@@ -197,7 +164,7 @@ struct FilesBandView: View {
                                 row(entry, controller: controller)
                                     .frame(height: rowHeight)
                                     // Row CONTENT comes/goes with the droplet: rows that bud in when a late
-                                    // async listing lands or a search filters the list (the depth-swap itself
+                                    // async listing lands (the depth-swap itself
                                     // is governed by the whole list's `.id`/`.transition`, so this only fires
                                     // for membership changes within a stable depth — design D8). Never on the
                                     // sliding highlight. The row's `.id` is the scroll target the reader seeks.
@@ -222,8 +189,8 @@ struct FilesBandView: View {
 
     /// Scroll the highlighted row into view (centered), the Files-band clone of `ClipboardBandView.scroll`:
     /// targets the entry at `highlightedIndex` within `visibleEntries` by its id, so the list follows the
-    /// sliding highlight when the folder is taller than the fixed container. A no-op on an empty/over-filtered
-    /// column (nothing highlighted to centre on).
+    /// sliding highlight when the folder is taller than the fixed container. A no-op on an empty column
+    /// (nothing highlighted to centre on).
     private func scroll(_ proxy: ScrollViewProxy, _ controller: FilesColumnController) {
         guard let id = controller.highlightedEntry?.id else { return }
         withAnimation(.easeInOut(duration: 0.16)) {
@@ -578,42 +545,6 @@ struct FilesBandView: View {
     /// details disclosure stays scroll-safe inside the band.
     private var failureCardWidth: CGFloat { 320 }
     private var failureCardMaxHeight: CGFloat { 280 }
-
-    // MARK: - Search field (top of the current list)
-
-    /// The type-to-filter field for the current folder. Its highlighted/focused appearance is driven by the
-    /// MODEL's `filesSearchFocused` (refinement 5), NOT a local `@State` that drifts: it lights up ONLY while
-    /// `filesSearchFocused` is true and visibly un-highlights when a step-down moves the highlight into the
-    /// list (`filesSearchFocused → false`), leaving only the list-row highlight lit. The `@FocusState` is kept
-    /// bound (mirrored from `filesSearchFocused` in `body`) so the field first-responds while focused — the
-    /// controller makes the panel key-interactive on the same signal, so keystrokes actually land here. Typing
-    /// filters `visibleEntries` live (each keystroke re-evaluates `body`, re-reading the now-filtered entries);
-    /// this typed search is the app's single scoped keypress exception, and WE filter (a local case-insensitive
-    /// filter in `FilesNavigationModel.visibleEntries`) — never an OS/Finder search (refinement 5a).
-    private var searchField: some View {
-        let focused = model.filesSearchFocused
-        return HStack(spacing: 6) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-            TextField("Filter", text: $query)
-                .textFieldStyle(.plain)
-                .font(.system(size: 12))
-                .focused($searchFocused)
-                .onChange(of: query) { _, q in controller?.setSearchQuery(q) }
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(focused ? tint.opacity(0.14) : Color.primary.opacity(0.06))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(focused ? tint.opacity(0.5) : Color.clear, lineWidth: 1)
-        )
-        .bubbleMorph()
-    }
 
     // MARK: - Live preview (right)
 

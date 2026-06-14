@@ -81,21 +81,6 @@ final class LauncherModel: ObservableObject {
     /// entry / preview off this; the model routes drill / highlight steps into it and reprojects the band.
     @Published private(set) var filesColumn: FilesColumnController?
 
-    /// One-shot **published focus-search signal** for the Files band: bumped when a top-of-column
-    /// clamp-overflow up-step asks the view to focus the search field (the model surfaces the navigator's
-    /// `focusSearchRequested` latch as a monotonically increasing token so a SwiftUI `.onChange` fires each
-    /// time, then the latch is cleared). The view observes this; nothing reads its absolute value.
-    @Published private(set) var filesFocusSearchToken: Int = 0
-
-    /// Whether the Files band's **search field is the focused element** (refinement 5): a top-of-column
-    /// clamp-overflow up-step (the same `filesFocusSearchToken` path) sets it TRUE, and a vertical DOWN step
-    /// that moves the highlight back into the list sets it FALSE — so stepping down off the field un-focuses
-    /// it (today both the field and the list stay highlighted). The controller flips the overlay panel
-    /// **key-interactive** on this (so keystrokes land in the field, like the AI canvas), and the view binds
-    /// its first-responder to it. Cleared on every band switch / `setBands` so a stale focus never carries
-    /// across opens. A *level* signal (not a token) because the panel's key state must track it both ways.
-    @Published private(set) var filesSearchFocused: Bool = false
-
     /// The held **Open-With picker** sub-state for the Files band: the relevant-apps list a relative
     /// +1-finger lift opened (`AppCoordinator.filesOpenWith` → `enterFilesPicker`), plus the highlighted
     /// row. Nil when not picking — the picker is a transient overlay budded over the column navigator,
@@ -185,7 +170,6 @@ final class LauncherModel: ObservableObject {
         self.canvasCommand = nil
         self.filesPicker = nil
         self.filesOpenFailure = nil
-        self.filesSearchFocused = false
         self.sessionPinToggles = []
         self.currentBand = clamp(startBand, 0, max(bands.count - 1, 0))
         // Multi-band lands on the band list at the home band (nothing armed); a single band has no
@@ -260,25 +244,13 @@ final class LauncherModel: ObservableObject {
 
     /// Move the Files-band highlight vertically: `dir > 0` (up) moves toward the top, `dir < 0` (down) moves
     /// toward the bottom — matching the grid/clipboard vertical convention (the reverse-vertical setting is
-    /// already applied upstream). An up-step at the top of the column overflows into a focus-search request,
-    /// which this surfaces as the published `filesFocusSearchToken`. Reprojects the band so the view follows
-    /// the new highlight.
+    /// already applied upstream). An up-step at the top of the column simply clamps (no overflow, no search —
+    /// the navigator is pure-trackpad). Reprojects the band so the view follows the new highlight.
     private func stepFilesVertical(_ dir: Int) {
         guard let controller = filesColumn else { return }
         if dir > 0 {
             controller.highlightUp()
-            // A top-of-column overflow latches a focus-search request; surface it once (bump the one-shot
-            // token the view focuses off) AND raise the level `filesSearchFocused` (the controller flips the
-            // panel key-interactive on it, so typing lands in the field), then clear the latch.
-            if controller.focusSearchRequested {
-                filesFocusSearchToken &+= 1
-                filesSearchFocused = true
-                controller.clearFocusSearchRequest()
-            }
         } else {
-            // A DOWN step moves the highlight back into the list, so it un-focuses the search field — both
-            // can no longer be highlighted at once (refinement 5). Harmless when search wasn't focused.
-            filesSearchFocused = false
             controller.highlightDown()
         }
         reprojectFilesBand()
@@ -366,10 +338,7 @@ final class LauncherModel: ObservableObject {
             // (nothing left to ascend) crosses back to the band list, matching the grid's column-0 escape.
             if currentBandIsFiles {
                 if dir < 0, filesColumn?.canAscend == false, bands.count > 1 {
-                    focus = .bands
-                    // Landing back on the band icon drops any search focus — the field belongs to the
-                    // column, not the rail (refinement 5). The drill also disengages (`filesDrillEngaged`).
-                    filesSearchFocused = false
+                    focus = .bands           // back to the band rail; the drill disengages (`filesDrillEngaged`)
                 } else {
                     stepFilesHorizontal(dir)
                 }
@@ -473,10 +442,6 @@ final class LauncherModel: ObservableObject {
         // Switching bands abandons any open Open-With picker — it belongs to the Files band's column, so
         // leaving (or re-entering) the band drops it rather than leaving a stale popup floating.
         if !currentBandIsFiles { filesPicker = nil }
-        // A band switch also drops any Files search focus (it belongs to the Files column; the field can't
-        // stay key once we've left the column / switched bands). The controller releases the panel's key
-        // state when this clears (refinement 5).
-        filesSearchFocused = false
         items = bands.indices.contains(currentBand) ? bands[currentBand] : []
         // The Files band's selection follows the navigator's live highlight (the source of truth for its
         // column), so switching back to it lands on the row the user left — not column 0.

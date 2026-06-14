@@ -152,11 +152,6 @@ enum FilesBandLayout {
     /// Width consumed by each `Divider()` between the three regions (rail | current | preview).
     static let dividerWidth: CGFloat = 1
 
-    /// Height of the top type-to-filter **search field** row (its content + vertical padding) inside the
-    /// current list. Subtracted (with the breadcrumb bar) from `containerHeight` to leave the scrollable
-    /// row area, so the view knows how tall the scroll region is.
-    static let searchFieldHeight: CGFloat = 34
-
     /// Height of the full-width **breadcrumb bar** pinned at the BOTTOM, spanning all three columns
     /// (refinement 4): it shows the path to the currently-highlighted item and updates live as the highlight
     /// moves. A fixed strip subtracted from `containerHeight` so it never eats the scroll area.
@@ -184,14 +179,14 @@ enum FilesBandLayout {
     static var containerHeight: CGFloat { ClipboardBandLayout.containerHeight }
 
     /// Height of the **scrollable current-folder row area** (refinement 3): the fixed container height minus
-    /// the top search field, the bottom breadcrumb bar, and the outer top/bottom padding — so the view knows
-    /// how tall the scroll region is. The view scrolls the current list within this region (a
-    /// `ScrollViewReader` following the highlight) when the folder has more rows than fit; the container
-    /// itself stays the fixed `containerHeight`. Density-independent (it's container minus chrome); the number
-    /// of rows that fit is `floor(rowAreaHeight / rowHeight(for: density))`, so density changes only how many
-    /// rows show before it scrolls, never the container.
+    /// the bottom breadcrumb bar and the outer top/bottom padding — so the view knows how tall the scroll
+    /// region is. The view scrolls the current list within this region (a `ScrollViewReader` following the
+    /// highlight) when the folder has more rows than fit; the container itself stays the fixed
+    /// `containerHeight`. Density-independent (it's container minus chrome); the number of rows that fit is
+    /// `floor(rowAreaHeight / rowHeight(for: density))`, so density changes only how many rows show before it
+    /// scrolls, never the container.
     static var rowAreaHeight: CGFloat {
-        containerHeight - searchFieldHeight - breadcrumbBarHeight - 2 * padding
+        containerHeight - breadcrumbBarHeight - 2 * padding
     }
 
     /// How many current-list rows fit the fixed `rowAreaHeight` at `density` before the list must scroll —
