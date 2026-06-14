@@ -358,6 +358,13 @@ Crossing **from the band list into the grid** (a horizontal-dominant stroke) SHA
 
 This SHALL apply equally to the Files band's navigator (its position-tracking highlight vs. its out-and-back depth), so a diagonal stroke does not move the highlight while drilling, nor drill while scrubbing the highlight.
 
+On a rail↔grid focus crossing the navigator SHALL **re-anchor at the current contact position**, so the surface crossed INTO starts fresh under the finger: entering the items does not carry the band-rail offset (which made the first item cost extra travel), a small relaxation after crossing does not bounce back across the boundary, and crossing back requires a deliberate move — making movement between the rail and the items equally easy in both directions.
+
+#### Scenario: Crossing re-anchors so moving between the rail and items is easy
+
+- **WHEN** the user crosses from the band rail into the items (or back)
+- **THEN** the navigator re-anchors at the finger, so a small relaxation stays on the surface just entered (no bounce back) and a deliberate move crosses again — neither direction costs extra travel over a normal item step
+
 #### Scenario: Entering a band's items forgives vertical drift
 
 - **WHEN** the band list is focused and the user strokes horizontally into the grid while drifting vertically

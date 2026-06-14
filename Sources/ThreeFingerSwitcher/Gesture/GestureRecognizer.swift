@@ -661,6 +661,17 @@ final class GestureRecognizer {
         if out.stepX != 0 { for _ in 0..<abs(out.stepX) { emitItemStep(forward: out.stepX > 0) } }
         if out.stepY != 0 { for _ in 0..<abs(out.stepY) { emitContextStep(up: out.stepY > 0) } }
         updateHeldZones(dx: out.heldX, dy: out.heldY)
+
+        // Crossing the band rail ⇄ grid boundary (a horizontal step that flips the band-list focus):
+        // RE-ANCHOR the navigator at the finger so the surface you crossed INTO starts fresh under your hand.
+        // Without this the band-rail anchor stays put, so its rest position sits right on the crossing
+        // boundary — relaxing your hand slides you back across, and the first item costs the band-anchored
+        // offset on top of its own step (the "extra steps" entering/leaving the items). After re-anchoring,
+        // each side is a small, equal, deliberate nudge. (`launcher-aim-lock` crossing-feel fix.)
+        if out.stepX != 0, (delegate?.launcherFocusIsOnBandList() ?? false) != onBandList {
+            launcherNav.reanchor(center: c, spread: frame.footprintSpread)
+            updateHeldZones(dx: 0, dy: 0)
+        }
     }
 
     /// Emit the per-axis HELD-IN-ZONE sign (offset held beyond the outer threshold) when it changes, so

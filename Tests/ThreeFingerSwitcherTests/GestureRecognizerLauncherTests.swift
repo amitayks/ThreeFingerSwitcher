@@ -17,6 +17,10 @@ private final class LauncherMockDelegate: GestureRecognizerDelegate {
     /// treated as band switching (the coarse context-step) rather than in-grid row movement (the fine
     /// item-step). Horizontal travel is always the fine item-step.
     var onBandList = false
+    /// When set, simulate the model's band-rail ⇄ grid focus crossing in response to item steps (the plain
+    /// mock keeps `onBandList` static), so the recognizer's re-anchor-on-cross can be exercised.
+    var simulateCrossing = false
+    private var simCol = 0
 
     // Switcher
     func gestureDidActivate() { events.append(.activate) }
@@ -28,7 +32,16 @@ private final class LauncherMockDelegate: GestureRecognizerDelegate {
 
     // Launcher
     func launcherDidActivate() { events.append(.lActivate) }
-    func launcherDidStepItem(_ d: Int) { events.append(.lItem(d)) }
+    func launcherDidStepItem(_ d: Int) {
+        events.append(.lItem(d))
+        guard simulateCrossing else { return }
+        if onBandList {
+            if d > 0 { onBandList = false; simCol = 0 }       // right from the rail → cross into the grid (item 0)
+        } else {
+            simCol += d
+            if simCol < 0 { onBandList = true; simCol = 0 }   // left past column 0 → cross back to the rail
+        }
+    }
     func launcherDidStepContext(_ d: Int) { events.append(.lContext(d)) }
     func launcherDidEnd() { events.append(.lEnd) }
     func launcherDidCancel() { events.append(.lCancel) }
@@ -247,6 +260,24 @@ final class GestureRecognizerLauncherTests: XCTestCase {
         feed(rec, x: 0.64, y: 0.57, fingers: 2)   // up-RIGHT: offset +0.8 / +0.7
         XCTAssertFalse(d.lItems.isEmpty, "the rightward stroke enters the items")
         XCTAssertTrue(d.lContexts.isEmpty, "the upward drift does not switch a band")
+    }
+
+    func test_bandRailCrossing_reanchorsForEasyBidirectionalCrossing() {
+        // Crossing the band rail ⇄ grid re-anchors the navigator at the finger, so each side starts fresh:
+        // a small relax does NOT bounce you back across, and a deliberate move crosses cleanly. (The fix for
+        // "extra steps / hard to move between the band and the items".)
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
+        d.onBandList = true
+        d.simulateCrossing = true
+        feed(rec, x: 0.50, y: 0.50, fingers: 4)
+        feed(rec, x: 0.56, y: 0.50, fingers: 4)   // activate → anchor 0.56
+        feed(rec, x: 0.56, y: 0.50, fingers: 2)   // relax → re-anchor 0.56
+        feed(rec, x: 0.62, y: 0.50, fingers: 2)   // RIGHT: cross into the grid; recognizer re-anchors at 0.62
+        XCTAssertFalse(d.onBandList, "crossed into the grid (item 0)")
+        feed(rec, x: 0.605, y: 0.50, fingers: 2)  // small relax from the re-anchored center → inside the deadzone
+        XCTAssertFalse(d.onBandList, "a small relax stays in the grid (no bounce back to the band)")
+        feed(rec, x: 0.57, y: 0.50, fingers: 2)   // deliberate LEFT from 0.62 → cross back
+        XCTAssertTrue(d.onBandList, "a deliberate left move crosses back to the band")
     }
 
     func test_edgeBand_acceleratesNearBorderInsideTheBox() {
