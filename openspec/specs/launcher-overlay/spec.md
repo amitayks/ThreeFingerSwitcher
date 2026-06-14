@@ -50,33 +50,33 @@ The **left band column** SHALL be a fixed-width icon strip. The launcher **windo
 - **THEN** the window height is clamped at the cap and the content grid scrolls (keeping the selected item visible)
 
 ### Requirement: Item stepping and context stepping
-While the launcher overlay is active, navigation SHALL be a 2D cursor split across the band list (left) and the content grid (right). Steps SHALL be **produced positionally** (see gesture-recognition's *Anchored positional navigation interpretation*): inside the **padding box** the cursor **tracks the finger's position** in discrete steps (moving back steps it back), and once the offset leaves the box — or reaches the **edge-margin band** — it **auto-repeats** along the eased curve, not per fixed distance of accumulated travel. The per-axis cursor topology is:
+While the launcher overlay is active, navigation SHALL be a 2D cursor split across the band list (left) and the content grid (right), with the per-axis behavior below:
 
-- With the **band list focused**, **vertical** offset SHALL switch the active band (one band per vertical step — a *deliberate* step), and **horizontal** offset toward the content SHALL cross the focus into the grid, landing on the band's home/first item. Horizontal offset away from the content SHALL clamp (there is nothing to the left of the band list).
-- With the **grid focused**, **horizontal** offset SHALL step the selection between items within the current row (one item per horizontal step); from the **first column**, a further step toward the band list SHALL cross the focus back to the band list. **Vertical** offset SHALL step between grid rows and SHALL clamp at the first and last row (it no longer rises to a separate header row — the bands are reached horizontally now).
+- With the **band list focused**, **vertical** travel SHALL switch the active band (one band per context-step distance — a *deliberate* step, with carry), and **horizontal** travel toward the content SHALL cross the focus into the grid, landing on the band's home/first item. Horizontal travel away from the content SHALL clamp (there is nothing to the left of the band list).
+- With the **grid focused**, **horizontal** travel SHALL step the selection between items within the current row (one item per item-step distance, with carry); from the **first column**, a further step toward the band list SHALL cross the focus back to the band list. **Vertical** travel SHALL step between grid rows and SHALL clamp at the first and last row (it no longer rises to a separate header row — the bands are reached horizontally now).
 
 Stepping past the first/last band or item SHALL clamp (not wrap) unless wrap is configured.
 
-The **Clipboard band** is an exception to the grid's horizontal mapping. Its content is a single-column master-detail list (key list + value preview): horizontal offset toward the content crosses into the **key list**, vertical offset scrubs between entries (rows), and horizontal offset within the key list is repurposed for pin / return-to-band-list (see the Clipboard band navigation requirement) rather than stepping items.
+The **Clipboard band** is an exception to the grid's horizontal mapping. Its content is a single-column master-detail list (key list + value preview): horizontal travel toward the content crosses into the **key list**, vertical travel scrubs between entries (rows), and horizontal travel within the key list is repurposed for pin / return-to-band-list (see the Clipboard band navigation requirement) rather than stepping items.
 
 #### Scenario: Vertical switches bands on the band list
-- **WHEN** the band list is focused and the vertical offset crosses the outer threshold (or auto-repeats while held)
-- **THEN** the active band changes to the adjacent band (and again per further step), the content pane updates to that band, and the active band's icon is highlighted
+- **WHEN** the band list is focused and the fingers move vertically past the context-step distance
+- **THEN** the active band changes to the adjacent band (and again per further context-step distance), the content pane updates to that band, and the active band's icon is highlighted
 
 #### Scenario: Horizontal crosses from the band list into the grid
-- **WHEN** the band list is focused and the horizontal offset toward the content crosses the outer threshold
+- **WHEN** the band list is focused and the fingers move horizontally toward the content past the item-step distance
 - **THEN** the focus crosses into the grid, landing on the band's first/home item (now armable)
 
 #### Scenario: Horizontal steps items within a row
-- **WHEN** the grid is focused on a normal band and the horizontal offset steps (not at the first column moving outward)
-- **THEN** the selection moves to the adjacent item in the current row (and again per further step)
+- **WHEN** the grid is focused on a normal band and the fingers move horizontally past the item-step distance (not at the first column moving outward)
+- **THEN** the selection moves to the adjacent item in the current row (and again per further item-step distance)
 
 #### Scenario: Horizontal from the first column returns to the band list
-- **WHEN** the grid is focused with the selection in the first column and the horizontal offset steps toward the band list
+- **WHEN** the grid is focused with the selection in the first column and the fingers move horizontally toward the band list
 - **THEN** the focus crosses back to the band list at the active band's icon
 
 #### Scenario: Vertical steps grid rows and clamps at the edges
-- **WHEN** the grid is focused and the vertical offset steps
+- **WHEN** the grid is focused and the fingers move vertically past the item-step distance
 - **THEN** the selection moves to the adjacent row, clamping at the first and last row (it does not rise onto the band list)
 
 #### Scenario: Selecting an empty edge clamps
@@ -84,7 +84,7 @@ The **Clipboard band** is an exception to the grid's horizontal mapping. Its con
 - **THEN** the selection stays on the first item (no wrap, by default)
 
 #### Scenario: Clipboard band overrides horizontal item stepping
-- **WHEN** the grid is focused on the Clipboard band and the horizontal offset steps within the key list
+- **WHEN** the grid is focused on the Clipboard band and the fingers move horizontally within the key list
 - **THEN** the selection does not step to another entry; instead the pin / return-to-band-list behavior applies
 
 ### Requirement: Deterministic home-cell entry
@@ -185,35 +185,33 @@ A horizontal pin action SHALL require a **deliberate excursion** whose travel ex
 
 ### Requirement: Edge-triggered auto-repeat for all launcher navigation
 
-While the launcher is active, **holding the offset beyond the padding box** (or in the edge-margin band — *not* keyed to a physical trackpad edge) SHALL **auto-repeat** the corresponding navigation step, on **both axes**: a held vertical offset repeats vertical stepping (switching bands when the band list is focused, or moving between grid rows / the Clipboard list when the grid is focused), and a held horizontal offset repeats horizontal stepping (moving the item cursor within the grid, or crossing between the band list and the grid).
+While the launcher is active, holding the controlling contact at a trackpad edge SHALL **auto-repeat** the corresponding navigation step, on **both axes**: the vertical edges repeat vertical stepping (switching bands when the band list is focused, or moving between grid rows / the Clipboard list when the grid is focused), and the horizontal edges repeat horizontal stepping (moving the item cursor within the grid, or crossing between the band list and the grid). Auto-repeat SHALL **accelerate** the longer an edge is held. It SHALL apply to every band's navigation, not only overflowing lists — a step that has nowhere to go SHALL simply clamp.
 
-Auto-repeat cadence SHALL follow a **smooth eased acceleration curve over dwell duration**: position-tracking already steps the cursor to the box edge, then the **first** auto-repeat fires after a short initial delay, and the interval SHALL **shorten along a curve** (never an abrupt slow→fast jump) toward a fast minimum floor the longer the offset is held. Returning the offset back into the box SHALL stop auto-repeat; a small move back past the **back-off** SHALL stop it and re-center onto the finger. The same eased curve SHALL apply to **both axes on every navigation surface** (launcher grid, Clipboard list, and the Files navigator's highlight axis).
+In the **Clipboard band**, horizontal auto-repeat SHALL be suppressed (there horizontal is the deliberate pin / return-to-band-list action), while vertical auto-repeat still applies. In the **Files navigator**, auto-repeat SHALL apply on **both axes** — vertical (highlight) and horizontal (depth) — so holding depth at the edge **auto-drills** through the directory tree, exactly like every other navigation axis. A clamped step (one that does not move the selection) SHALL NOT reset the dwell, so holding at an edge with nothing further to reach still lets the current item arm and fire. Detection SHALL use hysteresis (enter < exit) so jitter at the boundary does not flap. The edge zone, base rate, acceleration, and maximum rate SHALL be tunable.
 
-Auto-repeat SHALL apply to every band's navigation, not only overflowing lists — a step that has nowhere to go SHALL simply clamp. In the **Clipboard band**, horizontal auto-repeat SHALL be suppressed (there horizontal is the deliberate pin / return-to-band-list action), while vertical auto-repeat still applies. In the **Files navigator**, horizontal auto-repeat SHALL be suppressed (there horizontal *drills* the directory tree — descend/ascend a level — which must be a deliberate, discrete step, never auto-fired), while vertical (highlight) auto-repeat still applies. A clamped step (one that does not move the selection) SHALL NOT reset the dwell, so holding with nothing further to reach still lets the current item arm and fire. The padding-box size, edge-margin band, position-step, initial repeat delay, repeat floor, acceleration curve, and back-off SHALL be tunable.
+#### Scenario: Holding at a vertical edge keeps switching bands or stepping rows
+- **WHEN** the user scrubs to the end of finger travel at the bottom (or top) trackpad edge
+- **THEN** the active band keeps switching (band list focused) or the row selection keeps advancing (grid focused) without lifting, accelerating the longer the edge is held
 
-#### Scenario: Holding a vertical offset keeps switching bands or stepping rows
-- **WHEN** the user holds the vertical offset beyond the outer threshold (top or bottom)
-- **THEN** the active band keeps switching (band list focused) or the row selection keeps advancing (grid focused) without lifting, the interval shortening along the eased curve the longer it is held
+#### Scenario: Holding at a horizontal edge keeps stepping items
+- **WHEN** the grid is focused and the contact is held at the right/left edge
+- **THEN** the item cursor keeps moving in that direction, accelerating, until it clamps (or crosses to the band list at the left edge)
 
-#### Scenario: Holding a horizontal offset keeps stepping items
-- **WHEN** the grid is focused and the horizontal offset is held beyond the outer threshold
-- **THEN** the item cursor keeps moving in that direction, accelerating along the eased curve, until it clamps (or crosses to the band list)
+#### Scenario: Clipboard band suppresses horizontal auto-repeat
+- **WHEN** the Clipboard band is active and the contact is held at a horizontal edge
+- **THEN** no pin / return-to-band-list action auto-repeats (only vertical auto-repeat applies there)
 
-#### Scenario: First repeat is delayed, then the curve accelerates smoothly
-- **WHEN** an offset is held just beyond the outer threshold
-- **THEN** the first step fires immediately, the second fires after the initial repeat delay, and subsequent intervals shorten gradually along the curve toward the floor (not jumping straight to the fastest rate)
+#### Scenario: Files navigator auto-drills depth at the horizontal edge
+- **WHEN** the Files navigator is active and the contact is held at a horizontal edge
+- **THEN** depth descend/ascend auto-repeats (auto-drills), accelerating the longer the edge is held, just like the highlight axis at a vertical edge
 
-#### Scenario: Clipboard and Files bands suppress horizontal auto-repeat
-- **WHEN** the Clipboard or Files band is active and a horizontal offset is held beyond the outer threshold
-- **THEN** no pin / return-to-band-list or descend/ascend action auto-repeats (only vertical auto-repeat applies there)
-
-#### Scenario: A clamped held offset does not block arming
-- **WHEN** the selection is already at the end in the held direction and the offset stays beyond the outer threshold
+#### Scenario: A clamped edge does not block arming
+- **WHEN** the selection is already at the end in the held direction and the contact stays at that edge
 - **THEN** the auto-repeat is a no-op that does not reset the dwell, so the current item can still arm and fire
 
-#### Scenario: Returning to center stops auto-repeat
-- **WHEN** the offset returns inside the inner deadzone or the contact lifts
-- **THEN** auto-repeat stops and the axis re-arms
+#### Scenario: Leaving the edge stops auto-repeat
+- **WHEN** the contact moves back off the edge or lifts
+- **THEN** auto-repeat stops
 
 ### Requirement: AI availability is resolved in the preview canvas, not by hiding items
 AI-command items SHALL always appear and be fireable in the launcher regardless of whether AI is enabled or the model is downloaded. When an AI-command item is fired while AI is **disabled** or the selected model is **not yet available** (not downloaded or not ready), the overlay SHALL open the AI preview canvas in an **unavailable** state — a non-error presentation showing a clear message (a clean, bounded string — either an error headline routed through the single AI error→message translator, or a clear non-error guidance string; never raw error text), an **Enable** affordance that turns the AI opt-in on, a **Download** action that begins fetching the model, and a **model picker** to choose the desired model. This canvas SHALL be **dismissable with the normal swipe-to-resolve gesture** (a horizontal discard), and any download it starts SHALL continue **in the background** after dismissal. The unavailable state SHALL NOT be surfaced via an app-modal alert and SHALL NOT block; it is bounded and non-blocking per the AI error-handling convention. When AI is enabled and the model becomes ready, firing an AI-command item SHALL proceed to normal streaming.
@@ -349,53 +347,4 @@ The preview canvas SHALL render text **bidirectionally**: each paragraph's **bas
 #### Scenario: Left-to-right text is unaffected
 - **WHEN** the streamed result is English text
 - **THEN** it renders left-aligned with a left-to-right base direction as before
-
-### Requirement: Single-axis launcher navigation across the rail↔grid crossing
-
-With directional axis-lock active (see gesture-recognition's *Directional axis-lock commits a stroke to one axis*), launcher navigation SHALL move on **one axis at a time**, so a diagonally-angled stroke does not change the band/row **and** the focus/column at once.
-
-Crossing **from the band list into the grid** (a horizontal-dominant stroke) SHALL NOT switch the active band as a side effect of vertical drift — the user lands in the **current** band's items. Crossing **from the grid back to the band list** (a horizontal-dominant stroke) SHALL land on the **same band** the user entered from (the active band is preserved across a horizontal crossing) and SHALL NOT switch bands as a side effect of vertical drift; moving to an adjacent band SHALL require a **fresh, deliberate vertical stroke** after the crossing. Inside the grid, an angled stroke SHALL step on a single axis (between items, or between rows), not diagonally.
-
-This SHALL apply equally to the Files band's navigator (its position-tracking highlight vs. its out-and-back depth), so a diagonal stroke does not move the highlight while drilling, nor drill while scrubbing the highlight.
-
-On a rail↔grid focus crossing the navigator SHALL **re-anchor at the current contact position**, so the surface crossed INTO starts fresh under the finger: entering the items does not carry the band-rail offset (which made the first item cost extra travel), a small relaxation after crossing does not bounce back across the boundary, and crossing back requires a deliberate move — making movement between the rail and the items equally easy in both directions.
-
-#### Scenario: Crossing re-anchors so moving between the rail and items is easy
-
-- **WHEN** the user crosses from the band rail into the items (or back)
-- **THEN** the navigator re-anchors at the finger, so a small relaxation stays on the surface just entered (no bounce back) and a deliberate move crosses again — neither direction costs extra travel over a normal item step
-
-#### Scenario: Entering a band's items forgives vertical drift
-
-- **WHEN** the band list is focused and the user strokes horizontally into the grid while drifting vertically
-- **THEN** the focus crosses into the current band's items and the active band does not change
-
-#### Scenario: Returning to the band list lands on the origin band
-
-- **WHEN** the grid is focused at the first column and the user strokes horizontally back toward the band list while drifting vertically
-- **THEN** the focus crosses back to the band list on the **same** band the user came from, with no band switch from the drift
-
-#### Scenario: A fresh vertical stroke after returning switches bands
-
-- **WHEN** the user has crossed back to the band list and then makes a fresh, deliberate vertical stroke
-- **THEN** the active band changes to the adjacent band (the lock having re-armed after the crossing settled)
-
-#### Scenario: Grid navigation steps one axis at a time
-
-- **WHEN** the grid is focused and the user strokes diagonally
-- **THEN** the selection steps along the committed (dominant) axis only — between items or between rows — not diagonally
-
-### Requirement: Wider acceptance for crossing from the band rail into the items
-
-While the band list is focused, the **rightward** (into-items) direction SHALL use a **wider** acceptance cone than band switching, so an up/down-and-right stroke commits to **entering the items** (crossing the focus into the grid) rather than switching a band — a bigger "crossing triangle." A clearly-vertical stroke (steeper than the wider cone) SHALL still switch bands. This widening SHALL apply only while the band list is focused; once in the grid the wedge SHALL be symmetric again.
-
-#### Scenario: An up-and-right stroke enters the items, not the band above
-
-- **WHEN** the band list is focused and the user strokes toward the items while drifting upward, at an angle inside the wider crossing cone
-- **THEN** the focus crosses into the current band's items (item movement) and the active band does not change
-
-#### Scenario: A clearly-vertical stroke still switches bands
-
-- **WHEN** the band list is focused and the user strokes steeply (steeper than the wider crossing cone), e.g. nearly straight up or down
-- **THEN** the active band switches (the crossing widening does not swallow a deliberate band move)
 

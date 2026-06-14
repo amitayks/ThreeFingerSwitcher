@@ -14,7 +14,7 @@ The Files band SHALL render as a **column navigator** rather than the icon grid:
 
 ### Requirement: Files band depth and highlight navigation
 
-In the Files band, **horizontal** travel SHALL be the **depth** axis and **vertical** travel SHALL move the **highlight** within the current folder: horizontal in the descend direction enters the highlighted folder (collapsing the prior current list into its ancestor icon and budding the child list in), horizontal in the ascend direction returns one level (the deepest ancestor icon blooming back into the full current list), and vertical steps the highlight up/down the current list. These SHALL honor the **same direction-inversion settings** as the rest of the launcher. Horizontal depth steps SHALL require the same deliberate per-step travel as item-stepping and SHALL **NOT auto-repeat at the horizontal edges** (so a held edge cannot run away descending/ascending through the tree); vertical highlight stepping SHALL auto-repeat with acceleration like other bands.
+In the Files band, **horizontal** travel SHALL be the **depth** axis and **vertical** travel SHALL move the **highlight** within the current folder: horizontal in the descend direction enters the highlighted folder (collapsing the prior current list into its ancestor icon and budding the child list in), horizontal in the ascend direction returns one level (the deepest ancestor icon blooming back into the full current list), and vertical steps the highlight up/down the current list. These SHALL honor the **same direction-inversion settings** as the rest of the launcher. **Both axes SHALL use the launcher's odometer step distance (`launcherStepDistance`) — accumulated travel with carry — and SHALL auto-repeat at the trackpad edge** — depth has full parity with the launcher's item axis, so holding a contact at the horizontal edge auto-drills (descends/ascends) through the tree, just as holding at the vertical edge auto-scrolls the list. *(This supersedes the earlier rule that depth was a deliberate, non-auto-repeating step; the snappier, edge-accelerated depth was chosen deliberately.)*
 
 #### Scenario: Horizontal descends into the highlighted folder
 - **WHEN** a folder is highlighted and the user travels horizontally in the descend direction past the step distance
@@ -28,9 +28,9 @@ In the Files band, **horizontal** travel SHALL be the **depth** axis and **verti
 - **WHEN** the user travels vertically in the current list
 - **THEN** the highlight steps to the adjacent entry
 
-#### Scenario: Held horizontal edge does not run away through the tree
-- **WHEN** the user holds the controlling contact at a horizontal edge in the Files band
-- **THEN** depth does not auto-repeat (no runaway descent/ascent); only a fresh deliberate horizontal excursion changes depth
+#### Scenario: Held horizontal edge auto-drills through the tree
+- **WHEN** the user holds the controlling contact at the horizontal border in the Files band
+- **THEN** depth auto-repeats with border acceleration (descending/ascending through the tree), exactly as holding at the vertical border auto-scrolls the list
 
 ### Requirement: Files band live preview
 
@@ -48,21 +48,17 @@ The Files band's preview pane SHALL show the **actual content of the highlighted
 - **WHEN** the user travels horizontally with a file highlighted
 - **THEN** horizontal is interpreted as depth (no crossing into the preview pane)
 
-### Requirement: Files band type-to-filter search
+### Requirement: Files band is pure-trackpad (no type-to-filter search)
 
-From the top of the current list, a further **up** step SHALL move focus to a **search field** for the current folder (a clamp-overflow: the recognizer keeps emitting up-steps; the controller interprets an up-step while already at the top as focusing search). While the search field is focused the user MAY **type with the keyboard** to **filter the current folder's entries** live; this typed search is the **single, scoped exception** to the app's no-keypresses rule. A downward step from the focused search field SHALL return focus to the (filtered) list. Clearing the query SHALL restore the full list.
+The Files band SHALL be navigated **entirely by trackpad** with **no keyboard input** of any kind: there SHALL be no type-to-filter search field, and the overlay panel SHALL never become key/main for the Files band. An **up** step at the top of the current list SHALL simply **clamp** (the highlight stays on the top row) — it SHALL NOT focus a search field or any other keyboard surface. This keeps the band consistent with the app's "pure trackpad, no keypresses" rule with no exception.
 
-#### Scenario: Up from the top focuses search
+#### Scenario: Up at the top of the list clamps
 - **WHEN** the highlight is at the top entry and the user steps up again
-- **THEN** focus moves to the search field for the current folder
+- **THEN** the highlight stays on the top row and no search field or keyboard focus is engaged
 
-#### Scenario: Typing filters the current folder live
-- **WHEN** the search field is focused and the user types a query
-- **THEN** the current list filters to matching entries as the user types
-
-#### Scenario: Stepping down returns to the list
-- **WHEN** the search field is focused and the user steps down
-- **THEN** focus returns to the (filtered) current list
+#### Scenario: The Files navigator takes no keyboard input
+- **WHEN** the Files band is open at any depth
+- **THEN** every interaction is a trackpad intent and the overlay panel does not become key/main
 
 ### Requirement: Files band resolution — open, Open-With, discard
 

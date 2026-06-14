@@ -69,11 +69,11 @@ When the default engine reports it cannot decode a file, the system SHALL NOT fa
 - **THEN** the libmpv engine reports unavailable and the player surfaces a clean bounded message rather than crashing, remaining usable with the default engine
 
 ### Requirement: Trackpad transport grammar owns the trackpad while the player is open
-While the player is open it SHALL own the trackpad and interpret contacts as transport intents, NOT as the global window switcher or launcher: a two-finger horizontal excursion SHALL seek (with held-offset auto-repeat for continuous fast-forward / rewind); a two-finger vertical excursion SHALL change volume (with the same held-offset auto-repeat); a two-finger tap with no navigation excursion SHALL toggle play/pause; a relative one-finger-more posture (three fingers, relative to the two-finger navigation baseline) SHALL raise the action menu; and a four-finger gesture SHALL dismiss the player. A three-finger count while the player is open SHALL raise the action menu and SHALL NOT activate the window switcher. The player SHALL auto-repeat on both axes (unlike the depth/pin surfaces that suppress horizontal auto-repeat).
+While the player is open it SHALL own the trackpad and interpret contacts as transport intents, NOT as the global window switcher or launcher: a two-finger horizontal excursion SHALL seek (with held-at-edge auto-repeat for continuous fast-forward / rewind); a two-finger vertical excursion SHALL change volume (with the same held-at-edge auto-repeat); a two-finger tap with no navigation excursion SHALL toggle play/pause; a relative one-finger-more posture (three fingers, relative to the two-finger navigation baseline) SHALL raise the action menu; and a four-finger gesture SHALL dismiss the player. A three-finger count while the player is open SHALL raise the action menu and SHALL NOT activate the window switcher. The player SHALL auto-repeat on both axes (unlike the depth/pin surfaces that suppress horizontal auto-repeat).
 
 #### Scenario: Two-finger horizontal seeks
-- **WHEN** the player is open and the user makes a two-finger horizontal excursion and holds it
-- **THEN** playback seeks one step in that direction and then auto-repeats along the eased acceleration curve while held
+- **WHEN** the player is open and the user makes a two-finger horizontal excursion and holds it at the trackpad edge
+- **THEN** playback seeks one step in that direction and then auto-repeats along the edge-triggered acceleration ramp while held
 
 #### Scenario: Two-finger vertical changes volume
 - **WHEN** the player is open and the user makes a two-finger vertical excursion and holds it

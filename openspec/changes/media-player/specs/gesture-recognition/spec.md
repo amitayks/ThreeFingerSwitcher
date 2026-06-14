@@ -15,19 +15,19 @@ The recognizer SHALL support a sustained **player modal sub-state** that, while 
 - **WHEN** the controller activates the player sub-state
 - **THEN** a fresh tracking session is seeded (prior offsets/anchors cleared)
 
-### Requirement: Player transport intents from the anchored-positional model
-While the player sub-state is active, the recognizer SHALL emit player transport intents derived from the anchored-positional navigation model: a seek intent (with direction) on a two-finger horizontal outer-threshold crossing; a volume intent (with direction) on a two-finger vertical outer-threshold crossing; a play/pause-toggle intent on a two-finger tap with no navigation excursion; an action-menu intent on the relative one-finger-more posture (a finger added relative to the two-finger baseline, not an absolute count); a select intent when a lift resolves the open action menu; and a dismiss intent on a four-finger gesture. The recognizer SHALL emit a held-in-zone signal (with sign) on both the horizontal and vertical axes so the controller can auto-repeat seek and volume on both axes. The anchor SHALL be re-baselined on every contact-count change so a leaving or added finger emits no phantom transport intent.
+### Requirement: Player transport intents from the odometer model
+While the player sub-state is active, the recognizer SHALL emit player transport intents derived from the **odometer** navigation model (accumulated signed travel with carry): a seek intent (with direction) per step distance of two-finger horizontal travel; a volume intent (with direction) per step distance of two-finger vertical travel; a play/pause-toggle intent on a two-finger tap with no navigation excursion; an action-menu intent on the relative one-finger-more posture (a finger added relative to the two-finger baseline, not an absolute count); a select intent when a lift resolves the open action menu; and a dismiss intent on a four-finger gesture. The recognizer SHALL emit a held-at-edge signal (with sign) on both the horizontal and vertical axes so the controller can auto-repeat seek and volume on both axes. The origin SHALL be re-baselined on every contact-count change so a leaving or added finger emits no phantom transport intent.
 
 #### Scenario: Two-finger horizontal emits a seek intent
-- **WHEN** the player sub-state is active and a two-finger horizontal offset crosses the outer threshold
-- **THEN** the recognizer emits one seek intent in that direction and signals held-in-zone while the offset is held
+- **WHEN** the player sub-state is active and two-finger horizontal travel accumulates past the step distance
+- **THEN** the recognizer emits one seek intent in that direction, and signals held-at-edge while the contact is held at a trackpad edge
 
 #### Scenario: Two-finger vertical emits a volume intent
-- **WHEN** the player sub-state is active and a two-finger vertical offset crosses the outer threshold
-- **THEN** the recognizer emits one volume intent in that direction and signals held-in-zone while the offset is held
+- **WHEN** the player sub-state is active and two-finger vertical travel accumulates past the step distance
+- **THEN** the recognizer emits one volume intent in that direction, and signals held-at-edge while the contact is held at a trackpad edge
 
 #### Scenario: Two-finger tap emits play/pause toggle
-- **WHEN** the player sub-state is active and two fingers touch and lift without crossing the inner deadzone
+- **WHEN** the player sub-state is active and two fingers touch and lift without any navigation excursion
 - **THEN** the recognizer emits a play/pause-toggle intent
 
 #### Scenario: Relative +1 finger emits the action-menu intent
@@ -36,7 +36,7 @@ While the player sub-state is active, the recognizer SHALL emit player transport
 
 #### Scenario: Contact-count change emits no phantom intent
 - **WHEN** the player sub-state is active and the contact count changes (a finger leaves or is added)
-- **THEN** the anchor is re-baselined and no seek, volume, or toggle intent is emitted from the count change alone
+- **THEN** the origin is re-baselined and no seek, volume, or toggle intent is emitted from the count change alone
 
 #### Scenario: Four fingers emit dismiss
 - **WHEN** the player sub-state is active and a four-finger gesture is made

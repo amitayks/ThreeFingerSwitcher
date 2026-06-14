@@ -217,14 +217,15 @@ final class GestureRecognizer {
     private var playerMoved = false
     /// The centroid where the current player contact session seeded (for the tap-vs-scrub test).
     private var playerSeedCentroid = CGPoint.zero
-    /// Player held-in-zone state per axis (−1 / 0 / +1), kept separate from the launcher/files `edgeDX/DY`.
+    /// Player edge-hold state per axis (−1 / 0 / +1), kept separate from the launcher/files `edgeDX/DY`.
     private var playerEdgeDX = 0
     private var playerEdgeDY = 0
-    /// The anchored-positional navigator for the player's transport (change `positional-navigation`, D1).
-    /// Same model as the launcher/files; BOTH axes auto-repeat (seek + volume). Re-anchored on entry /
-    /// contact-count change; rebuilt from settings when a fresh session seeds.
-    private var playerNav = PositionalNavigator(footprintFactor: 1.2, fallbackScale: 0.12,
-                                                inner: 0.22, outer: 0.5)
+    /// Player odometer (restored v0.11.0 model): accumulate signed travel and emit discrete seek/volume
+    /// steps with carry. Re-baselined on entry / contact-count change so a leaving/landing finger emits
+    /// no phantom step. BOTH axes auto-repeat at the trackpad edge (seek + volume).
+    private var playerLast = CGPoint.zero
+    private var playerAccumX: CGFloat = 0   // horizontal → seek steps
+    private var playerAccumY: CGFloat = 0   // vertical → volume steps
 
     private enum Axis { case undetermined, horizontal, vertical }
     private enum State { case idle, tracking }
@@ -242,24 +243,17 @@ final class GestureRecognizer {
     /// Live contact count of the latched launcher gesture, used to detect contact-count changes so
     /// the step origin can be re-baselined (the centroid shifts as fingers leave). Seeded at begin.
     private var launcherContacts = 0
-    /// Held-in-zone state for auto-repeat, per axis (−1 / 0 / +1): `+1` = offset held beyond the outer
-    /// threshold on the high side (right / up), `−1` = low side. Emitted to the delegate (still via
-    /// `launcherEdgeChanged`, repurposed) when either changes; the controller drives the eased repeat
-    /// off it. Replaces the old physical-trackpad-edge detection (change `positional-navigation`, D3).
+    /// Edge-hold state for auto-repeat, per axis (−1 / 0 / +1): `edgeDX +1` = right edge, `edgeDY +1` =
+    /// top edge. Emitted to the delegate (`launcherEdgeChanged`) when either changes; the controller drives
+    /// the edge-triggered auto-repeat off it. Shared by the launcher and the Files drill (mutually exclusive
+    /// sub-states); the player keeps its own `playerEdgeDX/DY`.
     private var edgeDX = 0
     private var edgeDY = 0
-    /// The anchored-positional navigator for the launcher's post-activation navigation (change
-    /// `positional-navigation`, D1). (Re)anchored at activation and on every contact-count change; fed
-    /// the centroid each frame to yield item/context steps + held-zone signs. Rebuilt from settings at
-    /// `beginLauncher` so a tunable change between opens applies on the next gesture.
-    private var launcherNav = PositionalNavigator(footprintFactor: 1.2, fallbackScale: 0.12,
-                                                  inner: 0.22, outer: 0.5)
-    /// The anchored-positional navigator for the Files drill (change `positional-navigation`, D1). Same
-    /// model as the launcher: out-and-back = one step, held = auto-repeat. Horizontal (depth) is emitted
-    /// as a deliberate discrete step with NO auto-repeat (descend/ascend must settle); vertical (highlight)
-    /// out-and-backs and auto-repeats via the held-zone signal. Re-anchored on entry / contact-count change.
-    private var filesNav = PositionalNavigator(footprintFactor: 1.2, fallbackScale: 0.12,
-                                               inner: 0.22, outer: 0.5)
+    /// Normalized distance from a trackpad edge within which a held contact triggers auto-repeat, with
+    /// hysteresis (enter < exit) so micro-jitter at the boundary doesn't flap the hold on/off. The enter
+    /// zone is generous because a multi-finger centroid can't physically reach the very edge.
+    private let edgeEnterZone: CGFloat = 0.16
+    private let edgeExitZone: CGFloat = 0.24
     /// Live contact count of the switcher gesture *after activation*, used the same way as
     /// `launcherContacts`: once the overlay is up the user may relax three fingers to two, and the
     /// centroid shifts as the finger leaves — so on a count change we re-baseline the step origin.
@@ -562,20 +556,6 @@ final class GestureRecognizer {
         triggeredMissionControl = false
         launcherContacts = frame.fingerCount   // 4 at begin; tracked so a drop re-baselines the origin
         edgeDX = 0; edgeDY = 0
-        // Rebuild the positional navigator from current settings (a tunable change between opens applies
-        // here). It is anchored at activation, not begin — the opening fling moves the centroid, so the
-        // navigation center is the post-fling resting position.
-        // Position-tracking padding box: inside the box the selection follows the finger's position in
-        // steps (center locked); leaving the box (or hitting the edge band) accelerates. Per-axis step /
-        // radius / edge-margin are set per-feed (the band axis uses a coarser step on the band list).
-        launcherNav = PositionalNavigator(
-            footprintFactor: CGFloat(settings.positionalFootprintFactor),
-            fallbackScale: CGFloat(settings.positionalFallbackScale),
-            x: AxisZone(mode: .positionTracking),
-            y: AxisZone(mode: .positionTracking))
-        launcherNav.edgeMargin = CGFloat(settings.positionalEdgeMargin)
-        launcherNav.reArmBackoff = CGFloat(settings.positionalReArmBackoff)
-        applyAxisLock(to: &launcherNav)   // one axis per stroke: forgive diagonal drift (`launcher-aim-lock`)
     }
 
     private func trackLauncher(_ frame: TouchFrame) {
@@ -599,10 +579,6 @@ final class GestureRecognizer {
                 lastCentroid = frame.centroid
                 stepAccumulator = 0
                 stepAccumulatorY = 0
-                // Post-activation navigation is positional: re-anchor the joystick center/scale at the
-                // new posture so the centroid shift from a leaving/landing finger emits no step (the
-                // re-anchor also resets the per-axis arm/zone state, clearing any held auto-repeat).
-                if activated { launcherNav.reanchor(center: frame.centroid, spread: frame.footprintSpread) }
             }
             updateLauncher(frame)
         } else {
@@ -621,14 +597,13 @@ final class GestureRecognizer {
         let dx = c.x - startCentroid.x
 
         if !activated {
-            // Activate on deliberate horizontal travel (the opening fling is UNCHANGED — odometer, not
-            // positional). Pre-activation vertical is reserved (idle four-finger vertical does nothing in
-            // v1), so only |Δx| arms the launcher. On activation, anchor the positional navigator at the
-            // post-fling resting centroid so navigation offset is measured from where the hand settled.
+            // Activate on deliberate horizontal travel. Pre-activation vertical is reserved (idle
+            // four-finger vertical does nothing in v1), so only |Δx| arms the launcher.
             if abs(dx) >= CGFloat(settings.launcherActivationThreshold) {
                 activated = true
+                stepAccumulator = 0
+                stepAccumulatorY = 0
                 lastCentroid = c
-                launcherNav.reanchor(center: c, spread: frame.footprintSpread)
                 delegate?.launcherDidActivate()
             } else {
                 lastCentroid = c
@@ -636,52 +611,49 @@ final class GestureRecognizer {
             return
         }
 
-        // Active: navigation is ANCHORED-POSITIONAL (change `positional-navigation`). The offset of the
-        // centroid from the anchored center (footprint-scaled) is classified per axis into one discrete
-        // step on each out-and-back across the outer threshold, plus a held-zone sign while an offset is
-        // held (the controller turns that into eased auto-repeat). The threshold tracks the *action*:
-        // band switching (VERTICAL on the band list) uses the coarser context outer-threshold so it stays
-        // deliberate; all item movement uses the finer item outer-threshold.
+        // Active: the launcher owns both axes (the freed four-finger scroll is consumed by the scroll
+        // tap). Horizontal moves the item cursor and crosses between the band list and the grid; vertical
+        // switches bands (on the band list) or steps between grid rows (in the grid) — both with carry.
+        // The threshold tracks the *action*, not the axis: switching bands (VERTICAL on the band list)
+        // uses the coarser context-step so it can be made deliberate independently; all item movement —
+        // horizontal in the grid and vertical between grid rows — uses the finer item-step. So raising
+        // the context-step slows band switching without touching item movement.
+        stepAccumulator += (c.x - lastCentroid.x)
+        stepAccumulatorY += (c.y - lastCentroid.y)
         lastCentroid = c
+
+        let itemStep = CGFloat(max(settings.launcherStepDistance, 0.005))
         let onBandList = delegate?.launcherFocusIsOnBandList() ?? false
-        let itemStep = CGFloat(max(settings.launcherStepDistance, 0.02))
-        let bandStep = CGFloat(max(settings.launcherContextStepDistance, 0.02))
-        // The padding box radius (how far you can step before the margin accelerates). Floor it above the
-        // step so the box always holds at least one step.
-        let radius = CGFloat(max(settings.positionalPaddingRadius, max(itemStep, bandStep) + 0.05))
-        launcherNav.x.step = itemStep; launcherNav.x.radius = radius
-        launcherNav.y.step = onBandList ? bandStep : itemStep; launcherNav.y.radius = radius
-        // On the band rail, RIGHTWARD (into the items) gets a wider acceptance cone than band switching, so
-        // an off-axis nudge toward the items enters them rather than switching a band — the "bigger crossing
-        // triangle" (`launcher-aim-lock` crossing-wedge refinement). Off the rail: symmetric.
-        launcherNav.commitWedgeRightward = onBandList ? commitWedgeRatio(settings.positionalCrossingWedge) : nil
+        let horizStep = itemStep
+        let vertStep = onBandList ? CGFloat(max(settings.launcherContextStepDistance, 0.02)) : itemStep
+        while stepAccumulator >= horizStep { stepAccumulator -= horizStep; emitItemStep(forward: true) }
+        while stepAccumulator <= -horizStep { stepAccumulator += horizStep; emitItemStep(forward: false) }
 
-        let out = launcherNav.feed(centroid: c)
-        // Position-tracking can move several steps in one frame (a fast sweep) — emit the whole delta.
-        if out.stepX != 0 { for _ in 0..<abs(out.stepX) { emitItemStep(forward: out.stepX > 0) } }
-        if out.stepY != 0 { for _ in 0..<abs(out.stepY) { emitContextStep(up: out.stepY > 0) } }
-        updateHeldZones(dx: out.heldX, dy: out.heldY)
+        while stepAccumulatorY >= vertStep { stepAccumulatorY -= vertStep; emitContextStep(up: true) }
+        while stepAccumulatorY <= -vertStep { stepAccumulatorY += vertStep; emitContextStep(up: false) }
 
-        // Crossing the band rail ⇄ grid boundary (a horizontal step that flips the band-list focus):
-        // RE-ANCHOR the navigator at the finger so the surface you crossed INTO starts fresh under your hand.
-        // Without this the band-rail anchor stays put, so its rest position sits right on the crossing
-        // boundary — relaxing your hand slides you back across, and the first item costs the band-anchored
-        // offset on top of its own step (the "extra steps" entering/leaving the items). After re-anchoring,
-        // each side is a small, equal, deliberate nudge. (`launcher-aim-lock` crossing-feel fix.)
-        if out.stepX != 0, (delegate?.launcherFocusIsOnBandList() ?? false) != onBandList {
-            launcherNav.reanchor(center: c, spread: frame.footprintSpread)
-            updateHeldZones(dx: 0, dy: 0)
-        }
+        updateEdges(c)
     }
 
-    /// Emit the per-axis HELD-IN-ZONE sign (offset held beyond the outer threshold) when it changes, so
-    /// the controller drives eased auto-repeat off it. Repurposes `launcherEdgeChanged` from physical-edge
-    /// detection to positional held-zone (change `positional-navigation`, D3). Raw signs — the coordinator
-    /// applies the reverse-direction settings, exactly as it did for the old edge state.
-    private func updateHeldZones(dx: Int, dy: Int) {
+    /// Track whether the controlling contact is held at a trackpad edge on each axis (with hysteresis),
+    /// emitting `launcherEdgeChanged` only when the per-axis state changes. The controller decides what
+    /// to auto-repeat (and clamps when there's nowhere to go).
+    private func updateEdges(_ c: CGPoint) {
+        let dx = edgeAxis(c.x, current: edgeDX)
+        let dy = edgeAxis(c.y, current: edgeDY)
         guard dx != edgeDX || dy != edgeDY else { return }
         edgeDX = dx; edgeDY = dy
         delegate?.launcherEdgeChanged(dx: dx, dy: dy)
+    }
+
+    /// Per-axis edge direction with hysteresis: enter an edge at `edgeEnterZone`, leave it only past
+    /// `edgeExitZone`, so jitter at the boundary doesn't flap. `+1` = high edge, `-1` = low edge.
+    private func edgeAxis(_ v: CGFloat, current: Int) -> Int {
+        if current > 0 { return v >= 1 - edgeExitZone ? 1 : (v <= edgeEnterZone ? -1 : 0) }
+        if current < 0 { return v <= edgeExitZone ? -1 : (v >= 1 - edgeEnterZone ? 1 : 0) }
+        if v >= 1 - edgeEnterZone { return 1 }
+        if v <= edgeEnterZone { return -1 }
+        return 0
     }
 
     private func clearEdges() {
@@ -768,20 +740,21 @@ final class GestureRecognizer {
                 drillContacts = count
                 drillStart = frame.centroid       // baseline for the 4-finger discard swipe
                 drillLast = frame.centroid
-                configureFilesNav()
-                filesNav.reanchor(center: frame.centroid, spread: frame.footprintSpread)
+                drillAccumX = 0
+                drillAccumY = 0
                 return
             }
-            // A contact-count change shifts the centroid as fingers leave or land. Re-anchor the positional
-            // center so the jump emits no step (and stop any held auto-repeat across the re-baseline); a
-            // count rising ABOVE the relaxed baseline is the relative +1 Open-With morph (latched for the
-            // lift). The baseline then follows the count. While resolved, the whole session is inert.
+            // A contact-count change shifts the centroid as fingers leave or land. Re-baseline the origin
+            // (and clear carry) so the jump emits no step, and stop any held auto-repeat across the
+            // re-baseline; a count rising ABOVE the relaxed baseline is the relative +1 Open-With morph
+            // (latched for the lift). The baseline then follows the count. While resolved, the session is inert.
             if count != drillContacts {
                 if count > drillContacts && !drillResolved { pendingOpenWith = true }
                 drillContacts = count
                 drillStart = frame.centroid
                 drillLast = frame.centroid
-                filesNav.reanchor(center: frame.centroid, spread: frame.footprintSpread)
+                drillAccumX = 0
+                drillAccumY = 0
                 clearEdges()
                 return
             }
@@ -818,63 +791,22 @@ final class GestureRecognizer {
             return
         }
 
-        // Relaxed navigation posture (≥2, ≤3 contacts): ANCHORED-POSITIONAL (change `positional-navigation`),
-        // matching the launcher. HIGHLIGHT (vertical) position-tracks the finger inside the padding box and
-        // accelerates at the margin (box edge / trackpad edge band), with pull-back-recenter. DEPTH
-        // (horizontal) stays a DELIBERATE out-and-back — one folder descend/ascend per swipe, never
-        // auto-drilling (it's a stack push/pop, not a cursor).
+        // Relaxed navigation posture (≥2, ≤3 contacts): ODOMETER (restored v0.11.0 model). Accumulate signed
+        // travel and emit discrete steps with carry — HIGHLIGHT (vertical) moves the selection, DEPTH
+        // (horizontal) descends/ascends folders. Unlike the launcher's flat grid a horizontal step here
+        // mutates the folder stack, so holding at the trackpad edge AUTO-DRILLS through the tree (uniform
+        // edge auto-repeat on BOTH axes — the user opted into this).
+        drillAccumX += (c.x - drillLast.x)
+        drillAccumY += (c.y - drillLast.y)
         drillLast = c
-        let inner = CGFloat(max(settings.positionalInnerDeadzone, 0.01))
-        let depthOuter = CGFloat(max(settings.launcherStepDistance, inner + 0.02))
-        filesNav.x.inner = inner; filesNav.x.outer = depthOuter          // depth: out-and-back thresholds
-        let highlightStep = CGFloat(max(settings.launcherStepDistance, 0.02))
-        let radius = CGFloat(max(settings.positionalPaddingRadius, highlightStep + 0.05))
-        filesNav.y.step = highlightStep; filesNav.y.radius = radius      // highlight: position-tracking box
 
-        let out = filesNav.feed(centroid: c)
-        // Depth: one step per out-and-back (stepX is ±1). Highlight: position-tracking can move several
-        // rows in one frame — emit the whole delta.
-        if out.stepX != 0 { emitDrillDepth(forward: out.stepX > 0) }
-        if out.stepY != 0 { for _ in 0..<abs(out.stepY) { emitDrillHighlight(up: out.stepY > 0) } }
-        // Vertical highlight auto-repeats while held; horizontal depth never auto-repeats (held dx = 0).
-        updateHeldZones(dx: 0, dy: out.heldY)
-    }
+        let step = CGFloat(max(settings.launcherStepDistance, 0.005))
+        while drillAccumX >= step { drillAccumX -= step; emitDrillDepth(forward: true) }
+        while drillAccumX <= -step { drillAccumX += step; emitDrillDepth(forward: false) }
+        while drillAccumY >= step { drillAccumY -= step; emitDrillHighlight(up: true) }
+        while drillAccumY <= -step { drillAccumY += step; emitDrillHighlight(up: false) }
 
-    /// Rebuild the Files-drill positional navigator from current settings (called when a fresh drill
-    /// session seeds), so a tunable change applies on the next drill. Anchored separately by the caller.
-    ///
-    /// Matches the launcher's model on the HIGHLIGHT axis (vertical = position-tracking + margin accel +
-    /// pull-back-recenter), while keeping DEPTH (horizontal = descend/ascend) a DELIBERATE out-and-back —
-    /// depth is a folder-stack push/pop, not a cursor, so it must step one level at a time and never
-    /// auto-drill (CLAUDE.md landmine). Per-axis params are set per-feed.
-    private func configureFilesNav() {
-        filesNav = PositionalNavigator(
-            footprintFactor: CGFloat(settings.positionalFootprintFactor),
-            fallbackScale: CGFloat(settings.positionalFallbackScale),
-            x: AxisZone(mode: .outAndBack),       // depth: deliberate, one folder per swipe
-            y: AxisZone(mode: .positionTracking)) // highlight: tracks the finger like the launcher
-        filesNav.edgeMargin = CGFloat(settings.positionalEdgeMargin)
-        filesNav.reArmBackoff = CGFloat(settings.positionalReArmBackoff)
-        applyAxisLock(to: &filesNav)   // highlight vs. depth: a diagonal stroke does one, not both
-    }
-
-    /// Enable the directional axis-lock (change `launcher-aim-lock`) on a navigator from current settings:
-    /// commit a stroke to one dominant axis (acceptance half-angle → dominance ratio), re-commit on a
-    /// deliberate turn past the hysteresis, and reuse the inner deadzone as the commit/settle floor. The
-    /// media player deliberately does NOT call this (its transport stays free two-axis).
-    private func applyAxisLock(to nav: inout PositionalNavigator) {
-        nav.axisLock = true
-        nav.commitWedge = commitWedgeRatio(settings.positionalCommitWedge)
-        nav.recommitHysteresis = CGFloat(settings.positionalRecommitHysteresis)
-        nav.engage = CGFloat(max(settings.positionalInnerDeadzone, 0.01))
-    }
-
-    /// Convert the acceptance half-angle (degrees) into the dominance ratio the navigator wants
-    /// (`|lead| ≥ ratio · |other|`): `ratio = 1 / tan(angle)`. Clamped to `[1, 45]°` (45° → ratio 1 =
-    /// commit to whichever axis is larger; smaller angle → a stricter, wider ambiguous diagonal band).
-    private func commitWedgeRatio(_ degrees: Double) -> CGFloat {
-        let clamped = min(max(degrees, 1), 45)
-        return CGFloat(1.0 / tan(clamped * .pi / 180))
+        updateEdges(c)   // both axes auto-repeat at the edge: highlight (vertical) + depth auto-drill (horizontal)
     }
 
     /// The resolving lift: a one-shot Open-With (if a relative +1 finger was added) or plain Open. A lift
@@ -938,14 +870,15 @@ final class GestureRecognizer {
                 playerContacts = count
                 playerMoved = false
                 playerSeedCentroid = frame.centroid
-                configurePlayerNav()
-                playerNav.reanchor(center: frame.centroid, spread: frame.footprintSpread)
+                playerLast = frame.centroid
+                playerAccumX = 0
+                playerAccumY = 0
                 return
             }
             if count != playerContacts {
                 // A rising count is an intent (menu / dismiss); a falling count is just a relax. Detect the
-                // intent BEFORE re-baselining (mirrors the Files +1 Open-With latch), then re-anchor the
-                // positional center so the centroid jump from the changed contacts emits no phantom step.
+                // intent BEFORE re-baselining (mirrors the Files +1 Open-With latch), then re-baseline the
+                // odometer origin so the centroid jump from the changed contacts emits no phantom step.
                 if count > playerContacts {
                     if count >= 4 || count >= playerContacts + 2 {
                         delegate?.playerDismiss()
@@ -955,7 +888,9 @@ final class GestureRecognizer {
                 }
                 playerContacts = count
                 playerSeedCentroid = frame.centroid
-                playerNav.reanchor(center: frame.centroid, spread: frame.footprintSpread)
+                playerLast = frame.centroid
+                playerAccumX = 0
+                playerAccumY = 0
                 clearPlayerHeldZones()
                 return
             }
@@ -979,16 +914,20 @@ final class GestureRecognizer {
             playerMoved = true
         }
 
-        let inner = CGFloat(max(settings.positionalInnerDeadzone, 0.01))
-        let outer = CGFloat(max(settings.launcherStepDistance, inner + 0.02))
-        playerNav.x.inner = inner; playerNav.x.outer = outer
-        playerNav.y.inner = inner; playerNav.y.outer = outer
+        // Odometer (restored v0.11.0 model): accumulate signed travel and emit discrete seek/volume steps
+        // with carry. BOTH axes auto-repeat at the trackpad edge (seek + volume), unlike the Files/Clipboard
+        // surfaces that suppress horizontal auto-repeat.
+        playerAccumX += (c.x - playerLast.x)
+        playerAccumY += (c.y - playerLast.y)
+        playerLast = c
 
-        let out = playerNav.feed(centroid: c)
-        if out.stepX != 0 { emitPlayerSeek(forward: out.stepX > 0) }
-        if out.stepY != 0 { emitPlayerVolume(up: out.stepY > 0) }
-        // BOTH axes auto-repeat (seek + volume), unlike the depth/pin surfaces.
-        updatePlayerHeldZones(dx: out.heldX, dy: out.heldY)
+        let step = CGFloat(max(settings.launcherStepDistance, 0.005))
+        while playerAccumX >= step { playerAccumX -= step; emitPlayerSeek(forward: true) }
+        while playerAccumX <= -step { playerAccumX += step; emitPlayerSeek(forward: false) }
+        while playerAccumY >= step { playerAccumY -= step; emitPlayerVolume(up: true) }
+        while playerAccumY <= -step { playerAccumY += step; emitPlayerVolume(up: false) }
+
+        updatePlayerEdges(c)
     }
 
     /// A resolving lift in the player. While the action menu is open, it SELECTS the highlighted row;
@@ -1007,18 +946,12 @@ final class GestureRecognizer {
         playerMoved = false
     }
 
-    /// Rebuild the player positional navigator from current settings (called when a fresh session seeds),
-    /// so a tunable change applies on the next session. Anchored separately by the caller.
-    private func configurePlayerNav() {
-        playerNav = PositionalNavigator(
-            footprintFactor: CGFloat(settings.positionalFootprintFactor),
-            fallbackScale: CGFloat(settings.positionalFallbackScale),
-            inner: CGFloat(settings.positionalInnerDeadzone),
-            outer: CGFloat(settings.launcherStepDistance))
-        playerNav.reArmBackoff = CGFloat(settings.positionalReArmBackoff)
-    }
-
-    private func updatePlayerHeldZones(dx: Int, dy: Int) {
+    /// Track whether the player contact is held at a trackpad edge on each axis (with hysteresis), emitting
+    /// `playerHeldZoneChanged` only when the per-axis state changes — BOTH axes auto-repeat (seek + volume).
+    /// Reuses the shared `edgeAxis` hysteresis with the player's own `playerEdgeDX/DY` state.
+    private func updatePlayerEdges(_ c: CGPoint) {
+        let dx = edgeAxis(c.x, current: playerEdgeDX)
+        let dy = edgeAxis(c.y, current: playerEdgeDY)
         guard dx != playerEdgeDX || dy != playerEdgeDY else { return }
         playerEdgeDX = dx; playerEdgeDY = dy
         delegate?.playerHeldZoneChanged(dx: dx, dy: dy)

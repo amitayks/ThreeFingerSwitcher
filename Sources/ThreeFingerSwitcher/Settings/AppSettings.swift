@@ -126,77 +126,14 @@ final class AppSettings: ObservableObject {
     /// Normalized horizontal centroid travel required to show the launcher (four-finger).
     @Published var launcherActivationThreshold: Double { didSet { persist(launcherActivationThreshold, Keys.launcherActivationThreshold) } }
 
-    /// The positional **outer threshold** for *item* movement (change `positional-navigation`, D7):
-    /// the normalized centroid offset from the anchored center (≈1 at full footprint deflection) that
-    /// crosses to emit one item-step. Repurposed from the old odometer "one item per N travel" knob;
-    /// now expressed in offset units, not accumulated travel.
+    /// Normalized centroid travel to move the selection by one item — horizontally between items and
+    /// vertically between grid rows (odometer, with carry). Also drives the Files navigator's depth /
+    /// highlight stepping and the media player's seek / volume stepping.
     @Published var launcherStepDistance: Double { didSet { persist(launcherStepDistance, Keys.launcherStepDistance) } }
 
-    /// The positional **outer threshold** for *band* switching (change `positional-navigation`, D7):
-    /// the vertical offset on the band list that switches one band. Coarser than the item threshold so
-    /// band switching stays deliberate without slowing item movement.
+    /// Normalized vertical travel on the band list to switch one band (odometer, with carry). Coarser
+    /// than the item step so band switching stays deliberate without slowing item movement.
     @Published var launcherContextStepDistance: Double { didSet { persist(launcherContextStepDistance, Keys.launcherContextStepDistance) } }
-
-    /// The positional **inner deadzone** (change `positional-navigation`): returning the offset inside
-    /// this (toward center) re-arms an axis, so a quick out-and-back is exactly one step. `< the item
-    /// and band outer thresholds`.
-    @Published var positionalInnerDeadzone: Double { didSet { persist(positionalInnerDeadzone, Keys.positionalInnerDeadzone) } }
-
-    /// How many footprint-widths of centroid travel reach full deflection (change `positional-navigation`,
-    /// D2). Larger = a bigger physical move is needed for the same offset.
-    @Published var positionalFootprintFactor: Double { didSet { persist(positionalFootprintFactor, Keys.positionalFootprintFactor) } }
-
-    /// The fixed full-deflection distance used when the fingers' footprint is unavailable / degenerate
-    /// (test frames, a single contact) — the fallback scale for the anchored offset (change
-    /// `positional-navigation`, D2).
-    @Published var positionalFallbackScale: Double { didSet { persist(positionalFallbackScale, Keys.positionalFallbackScale) } }
-
-    /// Seconds before the *second* auto-repeat step once an offset is held (the first step fires
-    /// immediately on the outer-threshold crossing). The eased curve then shortens the interval from
-    /// here toward `positionalRepeatFloor` (change `positional-navigation`, D4).
-    @Published var positionalInitialRepeatDelay: Double { didSet { persist(positionalInitialRepeatDelay, Keys.positionalInitialRepeatDelay) } }
-
-    /// The fastest auto-repeat interval the eased curve approaches while an offset is held (change
-    /// `positional-navigation`, D4).
-    @Published var positionalRepeatFloor: Double { didSet { persist(positionalRepeatFloor, Keys.positionalRepeatFloor) } }
-
-    /// Dwell duration over which the auto-repeat interval eases from the initial delay down to the
-    /// floor — the "accelerate along a curve, not slow→fast in no time" ramp (change
-    /// `positional-navigation`, D4).
-    @Published var positionalRepeatRampTime: Double { didSet { persist(positionalRepeatRampTime, Keys.positionalRepeatRampTime) } }
-
-    /// How far the offset may retreat from its furthest held point (offset units) before the center snaps
-    /// onto the finger and auto-repeat stops — the "small move back re-centers and stops the acceleration"
-    /// refinement. Must sit above natural hold jitter or a steady hold can't sustain auto-repeat; lower it
-    /// for a more sensitive stop. `0` disables it (re-arm only via the deadzone).
-    @Published var positionalReArmBackoff: Double { didSet { persist(positionalReArmBackoff, Keys.positionalReArmBackoff) } }
-
-    /// The launcher **padding-box** half-size, in offset units (the "make the padding bigger/smaller"
-    /// control). Inside the box the selection position-tracks your finger in steps (center locked); leaving
-    /// it accelerates. Bigger = more room to step before acceleration.
-    @Published var positionalPaddingRadius: Double { didSet { persist(positionalPaddingRadius, Keys.positionalPaddingRadius) } }
-
-    /// The fixed **edge-margin band** width near the trackpad border (absolute normalized units). Pushing
-    /// the fingers into this band accelerates even before the padding box's radius is reached — the
-    /// always-present "min margin" the padding squeezes against near the edges. `0` = box radius only.
-    @Published var positionalEdgeMargin: Double { didSet { persist(positionalEdgeMargin, Keys.positionalEdgeMargin) } }
-
-    /// The directional axis-lock **acceptance half-angle**, in degrees (change `launcher-aim-lock`). A
-    /// stroke commits to an axis when it lands within this angle of it; the band around the 45° diagonal
-    /// (`90° − 2·angle` wide) is the ambiguous "commit to neither" zone. Larger = more forgiving of off-axis
-    /// drift (a wider acceptance cone). Clamped to `(0, 45)`; `45` commits to whichever axis is larger.
-    @Published var positionalCommitWedge: Double { didSet { persist(positionalCommitWedge, Keys.positionalCommitWedge) } }
-
-    /// The **wider** acceptance half-angle (degrees) for the band-rail → items crossing (change
-    /// `launcher-aim-lock`): while on the band rail, a rightward (into-items) stroke commits within this
-    /// angle, so an up/down-and-right nudge enters the items instead of switching a band. Bigger than
-    /// `positionalCommitWedge` = a bigger crossing "triangle". Clamped to `(0, 45)`.
-    @Published var positionalCrossingWedge: Double { didSet { persist(positionalCrossingWedge, Keys.positionalCrossingWedge) } }
-
-    /// How far (offset units) the perpendicular axis must exceed the committed axis before the lock switches
-    /// to it (change `launcher-aim-lock`) — keeps a committed axis through incidental drift; a deliberate
-    /// turn re-commits (with a per-axis re-anchor → an L-move). Above hold jitter.
-    @Published var positionalRecommitHysteresis: Double { didSet { persist(positionalRecommitHysteresis, Keys.positionalRecommitHysteresis) } }
 
     /// Seconds the selection must rest on an item before it arms (then a lift fires it). Brief but
     /// deliberate — a quick scrub-and-lift never fires.
@@ -469,18 +406,6 @@ final class AppSettings: ObservableObject {
         launcherActivationThreshold = defaults.object(forKey: Keys.launcherActivationThreshold) as? Double ?? Defaults.launcherActivationThreshold
         launcherStepDistance = defaults.object(forKey: Keys.launcherStepDistance) as? Double ?? Defaults.launcherStepDistance
         launcherContextStepDistance = defaults.object(forKey: Keys.launcherContextStepDistance) as? Double ?? Defaults.launcherContextStepDistance
-        positionalInnerDeadzone = defaults.object(forKey: Keys.positionalInnerDeadzone) as? Double ?? Defaults.positionalInnerDeadzone
-        positionalFootprintFactor = defaults.object(forKey: Keys.positionalFootprintFactor) as? Double ?? Defaults.positionalFootprintFactor
-        positionalFallbackScale = defaults.object(forKey: Keys.positionalFallbackScale) as? Double ?? Defaults.positionalFallbackScale
-        positionalInitialRepeatDelay = defaults.object(forKey: Keys.positionalInitialRepeatDelay) as? Double ?? Defaults.positionalInitialRepeatDelay
-        positionalRepeatFloor = defaults.object(forKey: Keys.positionalRepeatFloor) as? Double ?? Defaults.positionalRepeatFloor
-        positionalRepeatRampTime = defaults.object(forKey: Keys.positionalRepeatRampTime) as? Double ?? Defaults.positionalRepeatRampTime
-        positionalReArmBackoff = defaults.object(forKey: Keys.positionalReArmBackoff) as? Double ?? Defaults.positionalReArmBackoff
-        positionalPaddingRadius = defaults.object(forKey: Keys.positionalPaddingRadius) as? Double ?? Defaults.positionalPaddingRadius
-        positionalEdgeMargin = defaults.object(forKey: Keys.positionalEdgeMargin) as? Double ?? Defaults.positionalEdgeMargin
-        positionalCommitWedge = defaults.object(forKey: Keys.positionalCommitWedge) as? Double ?? Defaults.positionalCommitWedge
-        positionalCrossingWedge = defaults.object(forKey: Keys.positionalCrossingWedge) as? Double ?? Defaults.positionalCrossingWedge
-        positionalRecommitHysteresis = defaults.object(forKey: Keys.positionalRecommitHysteresis) as? Double ?? Defaults.positionalRecommitHysteresis
         dwellToArmDuration = defaults.object(forKey: Keys.dwellToArmDuration) as? Double ?? Defaults.dwellToArmDuration
         showDiagnostics = defaults.object(forKey: Keys.showDiagnostics) as? Bool ?? Defaults.showDiagnostics
         livePreviewEnabled = defaults.object(forKey: Keys.livePreviewEnabled) as? Bool ?? Defaults.livePreviewEnabled
@@ -542,18 +467,6 @@ final class AppSettings: ObservableObject {
         launcherActivationThreshold = Defaults.launcherActivationThreshold
         launcherStepDistance = Defaults.launcherStepDistance
         launcherContextStepDistance = Defaults.launcherContextStepDistance
-        positionalInnerDeadzone = Defaults.positionalInnerDeadzone
-        positionalFootprintFactor = Defaults.positionalFootprintFactor
-        positionalFallbackScale = Defaults.positionalFallbackScale
-        positionalInitialRepeatDelay = Defaults.positionalInitialRepeatDelay
-        positionalRepeatFloor = Defaults.positionalRepeatFloor
-        positionalRepeatRampTime = Defaults.positionalRepeatRampTime
-        positionalReArmBackoff = Defaults.positionalReArmBackoff
-        positionalPaddingRadius = Defaults.positionalPaddingRadius
-        positionalEdgeMargin = Defaults.positionalEdgeMargin
-        positionalCommitWedge = Defaults.positionalCommitWedge
-        positionalCrossingWedge = Defaults.positionalCrossingWedge
-        positionalRecommitHysteresis = Defaults.positionalRecommitHysteresis
         dwellToArmDuration = Defaults.dwellToArmDuration
         showDiagnostics = Defaults.showDiagnostics
         livePreviewEnabled = Defaults.livePreviewEnabled
@@ -604,8 +517,8 @@ final class AppSettings: ObservableObject {
     // and a quick dwell — the feel the product is meant to have out of the box.
     enum Defaults {
         static let activationThreshold = 0.01    // feather-light trigger (~1% of trackpad width)
-        static let axisLockRatio = 1.0           // no dominance requirement; any drift picks the axis
-        static let stepDistance = 0.03           // one window per ~3% of trackpad width (fine scrub)
+        static let axisLockRatio = 1.13          // slight horizontal dominance before scrubbing (in-hand tuned)
+        static let stepDistance = 0.027          // one window per ~2.7% of trackpad width (in-hand tuned)
         static let wrapAtEnds = false
         static let reverseDirection = false
         static let velocitySmoothing = 0.35
@@ -617,22 +530,8 @@ final class AppSettings: ObservableObject {
         static let manageVerticalGesture = false   // opt-in; relocates Mission Control to four fingers
         static let enableLauncher = false          // opt-in; frees four-finger native gestures
         static let launcherActivationThreshold = 0.01   // same feather-light trigger as the switcher
-        static let launcherStepDistance = 0.50     // item OUTER threshold (offset units, ≈half deflection)
-        static let launcherContextStepDistance = 0.85   // band OUTER threshold; coarser → deliberate band switch
-        // Positional navigation model (change `positional-navigation`).
-        static let positionalInnerDeadzone = 0.22       // re-arm zone; < the item/band outer thresholds
-        static let positionalFootprintFactor = 1.2      // footprint-widths of travel for full deflection
-        static let positionalFallbackScale = 0.12       // fixed deflection distance when no footprint
-        static let positionalInitialRepeatDelay = 0.22  // gap before the 2nd step (1st fires immediately)
-        static let positionalRepeatFloor = 0.03         // fastest auto-repeat interval the curve approaches
-        static let positionalRepeatRampTime = 1.2       // dwell seconds to ease from initial delay → floor
-        static let positionalReArmBackoff = 0.25        // offset retreat that snaps center to finger & stops accel
-        static let positionalPaddingRadius = 2.5        // padding-box half-size (offset units) before the margin
-        static let positionalEdgeMargin = 0.10          // fixed border band (normalized) that always accelerates
-        // Directional axis-lock (change `launcher-aim-lock`).
-        static let positionalCommitWedge = 35.0         // acceptance half-angle (deg); larger = forgive more drift
-        static let positionalCrossingWedge = 55.0       // WIDER half-angle for rail→items (bigger crossing triangle)
-        static let positionalRecommitHysteresis = 0.35  // offset the perp axis must beat the committed one by to turn
+        static let launcherStepDistance = 0.04     // one item per ~4% travel; also Files depth/highlight + player seek/volume
+        static let launcherContextStepDistance = 0.09   // ~2.2× the item step; deliberate band switching
         static let dwellToArmDuration = 0.3        // quick tick; the charge stays readable
         static let showDiagnostics = false         // troubleshooting tools hidden from the menu by default
         static let livePreviewEnabled = true       // show the in-flight preview while scrubbing (default ON)
@@ -700,18 +599,6 @@ final class AppSettings: ObservableObject {
         static let launcherActivationThreshold = "launcherActivationThreshold"
         static let launcherStepDistance = "launcherStepDistance"
         static let launcherContextStepDistance = "launcherContextStepDistance"
-        static let positionalInnerDeadzone = "positionalInnerDeadzone"
-        static let positionalFootprintFactor = "positionalFootprintFactor"
-        static let positionalFallbackScale = "positionalFallbackScale"
-        static let positionalInitialRepeatDelay = "positionalInitialRepeatDelay"
-        static let positionalRepeatFloor = "positionalRepeatFloor"
-        static let positionalRepeatRampTime = "positionalRepeatRampTime"
-        static let positionalReArmBackoff = "positionalReArmBackoff"
-        static let positionalPaddingRadius = "positionalPaddingRadius"
-        static let positionalEdgeMargin = "positionalEdgeMargin"
-        static let positionalCommitWedge = "positionalCommitWedge"
-        static let positionalCrossingWedge = "positionalCrossingWedge"
-        static let positionalRecommitHysteresis = "positionalRecommitHysteresis"
         static let dwellToArmDuration = "dwellToArmDuration"
         static let showDiagnostics = "showDiagnostics"
         static let livePreviewEnabled = "livePreviewEnabled"

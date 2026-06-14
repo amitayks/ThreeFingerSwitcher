@@ -75,8 +75,32 @@ final class AppCoordinator: GestureRecognizerDelegate {
             // opened document lands in the context the user was looking at, not the frontmost app at fire
             // time. The `activate` result is best-effort and intentionally discarded.
             _ = self?.capturedFrontApp?.activate(options: [])
+        },
+        // Built-in player routing (media-player): a playable media file plays IN the player when the
+        // opt-in is on AND the per-kind default-open is enabled — else it falls through to the system app.
+        mediaPlaybackRoute: { [weak self] entry in
+            guard let self, self.settings.useBuiltInPlayer,
+                  let kind = MediaKind.classify(entry),
+                  self.settings.builtInPlayerHandles(kind) else { return nil }
+            return kind
+        },
+        playMedia: { [weak self] entry, kind in
+            await self?.playerController.play(entry, kind: kind)
         }
     )
+
+    // Built-in media player (opt-in). The player is its OWN non-activating overlay (separate from the
+    // launcher, which dismisses on the lift-to-open) and a third sustained recognizer sub-state: while
+    // open it owns the trackpad. Engines are injected at the seam (`PlayerEngineInjection`) from main.swift.
+    private let playerOverlay = PlayerOverlay()
+    private lazy var playerController = PlayerController(
+        settings: settings,
+        store: PlaybackStateStore.shared,
+        availableEngines: PlayerEngineInjection.availableEngines,
+        makeEngine: { PlayerEngineInjection.engineFactory?($0) },
+        surface: playerOverlay,
+        setPlayerActive: { [weak self] active in self?.recognizer.playerActive = active },
+        setPlayerMenuOpen: { [weak self] open in self?.recognizer.playerMenuOpen = open })
 
     /// The last Files open that was fired (default open / Open-With), captured so the failure row's **Retry**
     /// can re-fire the identical open through `FileOpenService`. Set in `filesOpen`/`filesOpenWith`, replaced
@@ -245,18 +269,12 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// untouched; this only mirrors frames).
     var onWizardTouchFrame: ((TouchFrame) -> Void)?
 
-    /// Read-only tap on the touch stream for the Hub's live trackpad preview (the positional-zones
-    /// visualizer on the Launcher page). Like `onWizardTouchFrame`, it only mirrors frames — the
-    /// recognizer path is untouched — and reuses the single running engine, so no second listener.
-    var onHubTouchFrame: ((TouchFrame) -> Void)?
-
     init() {
         recognizer.delegate = self
         touchEngine.onFrame = { [weak self] frame in
             self?.currentFingerCount = frame.fingerCount
             self?.recognizer.feed(frame)
             self?.onWizardTouchFrame?(frame)
-            self?.onHubTouchFrame?(frame)
         }
         scrollTap.consumePredicate = { [weak self] in
             guard let self else { return false }
@@ -821,10 +839,8 @@ final class AppCoordinator: GestureRecognizerDelegate {
         // targets that window.
         let front = NSWorkspace.shared.frontmostApplication
         capturedFrontApp = (front?.processIdentifier == getpid()) ? capturedFrontApp : front
-        // Eased held-in-zone auto-repeat curve (change `positional-navigation`, D4).
-        launcherOverlay.repeatInitialDelay = settings.positionalInitialRepeatDelay
-        launcherOverlay.repeatFloor = settings.positionalRepeatFloor
-        launcherOverlay.repeatRampTime = settings.positionalRepeatRampTime
+        // Edge-triggered auto-repeat acceleration.
+        launcherOverlay.edgeAcceleration = settings.clipboardEdgeAcceleration
         // Convert the deliberate pin-flick distance into a count of fine horizontal steps (also reused
         // as the canvas discard-flick threshold).
         launcherOverlay.clipboardPinSteps =
@@ -1035,6 +1051,19 @@ final class AppCoordinator: GestureRecognizerDelegate {
         }
         launcherOverlay.hide()
     }
+
+    // MARK: - Player transport intents (forwarded to PlayerController while `playerActive`)
+    //
+    // The recognizer routes these only while the built-in player owns the trackpad (a third sustained
+    // modal sub-state). `PlayerController` owns the transport model, the action menu, and resume.
+
+    func playerSeek(_ direction: Int) { playerController.seek(direction) }
+    func playerVolume(_ direction: Int) { playerController.volume(direction) }
+    func playerTogglePlayPause() { playerController.togglePlayPause() }
+    func playerActionMenu() { playerController.openActionMenu() }
+    func playerSelectMenuItem() { playerController.selectMenuItem() }
+    func playerDismiss() { playerController.dismiss() }
+    func playerHeldZoneChanged(dx: Int, dy: Int) { playerController.heldZone(dx: dx, dy: dy) }
 
     /// Short pre-launch fuse on a committed Files open, so a discard issued within the window still defuses
     /// it (design D7). Tiny — the held → swipe-to-resolve UI (a longer visible hold) is the view stage; here
@@ -2186,9 +2215,6 @@ final class AppCoordinator: GestureRecognizerDelegate {
                              clipboard: clipboardStore,
                              models: modelManager,
                              permissions: permissions)
-        // Launcher — live trackpad preview taps the running engine's frames (single listener).
-        ctx.subscribeTrackpadTouch = { [weak self] handler in self?.onHubTouchFrame = handler }
-        ctx.unsubscribeTrackpadTouch = { [weak self] in self?.onHubTouchFrame = nil }
         // Clipboard.
         ctx.onClearClipboard = { [weak self] includingPinned in self?.clipboardStore.clear(includingPinned: includingPinned) }
         // AI.

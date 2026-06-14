@@ -7,7 +7,7 @@ import AppKit
 enum HubDestination: Hashable, CaseIterable {
     case overview
     case bands
-    case switcher, launcher, clipboard, files, ai, keyboardLanguage
+    case switcher, launcher, clipboard, files, player, ai, keyboardLanguage
     case devices
     case setup, general
 
@@ -19,6 +19,7 @@ enum HubDestination: Hashable, CaseIterable {
         case .launcher: return "Launcher"
         case .clipboard: return "Clipboard"
         case .files: return "Files"
+        case .player: return "Media Player"
         case .ai: return "AI Commands"
         case .keyboardLanguage: return "Keyboard Language"
         case .devices: return "Devices"
@@ -31,6 +32,7 @@ enum HubDestination: Hashable, CaseIterable {
     var sidebarTitle: String {
         switch self {
         case .switcher: return "Switcher"
+        case .player: return "Player"
         case .ai: return "AI"
         case .keyboardLanguage: return "Language"
         case .setup: return "Setup"
@@ -46,6 +48,7 @@ enum HubDestination: Hashable, CaseIterable {
         case .launcher: return "square.grid.3x3.fill"
         case .clipboard: return "doc.on.clipboard"
         case .files: return "folder"
+        case .player: return "play.rectangle.fill"
         case .ai: return "sparkles"
         case .keyboardLanguage: return "globe"
         case .devices: return "iphone.and.arrow.forward"
@@ -73,12 +76,6 @@ final class HubContext {
     let clipboard: ClipboardStore
     let models: ModelManager
     let permissions: PermissionsService
-
-    // Launcher feature page — the live trackpad preview of the positional zones. Subscribe while the
-    // preview is on screen (it reuses the running TouchEngine's frames — no second listener, no new
-    // permission); unsubscribe when it disappears.
-    var subscribeTrackpadTouch: (@escaping (TouchFrame) -> Void) -> Void = { _ in }
-    var unsubscribeTrackpadTouch: () -> Void = {}
 
     // Clipboard feature page.
     var onClearClipboard: (_ includingPinned: Bool) -> Void = { _ in }
@@ -204,7 +201,7 @@ struct HubView: View {
                     railDivider
                     railButton(.bands)
                     railDivider
-                    railButton(.switcher); railButton(.launcher); railButton(.clipboard); railButton(.files); railButton(.ai); railButton(.keyboardLanguage); railButton(.devices)
+                    railButton(.switcher); railButton(.launcher); railButton(.clipboard); railButton(.files); railButton(.player); railButton(.ai); railButton(.keyboardLanguage); railButton(.devices)
                     railDivider
                     railButton(.setup); railButton(.general)
                 }
@@ -254,11 +251,10 @@ struct HubView: View {
         case .overview: OverviewPage(context: context, nav: nav)
         case .bands: BandsPage(context: context)
         case .switcher: SwitcherPage(settings: context.settings)
-        case .launcher: LauncherPage(settings: context.settings,
-                                     subscribeTouch: context.subscribeTrackpadTouch,
-                                     unsubscribeTouch: context.unsubscribeTrackpadTouch)
+        case .launcher: LauncherPage(settings: context.settings)
         case .clipboard: ClipboardPage(context: context)
         case .files: FilesPage(context: context)
+        case .player: PlayerPage(context: context)
         case .ai: AIPage(context: context)
         case .keyboardLanguage: KeyboardLanguagePage(context: context)
         case .devices: DevicesPage(context: context)

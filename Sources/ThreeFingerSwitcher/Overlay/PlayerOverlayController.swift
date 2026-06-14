@@ -53,6 +53,12 @@ final class PlayerController {
     private(set) var menuItems: [PlayerActionMenuItem] = []
     private(set) var menuHighlight = 0
 
+    // Edge-triggered auto-repeat, mirroring the launcher's edge timer (seek + volume, both axes).
+    private var repeatTimer: DispatchSourceTimer?
+    private var repeatDX = 0
+    private var repeatDY = 0
+    private var repeatTicks = 0
+
     init(settings: AppSettings,
          store: PlaybackStateStore,
          availableEngines: Set<PlaybackEngineKind>,
@@ -107,6 +113,7 @@ final class PlayerController {
     /// Tear down the player: persist resume state, stop the engine, hide the surface, and release the
     /// trackpad. NOT a failure — a dismiss never records a `.failed` state.
     func dismiss() {
+        stopAutoRepeat()
         persistState()
         model?.dismiss()
         surface.hidePlayer()
@@ -131,7 +138,45 @@ final class PlayerController {
 
     func togglePlayPause() { model?.togglePlayPause() }
 
-    func heldZone(dx: Int, dy: Int) { surface.setHeldZone(dx: dx, dy: dy) }
+    // MARK: - Edge-triggered auto-repeat
+
+    /// The recognizer's held-at-edge sign (the first step already fired on the edge crossing). A nonzero
+    /// hold starts an accelerating auto-repeat — BOTH axes (seek + volume), routed through the menu-aware
+    /// `seek`/`volume` — that ramps from ~0.18s toward a 0.03s floor, exactly like the launcher's `edgeTimer`.
+    func heldZone(dx: Int, dy: Int) {
+        surface.setHeldZone(dx: dx, dy: dy)
+        guard dx != repeatDX || dy != repeatDY else { return }
+        repeatDX = dx; repeatDY = dy; repeatTicks = 0
+        if dx == 0 && dy == 0 {
+            stopAutoRepeat()
+        } else if repeatTimer == nil {
+            let timer = DispatchSource.makeTimerSource(queue: .main)
+            timer.setEventHandler { [weak self] in self?.repeatTick() }
+            repeatTimer = timer
+            rescheduleRepeat()
+            timer.resume()
+        }
+    }
+
+    private func repeatTick() {
+        if repeatDX != 0 { seek(repeatDX) }
+        if repeatDY != 0 { volume(repeatDY) }   // routes to menu-highlight movement while the menu is open
+        repeatTicks += 1
+        rescheduleRepeat()
+    }
+
+    private func rescheduleRepeat() {
+        guard let timer = repeatTimer else { return }
+        let interval = LauncherOverlayController.edgeInterval(tick: repeatTicks,
+                                                             acceleration: settings.clipboardEdgeAcceleration)
+        timer.schedule(deadline: .now() + interval)
+    }
+
+    private func stopAutoRepeat() {
+        repeatTimer?.cancel()
+        repeatTimer = nil
+        repeatDX = 0; repeatDY = 0; repeatTicks = 0
+    }
 
     // MARK: - Action menu
 

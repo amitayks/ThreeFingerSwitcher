@@ -11,7 +11,7 @@ While in the sub-state the recognizer SHALL:
 - treat a fresh deliberate **four-finger horizontal swipe-away** as a **discard** resolution;
 - treat the resolving lift (contact count dropping below two, with the standard below-target debounce) as a **one-shot** resolution (open / open-with / discard), so a stray re-lift after resolution is a **no-op**.
 
-The recognizer SHALL NOT itself implement directory navigation, preview, search-field focus, dwell, arm, or fire — it emits only intents; the controller and model interpret them (including deciding that an up-step while already at the top of the list means focus-search).
+The recognizer SHALL NOT itself implement directory navigation, preview, dwell, arm, or fire — it emits only intents; the controller and model interpret them (an up-step while already at the top of the list simply clamps — the navigator is pure-trackpad with no search to focus).
 
 #### Scenario: Drill-in bypasses the latch
 - **WHEN** the navigator is open and a fresh contact lands

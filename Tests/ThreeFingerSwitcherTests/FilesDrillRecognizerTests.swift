@@ -9,6 +9,7 @@ import CoreGraphics
 private final class FilesDrillMockDelegate: GestureRecognizerDelegate {
     enum Event: Equatable {
         case depth(Int), highlight(Int), open, openWith, discard
+        case edge(Int, Int)   // launcherEdgeChanged(dx,dy): the held-at-edge sign that drives auto-repeat
         // Tripwires: these MUST stay empty while drilling (the latch is bypassed).
         case sActivate, lActivate
     }
@@ -20,6 +21,9 @@ private final class FilesDrillMockDelegate: GestureRecognizerDelegate {
     func filesOpen() { events.append(.open) }
     func filesOpenWith() { events.append(.openWith) }
     func filesDiscard() { events.append(.discard) }
+    // The held-at-edge sign (depth/highlight border auto-repeat): the recognizer publishes it through the
+    // launcher edge delegate, and the controller turns it into edge-triggered auto-repeat.
+    func launcherEdgeChanged(dx: Int, dy: Int) { events.append(.edge(dx, dy)) }
 
     // Tripwires (must never fire during a drill)
     func gestureDidActivate() { events.append(.sActivate) }
@@ -36,6 +40,7 @@ private final class FilesDrillMockDelegate: GestureRecognizerDelegate {
 
     var depths: [Int] { events.compactMap { if case let .depth(d) = $0 { return d } else { return nil } } }
     var highlights: [Int] { events.compactMap { if case let .highlight(d) = $0 { return d } else { return nil } } }
+    var lastEdgeDX: Int? { events.reversed().compactMap { if case let .edge(dx, _) = $0 { return dx } else { return nil } }.first }
     var openCount: Int { events.filter { $0 == .open }.count }
     var openWithCount: Int { events.filter { $0 == .openWith }.count }
     var discardCount: Int { events.filter { $0 == .discard }.count }
@@ -48,17 +53,15 @@ final class FilesDrillRecognizerTests: XCTestCase {
 
     // MARK: - Fixture
 
-    /// The drill is now ANCHORED-POSITIONAL (change `positional-navigation`): `launcherStepDistance` is the
-    /// depth/highlight **outer threshold** (offset units), and a step fires per out-and-back across it (not
-    /// per N of travel). `launcherActivationThreshold` is still the four-finger discard-swipe threshold;
-    /// `axisLockRatio` gates the discard to a horizontal-dominant sweep. Test frames carry no footprint, so
-    /// the anchored offset uses `fallbackScale` — with fallbackScale 0.1, an offset of `itemOuter` is
-    /// reached `itemOuter · 0.1` of travel from the anchor (itemOuter 0.5 → 0.05 of travel).
+    /// The drill navigation is the **odometer** (restored v0.11.0 model) on BOTH axes: `launcherStepDistance`
+    /// is the per-step travel distance, so a centroid Δ of one step emits one depth/highlight step (with
+    /// carry), and holding a contact at a trackpad edge sets the held sign so the controller auto-repeats —
+    /// uniform on both axes (depth auto-drills the folder tree). `launcherActivationThreshold` is the
+    /// four-finger discard-swipe threshold; `axisLockRatio` gates the discard to a horizontal-dominant
+    /// sweep. With step 0.1, a centroid Δ of 0.15 ≈ one step and 0.35 ≈ three steps.
     private func makeSettings(
         launcherActivationThreshold: Double = 0.045,
-        itemOuter: Double = 0.5,
-        innerDeadzone: Double = 0.2,
-        fallbackScale: Double = 0.1,
+        step: Double = 0.1,
         axisLockRatio: Double = 1.4,
         reverseDirection: Bool = false,
         reverseVerticalDirection: Bool = false
@@ -66,20 +69,11 @@ final class FilesDrillRecognizerTests: XCTestCase {
         let defaults = UserDefaults(suiteName: "ThreeFingerSwitcherTests.\(UUID().uuidString)")!
         let settings = AppSettings(defaults: defaults)
         settings.launcherActivationThreshold = launcherActivationThreshold
-        settings.launcherStepDistance = itemOuter             // positional depth/highlight outer threshold
-        settings.positionalInnerDeadzone = innerDeadzone
-        settings.positionalFallbackScale = fallbackScale      // no footprint in test frames → fallback
+        settings.launcherStepDistance = step                  // odometer step (travel per depth/highlight step)
         settings.axisLockRatio = axisLockRatio
         settings.reverseDirection = reverseDirection
         settings.reverseVerticalDirection = reverseVerticalDirection
         return settings
-    }
-
-    /// Positional out-and-back from the seeded anchor: push past the outer threshold (one step) then
-    /// return to the anchor (re-arm). Same finger count both frames so no re-anchor between them.
-    private func outAndBack(_ rec: GestureRecognizer, anchor: CGPoint, dx: Double, dy: Double, fingers: Int) {
-        feed(rec, x: anchor.x + dx, y: anchor.y + dy, fingers: fingers)   // out → one step
-        feed(rec, x: anchor.x, y: anchor.y, fingers: fingers)            // back → re-arm
     }
 
     /// Builds a recognizer already in the drill sub-state (the controller flips the flag when the Files
@@ -100,37 +94,37 @@ final class FilesDrillRecognizerTests: XCTestCase {
 
     // MARK: - Depth (horizontal) / Highlight (vertical)
 
-    func test_horizontalTravel_emitsDepthSteps() {
-        // Positional depth: each out-and-back across the outer threshold emits ONE depth step (depth is
-        // deliberate — no auto-repeat). The FIRST ≥2-finger frame only seeds/anchors.
+    func test_horizontalTravel_odometerDepth() {
+        // Depth is the odometer: a +0.35 sweep (≈3 steps) descends three levels with carry; moving back
+        // steps it back (ascends). The first ≥2-finger frame seeds the origin.
         let (rec, d) = makeDrillRecognizer(makeSettings())
-        feed(rec, x: 0.20, y: 0.50, fingers: 2)    // seed/anchor (no step)
-        let anchor = CGPoint(x: 0.20, y: 0.50)
-        outAndBack(rec, anchor: anchor, dx: 0.06, dy: 0, fingers: 2)   // offset +0.6 > outer 0.5 → step
-        outAndBack(rec, anchor: anchor, dx: 0.06, dy: 0, fingers: 2)
-        feed(rec, x: 0.26, y: 0.50, fingers: 2)                        // third push
-        XCTAssertEqual(d.depths, [1, 1, 1])
+        feed(rec, x: 0.20, y: 0.50, fingers: 2)    // seed (0.20, 0.50)
+        feed(rec, x: 0.55, y: 0.50, fingers: 2)    // Δx +0.35 → +3 depth steps
+        XCTAssertEqual(d.depths, [1, 1, 1], "depth accumulates one step per step-distance of travel")
         XCTAssertTrue(d.highlights.isEmpty, "pure horizontal emits no highlight steps")
+        feed(rec, x: 0.20, y: 0.50, fingers: 2)    // Δx −0.35 → 3 depth steps back (ascend)
+        XCTAssertEqual(d.depths, [1, 1, 1, -1, -1, -1])
     }
 
-    func test_singleHorizontalPush_isOneDepthStep() {
-        // A single push past the outer threshold is exactly ONE depth step (depth never auto-repeats).
+    func test_horizontalHeldAtBorder_setsDepthHeldSign_forAutoRepeat() {
+        // Uniform auto-repeat: holding depth at the trackpad border sets the HORIZONTAL held sign, so the
+        // controller auto-drills (the border acceleration the user asked for).
         let (rec, d) = makeDrillRecognizer(makeSettings())
-        feed(rec, x: 0.20, y: 0.50, fingers: 2)    // anchor
-        feed(rec, x: 0.30, y: 0.50, fingers: 2)    // offset +1.0; still one step
-        feed(rec, x: 0.36, y: 0.50, fingers: 2)    // held further out: NO additional depth step
-        XCTAssertEqual(d.depths, [1], "one depth step per push; depth does not auto-repeat")
+        feed(rec, x: 0.50, y: 0.50, fingers: 2)    // seed mid-trackpad
+        feed(rec, x: 0.96, y: 0.50, fingers: 2)    // push into the right edge zone → depth held
+        XCTAssertEqual(d.lastEdgeDX, 1, "holding depth at the border sets the horizontal held sign")
+        XCTAssertFalse(d.depths.isEmpty, "and the depth stepped on the way out")
     }
 
-    func test_verticalTravel_positionTracksHighlight() {
-        // Highlight now matches the launcher: POSITION-TRACKING. A push to offset +1.5 (3 steps) moves the
-        // highlight 3 rows at once; moving back steps it back. (Depth stays deliberate out-and-back.)
+    func test_verticalTravel_odometerHighlight() {
+        // Highlight is the odometer too: a +0.35 vertical sweep moves the highlight three rows; moving
+        // back steps it back.
         let (rec, d) = makeDrillRecognizer(makeSettings())
-        feed(rec, x: 0.50, y: 0.20, fingers: 2)    // anchor (0.50, 0.20)
-        feed(rec, x: 0.50, y: 0.35, fingers: 2)    // dy offset +1.5 → index 3 → +3 highlight steps
-        XCTAssertEqual(d.highlights, [1, 1, 1], "the highlight tracks the finger's position")
+        feed(rec, x: 0.50, y: 0.20, fingers: 2)    // seed (0.50, 0.20)
+        feed(rec, x: 0.50, y: 0.55, fingers: 2)    // Δy +0.35 → +3 highlight steps
+        XCTAssertEqual(d.highlights, [1, 1, 1], "the highlight accumulates one step per step-distance")
         XCTAssertTrue(d.depths.isEmpty, "pure vertical emits no depth steps")
-        feed(rec, x: 0.50, y: 0.20, fingers: 2)    // back to center → highlight steps back
+        feed(rec, x: 0.50, y: 0.20, fingers: 2)    // Δy −0.35 → 3 highlight steps back
         XCTAssertEqual(d.highlights, [1, 1, 1, -1, -1, -1])
     }
 
@@ -138,46 +132,44 @@ final class FilesDrillRecognizerTests: XCTestCase {
         // The drill applies the SAME reverseDirection / reverseVerticalDirection as the launcher: a forward
         // (+x / +y) push flips to -1 when inverted.
         let (rec, d) = makeDrillRecognizer(makeSettings(reverseDirection: true, reverseVerticalDirection: true))
-        feed(rec, x: 0.20, y: 0.20, fingers: 2)    // anchor
-        feed(rec, x: 0.26, y: 0.20, fingers: 2)    // +x push, inverted → depth -1
+        feed(rec, x: 0.20, y: 0.20, fingers: 2)    // seed
+        feed(rec, x: 0.35, y: 0.20, fingers: 2)    // +x push (1 step), inverted → depth -1
         XCTAssertEqual(d.depths, [-1])
-        feed(rec, x: 0.20, y: 0.20, fingers: 2)    // back → re-arm both axes
-        feed(rec, x: 0.20, y: 0.26, fingers: 2)    // +y push, inverted → highlight -1
+        feed(rec, x: 0.20, y: 0.20, fingers: 2)    // back (steps the depth the other way)
+        feed(rec, x: 0.20, y: 0.35, fingers: 2)    // +y push (1 step), inverted → highlight -1
         XCTAssertEqual(d.highlights, [-1])
     }
 
-    func test_negativeTravel_emitsNegativeSteps() {
+    func test_negativeTravel_emitsNegativeDepthSteps() {
+        // Leftward depth ascends: a −0.35 sweep → −3 steps.
         let (rec, d) = makeDrillRecognizer(makeSettings())
-        feed(rec, x: 0.80, y: 0.50, fingers: 3)    // anchor at three fingers (still the relaxed posture)
-        let anchor = CGPoint(x: 0.80, y: 0.50)
-        outAndBack(rec, anchor: anchor, dx: -0.06, dy: 0, fingers: 3)  // offset -0.6 → backward depth
-        outAndBack(rec, anchor: anchor, dx: -0.06, dy: 0, fingers: 3)
-        feed(rec, x: 0.74, y: 0.50, fingers: 3)                        // third push
+        feed(rec, x: 0.80, y: 0.50, fingers: 3)    // seed at three fingers (still the relaxed posture)
+        feed(rec, x: 0.45, y: 0.50, fingers: 3)    // Δx −0.35 → −3 depth steps
         XCTAssertEqual(d.depths, [-1, -1, -1])
     }
 
-    // MARK: - Re-anchor on contact-count change (no phantom step)
+    // MARK: - Re-baseline on contact-count change (no phantom step)
 
-    func test_contactCountChange_reAnchors_emitsNoPhantomStep() {
-        // A finger leaving shifts the centroid; without re-anchoring that jump would read as a huge offset
+    func test_contactCountChange_reBaselines_emitsNoPhantomStep() {
+        // A finger leaving shifts the centroid; without re-baselining that jump would read as a huge travel
         // and fire spurious steps. Assert zero steps from the count change, then one step from a push.
         let (rec, d) = makeDrillRecognizer(makeSettings())
-        feed(rec, x: 0.20, y: 0.20, fingers: 3)    // anchor at three
-        feed(rec, x: 0.60, y: 0.80, fingers: 2)    // drop to two AND a large jump → re-anchor, no step
+        feed(rec, x: 0.20, y: 0.20, fingers: 3)    // seed at three
+        feed(rec, x: 0.60, y: 0.80, fingers: 2)    // drop to two AND a large jump → re-baseline, no step
         XCTAssertTrue(d.depths.isEmpty, "the count-change centroid jump emits no depth step")
         XCTAssertTrue(d.highlights.isEmpty, "the count-change centroid jump emits no highlight step")
-        feed(rec, x: 0.66, y: 0.80, fingers: 2)    // +0.6 offset from the NEW center → one depth step
+        feed(rec, x: 0.75, y: 0.80, fingers: 2)    // Δx +0.15 from the NEW baseline → one depth step
         XCTAssertEqual(d.depths, [1])
         XCTAssertTrue(d.highlights.isEmpty)
     }
 
-    func test_landingFinger_alsoReAnchors() {
-        // Symmetric to a leaving finger: a landing finger re-anchors too, so the centroid jump emits no step.
+    func test_landingFinger_alsoReBaselines() {
+        // Symmetric to a leaving finger: a landing finger re-baselines too, so the centroid jump emits no step.
         let (rec, d) = makeDrillRecognizer(makeSettings())
-        feed(rec, x: 0.20, y: 0.50, fingers: 2)    // anchor at two
-        feed(rec, x: 0.55, y: 0.50, fingers: 3)    // a finger lands; big jump → re-anchor, no step
+        feed(rec, x: 0.20, y: 0.50, fingers: 2)    // seed at two
+        feed(rec, x: 0.55, y: 0.50, fingers: 3)    // a finger lands; big jump → re-baseline, no step
         XCTAssertTrue(d.depths.isEmpty)
-        feed(rec, x: 0.61, y: 0.50, fingers: 3)    // +0.6 offset from the new center → one depth step
+        feed(rec, x: 0.70, y: 0.50, fingers: 3)    // Δx +0.15 from the new baseline → one depth step
         XCTAssertEqual(d.depths, [1])
     }
 
@@ -207,9 +199,9 @@ final class FilesDrillRecognizerTests: XCTestCase {
 
     func test_noAddedFinger_liftEmitsPlainOpen() {
         let (rec, d) = makeDrillRecognizer(makeSettings())
-        feed(rec, x: 0.20, y: 0.50, fingers: 2)    // anchor
-        feed(rec, x: 0.30, y: 0.50, fingers: 2)    // navigate (a depth step), no finger added
-        feed(rec, x: 0.30, y: 0.50, fingers: 0)    // resolving lift → plain Open
+        feed(rec, x: 0.20, y: 0.50, fingers: 2)    // seed
+        feed(rec, x: 0.50, y: 0.50, fingers: 2)    // navigate (depth steps), no finger added
+        feed(rec, x: 0.50, y: 0.50, fingers: 0)    // resolving lift → plain Open
         XCTAssertEqual(d.openCount, 1)
         XCTAssertEqual(d.openWithCount, 0)
     }
@@ -240,8 +232,8 @@ final class FilesDrillRecognizerTests: XCTestCase {
     }
 
     func test_fourFingerSmallNudge_doesNotDiscard() {
-        // A small (depth-sized) horizontal nudge at four fingers is below the discard threshold: no discard,
-        // and (arming posture) no depth steps either; a lift then resolves Open-With from the +1.
+        // A small horizontal nudge at four fingers is below the discard threshold: no discard, and (arming
+        // posture) no depth steps either; a lift then resolves Open-With from the +1.
         let (rec, d) = makeDrillRecognizer(makeSettings(launcherActivationThreshold: 0.045))
         feed(rec, x: 0.50, y: 0.50, fingers: 3)    // seed; baseline = 3
         feed(rec, x: 0.50, y: 0.50, fingers: 4)    // 3 → 4: latch Open-With, re-baseline
@@ -265,9 +257,9 @@ final class FilesDrillRecognizerTests: XCTestCase {
 
     func test_resolution_isOneShot_strayReLiftEmitsNothing() {
         let (rec, d) = makeDrillRecognizer(makeSettings())
-        feed(rec, x: 0.20, y: 0.50, fingers: 2)    // anchor
-        feed(rec, x: 0.30, y: 0.50, fingers: 2)    // navigate: one depth step
-        feed(rec, x: 0.30, y: 0.50, fingers: 0)    // lift → Open (resolved)
+        feed(rec, x: 0.20, y: 0.50, fingers: 2)    // seed
+        feed(rec, x: 0.35, y: 0.50, fingers: 2)    // navigate: Δx +0.15 → one depth step
+        feed(rec, x: 0.35, y: 0.50, fingers: 0)    // lift → Open (resolved)
         XCTAssertEqual(d.openCount, 1)
         // A stray re-lift: fingers return, then lift again — must emit nothing further.
         feed(rec, x: 0.40, y: 0.50, fingers: 2)    // fingers return (re-seed only)
@@ -312,7 +304,7 @@ final class FilesDrillRecognizerTests: XCTestCase {
         // never to the switcher — the early short-circuit bypasses the idle re-latch.
         let (rec, d) = makeDrillRecognizer(makeSettings())
         feed(rec, x: 0.20, y: 0.50, fingers: 3)    // fresh three-finger contact (would normally arm switcher)
-        feed(rec, x: 0.30, y: 0.50, fingers: 3)    // horizontal push past the outer threshold
+        feed(rec, x: 0.35, y: 0.50, fingers: 3)    // horizontal push, Δx +0.15 → one depth step
         XCTAssertFalse(d.didSwitcherActivate, "a fresh contact during drill never opens the switcher")
         XCTAssertEqual(d.depths, [1], "it routes to the drill instead")
     }

@@ -2,7 +2,7 @@ import Foundation
 import Combine
 
 /// The pure transport state machine the player surface binds to (`media-player` spec: the transport
-/// grammar + the observable libmpv fallback). It maps the recognizer's positional intents (seek / volume
+/// grammar + the observable libmpv fallback). It maps the recognizer's navigation intents (seek / volume
 /// / toggle / track-select / dismiss) into commands on an injected `MediaPlaybackEngine`, and owns the
 /// observable surface `state`. Modeled on `AICommandExecutor` / `FileOpenService`: `@MainActor` +
 /// `ObservableObject`, holding the `@Published state` the view reflects, so a failure is **observable,

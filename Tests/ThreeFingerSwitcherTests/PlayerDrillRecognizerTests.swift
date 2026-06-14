@@ -48,16 +48,15 @@ private final class PlayerMockDelegate: GestureRecognizerDelegate {
 @MainActor
 final class PlayerDrillRecognizerTests: XCTestCase {
 
-    /// Same positional fixture as the Files drill: `launcherStepDistance` is the outer threshold (offset
-    /// units), test frames carry no footprint so the offset uses `fallbackScale`. With fallbackScale 0.1
-    /// and outer 0.5, an offset of `outer` is reached at ~0.05 of centroid travel from the anchor.
+    /// The player transport is the **odometer** (restored v0.11.0 model) on BOTH axes: `launcherStepDistance`
+    /// is the per-step travel distance (seek horizontally, volume vertically, with carry), and holding a
+    /// contact at a trackpad edge sets the held sign so the controller auto-repeats both axes. With step 0.1,
+    /// a centroid Δ of 0.15 ≈ one step.
     private func makeSettings(reverseDirection: Bool = false,
                               reverseVerticalDirection: Bool = false) -> AppSettings {
         let defaults = UserDefaults(suiteName: "ThreeFingerSwitcherTests.\(UUID().uuidString)")!
         let s = AppSettings(defaults: defaults)
-        s.launcherStepDistance = 0.5
-        s.positionalInnerDeadzone = 0.2
-        s.positionalFallbackScale = 0.1
+        s.launcherStepDistance = 0.1   // odometer step (travel per seek/volume step)
         s.axisLockRatio = 1.4
         s.reverseDirection = reverseDirection
         s.reverseVerticalDirection = reverseVerticalDirection
@@ -92,17 +91,19 @@ final class PlayerDrillRecognizerTests: XCTestCase {
     func test_horizontalEmitsSeekAndHeldSign() {
         let (rec, d) = makePlayerRecognizer(makeSettings())
         feed(rec, x: 0.20, y: 0.50, fingers: 2)    // seed/anchor (no step)
-        feed(rec, x: 0.26, y: 0.50, fingers: 2)    // offset +0.6 > outer 0.5 → one seek + held
-        XCTAssertEqual(d.seeks, [1])
+        feed(rec, x: 0.95, y: 0.50, fingers: 2)    // big rightward sweep into the edge zone → seeks + held(1,0)
+        XCTAssertFalse(d.seeks.isEmpty, "horizontal travel emits seek steps")
+        XCTAssertTrue(d.seeks.allSatisfy { $0 == 1 }, "all forward")
         XCTAssertTrue(d.volumes.isEmpty, "pure horizontal emits no volume steps")
-        XCTAssertTrue(d.heldSigns.contains(.held(1, 0)), "a held horizontal offset signals auto-repeat")
+        XCTAssertTrue(d.heldSigns.contains(.held(1, 0)), "holding at the border signals auto-repeat")
     }
 
     func test_verticalEmitsVolumeAndHeldSign() {
         let (rec, d) = makePlayerRecognizer(makeSettings())
         feed(rec, x: 0.50, y: 0.20, fingers: 2)    // seed/anchor
-        feed(rec, x: 0.50, y: 0.26, fingers: 2)    // offset +0.6 → one volume + held
-        XCTAssertEqual(d.volumes, [1])
+        feed(rec, x: 0.50, y: 0.95, fingers: 2)    // big upward sweep into the edge zone → volumes + held(0,1)
+        XCTAssertFalse(d.volumes.isEmpty, "vertical travel emits volume steps")
+        XCTAssertTrue(d.volumes.allSatisfy { $0 == 1 }, "all up")
         XCTAssertTrue(d.seeks.isEmpty, "pure vertical emits no seek steps")
         XCTAssertTrue(d.heldSigns.contains(.held(0, 1)), "volume axis also auto-repeats")
     }
@@ -119,8 +120,8 @@ final class PlayerDrillRecognizerTests: XCTestCase {
     func test_scrubThenLift_doesNotToggle() {
         let (rec, d) = makePlayerRecognizer(makeSettings())
         feed(rec, x: 0.20, y: 0.50, fingers: 2)    // seed
-        feed(rec, x: 0.30, y: 0.50, fingers: 2)    // a real scrub (seek)
-        feed(rec, x: 0.30, y: 0.50, fingers: 0)    // lift → NOT a tap
+        feed(rec, x: 0.35, y: 0.50, fingers: 2)    // a real scrub: Δx +0.15 → one seek
+        feed(rec, x: 0.35, y: 0.50, fingers: 0)    // lift → NOT a tap
         XCTAssertEqual(d.toggles, 0, "a scrub-and-lift must not be read as a play/pause tap")
         XCTAssertEqual(d.seeks, [1])
     }

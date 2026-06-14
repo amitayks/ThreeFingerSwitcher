@@ -175,8 +175,8 @@ final class AppSettingsTests: XCTestCase {
         // The shipped gesture-feel numbers are the maintainer's dialed-in daily-use values
         // (feather-light trigger, fine steps) — change them only as deliberately as they were set.
         XCTAssertEqual(AppSettings.Defaults.activationThreshold, 0.01, accuracy: eps)
-        XCTAssertEqual(AppSettings.Defaults.axisLockRatio, 1.0, accuracy: eps)
-        XCTAssertEqual(AppSettings.Defaults.stepDistance, 0.03, accuracy: eps)
+        XCTAssertEqual(AppSettings.Defaults.axisLockRatio, 1.13, accuracy: eps)
+        XCTAssertEqual(AppSettings.Defaults.stepDistance, 0.027, accuracy: eps)
         XCTAssertFalse(AppSettings.Defaults.wrapAtEnds)
         XCTAssertFalse(AppSettings.Defaults.reverseDirection)
         XCTAssertEqual(AppSettings.Defaults.velocitySmoothing, 0.35, accuracy: eps)
