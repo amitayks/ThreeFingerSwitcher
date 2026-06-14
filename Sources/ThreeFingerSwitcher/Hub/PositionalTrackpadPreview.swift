@@ -39,6 +39,8 @@ struct PositionalTrackpadPreview: View {
                 let box = CGFloat(settings.positionalPaddingRadius) * scale   // padding-box half-size (offset → norm)
                 let item = CGFloat(settings.launcherStepDistance) * scale     // one item step (offset → norm)
                 let edge = CGFloat(settings.positionalEdgeMargin)             // absolute border band
+                let wedge = CGFloat(settings.positionalCommitWedge)           // aim acceptance half-angle (deg)
+                let crossing = CGFloat(settings.positionalCrossingWedge)      // wider half-angle for rail → items
 
                 ZStack {
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
@@ -55,6 +57,14 @@ struct PositionalTrackpadPreview: View {
                                           lineWidth: max(1, edge * min(w, h)))
                             .allowsHitTesting(false)
                     }
+
+                    // The aim wedge (`launcher-aim-lock`): the green acceptance cones around each axis — a
+                    // stroke within this angle commits straight to that axis; the clear diagonal gaps are
+                    // the ambiguous "commit to neither" zone. Resizes live as the forgiveness angle changes.
+                    wedgeCones(center: center, rx: box * w, ry: box * h, halfAngleDeg: wedge,
+                               rightHalfAngleDeg: crossing)
+                        .fill(Color.green.opacity(model.live ? 0.20 : 0.12))
+                        .allowsHitTesting(false)
 
                     // The padding box (step zone): leave it → accelerate. An ellipse on the wide pad.
                     zoneEllipse(rx: box * w, ry: box * h, center: center)
@@ -97,6 +107,7 @@ struct PositionalTrackpadPreview: View {
                 legendItem(color: .accentColor, label: "Padding box", filled: false)
                 legendItem(color: .accentColor, label: "Item step", filled: false, dashed: true)
                 legendItem(color: .orange, label: "Edge margin", filled: false)
+                legendItem(color: .green, label: "Aim wedge", filled: true)
             }
             .font(.caption2).foregroundStyle(.secondary)
         }
@@ -106,6 +117,25 @@ struct PositionalTrackpadPreview: View {
 
     private func zoneEllipse(rx: CGFloat, ry: CGFloat, center: CGPoint) -> Path {
         Path(ellipseIn: CGRect(x: center.x - rx, y: center.y - ry, width: 2 * rx, height: 2 * ry))
+    }
+
+    /// The four acceptance cones of the aim wedge (`launcher-aim-lock`) — one per axis direction (right /
+    /// up / left / down), each spanning `±halfAngle` around its axis, drawn out to the box ellipse. The
+    /// **right** cone (toward the items) uses the wider `rightHalfAngle` — the bigger band-rail crossing
+    /// triangle. The unfilled diagonal gaps between cones are the ambiguous "commit to neither" region.
+    /// (View y grows downward, hence the `-sin`.)
+    private func wedgeCones(center: CGPoint, rx: CGFloat, ry: CGFloat,
+                            halfAngleDeg: CGFloat, rightHalfAngleDeg: CGFloat) -> Path {
+        var path = Path()
+        for phi in [CGFloat(0), .pi / 2, .pi, 3 * .pi / 2] {
+            let t = (phi == 0 ? rightHalfAngleDeg : halfAngleDeg) * .pi / 180   // right = the wider crossing cone
+            let a0 = phi - t, a1 = phi + t
+            path.move(to: center)
+            path.addLine(to: CGPoint(x: center.x + rx * cos(a0), y: center.y - ry * sin(a0)))
+            path.addLine(to: CGPoint(x: center.x + rx * cos(a1), y: center.y - ry * sin(a1)))
+            path.closeSubpath()
+        }
+        return path
     }
 
     private func legendItem(color: Color, label: String, filled: Bool, dashed: Bool = false) -> some View {

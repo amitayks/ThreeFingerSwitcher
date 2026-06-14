@@ -181,6 +181,23 @@ final class AppSettings: ObservableObject {
     /// always-present "min margin" the padding squeezes against near the edges. `0` = box radius only.
     @Published var positionalEdgeMargin: Double { didSet { persist(positionalEdgeMargin, Keys.positionalEdgeMargin) } }
 
+    /// The directional axis-lock **acceptance half-angle**, in degrees (change `launcher-aim-lock`). A
+    /// stroke commits to an axis when it lands within this angle of it; the band around the 45° diagonal
+    /// (`90° − 2·angle` wide) is the ambiguous "commit to neither" zone. Larger = more forgiving of off-axis
+    /// drift (a wider acceptance cone). Clamped to `(0, 45)`; `45` commits to whichever axis is larger.
+    @Published var positionalCommitWedge: Double { didSet { persist(positionalCommitWedge, Keys.positionalCommitWedge) } }
+
+    /// The **wider** acceptance half-angle (degrees) for the band-rail → items crossing (change
+    /// `launcher-aim-lock`): while on the band rail, a rightward (into-items) stroke commits within this
+    /// angle, so an up/down-and-right nudge enters the items instead of switching a band. Bigger than
+    /// `positionalCommitWedge` = a bigger crossing "triangle". Clamped to `(0, 45)`.
+    @Published var positionalCrossingWedge: Double { didSet { persist(positionalCrossingWedge, Keys.positionalCrossingWedge) } }
+
+    /// How far (offset units) the perpendicular axis must exceed the committed axis before the lock switches
+    /// to it (change `launcher-aim-lock`) — keeps a committed axis through incidental drift; a deliberate
+    /// turn re-commits (with a per-axis re-anchor → an L-move). Above hold jitter.
+    @Published var positionalRecommitHysteresis: Double { didSet { persist(positionalRecommitHysteresis, Keys.positionalRecommitHysteresis) } }
+
     /// Seconds the selection must rest on an item before it arms (then a lift fires it). Brief but
     /// deliberate — a quick scrub-and-lift never fires.
     @Published var dwellToArmDuration: Double { didSet { persist(dwellToArmDuration, Keys.dwellToArmDuration) } }
@@ -461,6 +478,9 @@ final class AppSettings: ObservableObject {
         positionalReArmBackoff = defaults.object(forKey: Keys.positionalReArmBackoff) as? Double ?? Defaults.positionalReArmBackoff
         positionalPaddingRadius = defaults.object(forKey: Keys.positionalPaddingRadius) as? Double ?? Defaults.positionalPaddingRadius
         positionalEdgeMargin = defaults.object(forKey: Keys.positionalEdgeMargin) as? Double ?? Defaults.positionalEdgeMargin
+        positionalCommitWedge = defaults.object(forKey: Keys.positionalCommitWedge) as? Double ?? Defaults.positionalCommitWedge
+        positionalCrossingWedge = defaults.object(forKey: Keys.positionalCrossingWedge) as? Double ?? Defaults.positionalCrossingWedge
+        positionalRecommitHysteresis = defaults.object(forKey: Keys.positionalRecommitHysteresis) as? Double ?? Defaults.positionalRecommitHysteresis
         dwellToArmDuration = defaults.object(forKey: Keys.dwellToArmDuration) as? Double ?? Defaults.dwellToArmDuration
         showDiagnostics = defaults.object(forKey: Keys.showDiagnostics) as? Bool ?? Defaults.showDiagnostics
         livePreviewEnabled = defaults.object(forKey: Keys.livePreviewEnabled) as? Bool ?? Defaults.livePreviewEnabled
@@ -531,6 +551,9 @@ final class AppSettings: ObservableObject {
         positionalReArmBackoff = Defaults.positionalReArmBackoff
         positionalPaddingRadius = Defaults.positionalPaddingRadius
         positionalEdgeMargin = Defaults.positionalEdgeMargin
+        positionalCommitWedge = Defaults.positionalCommitWedge
+        positionalCrossingWedge = Defaults.positionalCrossingWedge
+        positionalRecommitHysteresis = Defaults.positionalRecommitHysteresis
         dwellToArmDuration = Defaults.dwellToArmDuration
         showDiagnostics = Defaults.showDiagnostics
         livePreviewEnabled = Defaults.livePreviewEnabled
@@ -606,6 +629,10 @@ final class AppSettings: ObservableObject {
         static let positionalReArmBackoff = 0.25        // offset retreat that snaps center to finger & stops accel
         static let positionalPaddingRadius = 2.5        // padding-box half-size (offset units) before the margin
         static let positionalEdgeMargin = 0.10          // fixed border band (normalized) that always accelerates
+        // Directional axis-lock (change `launcher-aim-lock`).
+        static let positionalCommitWedge = 35.0         // acceptance half-angle (deg); larger = forgive more drift
+        static let positionalCrossingWedge = 55.0       // WIDER half-angle for rail→items (bigger crossing triangle)
+        static let positionalRecommitHysteresis = 0.35  // offset the perp axis must beat the committed one by to turn
         static let dwellToArmDuration = 0.3        // quick tick; the charge stays readable
         static let showDiagnostics = false         // troubleshooting tools hidden from the menu by default
         static let livePreviewEnabled = true       // show the in-flight preview while scrubbing (default ON)
@@ -682,6 +709,9 @@ final class AppSettings: ObservableObject {
         static let positionalReArmBackoff = "positionalReArmBackoff"
         static let positionalPaddingRadius = "positionalPaddingRadius"
         static let positionalEdgeMargin = "positionalEdgeMargin"
+        static let positionalCommitWedge = "positionalCommitWedge"
+        static let positionalCrossingWedge = "positionalCrossingWedge"
+        static let positionalRecommitHysteresis = "positionalRecommitHysteresis"
         static let dwellToArmDuration = "dwellToArmDuration"
         static let showDiagnostics = "showDiagnostics"
         static let livePreviewEnabled = "livePreviewEnabled"

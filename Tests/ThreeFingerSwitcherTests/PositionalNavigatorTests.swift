@@ -160,6 +160,154 @@ final class PositionalNavigatorTests: XCTestCase {
                        PositionalNavigator.Output(stepX: 0, stepY: 0, heldX: 0, heldY: 0))
     }
 
+    // MARK: - Directional axis-lock (change `launcher-aim-lock`)
+
+    /// A position-tracking-both navigator (the launcher) with the directional lock on. `wedge` 1.732 ≈ a
+    /// 30° acceptance half-angle; scale 0.1 so offset = centroid travel / 0.1.
+    private func lockNav(step: CGFloat = 0.5, radius: CGFloat = 3.0,
+                         wedge: CGFloat = 1.732, hysteresis: CGFloat = 0.5,
+                         engage: CGFloat = 0.22) -> PositionalNavigator {
+        var nav = PositionalNavigator(footprintFactor: 1.0, fallbackScale: 0.1,
+                                      x: AxisZone(mode: .positionTracking, step: step, radius: radius),
+                                      y: AxisZone(mode: .positionTracking, step: step, radius: radius))
+        nav.axisLock = true
+        nav.commitWedge = wedge
+        nav.recommitHysteresis = hysteresis
+        nav.engage = engage
+        nav.reanchor(center: CGPoint(x: 0.5, y: 0.5), spread: 0.1)
+        return nav
+    }
+
+    // 2.1 — an angled stroke commits to the dominant axis; the perpendicular drift emits no step.
+    func testAxisLockCommitsToDominantAxisForgivingDrift() {
+        // Horizontal-dominant (offset +0.9 / +0.4): commits H, steps items; the +0.4 vertical (which WOULD
+        // be one step unlocked) is frozen.
+        var h = lockNav()
+        let oh = h.feed(centroid: CGPoint(x: 0.59, y: 0.54))
+        XCTAssertEqual(h.committed, .horizontal)
+        XCTAssertEqual(oh.stepX, 2, "offset +0.9 → round(1.8) = 2 item steps")
+        XCTAssertEqual(oh.stepY, 0, "vertical drift is frozen (would be +1 unlocked)")
+
+        // Vertical-dominant the other way (offset −0.4 / −0.9): commits V; the horizontal drift is frozen.
+        var v = lockNav()
+        let ov = v.feed(centroid: CGPoint(x: 0.46, y: 0.41))
+        XCTAssertEqual(v.committed, .vertical)
+        XCTAssertEqual(ov.stepY, -2)
+        XCTAssertEqual(ov.stepX, 0, "horizontal drift is frozen")
+    }
+
+    // 2.2 — a frozen perpendicular axis HOLDS its index (it is not stepped back to center).
+    func testAxisLockFrozenAxisHoldsIndexNotPulledBack() {
+        var nav = lockNav()
+        _ = nav.feed(centroid: CGPoint(x: 0.5, y: 0.6))    // commit V, Y index → 2
+        XCTAssertEqual(nav.committed, .vertical)
+        XCTAssertEqual(nav.y.index, 2)
+        // Turn hard to horizontal (offset +1.6 / +1.0 → ox ≥ oy + hysteresis): re-commit H, Y is frozen.
+        let out = nav.feed(centroid: CGPoint(x: 0.66, y: 0.6))
+        XCTAssertEqual(nav.committed, .horizontal)
+        XCTAssertEqual(nav.y.index, 2, "the frozen Y index holds — not fed 0, not stepped back")
+        XCTAssertEqual(out.stepY, 0, "Y emits nothing while frozen")
+    }
+
+    // 2.3 — a near-diagonal stroke commits to neither axis until one clearly dominates.
+    func testAxisLockAmbiguousDiagonalCommitsToNeither() {
+        var nav = lockNav()
+        let amb = nav.feed(centroid: CGPoint(x: 0.57, y: 0.57))   // offset +0.7 / +0.7: tied
+        XCTAssertEqual(nav.committed, .none)
+        XCTAssertEqual(amb, PositionalNavigator.Output(stepX: 0, stepY: 0, heldX: 0, heldY: 0))
+        // Tip clearly horizontal (offset +1.4 / +0.7 ≥ wedge·other): now it commits.
+        let go = nav.feed(centroid: CGPoint(x: 0.64, y: 0.57))
+        XCTAssertEqual(nav.committed, .horizontal)
+        XCTAssertEqual(go.stepX, 3, "offset +1.4 → round(2.8) = 3")
+    }
+
+    // 2.4 — a deliberate perpendicular turn re-commits with a per-axis re-anchor: an L-move, no jump.
+    func testAxisLockRecommitIsAnLMoveWithNoJump() {
+        var nav = lockNav()
+        _ = nav.feed(centroid: CGPoint(x: 0.6, y: 0.5))    // commit H, X index → 2
+        XCTAssertEqual(nav.x.index, 2)
+        // Turn down hard (offset +1.0 / +1.6 → oy ≥ ox + hysteresis): re-commit V, Y re-anchored to here.
+        let turn = nav.feed(centroid: CGPoint(x: 0.6, y: 0.66))
+        XCTAssertEqual(nav.committed, .vertical)
+        XCTAssertEqual(nav.x.index, 2, "X frozen at the column it reached")
+        XCTAssertEqual(turn.stepY, 0, "Y re-anchored on the turn → no multi-step jump")
+        // Continue down from the fresh Y anchor → clean single steps (the L's second leg).
+        let down = nav.feed(centroid: CGPoint(x: 0.6, y: 0.72))
+        XCTAssertEqual(down.stepY, 1)
+        XCTAssertEqual(nav.x.index, 2, "X stays frozen through the vertical leg")
+    }
+
+    // 2.5 — settling to the deadzone re-arms; an explicit re-anchor re-arms and emits no step.
+    func testAxisLockReArmsOnSettleAndReanchor() {
+        var nav = lockNav()
+        _ = nav.feed(centroid: CGPoint(x: 0.6, y: 0.5))    // commit H, X index → 2
+        let back = nav.feed(centroid: CGPoint(x: 0.51, y: 0.5))   // relax inside the deadzone
+        XCTAssertEqual(back.stepX, -2, "the committed axis is absolute within a stroke — it steps back")
+        XCTAssertEqual(nav.committed, .none, "both axes inside the deadzone → re-armed")
+        // A fresh vertical stroke now commits vertical (the lock picked a new axis from rest).
+        let v = nav.feed(centroid: CGPoint(x: 0.51, y: 0.6))
+        XCTAssertEqual(nav.committed, .vertical)
+        XCTAssertEqual(v.stepY, 2)
+
+        // reanchor re-arms and emits no step.
+        nav.reanchor(center: CGPoint(x: 0.5, y: 0.5), spread: 0.1)
+        XCTAssertEqual(nav.committed, .none)
+        XCTAssertEqual(nav.feed(centroid: CGPoint(x: 0.5, y: 0.5)),
+                       PositionalNavigator.Output(stepX: 0, stepY: 0, heldX: 0, heldY: 0))
+    }
+
+    // 2.6 — the lock also gates an out-and-back axis (the Files drill: depth = out-and-back, highlight = box).
+    func testAxisLockGatesOutAndBackDepthAxis() {
+        func filesNav() -> PositionalNavigator {
+            var nav = PositionalNavigator(footprintFactor: 1.0, fallbackScale: 0.1,
+                                          x: AxisZone(mode: .outAndBack, inner: 0.2, outer: 0.5),
+                                          y: AxisZone(mode: .positionTracking, step: 0.5, radius: 3.0))
+            nav.axisLock = true
+            nav.commitWedge = 1.732
+            nav.recommitHysteresis = 0.5
+            nav.engage = 0.22
+            nav.reanchor(center: CGPoint(x: 0.5, y: 0.5), spread: 0.1)
+            return nav
+        }
+        // Horizontal-dominant (offset +0.8 / +0.3): one depth step, highlight frozen.
+        var drill = filesNav()
+        let od = drill.feed(centroid: CGPoint(x: 0.58, y: 0.53))
+        XCTAssertEqual(drill.committed, .horizontal)
+        XCTAssertEqual(od.stepX, 1, "out-and-back depth: exactly one step on the crossing")
+        XCTAssertEqual(od.stepY, 0, "highlight frozen while drilling")
+
+        // Vertical-dominant (offset +0.6 / +1.2): highlight scrubs; the depth axis (whose +0.6 ≥ outer 0.5
+        // would drill unlocked) is frozen → no phantom drill.
+        var scrub = filesNav()
+        let os = scrub.feed(centroid: CGPoint(x: 0.56, y: 0.62))
+        XCTAssertEqual(scrub.committed, .vertical)
+        XCTAssertEqual(os.stepY, 2)
+        XCTAssertEqual(os.stepX, 0, "depth frozen while scrubbing the highlight")
+    }
+
+    // 2.7 — the rightward crossing wedge widens ONLY the into-items direction (a bigger crossing triangle).
+    func testAxisLockRightwardCrossingWedgeWidensIntoItems() {
+        // A ~45° up-right stroke (offset +1.0 / +1.0) is ambiguous under the symmetric 30° wedge.
+        var sym = lockNav(wedge: 1.732)
+        let s = sym.feed(centroid: CGPoint(x: 0.6, y: 0.6))
+        XCTAssertEqual(sym.committed, .none, "symmetric wedge: a 45° up-right is ambiguous")
+        XCTAssertEqual(s.stepX, 0)
+
+        // With a wider RIGHTWARD crossing wedge (55° → ratio 0.70) the same stroke commits horizontal —
+        // entering the items, forgiving the upward drift.
+        var cross = lockNav(wedge: 1.732)
+        cross.commitWedgeRightward = 0.70
+        let c = cross.feed(centroid: CGPoint(x: 0.6, y: 0.6))
+        XCTAssertEqual(cross.committed, .horizontal, "rightward crossing wedge enters the items despite the up drift")
+        XCTAssertEqual(c.stepX, 2, "offset +1.0 → round(2.0) = 2 item steps")
+
+        // The widening is rightward-only: the same angle up-LEFT keeps the base wedge (nothing's there).
+        var left = lockNav(wedge: 1.732)
+        left.commitWedgeRightward = 0.70
+        _ = left.feed(centroid: CGPoint(x: 0.4, y: 0.6))   // offset −1.0 / +1.0
+        XCTAssertNotEqual(left.committed, .horizontal, "leftward keeps the base wedge — up-left is not 'into items'")
+    }
+
     // MARK: - RepeatCadence (eased curve)
 
     func testCadenceStartsAtInitialDelayAndConvergesToFloor() {

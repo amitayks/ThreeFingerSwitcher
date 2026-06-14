@@ -107,6 +107,21 @@ struct LauncherPage: View {
                               help: "How many finger-widths of travel the box spans. Larger = a bigger physical move per step, and a bigger box in the preview as you spread your fingers.")
                     .disabled(!settings.enableLauncher)
             }
+            HubSection("Aim (one axis per stroke)",
+                       footnote: "Each stroke commits to one direction, so an angled nudge moves straight (no diagonal drift) — and crossing between the band rail and the items doesn't change the band by accident.") {
+                LabeledSlider(title: "Aim forgiveness (degrees)", value: $settings.positionalCommitWedge,
+                              range: 10...45, format: "%.0f",
+                              help: "How far off-axis a stroke can drift and still go straight. Larger = more forgiving (a wider acceptance cone — the green wedge in the preview); 45° commits to whichever direction is larger. The grey band around the diagonal is the ambiguous 'commit to neither' zone.")
+                    .disabled(!settings.enableLauncher)
+                LabeledSlider(title: "Into-items forgiveness (degrees)", value: $settings.positionalCrossingWedge,
+                              range: 30...80, format: "%.0f",
+                              help: "On the band rail, how forgiving the move INTO the items is — the bigger 'crossing triangle' (the wider green cone pointing right in the preview). Larger = an up/down-and-right nudge enters the items rather than switching a band; only a steeper, clearly-vertical move still switches bands. Keep it above the aim forgiveness.")
+                    .disabled(!settings.enableLauncher)
+                LabeledSlider(title: "Turn resistance (offset to switch axes)", value: $settings.positionalRecommitHysteresis,
+                              range: 0.10...1.00, format: "%.2f",
+                              help: "Once committed to an axis, how much farther the other direction must travel before the stroke turns onto it. Larger = the committed axis sticks harder through incidental drift; a deliberate turn re-commits as a clean L-move.")
+                    .disabled(!settings.enableLauncher)
+            }
             HubSection("Ease (hold-to-repeat curve)",
                        footnote: "When you hold a nudge: the first step is immediate, the second after the delay, then the interval eases down to the fastest over the ramp time — never an abrupt jump.") {
                 LabeledSlider(title: "First repeat delay (seconds)", value: $settings.positionalInitialRepeatDelay,

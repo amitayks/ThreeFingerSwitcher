@@ -575,6 +575,7 @@ final class GestureRecognizer {
             y: AxisZone(mode: .positionTracking))
         launcherNav.edgeMargin = CGFloat(settings.positionalEdgeMargin)
         launcherNav.reArmBackoff = CGFloat(settings.positionalReArmBackoff)
+        applyAxisLock(to: &launcherNav)   // one axis per stroke: forgive diagonal drift (`launcher-aim-lock`)
     }
 
     private func trackLauncher(_ frame: TouchFrame) {
@@ -650,6 +651,10 @@ final class GestureRecognizer {
         let radius = CGFloat(max(settings.positionalPaddingRadius, max(itemStep, bandStep) + 0.05))
         launcherNav.x.step = itemStep; launcherNav.x.radius = radius
         launcherNav.y.step = onBandList ? bandStep : itemStep; launcherNav.y.radius = radius
+        // On the band rail, RIGHTWARD (into the items) gets a wider acceptance cone than band switching, so
+        // an off-axis nudge toward the items enters them rather than switching a band — the "bigger crossing
+        // triangle" (`launcher-aim-lock` crossing-wedge refinement). Off the rail: symmetric.
+        launcherNav.commitWedgeRightward = onBandList ? commitWedgeRatio(settings.positionalCrossingWedge) : nil
 
         let out = launcherNav.feed(centroid: c)
         // Position-tracking can move several steps in one frame (a fast sweep) — emit the whole delta.
@@ -839,6 +844,26 @@ final class GestureRecognizer {
             y: AxisZone(mode: .positionTracking)) // highlight: tracks the finger like the launcher
         filesNav.edgeMargin = CGFloat(settings.positionalEdgeMargin)
         filesNav.reArmBackoff = CGFloat(settings.positionalReArmBackoff)
+        applyAxisLock(to: &filesNav)   // highlight vs. depth: a diagonal stroke does one, not both
+    }
+
+    /// Enable the directional axis-lock (change `launcher-aim-lock`) on a navigator from current settings:
+    /// commit a stroke to one dominant axis (acceptance half-angle → dominance ratio), re-commit on a
+    /// deliberate turn past the hysteresis, and reuse the inner deadzone as the commit/settle floor. The
+    /// media player deliberately does NOT call this (its transport stays free two-axis).
+    private func applyAxisLock(to nav: inout PositionalNavigator) {
+        nav.axisLock = true
+        nav.commitWedge = commitWedgeRatio(settings.positionalCommitWedge)
+        nav.recommitHysteresis = CGFloat(settings.positionalRecommitHysteresis)
+        nav.engage = CGFloat(max(settings.positionalInnerDeadzone, 0.01))
+    }
+
+    /// Convert the acceptance half-angle (degrees) into the dominance ratio the navigator wants
+    /// (`|lead| ≥ ratio · |other|`): `ratio = 1 / tan(angle)`. Clamped to `[1, 45]°` (45° → ratio 1 =
+    /// commit to whichever axis is larger; smaller angle → a stricter, wider ambiguous diagonal band).
+    private func commitWedgeRatio(_ degrees: Double) -> CGFloat {
+        let clamped = min(max(degrees, 1), 45)
+        return CGFloat(1.0 / tan(clamped * .pi / 180))
     }
 
     /// The resolving lift: a one-shot Open-With (if a relative +1 finger was added) or plain Open. A lift

@@ -213,13 +213,40 @@ final class GestureRecognizerLauncherTests: XCTestCase {
         XCTAssertEqual(d.lastEdge.map { [$0.0, $0.1] }, [1, 0], "held right: dx = +1")
     }
 
-    func test_holdCorner_bothAxes() {
+    func test_holdCorner_locksToDominantAxis() {
+        // With the directional axis-lock the launcher commits a diagonal hold to the DOMINANT axis only —
+        // it no longer reports both axes at once (change `launcher-aim-lock`).
         let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
         feed(rec, x: 0.50, y: 0.50, fingers: 4)
         feed(rec, x: 0.56, y: 0.50, fingers: 4)   // activate
         feed(rec, x: 0.56, y: 0.50, fingers: 2)   // relax → re-anchor at (0.56, 0.50)
-        feed(rec, x: 0.34, y: 0.72, fingers: 2)   // x offset −2.2, y offset +2.2 → held (−1, +1)
-        XCTAssertEqual(d.lastEdge.map { [$0.0, $0.1] }, [-1, 1], "a corner reports both axes")
+        // Clearly left-dominant diagonal: x offset −2.2 (held), y offset +0.8 (frozen drift).
+        feed(rec, x: 0.34, y: 0.58, fingers: 2)
+        XCTAssertEqual(d.lastEdge.map { [$0.0, $0.1] }, [-1, 0], "the lock holds one axis (left), not both")
+    }
+
+    func test_holdPerfectDiagonal_commitsToNeither() {
+        // A perfectly balanced 45° hold is ambiguous → the lock commits to neither axis (no held sign).
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
+        feed(rec, x: 0.50, y: 0.50, fingers: 4)
+        feed(rec, x: 0.56, y: 0.50, fingers: 4)   // activate
+        feed(rec, x: 0.56, y: 0.50, fingers: 2)   // relax → re-anchor at (0.56, 0.50)
+        feed(rec, x: 0.34, y: 0.72, fingers: 2)   // x offset −2.2, y offset +2.2 → tied → no commit
+        XCTAssertNil(d.lastEdge, "an ambiguous diagonal emits no held-axis change")
+    }
+
+    func test_bandRailCrossing_upRightEntersItemsNotBand() {
+        // On the band rail the WIDER rightward crossing wedge means an up-and-right stroke enters the items
+        // (item steps) instead of switching a band — the "bigger crossing triangle" (change
+        // `launcher-aim-lock`). The same 45°-ish angle would be ambiguous under the symmetric base wedge.
+        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
+        d.onBandList = true
+        feed(rec, x: 0.50, y: 0.50, fingers: 4)
+        feed(rec, x: 0.56, y: 0.50, fingers: 4)   // activate → anchor (0.56, 0.50)
+        feed(rec, x: 0.56, y: 0.50, fingers: 2)   // relax → re-anchor
+        feed(rec, x: 0.64, y: 0.57, fingers: 2)   // up-RIGHT: offset +0.8 / +0.7
+        XCTAssertFalse(d.lItems.isEmpty, "the rightward stroke enters the items")
+        XCTAssertTrue(d.lContexts.isEmpty, "the upward drift does not switch a band")
     }
 
     func test_edgeBand_acceleratesNearBorderInsideTheBox() {
