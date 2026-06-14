@@ -88,16 +88,23 @@ final class AppDataReset {
     private let bundleID: String
     private let defaults: UserDefaults
     private let fileManager: FileManager
+    /// `~/Library` — the root all filesystem targets hang off. An injectable **seam** so tests can point
+    /// the (real, destructive) deletions at a temp directory instead of the user's actual home: the
+    /// Application Support root is hardcoded `Application Support/ThreeFingerSwitcher` (NOT keyed by
+    /// `bundleID`), so a fake bundleID alone does NOT isolate the filesystem — only this does.
+    private let library: URL
     /// Runs an external command, returning success. Real: Process; tests: a spy.
     private let runCommand: (_ launchPath: String, _ arguments: [String]) -> Bool
 
     init(bundleID: String = Bundle.main.bundleIdentifier ?? "com.threefingerswitcher.app",
          defaults: UserDefaults = .standard,
          fileManager: FileManager = .default,
+         library: URL? = nil,
          runCommand: ((String, [String]) -> Bool)? = nil) {
         self.bundleID = bundleID
         self.defaults = defaults
         self.fileManager = fileManager
+        self.library = library ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Library", isDirectory: true)
         self.runCommand = runCommand ?? { launchPath, arguments in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: launchPath)
@@ -119,7 +126,6 @@ final class AppDataReset {
     /// after an App-data clear so the wiped domain stays wiped).
     func clear(_ selection: DangerZoneSelection) -> Outcome {
         var outcome = Outcome()
-        let library = fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Library", isDirectory: true)
         let targets = Self.filesystemTargets(for: selection, library: library, bundleID: bundleID)
 
         for url in targets.removeWhole where fileManager.fileExists(atPath: url.path) {

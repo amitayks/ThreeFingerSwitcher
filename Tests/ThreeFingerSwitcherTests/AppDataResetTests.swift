@@ -68,10 +68,19 @@ final class AppDataResetTests: XCTestCase {
 
     // MARK: - Perform step (temp filesystem + command spy)
 
+    /// A throwaway `~/Library` under the temp dir, so `clear()`'s real, destructive filesystem deletions
+    /// never touch the user's actual home (the Application Support root is hardcoded, NOT keyed by the
+    /// fake bundleID — without this seam the suite wiped the real clipboard/AI/player stores). Per test.
+    private func tempLibrary() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppDataResetTests-\(UUID())/Library", isDirectory: true)
+    }
+
     func testClearPermissionsRunsTCCUtilPerService() {
         var commands: [[String]] = []
         let reset = AppDataReset(bundleID: bid,
                                  defaults: UserDefaults(suiteName: "AppDataResetTests.\(UUID())")!,
+                                 library: tempLibrary(),
                                  runCommand: { launchPath, args in
                                      XCTAssertEqual(launchPath, "/usr/bin/tccutil")
                                      commands.append(args)
@@ -86,6 +95,7 @@ final class AppDataResetTests: XCTestCase {
     func testFailedTCCResetIsCollectedNotFatal() {
         let reset = AppDataReset(bundleID: bid,
                                  defaults: UserDefaults(suiteName: "AppDataResetTests.\(UUID())")!,
+                                 library: tempLibrary(),
                                  runCommand: { _, _ in false })
         let outcome = reset.clear(.permissions)
         XCTAssertEqual(outcome.failures.count, AppDataReset.tccServices.count)
@@ -95,7 +105,8 @@ final class AppDataResetTests: XCTestCase {
         let suite = "AppDataResetTests.prefs.\(UUID())"
         let defaults = UserDefaults(suiteName: suite)!
         defaults.set(true, forKey: "anything")
-        let reset = AppDataReset(bundleID: suite, defaults: defaults, runCommand: { _, _ in true })
+        let reset = AppDataReset(bundleID: suite, defaults: defaults, library: tempLibrary(),
+                                 runCommand: { _, _ in true })
         _ = reset.clear(.appData)
         XCTAssertNil(defaults.persistentDomain(forName: suite), "the domain is removed")
         defaults.removePersistentDomain(forName: suite)
