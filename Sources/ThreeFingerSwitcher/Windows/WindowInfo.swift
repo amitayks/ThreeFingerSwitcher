@@ -27,6 +27,10 @@ struct WindowInfo: Identifiable {
     /// The Space's order index in Mission Control (display order); lower = earlier/leftmost.
     /// 0 in the legacy current-Space path. Drives stable Space-row ordering in the overlay.
     let spaceIndex: Int
+    /// Whether the window is minimized. Always `false` on the switcher's `snapshot()` path (which
+    /// excludes minimized windows); set by the Dock-preview `currentSpaceWindows(forApp:)` variant,
+    /// which includes them so the popup can badge them and de-minimize on commit.
+    var isMinimized: Bool = false
 
     var displayTitle: String {
         title.isEmpty ? appName : title

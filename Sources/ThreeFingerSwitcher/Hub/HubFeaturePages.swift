@@ -51,6 +51,12 @@ struct SwitcherPage: View {
                        footnote: "Turns off macOS “Automatically rearrange Spaces based on most recent use” so each Space keeps its position and the switcher's row order stays stable. Changes a system setting (Mission Control, everywhere) and briefly restarts the Dock; restored when you quit and reapplied on launch.") {
                 Toggle("Keep Spaces in a fixed order", isOn: $settings.manageSpacesRearrange)
             }
+            // The switcher "from another angle": hover the Dock with the mouse instead of swiping the
+            // trackpad. Reuses the same window enumeration + live capture + raise, triggered by Dock hover.
+            HubSection("Dock window previews",
+                       footnote: "Hover an app's Dock icon to fan out its windows on the current Space (including minimized). Hover a thumbnail to peek its live content — the real window isn't disturbed — and click to bring it forward. Reuses the permissions you've already granted: no new permission, no logout. Off by default.") {
+                ToggleRow(title: "Show window previews when hovering the Dock", isOn: $settings.showDockPreviews)
+            }
         }
     }
 }

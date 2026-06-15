@@ -324,6 +324,17 @@ final class AppSettings: ObservableObject {
     /// back to Accessibility. Default OFF — set only via explicit consent. Older settings decode OFF.
     @Published var keyboardLanguageAllowBrowserControl: Bool { didSet { defaults.set(keyboardLanguageAllowBrowserControl, forKey: Keys.keyboardLanguageAllowBrowserControl) } }
 
+    // MARK: - Dock window previews (opt-in; default OFF)
+
+    /// Opt-in to the Dock-hover window previews — the switcher "from another angle": hover an app's Dock
+    /// tile to fan out its current-Space windows (including minimized), peek any one live, and click to
+    /// raise it. Like the clipboard / Files opt-ins (and unlike the gesture opt-ins) this relocates NO
+    /// native gesture, needs NO re-login, and requests NO new permission — it reuses the already-granted
+    /// Accessibility (read the Dock's AX tree + raise) and Screen Recording (thumbnails) grants. There is
+    /// NO `is…Effective` gate: flipping it ON installs the cursor monitor + Dock reader, OFF tears them
+    /// down. Default OFF. Older settings have no key and decode with the opt-in OFF.
+    @Published var showDockPreviews: Bool { didSet { defaults.set(showDockPreviews, forKey: Keys.showDockPreviews) } }
+
     /// The language last chosen for `commandID`, or nil if none has been chosen yet (cold start).
     func rememberedLanguage(for commandID: UUID) -> String? { aiCommandLanguages[commandID.uuidString] }
 
@@ -400,6 +411,7 @@ final class AppSettings: ObservableObject {
         keyboardLanguageDefaultSourceID = defaults.object(forKey: Keys.keyboardLanguageDefaultSourceID) as? String ?? Defaults.keyboardLanguageDefaultSourceID
         keyboardLanguagePerSiteEnabled = defaults.object(forKey: Keys.keyboardLanguagePerSiteEnabled) as? Bool ?? Defaults.keyboardLanguagePerSiteEnabled
         keyboardLanguageAllowBrowserControl = defaults.object(forKey: Keys.keyboardLanguageAllowBrowserControl) as? Bool ?? Defaults.keyboardLanguageAllowBrowserControl
+        showDockPreviews = defaults.object(forKey: Keys.showDockPreviews) as? Bool ?? Defaults.showDockPreviews
     }
 
     func resetToDefaults() {
@@ -449,6 +461,7 @@ final class AppSettings: ObservableObject {
         // (the learned per-app map is a separate store), so they're intentionally NOT reset either.
         // The per-site sub-toggle and the Apple Events ("Allow browser control") opt-in are the same:
         // consent-gated user choices (the latter governs a per-browser permission), NOT reset here.
+        // `showDockPreviews` is likewise an opt-in user choice (no tunables of its own), NOT reset here.
     }
 
     private func persist(_ value: Double, _ key: String) { defaults.set(value, forKey: key) }
@@ -511,6 +524,7 @@ final class AppSettings: ObservableObject {
         // deliberate opt-in below. The feature is still fully inert until the MASTER toggle is on.
         static let keyboardLanguagePerSiteEnabled = true
         static let keyboardLanguageAllowBrowserControl = false   // opt-in; Apple Events host reader (per-browser permission)
+        static let showDockPreviews = false        // opt-in; Dock-hover window previews (no re-login, no new permission)
     }
 
     private enum Keys {
@@ -565,5 +579,6 @@ final class AppSettings: ObservableObject {
         static let keyboardLanguageDefaultSourceID = "keyboardLanguageDefaultSourceID"
         static let keyboardLanguagePerSiteEnabled = "keyboardLanguagePerSiteEnabled"
         static let keyboardLanguageAllowBrowserControl = "keyboardLanguageAllowBrowserControl"
+        static let showDockPreviews = "showDockPreviews"
     }
 }

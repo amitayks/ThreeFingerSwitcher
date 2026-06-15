@@ -33,6 +33,15 @@ final class AppCoordinator: GestureRecognizerDelegate {
     private let scrollTap = ScrollEventTap()
     private var cancellables: Set<AnyCancellable> = []
 
+    // Dock-hover window previews (opt-in; the switcher "from another angle"). Reuses windowService for
+    // enumeration + raise; owns its own cursor monitor, Dock AX reader, thumbnails, and overlay.
+    private lazy var dockPreviewController = DockPreviewController(
+        cursor: GlobalCursorMonitor(),
+        reader: AXDockReader(),
+        windowService: windowService,
+        switcherThumbnails: thumbnails
+    )
+
     // Four-finger launcher.
     private let favoritesStore = FavoritesStore.shared
     private let launcherOverlay = LauncherOverlayController()
@@ -319,6 +328,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         observeKeyboardLanguageToggle()
         observeKeyboardLanguagePerSiteToggle()
         observeKeyboardLanguageBrowserControlToggle()
+        observeDockPreviewsToggle()
         reconcileAIModelAtLaunch()
     }
 
@@ -379,6 +389,9 @@ final class AppCoordinator: GestureRecognizerDelegate {
         if settings.keyboardLanguageEnabled { keyboardLanguageService.start() }
         // The within-browser host-change poll is gated on the master toggle AND the per-site sub-toggle.
         refreshKeyboardLanguageBrowserMonitor()
+        // Dock-hover previews are gated ONLY on their own opt-in (independent of the switcher master
+        // enable, like per-app keyboard language): a cursor-driven surface, no gesture involved.
+        dockPreviewController.setEnabled(settings.showDockPreviews)
         refreshRowSwitchingGate()
         refreshClipboardMonitor()
         applySpacesRearrangeOnLaunchIfManaged()
@@ -1080,6 +1093,19 @@ final class AppCoordinator: GestureRecognizerDelegate {
         settings.$clipboardPaused
             .dropFirst()
             .sink { [weak self] paused in MainActor.assumeIsolated { self?.clipboardMonitor.isPaused = paused } }
+            .store(in: &cancellables)
+    }
+
+    // MARK: - Dock-preview lifecycle
+
+    /// React to the `showDockPreviews` toggle: install/tear down the cursor monitor + Dock reader. Uses
+    /// the emitted value (not a re-read), since `@Published` fires in `willSet` (mirrors the others).
+    /// There is no `is…Effective` gate, no re-login, and no new permission — flipping it ON arms the
+    /// hover detection immediately, OFF tears it down.
+    private func observeDockPreviewsToggle() {
+        settings.$showDockPreviews
+            .dropFirst()
+            .sink { [weak self] on in MainActor.assumeIsolated { self?.dockPreviewController.setEnabled(on) } }
             .store(in: &cancellables)
     }
 

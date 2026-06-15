@@ -121,6 +121,16 @@ final class ThumbnailService {
         cacheOrder.removeAll()
     }
 
+    /// Store an externally-captured **good** frame into this service's cache and notify its observer, so a
+    /// frame another surface captured (e.g. the Dock preview capturing a window while it had fronted it)
+    /// refreshes this cache — and therefore a later `seed` / `cached` read — plus any live model bound via
+    /// `onThumbnail`. Intended for known-good frames only (no degraded gate here); pass the same
+    /// `CGWindowID` both services key on, so the frame lands on the right window everywhere.
+    func inject(_ image: NSImage, for id: CGWindowID) {
+        store(id, image)
+        onThumbnail?(id, image)
+    }
+
     /// Diagnostic: dump every layer-0 window ScreenCaptureKit can see, with its frame and the
     /// `isOnScreen` flag, so a Stage-Manager *set-aside* window (the tilted strip proxy that captures
     /// badly) can be told apart from a cleanly-presented one. Appended to "Write Diagnostics" — no env

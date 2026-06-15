@@ -366,6 +366,137 @@ final class WindowService {
         }
     }
 
+    // MARK: - Dock-preview variant (app-scoped, current-Space, minimized-inclusive)
+
+    /// App-scoped, current-Space enumeration that — unlike `snapshot()` — **includes minimized windows**,
+    /// each flagged via `WindowInfo.isMinimized`. Built for the Dock-hover preview popup; it does NOT
+    /// touch the switcher's all-Spaces snapshot or its `isSwitchable` exclusion. Windows are ordered with
+    /// non-minimized first (then by id) so the live ones lead the row. Returns `[]` when Accessibility is
+    /// unavailable or the app has no current-Space windows (the popup then shows nothing).
+    func currentSpaceWindows(forApp pid: pid_t) -> [WindowInfo] {
+        guard AXIsProcessTrusted(), pid != getpid() else { return [] }
+        let app = NSRunningApplication(processIdentifier: pid)
+        let appName = app?.localizedName ?? ""
+        let icon = app?.icon
+        // kAXWindowsAttribute lists the app's current-Space windows INCLUDING minimized ones.
+        let elements = currentSpaceElements(pid: pid)
+        guard !elements.isEmpty else { return [] }
+        let meta = metadata(for: Array(elements.keys))
+
+        var result: [WindowInfo] = []
+        for (wid, el) in elements {
+            guard isPreviewable(el) else { continue }     // standard windows/dialogs, minimized INCLUDED
+            let minimized = axBool(el, kAXMinimizedAttribute as String)
+            let m = meta[wid]
+            let title = axString(el, kAXTitleAttribute as String) ?? m?.name ?? appName
+            // Cache the element so a later commit can resolve it even if the app moves off-Space.
+            elementCache[wid] = el
+            result.append(WindowInfo(
+                id: wid, pid: pid, appName: appName, title: title, appIcon: icon,
+                frame: m?.bounds ?? .zero, realFrame: axFrame(el), axElement: el,
+                isOnCurrentSpace: true, spaceID: nil, spaceIndex: 0, isMinimized: minimized
+            ))
+        }
+        return Self.dockPreviewOrder(result)
+    }
+
+    /// Order Dock-preview windows: non-minimized first (live windows lead the row), then a stable id
+    /// order so re-lists don't restrobe. Pure + static so the ordering is unit-testable without AX/CGS.
+    static func dockPreviewOrder(_ windows: [WindowInfo]) -> [WindowInfo] {
+        windows.sorted { a, b in
+            if a.isMinimized != b.isMinimized { return !a.isMinimized }
+            return a.id < b.id
+        }
+    }
+
+    /// Like `isSwitchable` but does NOT exclude minimized windows — the Dock preview wants them. Keeps the
+    /// same role/subrole gate (standard windows + dialogs/sheets) so non-window AX surfaces are dropped.
+    private func isPreviewable(_ axWin: AXUIElement) -> Bool {
+        let role = axString(axWin, kAXRoleAttribute as String)
+        guard role == (kAXWindowRole as String) else { return false }
+        if let subrole = axString(axWin, kAXSubroleAttribute as String) {
+            return subrole == (kAXStandardWindowSubrole as String)
+        }
+        return true
+    }
+
+    /// Dock-preview commit: bring `window` to the front, **un-minimizing it first** if needed, then run
+    /// the standard raise sequence (inheriting the watchdog / Stage-Manager hold-guard hardening of
+    /// `raise`). Returns `false` when no AX element resolves (the window is gone) so the caller can
+    /// surface `DockPreviewError.windowUnavailable` instead of a silent no-op.
+    @discardableResult
+    func raiseDeminimizing(_ window: WindowInfo) -> Bool {
+        guard let el = resolveElement(window) else { return false }
+        if window.isMinimized || axBool(el, kAXMinimizedAttribute as String) {
+            // Clearing kAXMinimized deminiaturizes the window so the subsequent raise can front it.
+            AXUIElementSetAttributeValue(el, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        }
+        raise(window)
+        return true
+    }
+
+    /// **Transient, reversible** front-raise for the Dock-preview peek: bring `window` to the front so
+    /// macOS renders it **live** (an occluded/non-focused window yields no fresh pixels — Apple won't
+    /// keep drawing what isn't the active surface). Crucially it makes THIS window the app's
+    /// **focused/main** window, not merely raised: the Dock preview shows several windows of one app, and
+    /// `kAXRaise` + `activate()` alone leaves the app still drawing its previously-focused window — so a
+    /// capture of the merely-raised window stays stale (the bug: live preview only worked after a click,
+    /// which set these singletons). Skipped under Stage Manager, where asserting the per-app focus
+    /// singletons makes WindowManager's stage arbiter oscillate (the documented switcher landmine) — a
+    /// peek there falls back to raise + activate. No focus-history promotion / watchdog / hold-guard
+    /// (those fight a quick put-back); pair with `frontmostWindow()` to restore the prior window on leave.
+    @discardableResult
+    func peekRaise(_ window: WindowInfo) -> Bool {
+        guard let el = resolveElement(window) else { return false }
+        let stageManager = StageManager.isEnabled
+        // RELIABLE cross-app front: the SkyLight `setFront` handshake fronts the process + this specific
+        // window in one shot, so a BACKGROUND app actually becomes active and renders the window live.
+        // `kAXRaise` + `activate()` alone often leaves a background app un-activated (that is why the
+        // commit path needs a watchdog to retry until it sticks) — so its window stays throttled and the
+        // capture comes back stale (the bug: a peek's live preview only worked for the app already in
+        // front). We front it directly instead, no watchdog needed. Skipped under Stage Manager, where the
+        // byte-protocol + focus singletons make WindowManager's stage arbiter oscillate (the documented
+        // landmine); there a peek falls back to raise + activate.
+        if !stageManager, cgs.offSpaceRaiseSupported,
+           let getPSN = cgs.getProcessForPID, let setFront = cgs.setFrontProcessWithOptions {
+            var psn = ProcessSerialNumber()
+            if getPSN(window.pid, &psn) == 0, !(psn.highLongOfPSN == 0 && psn.lowLongOfPSN == 0) {
+                _ = setFront(&psn, window.id, 0x200) // 0x200 = userGenerated
+                _ = makeKeyWindow(psn, window.id)
+            }
+        }
+        AXUIElementPerformAction(el, kAXRaiseAction as CFString)
+        if !stageManager {
+            // Make THIS window the app's focused/main window (not merely raised) so the app draws it live —
+            // an app with several windows otherwise keeps rendering its previously-focused window.
+            AXUIElementSetAttributeValue(el, kAXMainAttribute as CFString, kCFBooleanTrue)
+            let appEl = AXUIElementCreateApplication(window.pid)
+            AXUIElementSetAttributeValue(appEl, kAXFocusedWindowAttribute as CFString, el)
+        }
+        NSRunningApplication(processIdentifier: window.pid)?.activate()
+        return true
+    }
+
+    /// The current frontmost window as a `WindowInfo`, captured BEFORE a peek begins so it can be
+    /// re-fronted (restored) when the cursor leaves without committing. Resolves the frontmost app's
+    /// focused window via Accessibility; nil when none resolves. Our overlay is non-activating, so the
+    /// frontmost app here is the user's real app, not the popup.
+    func frontmostWindow() -> WindowInfo? {
+        guard AXIsProcessTrusted(),
+              let app = NSWorkspace.shared.frontmostApplication,
+              app.processIdentifier != getpid() else { return nil }
+        let appEl = AXUIElementCreateApplication(app.processIdentifier)
+        guard let focusedRef = axCopy(appEl, kAXFocusedWindowAttribute as String) else { return nil }
+        let el = focusedRef as! AXUIElement
+        guard let wid = axWindowID(el) else { return nil }
+        return WindowInfo(
+            id: wid, pid: app.processIdentifier, appName: app.localizedName ?? "",
+            title: axString(el, kAXTitleAttribute as String) ?? "", appIcon: app.icon,
+            frame: .zero, realFrame: axFrame(el), axElement: el,
+            isOnCurrentSpace: true, spaceID: nil, spaceIndex: 0
+        )
+    }
+
     /// Off-Space focus-hold guard tuning. Under Stage Manager, WindowManager grabs frontmost ~300–500ms
     /// after an off-Space raise — a key-less vacuum the +180ms watchdog is too early to see (verified by
     /// trace). Rather than re-front at a fixed delay (a visible ~200ms flash), poll frequently and
