@@ -65,6 +65,23 @@ private enum SourceCategory: String, CaseIterable, Identifiable {
         case .presets: return "square.stack.3d.up.fill"
         }
     }
+    /// The tile sublabel: immediate-add categories say "Add", browsable ones say "Browse".
+    var hint: String {
+        switch self {
+        case .urls, .scripts, .paths: return "Add"
+        case .apps, .shortcuts, .actions, .aiCommands, .presets: return "Browse"
+        }
+    }
+}
+
+/// A category / candidate icon rendered like a `LaunchItemIconView` symbol (accent-tinted, square) so
+/// source tiles match the band's item tiles.
+private struct SourceSymbol: View {
+    let name: String
+    var body: some View {
+        Image(systemName: name).resizable().scaledToFit()
+            .foregroundStyle(Color.accentColor).frame(width: 40, height: 40)
+    }
 }
 
 /// The per-band item-source picker, shown inline under an expanded band: a category index (Applications,
@@ -87,19 +104,15 @@ private struct SourcePicker: View {
     }
 
     private var categoryIndex: some View {
-        VStack(spacing: 0) {
+        LazyVGrid(columns: sourceGridColumns, spacing: 12) {
             ForEach(SourceCategory.allCases) { cat in
                 Button { activate(cat) } label: {
-                    Label(cat.rawValue, systemImage: cat.symbol)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 16).padding(.vertical, 8)
-                        .contentShape(Rectangle())
+                    GridTile(title: cat.rawValue, subtitle: cat.hint) { SourceSymbol(name: cat.symbol) }
                 }
-                .buttonStyle(.plain)
-                if cat != SourceCategory.allCases.last { Divider().padding(.leading, 16) }
+                .buttonStyle(PickTileButtonStyle())
             }
         }
-        .padding(.vertical, 4)
+        .padding(12)
     }
 
     /// URLs / Scripts / Files&Folders add an item immediately and open it for editing in the item panel
@@ -146,8 +159,12 @@ private struct SourcePicker: View {
     }
 
     private func add(_ item: LaunchItem, focus: Bool = false) {
-        store.addItem(item, toBand: targetBandID)
-        selectedItemID = item.id   // select the freshly added item so its inspector shows in the items column
+        // Run the insertion in the wizard's settle spring so the new tile *grows* into the band grid
+        // (the band cell carries a scale transition; this transaction is what animates it).
+        withAnimation(WizardMotion.arrival) {
+            store.addItem(item, toBand: targetBandID)
+            selectedItemID = item.id   // select the freshly added item so its inspector shows in the items column
+        }
         if focus { autoFocusItemID = item.id }   // and land the cursor on its first field
     }
 }
@@ -170,19 +187,23 @@ private struct AppBrowser: View {
             if loading {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List(shown) { app in
-                    Button {
-                        onPick(LaunchItem(title: app.name, icon: .appDefault,
-                                          kind: .app(bundleURL: app.url, strategy: nil)))
-                    } label: {
-                        Label { Text(app.name) } icon: {
-                            Image(nsImage: NSWorkspace.shared.icon(forFile: app.url.path))
-                                .resizable().frame(width: 18, height: 18)
+                ScrollView {
+                    LazyVGrid(columns: sourceGridColumns, spacing: 12) {
+                        ForEach(shown) { app in
+                            Button {
+                                onPick(LaunchItem(title: app.name, icon: .appDefault,
+                                                  kind: .app(bundleURL: app.url, strategy: nil)))
+                            } label: {
+                                GridTile(title: app.name, subtitle: "App") {
+                                    Image(nsImage: NSWorkspace.shared.icon(forFile: app.url.path)).resizable()
+                                        .frame(width: 44, height: 44)
+                                }
+                            }
+                            .buttonStyle(PickTileButtonStyle())
                         }
                     }
-                    .buttonStyle(.plain)
+                    .padding(12)
                 }
-                .listStyle(.inset)
             }
         }
         .task { apps = await loadInstalledApps(); loading = false }
@@ -202,13 +223,19 @@ private struct ShortcutBrowser: View {
                 ContentUnavailable("No shortcuts found", systemImage: "bolt.slash",
                                    caption: "Create shortcuts in the Shortcuts app, or check that the `shortcuts` CLI is available.")
             } else {
-                List(names, id: \.self) { name in
-                    Button {
-                        onPick(LaunchItem(title: name, icon: .sfSymbol("bolt.fill"), kind: .shortcut(name: name)))
-                    } label: { Label(name, systemImage: "bolt.fill") }
-                    .buttonStyle(.plain)
+                ScrollView {
+                    LazyVGrid(columns: sourceGridColumns, spacing: 12) {
+                        ForEach(names, id: \.self) { name in
+                            Button {
+                                onPick(LaunchItem(title: name, icon: .sfSymbol("bolt.fill"), kind: .shortcut(name: name)))
+                            } label: {
+                                GridTile(title: name, subtitle: "Shortcut") { SourceSymbol(name: "bolt.fill") }
+                            }
+                            .buttonStyle(PickTileButtonStyle())
+                        }
+                    }
+                    .padding(12)
                 }
-                .listStyle(.inset)
             }
         }
         .task { names = await loadShortcutNames(); loading = false }
@@ -253,22 +280,27 @@ private enum ScriptKind: String, CaseIterable, Identifiable {
 private struct ActionBrowser: View {
     let onPick: (LaunchItem) -> Void
     var body: some View {
-        List {
-            ForEach(SystemAction.Category.allCases) { category in
-                Section(category.rawValue) {
-                    ForEach(SystemAction.allCases.filter { $0.category == category }) { action in
-                        Button {
-                            onPick(LaunchItem(title: action.title, icon: .sfSymbol(action.symbol), kind: .action(action)))
-                        } label: {
-                            Label(action.title, systemImage: action.symbol)
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 12) {
+                ForEach(SystemAction.Category.allCases) { category in
+                    Text(category.rawValue).font(.caption).foregroundStyle(.secondary)
+                        .padding(.horizontal, 12).padding(.top, 4)
+                    LazyVGrid(columns: sourceGridColumns, spacing: 12) {
+                        ForEach(SystemAction.allCases.filter { $0.category == category }) { action in
+                            Button {
+                                onPick(LaunchItem(title: action.title, icon: .sfSymbol(action.symbol), kind: .action(action)))
+                            } label: {
+                                GridTile(title: action.title, subtitle: "Action") { SourceSymbol(name: action.symbol) }
+                            }
+                            .buttonStyle(PickTileButtonStyle())
+                            .help(action.detail)
                         }
-                        .buttonStyle(.plain)
-                        .help(action.detail)
                     }
+                    .padding(.horizontal, 12)
                 }
             }
+            .padding(.vertical, 8)
         }
-        .listStyle(.inset)
     }
 }
 
@@ -284,21 +316,11 @@ private struct AICommandSource: View {
     let onPick: (LaunchItem) -> Void
 
     var body: some View {
-        List {
-            ForEach(AICommandCatalog.Category.allCases) { category in
-                Section {
-                    ForEach(AICommandCatalog.commands(in: category)) { preset in
-                        Button {
-                            onPick(AIBand.item(for: AICommandCatalog.copy(of: preset)))
-                        } label: {
-                            Label(preset.name, systemImage: symbolName(preset.icon))
-                        }
-                        .buttonStyle(.plain)
-                        .help(preset.promptTemplate)
-                    }
-                } header: {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 12) {
+                ForEach(AICommandCatalog.Category.allCases) { category in
                     HStack {
-                        Label(category.title, systemImage: category.sfSymbol)
+                        Label(category.title, systemImage: category.sfSymbol).font(.caption)
                         Spacer()
                         Button("Add all as a band") { addCategoryAsBand(category) }
                             .buttonStyle(.borderless)
@@ -306,21 +328,35 @@ private struct AICommandSource: View {
                             .font(.caption)
                             .help("Create a new \"\(category.title)\" band populated with these presets.")
                     }
+                    .padding(.horizontal, 12).padding(.top, 4)
+                    LazyVGrid(columns: sourceGridColumns, spacing: 12) {
+                        ForEach(AICommandCatalog.commands(in: category)) { preset in
+                            Button {
+                                onPick(AIBand.item(for: AICommandCatalog.copy(of: preset)))
+                            } label: {
+                                GridTile(title: preset.name, subtitle: "AI Command") { SourceSymbol(name: symbolName(preset.icon)) }
+                            }
+                            .buttonStyle(PickTileButtonStyle())
+                            .help(preset.promptTemplate)
+                        }
+                    }
+                    .padding(.horizontal, 12)
                 }
-            }
-            Section {
-                Button {
-                    let cmd = AICommand(name: "New Command", icon: .sfSymbol("wand.and.stars"),
-                                        input: .selection, promptTemplate: "{input}", output: .previewOnly)
-                    onPick(AIBand.item(for: cmd))
-                } label: {
-                    Label("Custom command", systemImage: "wand.and.stars")
+                LazyVGrid(columns: sourceGridColumns, spacing: 12) {
+                    Button {
+                        let cmd = AICommand(name: "New Command", icon: .sfSymbol("wand.and.stars"),
+                                            input: .selection, promptTemplate: "{input}", output: .previewOnly)
+                        onPick(AIBand.item(for: cmd))
+                    } label: {
+                        GridTile(title: "Custom command", subtitle: "AI Command") { SourceSymbol(name: "wand.and.stars") }
+                    }
+                    .buttonStyle(PickTileButtonStyle())
+                    .help("Add a blank AI command, then edit its prompt, input, and output on the right.")
                 }
-                .buttonStyle(.plain)
-                .help("Add a blank AI command, then edit its prompt, input, and output on the right.")
+                .padding(.horizontal, 12)
             }
+            .padding(.vertical, 8)
         }
-        .listStyle(.inset)
     }
 
     /// Create a new band named after the category (carrying its color), populated with that category's
@@ -392,6 +428,9 @@ private struct BandsColumn: View {
     @Binding var selectedItemID: UUID?
     @Binding var autoFocusItemID: UUID?
     @State private var draggingBand: UUID?
+    /// The pinned band-settings card starts collapsed (it's secondary to adding items) and is opened
+    /// via its disclosure arrow; the state persists across band selections.
+    @State private var bandSettingsExpanded = false
 
     private var selectedBand: ContextBand? { store.favorites.bands.first { $0.id == selectedBandID } }
 
@@ -409,10 +448,29 @@ private struct BandsColumn: View {
             }
             .buttonStyle(.borderless)
             .padding(8)
-            // The selected band's settings live at the bottom of this same column.
+            // The selected band's settings live at the bottom of this same column, collapsed behind a
+            // disclosure arrow so they're not always taking up space.
             if let band = selectedBand {
                 Divider()
-                BandInspector(store: store, band: band).id(band.id)
+                Button {
+                    withAnimation(WizardMotion.pop) { bandSettingsExpanded.toggle() }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .rotationEffect(.degrees(bandSettingsExpanded ? 90 : 0))
+                        Text("Band settings").font(.subheadline.weight(.medium))
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                if bandSettingsExpanded {
+                    BandInspector(store: store, band: band).id(band.id)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
             }
         }
     }
@@ -511,6 +569,9 @@ private struct ItemsPane: View {
                         }
                         .onDrop(of: [.text], delegate: ItemReorderDrop(
                             target: item.id, bandID: band.id, store: store, dragging: $dragging))
+                        // The picked source tile shrinks; the new item grows in here (the add runs in a
+                        // `WizardMotion.arrival` transaction, so this insertion springs from small).
+                        .transition(.scale(scale: 0.15).combined(with: .opacity))
                     }
                 }
                 .padding(16)
@@ -560,13 +621,15 @@ private struct BandRow: View {
 
 // MARK: - Item grid cell
 
-/// One grid cell: icon + label. When selected it highlights and shows a trash badge on top; a second
-/// click on the cell (or a click on the badge) deletes it.
-private struct ItemGridCell: View {
-    let item: LaunchItem
-    let selected: Bool
-    let onTap: () -> Void
-    let onTrash: () -> Void
+/// The shared square tile — a rounded icon container + title + sublabel — used by BOTH the band's item
+/// grid and the source-picker grids, so a candidate looks identical to the item it becomes. `trash`
+/// (shown only while `selected`) is the band grid's delete badge; the source grids omit it.
+private struct GridTile<Icon: View>: View {
+    var selected: Bool = false
+    let title: String
+    let subtitle: String
+    var trash: (() -> Void)? = nil
+    @ViewBuilder var icon: () -> Icon
 
     var body: some View {
         VStack(spacing: 6) {
@@ -575,11 +638,11 @@ private struct ItemGridCell: View {
                     .fill(selected ? Color.accentColor.opacity(0.22) : Color.secondary.opacity(0.08))
                     .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .strokeBorder(selected ? Color.accentColor : .clear, lineWidth: 2))
-                LaunchItemIconView(item: item, size: 44)
+                icon()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .padding(12)
-                if selected {
-                    Button(action: onTrash) {
+                if selected, let trash {
+                    Button(action: trash) {
                         Image(systemName: "trash.circle.fill")
                             .font(.system(size: 20))
                             .symbolRenderingMode(.palette)
@@ -591,11 +654,39 @@ private struct ItemGridCell: View {
                 }
             }
             .frame(height: 78)
-            Text(item.title).font(.system(size: 12)).lineLimit(1).truncationMode(.tail)
+            Text(title).font(.system(size: 12)).lineLimit(1).truncationMode(.tail)
                 .foregroundStyle(selected ? .primary : .secondary)
-            Text(kindLabel(item.kind)).font(.system(size: 9)).foregroundStyle(.tertiary)
+            Text(subtitle).font(.system(size: 9)).foregroundStyle(.tertiary)
         }
         .contentShape(Rectangle())
+    }
+}
+
+/// Press feedback for a pickable source tile: it scales down while pressed — the *shrink* half of
+/// the shrink-then-grow gesture, the picked item then *grows* into the band grid (see `SourcePicker.add`).
+private struct PickTileButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.86 : 1)
+            .animation(WizardMotion.arrival, value: configuration.isPressed)
+    }
+}
+
+/// Three fixed columns for every source-picker grid (the band item grid uses adaptive columns in its
+/// wider pane, but the tiles themselves are identical).
+private let sourceGridColumns = Array(repeating: GridItem(.flexible(), spacing: 12), count: 3)
+
+/// One band-grid cell: a `GridTile` for the item plus tap-to-select / tap-again-to-delete behavior.
+private struct ItemGridCell: View {
+    let item: LaunchItem
+    let selected: Bool
+    let onTap: () -> Void
+    let onTrash: () -> Void
+
+    var body: some View {
+        GridTile(selected: selected, title: item.title, subtitle: kindLabel(item.kind), trash: onTrash) {
+            LaunchItemIconView(item: item, size: 44)
+        }
         .onTapGesture { onTap() }
     }
 }
@@ -623,20 +714,32 @@ private struct ItemReorderDrop: DropDelegate {
 private struct BandInspector: View {
     @ObservedObject var store: FavoritesStore
     let band: ContextBand
+    /// Local edit buffer for the band name (committed on change) so per-keystroke store writes don't
+    /// churn the text field's cursor. Reset per band via the parent's `.id(band.id)`.
+    @State private var name: String
+
+    init(store: FavoritesStore, band: ContextBand) {
+        self.store = store; self.band = band
+        _name = State(initialValue: band.name)
+    }
 
     var body: some View {
         Form {
-            // A band is identified by its ICON, not a name (the launcher shows icons only). Reuses the
-            // item icon picker; the band's own Color below tints it, so the per-icon tint is hidden.
-            AppearanceEditor(
-                icon: Binding(get: { band.resolvedIcon },
-                              set: { ic in store.updateBand(band.id) { $0.icon = ic } }),
-                tint: .constant(nil),
-                naturalIcon: nil,
-                showTint: false)
-            ColorPicker("Color", selection: Binding(
-                get: { Color(band.color) },
-                set: { newColor in store.updateBand(band.id) { $0.color = ItemColor(newColor) } }))
+            // Icon + color + name on one row. The launcher still shows bands by icon only; the name
+            // labels the band in the "Move to band" / "Send to band" menus. The band's color tints
+            // its icon, so the color swatch *is* the band color (no separate per-icon tint).
+            HStack(spacing: 10) {
+                IconColorControl(
+                    icon: Binding(get: { band.resolvedIcon },
+                                  set: { ic in store.updateBand(band.id) { $0.icon = ic } }),
+                    tint: Binding(get: { Optional(band.color) },
+                                  set: { c in if let c { store.updateBand(band.id) { $0.color = c } } }),
+                    naturalIcon: nil) {
+                        IconGlyphView(icon: band.resolvedIcon, tint: band.color, size: 20)
+                    }
+                TextField("Band name", text: $name)
+                    .onChange(of: name) { store.updateBand(band.id) { $0.name = name } }
+            }
             Picker("Default app strategy", selection: Binding(
                 get: { band.defaultAppStrategy },
                 set: { s in store.updateBand(band.id) { $0.defaultAppStrategy = s } })) {
@@ -702,15 +805,19 @@ private struct ItemInspector: View {
 
     private var standardForm: some View {
         Form {
-            TextField("Name", text: $title)
-                .focused($focus, equals: .name)
-                .onChange(of: title) { store.updateItem(item.id, inBand: bandID) { $0.title = title } }
-            AppearanceEditor(
-                icon: Binding(get: { item.icon },
-                              set: { ic in store.updateItem(item.id, inBand: bandID) { $0.icon = ic } }),
-                tint: Binding(get: { item.tint },
-                              set: { t in store.updateItem(item.id, inBand: bandID) { $0.tint = t } }),
-                naturalIcon: naturalIcon(for: item.kind))
+            HStack(spacing: 10) {
+                IconColorControl(
+                    icon: Binding(get: { item.icon },
+                                  set: { ic in store.updateItem(item.id, inBand: bandID) { $0.icon = ic } }),
+                    tint: Binding(get: { item.tint },
+                                  set: { t in store.updateItem(item.id, inBand: bandID) { $0.tint = t } }),
+                    naturalIcon: naturalIcon(for: item.kind)) {
+                        LaunchItemIconView(item: item, size: 20)
+                    }
+                TextField("Name", text: $title)
+                    .focused($focus, equals: .name)
+                    .onChange(of: title) { store.updateItem(item.id, inBand: bandID) { $0.title = title } }
+            }
             if case let .url(_, _, newWindow) = item.kind {
                 urlEditor(newWindow: newWindow ?? false)
             }
@@ -1030,25 +1137,51 @@ private struct ItemInspector: View {
         updateCommand { $0.promptTemplate = prompt }
     }
 
+    /// Whether any band other than this item's exists (gates the "Move to band" control + its divider).
+    private var hasOtherBands: Bool { store.favorites.bands.contains { $0.id != bandID } }
+
+    /// A compact "Title: control" field — a `.labelsHidden()` picker sits right next to its title so
+    /// two can share a row without the Form's full-width label/value spread.
+    private func aiField<Content: View>(_ title: String, @ViewBuilder _ content: () -> Content) -> some View {
+        HStack(spacing: 6) {
+            Text("\(title):").foregroundStyle(.secondary)
+            content()
+        }
+    }
+
     private var aiForm: some View {
         ScrollView {
+            // One unified container holds the whole command configuration: identity, input, prompt,
+            // output, model, reasoning, confirmation, and move — grouped by light inline subheaders
+            // instead of separate boxed Sections, so the inspector reads as a single item card.
             Form {
-                Section("Identity") {
-                    TextField("Name", text: $title)
-                        .onChange(of: title) { updateCommand { $0.name = title } }
-                    AppearanceEditor(
-                        icon: Binding(get: { ai.icon }, set: { ic in updateCommand { $0.icon = ic } }),
-                        tint: Binding(get: { ai.tint }, set: { t in updateCommand { $0.tint = t } }),
-                        naturalIcon: nil)
-                }
-                Section("Input") {
-                    Picker("Input source", selection: Binding(
-                        get: { ai.input }, set: { src in updateCommand { $0.input = src } })) {
-                        ForEach(InputSource.allCases, id: \.self) { Text(aiInputLabel($0)).tag($0) }
+                Section {
+                    HStack(spacing: 10) {
+                        IconColorControl(
+                            icon: Binding(get: { ai.icon }, set: { ic in updateCommand { $0.icon = ic } }),
+                            tint: Binding(get: { ai.tint }, set: { t in updateCommand { $0.tint = t } }),
+                            naturalIcon: nil) {
+                                IconGlyphView(icon: ai.icon, tint: ai.tint, size: 20)
+                            }
+                        TextField("Name", text: $title)
+                            .onChange(of: title) { updateCommand { $0.name = title } }
                     }
-                    Text(aiInputHelp(ai.input)).font(.caption).foregroundStyle(.secondary)
-                }
-                Section("Prompt") {
+
+                    // Input source + Output target on one tight row; the output's conditional
+                    // task/destination sub-editors flow below it.
+                    HStack(spacing: 18) {
+                        aiField("Input source") {
+                            Picker("Input source", selection: Binding(
+                                get: { ai.input }, set: { src in updateCommand { $0.input = src } })) {
+                                ForEach(InputSource.allCases, id: \.self) { Text(aiInputLabel($0)).tag($0) }
+                            }
+                            .labelsHidden()
+                        }
+                        aiField("Output target") { aiOutputPicker.labelsHidden() }
+                        Spacer(minLength: 0)
+                    }
+                    aiOutputDetail
+
                     AITokenBar { insertToken($0) }
                     TextEditor(text: $prompt)
                         .frame(minHeight: 110)
@@ -1057,19 +1190,19 @@ private struct ItemInspector: View {
                         .onChange(of: prompt) { updateCommand { $0.promptTemplate = prompt } }
                     Text("Tokens are substituted at fire time: {input} the acquired text, {date} today, {app} the front app, {url} the front document URL. Unknown braces are left as-is.")
                         .font(.caption).foregroundStyle(.secondary)
-                }
-                Section("Output") { aiOutputEditor }
-                Section("Model") { aiModelEditor }
-                Section("Reasoning") { aiReasoningEditor }
-                Section("Confirmation") {
+
+                    // Model + Reasoning on one tight row.
+                    HStack(spacing: 18) {
+                        aiField("Model") { aiModelPicker.labelsHidden() }
+                        aiField("Reasoning") { aiReasoningPicker.labelsHidden() }
+                        Spacer(minLength: 0)
+                    }
+
                     Toggle("Confirm before running", isOn: Binding(
                         get: { ai.confirmBeforeRun }, set: { on in updateCommand { $0.confirmBeforeRun = on } }))
-                    Text(ai.output.isSideEffecting
-                         ? "This output has a side effect; confirmation defaults on, but you can turn it off for a trusted command."
-                         : "In-place edits don't ask by default; turn this on to review the result before it's applied.")
-                        .font(.caption).foregroundStyle(.secondary)
+
+                    if hasOtherBands { Divider().padding(.vertical, 2); moveToBandControl }
                 }
-                Section { moveToBandControl }
             }
             .formStyle(.grouped)
             .padding(.bottom, 8)
@@ -1077,13 +1210,17 @@ private struct ItemInspector: View {
         .frame(height: 380)
     }
 
-    @ViewBuilder
-    private var aiOutputEditor: some View {
+    private var aiOutputPicker: some View {
         Picker("Output target", selection: Binding(
             get: { outputChoice(ai.output) }, set: { setOutputChoice($0) })) {
             ForEach(OutputChoice.allCases) { Text($0.label).tag($0) }
         }
-        Text(aiOutputLabel(ai.output)).font(.caption).foregroundStyle(.secondary)
+    }
+
+    /// The output's conditional task/destination sub-editors — shown below the paired input/output
+    /// row (only when the chosen output target needs further configuration).
+    @ViewBuilder
+    private var aiOutputDetail: some View {
         if case let .runTask(kind) = ai.output { aiTaskKindEditor(kind) }
         if case let .sendTo(dest) = ai.output {
             aiDestinationEditor(dest) { newDest in updateCommand { $0.output = .sendTo(newDest) } }
@@ -1132,28 +1269,22 @@ private struct ItemInspector: View {
         }
     }
 
-    @ViewBuilder
-    private var aiModelEditor: some View {
+    private var aiModelPicker: some View {
         let registry = ModelRegistry.standard
-        Picker("Model", selection: Binding(
+        return Picker("Model", selection: Binding(
             get: { selectedModelID(ai.model) }, set: { id in updateCommand { $0.model = .onDevice(modelID: id) } })) {
             Text("Registry default").tag(String?.none)
             ForEach(registry.models) { m in Text(m.displayName).tag(Optional(m.id)) }
         }
-        Text("On-device Gemma 4. \"Registry default\" tracks the recommended model; pin a specific one only if you need it.")
-            .font(.caption).foregroundStyle(.secondary)
     }
 
-    @ViewBuilder
-    private var aiReasoningEditor: some View {
+    private var aiReasoningPicker: some View {
         Picker("Reasoning", selection: Binding(
             get: { ai.reasoning }, set: { r in updateCommand { $0.reasoning = r } })) {
             Text("Default").tag(AIReasoning?.none)
             Text("On").tag(Optional(AIReasoning.on))
             Text("Off").tag(Optional(AIReasoning.off))
         }
-        Text("Default follows the AI Reasoning toggle; override per command.")
-            .font(.caption).foregroundStyle(.secondary)
     }
 
     private func outputChoice(_ o: OutputTarget) -> OutputChoice {
@@ -1230,49 +1361,61 @@ private struct ItemInspector: View {
     }
 }
 
-/// Icon + tint editor shared by the item inspector and the manual url/script forms. Offers a
-/// "Default" mode (the app/file icon) only when the kind has one (`naturalIcon`), plus SF Symbol
-/// and Emoji modes.
-private struct AppearanceEditor: View {
+/// Compact appearance control: a clickable icon button (opens the SF Symbol picker) plus a color
+/// swatch that tints it. Designed to sit on one row beside a name field (items / AI) or alone for
+/// an icon-only band. The `preview` closure renders the live icon so each call site can show the
+/// real thing (an app/file icon via `LaunchItemIconView`, or a plain symbol glyph).
+///
+/// SF Symbols only — the old Emoji mode was dropped. Existing emoji icons still *render* everywhere
+/// (`ItemIcon.emoji` stays in the model for backward compatibility); they just can't be authored here.
+private struct IconColorControl<Preview: View>: View {
     @Binding var icon: ItemIcon
     @Binding var tint: ItemColor?
+    /// The app/file icon offered as a "Default" reset inside the picker, when the kind has one.
     let naturalIcon: ItemIcon?
-    /// When false, the per-icon Tint picker is hidden (e.g. a band, which already has its own color).
-    var showTint: Bool = true
-
-    private enum Mode: Hashable { case auto, symbol, emoji }
-
-    private var mode: Mode {
-        switch icon {
-        case .appDefault, .fileIcon: return .auto
-        case .sfSymbol: return .symbol
-        case .emoji: return .emoji
-        }
-    }
+    @ViewBuilder var preview: () -> Preview
+    @State private var showing = false
 
     var body: some View {
-        Picker("Icon", selection: Binding(get: { mode }, set: { setMode($0) })) {
-            if naturalIcon != nil { Text("Default").tag(Mode.auto) }
-            Text("SF Symbol").tag(Mode.symbol)
-            Text("Emoji").tag(Mode.emoji)
-        }
-        if case .sfSymbol = icon {
-            SymbolPickerRow(icon: $icon)
-        } else if case .emoji = icon {
-            EmojiPickerRow(icon: $icon)
-        }
-        if showTint {
-            ColorPicker("Tint", selection: Binding(
+        HStack(spacing: 8) {
+            Button { showing = true } label: {
+                preview()
+                    .frame(width: 30, height: 30)
+                    .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.secondary.opacity(0.12)))
+                    .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(.quaternary))
+            }
+            .buttonStyle(.plain)
+            .help("Choose an icon")
+            .popover(isPresented: $showing, arrowEdge: .bottom) {
+                SymbolPicker(icon: $icon, naturalIcon: naturalIcon, isPresented: $showing)
+            }
+            ColorPicker("Icon color", selection: Binding(
                 get: { tint.map(Color.init) ?? .accentColor },
                 set: { tint = ItemColor($0) }))
+                .labelsHidden()
+                .help("Icon color")
         }
     }
+}
 
-    private func setMode(_ m: Mode) {
-        switch m {
-        case .auto:   if let n = naturalIcon { icon = n }
-        case .symbol: if case .sfSymbol = icon {} else { icon = .sfSymbol("star.fill") }
-        case .emoji:  if case .emoji = icon {} else { icon = .emoji("⭐️") }
+/// Renders an `ItemIcon` (symbol / legacy emoji) tinted, for previews that have no backing
+/// `LaunchItem` (the AI identity row, the band row). App/file defaults fall back to a generic glyph.
+private struct IconGlyphView: View {
+    let icon: ItemIcon
+    let tint: ItemColor?
+    var size: CGFloat = 20
+
+    var body: some View {
+        switch icon {
+        case .sfSymbol(let n):
+            Image(systemName: n).resizable().scaledToFit()
+                .foregroundStyle(tint.map(Color.init) ?? .accentColor)
+                .frame(width: size, height: size)
+        case .emoji(let g):
+            Text(g).font(.system(size: size * 0.85)).frame(width: size, height: size)
+        case .appDefault, .fileIcon:
+            Image(systemName: "app.dashed").resizable().scaledToFit()
+                .foregroundStyle(.secondary).frame(width: size, height: size)
         }
     }
 }
@@ -1285,87 +1428,68 @@ private func naturalIcon(for kind: LaunchItemKind) -> ItemIcon? {
     }
 }
 
-/// SF Symbol chooser: a preview + a typed fallback + a popover grid of curated symbols (searchable).
-private struct SymbolPickerRow: View {
+/// SF Symbol chooser popover: a searchable grid of curated symbols. When the kind has a natural
+/// icon (app / file) it offers a "Default" reset at the top; a search that names a real SF Symbol
+/// outside the curated set can be picked directly, preserving the old typed-name power.
+private struct SymbolPicker: View {
     @Binding var icon: ItemIcon
-    @State private var showing = false
+    let naturalIcon: ItemIcon?
+    @Binding var isPresented: Bool
     @State private var search = ""
 
-    private var name: String { if case .sfSymbol(let n) = icon { return n } else { return "" } }
+    private var current: String { if case .sfSymbol(let n) = icon { return n } else { return "" } }
     private var filtered: [String] {
         search.isEmpty ? curatedSFSymbols : curatedSFSymbols.filter { $0.localizedCaseInsensitiveContains(search) }
     }
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: name.isEmpty ? "questionmark.square.dashed" : name)
-                .frame(width: 22, height: 22)
-            TextField("Symbol name", text: Binding(get: { name }, set: { icon = .sfSymbol($0) }))
-            Button("Choose…") { showing = true }
-                .popover(isPresented: $showing, arrowEdge: .bottom) { picker }
-        }
+    /// A typed query that is a real SF Symbol but isn't already in the curated grid — offered first.
+    private var typedExtra: String? {
+        let q = search.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty, !curatedSFSymbols.contains(q),
+              NSImage(systemSymbolName: q, accessibilityDescription: nil) != nil else { return nil }
+        return q
     }
 
-    private var picker: some View {
+    var body: some View {
         VStack(spacing: 8) {
+            if naturalIcon != nil {
+                Button { if let n = naturalIcon { icon = n }; isPresented = false } label: {
+                    Label("Default icon", systemImage: "app.dashed").frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.bordered)
+            }
             TextField("Search symbols", text: $search).textFieldStyle(.roundedBorder)
             ScrollView {
                 LazyVGrid(columns: Array(repeating: GridItem(.fixed(38)), count: 7), spacing: 6) {
-                    ForEach(filtered, id: \.self) { sym in
-                        Button { icon = .sfSymbol(sym); showing = false } label: {
-                            Image(systemName: sym).font(.system(size: 18)).frame(width: 34, height: 34)
-                                .background(RoundedRectangle(cornerRadius: 6)
-                                    .fill(name == sym ? Color.accentColor.opacity(0.30) : .clear))
-                        }
-                        .buttonStyle(.plain)
-                        .help(sym)
-                    }
+                    if let typedExtra { cell(typedExtra) }
+                    ForEach(filtered, id: \.self) { cell($0) }
                 }
                 .padding(.vertical, 2)
             }
         }
         .padding(10)
-        .frame(width: 330, height: 360)
+        .frame(width: 330, height: 380)
+    }
+
+    private func cell(_ sym: String) -> some View {
+        Button { icon = .sfSymbol(sym); isPresented = false } label: {
+            Image(systemName: sym).font(.system(size: 18)).frame(width: 34, height: 34)
+                .background(RoundedRectangle(cornerRadius: 6)
+                    .fill(current == sym ? Color.accentColor.opacity(0.30) : .clear))
+        }
+        .buttonStyle(.plain)
+        .help(sym)
     }
 }
 
-/// Emoji chooser: a preview + a typed fallback + a popover grid of curated emoji, plus a button to
-/// open the full macOS emoji & symbols viewer (inserts into the focused field).
-private struct EmojiPickerRow: View {
-    @Binding var icon: ItemIcon
-    @State private var showing = false
-
-    private var glyph: String { if case .emoji(let g) = icon { return g } else { return "" } }
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Text(glyph.isEmpty ? "—" : glyph).font(.system(size: 18)).frame(width: 22, height: 22)
-            TextField("Emoji", text: Binding(get: { glyph }, set: { icon = .emoji($0) }))
-            Button("Choose…") { showing = true }
-                .popover(isPresented: $showing, arrowEdge: .bottom) { picker }
-            Button { NSApp.orderFrontCharacterPalette(nil) } label: { Image(systemName: "face.smiling") }
-                .help("Open the macOS emoji & symbols viewer")
-        }
-    }
-
-    private var picker: some View {
-        ScrollView {
-            LazyVGrid(columns: Array(repeating: GridItem(.fixed(34)), count: 8), spacing: 6) {
-                ForEach(curatedEmojis, id: \.self) { e in
-                    Button { icon = .emoji(e); showing = false } label: {
-                        Text(e).font(.system(size: 22)).frame(width: 30, height: 30)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(10)
-        }
-        .frame(width: 320, height: 300)
-    }
-}
-
-/// A curated set of common SF Symbols for the icon picker (typing any other name still works).
+/// A curated set of common SF Symbols for the icon picker (searching any other name still works).
 let curatedSFSymbols: [String] = [
+    // Shapes
+    "circle.fill", "circle", "square.fill", "square", "triangle.fill", "triangle",
+    "diamond.fill", "diamond", "hexagon.fill", "hexagon", "pentagon.fill", "pentagon",
+    "octagon.fill", "octagon", "seal.fill", "seal", "capsule.fill", "capsule",
+    "oval.fill", "oval", "rhombus.fill", "rhombus", "rectangle.fill", "rectangle",
+    "suit.heart.fill", "suit.club.fill", "suit.spade.fill", "suit.diamond.fill",
+    "circle.hexagongrid.fill", "circle.grid.2x2.fill", "square.on.square",
     "star.fill", "star", "heart.fill", "heart", "bolt.fill", "bolt", "flame.fill", "flame",
     "sparkles", "wand.and.stars", "crown.fill", "trophy.fill", "rosette", "medal.fill",
     "folder.fill", "folder", "doc.fill", "doc", "doc.text.fill", "tray.fill", "archivebox.fill",
@@ -1403,21 +1527,6 @@ let curatedSFSymbols: [String] = [
     "moon.fill", "sun.max.fill", "cloud.fill", "drop.fill", "leaf.fill", "tree.fill",
     "pawprint.fill", "tortoise.fill", "ant.fill", "ladybug.fill",
     "cross.case.fill", "pills.fill", "stethoscope", "heart.text.square.fill",
-]
-
-/// A curated set of common emoji for the quick grid (the system viewer covers everything else).
-let curatedEmojis: [String] = [
-    "⭐️", "🔥", "💡", "🚀", "✨", "🎯", "📌", "🏆", "🎉", "🎁",
-    "📁", "📂", "📄", "🗂️", "🗃️", "📦", "🧰", "🛠️", "🔧", "⚙️",
-    "💻", "🖥️", "⌨️", "🖱️", "📱", "⌚️", "🎮", "🎧", "🎵", "🎬",
-    "📷", "📸", "🎨", "✏️", "📝", "📚", "🔖", "🗺️", "📍", "🧭",
-    "🏠", "🏢", "🏦", "🛒", "💳", "💰", "💵", "📊", "📈", "📉",
-    "✅", "❌", "⚠️", "⛔️", "🔒", "🔓", "🔑", "🛡️", "🔔", "🏷️",
-    "🌐", "🔗", "✉️", "📨", "💬", "📞", "📅", "⏰", "⏱️", "⏳",
-    "🧠", "🤖", "👤", "👥", "🫶", "👍", "🙌", "💪", "🧪", "🔬",
-    "☕️", "🍔", "🍕", "🍎", "🌙", "☀️", "☁️", "⚡️", "💧", "🍃",
-    "🐙", "🐳", "🦊", "🐱", "🦄", "🐢", "❤️", "💙", "💚", "💜",
-    "🟠", "🟢", "🔵", "🟣", "⚫️", "⭕️", "▶️", "⏸️", "⏹️", "🆕",
 ]
 
 // MARK: - Shared rendering helpers
@@ -1782,40 +1891,3 @@ private func aiInputLabel(_ s: InputSource) -> String {
     }
 }
 
-private func aiInputHelp(_ s: InputSource) -> String {
-    switch s {
-    case .selection: return "The front app's selected text (falls back to the clipboard when nothing is selected)."
-    case .clipboard: return "The current clipboard contents."
-    case .screenRegion: return "A captured screen region, fed to a vision-capable model."
-    case .none: return "No input — the prompt template stands alone."
-    }
-}
-
-private func aiOutputLabel(_ o: OutputTarget) -> String {
-    switch o {
-    case .replaceSelection: return "Replace the selected text with the result."
-    case .pasteAtCursor: return "Paste the result at the cursor."
-    case .previewOnly: return "Show the result in the preview only; write nothing back."
-    case let .runTask(kind): return "Run task: \(aiTaskLabel(kind))."
-    case let .sendTo(dest): return "Send to \(aiDestinationLabel(dest))."
-    }
-}
-
-private func aiTaskLabel(_ k: TaskKind) -> String {
-    switch k {
-    case .addToCalendar: return "Add to Calendar"
-    case .addToReminder: return "Add to Reminders"
-    case .newContact: return "New Contact"
-    case let .saveToProject(p): return "Save to project \(p.isEmpty ? "…" : p)"
-    case let .openToolWithPayload(t): return "Open \(t.isEmpty ? "tool" : t) with payload"
-    case let .sendTo(d): return "Send to \(aiDestinationLabel(d))"
-    }
-}
-
-private func aiDestinationLabel(_ d: Destination) -> String {
-    switch d {
-    case let .shortcut(n): return "Shortcut \(n.isEmpty ? "…" : n)"
-    case let .urlScheme(s): return "URL \(s.isEmpty ? "…" : s)"
-    case let .shell(c): return "Shell \(c.isEmpty ? "…" : c)"
-    }
-}
