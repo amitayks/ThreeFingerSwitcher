@@ -72,30 +72,6 @@ protocol GestureRecognizerDelegate: AnyObject {
     /// A fresh deliberate four-finger horizontal swipe-away while drilled: discard (defuse a held open /
     /// dismiss the navigator). One-shot.
     func filesDiscard()
-
-    // MARK: Player transport intents (emitted only while `playerActive`; the controller drives entry/exit).
-    // The built-in media player owns the trackpad while open — a third sustained modal sub-state mirroring
-    // the Files drill, but PERSISTENT (a lift ends one scrub, it does not leave the player). Default no-op
-    // implementations are provided below so non-player conformers compile unchanged.
-
-    /// Two-finger horizontal step (`+1` / `-1`, direction-adjusted): seek one step (the controller scales
-    /// it to seconds + auto-repeats off the held-zone signal). Fast-forward / rewind.
-    func playerSeek(_ direction: Int)
-    /// Two-finger vertical step (`+1` / `-1`, direction-adjusted): change volume one step — OR, while the
-    /// action menu is open, move the menu highlight (the controller routes it).
-    func playerVolume(_ direction: Int)
-    /// A two-finger tap (contact + lift with no navigation excursion): toggle play/pause.
-    func playerTogglePlayPause()
-    /// A relative +1 finger (one more than the navigation baseline): raise the action menu.
-    func playerActionMenu()
-    /// A resolving lift while the action menu is open: select the highlighted row (the Open-With pattern).
-    func playerSelectMenuItem()
-    /// A four-finger gesture: dismiss the player (persist + leave). One-shot.
-    func playerDismiss()
-    /// The per-axis held-in-zone sign (−1 / 0 / +1) for the player, emitted when it changes so the
-    /// controller drives eased auto-repeat. BOTH axes auto-repeat (seek and volume), unlike the Files/
-    /// Clipboard surfaces that suppress horizontal auto-repeat.
-    func playerHeldZoneChanged(dx: Int, dy: Int)
 }
 
 extension GestureRecognizerDelegate {
@@ -112,13 +88,6 @@ extension GestureRecognizerDelegate {
     func filesOpen() {}
     func filesOpenWith() {}
     func filesDiscard() {}
-    func playerSeek(_ direction: Int) {}
-    func playerVolume(_ direction: Int) {}
-    func playerTogglePlayPause() {}
-    func playerActionMenu() {}
-    func playerSelectMenuItem() {}
-    func playerDismiss() {}
-    func playerHeldZoneChanged(dx: Int, dy: Int) {}
 }
 
 /// Multi-finger scrub state machine. The active finger count is **latched at gesture start**:
@@ -194,39 +163,6 @@ final class GestureRecognizer {
     private var drillAccumX: CGFloat = 0   // horizontal → depth steps
     private var drillAccumY: CGFloat = 0   // vertical → highlight steps
 
-    /// While true (the built-in media player is open), every frame routes to `trackPlayer` and the normal
-    /// finger-count latch is bypassed — a fresh contact during playback never opens the switcher or the
-    /// launcher (so a three-finger count is the player's action menu, NOT the window switcher). The player
-    /// controller flips it from the player's open/close state (mirroring `filesDrillActive`). Setting it
-    /// `true` seeds a fresh session; while `false` (the default + all non-player use) everything is
-    /// byte-identical to before.
-    var playerActive = false {
-        didSet { if playerActive && !oldValue { resetPlayer() } }
-    }
-    /// Set by the controller while the player's action menu is open: a resolving lift then SELECTS the
-    /// highlighted row (the Open-With scrubbable-picker pattern) and `playerVolume` steps are the menu's
-    /// (the controller routes them), rather than a tap toggling play/pause or volume changing.
-    var playerMenuOpen = false
-    /// Whether the current player scrub session has seeded its baseline yet (a fresh contact seeds it).
-    private var playerStarted = false
-    /// Relaxed contact baseline of the player scrub, re-baselined on every contact-count change. A count
-    /// rising to baseline+1 is the action-menu morph; baseline+2 (or ≥4) dismisses.
-    private var playerContacts = 0
-    /// Whether the current contact session moved past the axis-detect threshold (so a lift is a scrub-end,
-    /// not a tap). Reset when a fresh contact seeds. A tap = contact + lift with no movement → play/pause.
-    private var playerMoved = false
-    /// The centroid where the current player contact session seeded (for the tap-vs-scrub test).
-    private var playerSeedCentroid = CGPoint.zero
-    /// Player edge-hold state per axis (−1 / 0 / +1), kept separate from the launcher/files `edgeDX/DY`.
-    private var playerEdgeDX = 0
-    private var playerEdgeDY = 0
-    /// Player odometer (restored v0.11.0 model): accumulate signed travel and emit discrete seek/volume
-    /// steps with carry. Re-baselined on entry / contact-count change so a leaving/landing finger emits
-    /// no phantom step. BOTH axes auto-repeat at the trackpad edge (seek + volume).
-    private var playerLast = CGPoint.zero
-    private var playerAccumX: CGFloat = 0   // horizontal → seek steps
-    private var playerAccumY: CGFloat = 0   // vertical → volume steps
-
     private enum Axis { case undetermined, horizontal, vertical }
     private enum State { case idle, tracking }
     private enum Mode { case switcher, launcher }
@@ -246,7 +182,7 @@ final class GestureRecognizer {
     /// Edge-hold state for auto-repeat, per axis (−1 / 0 / +1): `edgeDX +1` = right edge, `edgeDY +1` =
     /// top edge. Emitted to the delegate (`launcherEdgeChanged`) when either changes; the controller drives
     /// the edge-triggered auto-repeat off it. Shared by the launcher and the Files drill (mutually exclusive
-    /// sub-states); the player keeps its own `playerEdgeDX/DY`.
+    /// sub-states).
     private var edgeDX = 0
     private var edgeDY = 0
     /// Normalized distance from a trackpad edge within which a held contact triggers auto-repeat, with
@@ -293,13 +229,6 @@ final class GestureRecognizer {
         // a second launcher on top of the navigator. Off by default → byte-identical to before.
         if filesDrillActive {
             trackFilesDrill(frame)
-            return
-        }
-        // While the built-in player is open it OWNS the trackpad: every frame routes to the player
-        // tracker before the idle re-latch, so a fresh contact during playback never opens the switcher
-        // (a three-finger count is the player's action menu) or the launcher. Off by default → unchanged.
-        if playerActive {
-            trackPlayer(frame)
             return
         }
         let switcherTarget = settings.requireExactlyThree ? (frame.fingerCount == 3) : (frame.fingerCount >= 3)
@@ -842,136 +771,4 @@ final class GestureRecognizer {
         delegate?.filesHighlight(dir)
     }
 
-    // MARK: - Player (sustained modal sub-state; bypasses the latch while the player is open)
-
-    /// Seed a fresh player session. Called when the controller ENTERS the sub-state (the `didSet` false→
-    /// true edge); the next contact baselines the origin. Unlike the Files drill the player is PERSISTENT
-    /// — a lift ends one scrub but stays in the player — so there is no session-wide one-shot "resolved".
-    private func resetPlayer() {
-        playerStarted = false
-        playerMenuOpen = false
-        playerContacts = 0
-        playerMoved = false
-        belowTargetFrames = 0
-        clearPlayerHeldZones()
-    }
-
-    /// Sustained player tracking (see `playerActive`). Navigation (seek/volume) happens at the relaxed
-    /// posture; a relative +1 finger raises the action menu; a four-finger gesture dismisses; a lift with
-    /// no movement is a play/pause tap (or, while the menu is open, selects the highlighted row). The origin
-    /// is re-anchored on every contact-count change so a leaving/landing finger emits no phantom step.
-    private func trackPlayer(_ frame: TouchFrame) {
-        let count = frame.fingerCount
-
-        if count >= 2 {
-            belowTargetFrames = 0
-            if !playerStarted {
-                playerStarted = true
-                playerContacts = count
-                playerMoved = false
-                playerSeedCentroid = frame.centroid
-                playerLast = frame.centroid
-                playerAccumX = 0
-                playerAccumY = 0
-                return
-            }
-            if count != playerContacts {
-                // A rising count is an intent (menu / dismiss); a falling count is just a relax. Detect the
-                // intent BEFORE re-baselining (mirrors the Files +1 Open-With latch), then re-baseline the
-                // odometer origin so the centroid jump from the changed contacts emits no phantom step.
-                if count > playerContacts {
-                    if count >= 4 || count >= playerContacts + 2 {
-                        delegate?.playerDismiss()
-                    } else {
-                        delegate?.playerActionMenu()
-                    }
-                }
-                playerContacts = count
-                playerSeedCentroid = frame.centroid
-                playerLast = frame.centroid
-                playerAccumX = 0
-                playerAccumY = 0
-                clearPlayerHeldZones()
-                return
-            }
-            updatePlayer(frame)
-        } else {
-            // Below two contacts ("lift"): same below-target debounce as the launcher/files. A lift ends the
-            // scrub but stays in the player; if nothing moved it's a tap (toggle), or selects an open menu.
-            belowTargetFrames += 1
-            if count == 0 || belowTargetFrames >= 2 {
-                resolvePlayerLift()
-            }
-        }
-    }
-
-    private func updatePlayer(_ frame: TouchFrame) {
-        let c = frame.centroid
-        // Tap-vs-scrub: any travel past the axis-detect threshold marks this contact a scrub (so the lift
-        // is not a play/pause tap). A true tap barely moves.
-        if abs(c.x - playerSeedCentroid.x) >= axisDetectThreshold ||
-           abs(c.y - playerSeedCentroid.y) >= axisDetectThreshold {
-            playerMoved = true
-        }
-
-        // Odometer (restored v0.11.0 model): accumulate signed travel and emit discrete seek/volume steps
-        // with carry. BOTH axes auto-repeat at the trackpad edge (seek + volume), unlike the Files/Clipboard
-        // surfaces that suppress horizontal auto-repeat.
-        playerAccumX += (c.x - playerLast.x)
-        playerAccumY += (c.y - playerLast.y)
-        playerLast = c
-
-        let step = CGFloat(max(settings.launcherStepDistance, 0.005))
-        while playerAccumX >= step { playerAccumX -= step; emitPlayerSeek(forward: true) }
-        while playerAccumX <= -step { playerAccumX += step; emitPlayerSeek(forward: false) }
-        while playerAccumY >= step { playerAccumY -= step; emitPlayerVolume(up: true) }
-        while playerAccumY <= -step { playerAccumY += step; emitPlayerVolume(up: false) }
-
-        updatePlayerEdges(c)
-    }
-
-    /// A resolving lift in the player. While the action menu is open, it SELECTS the highlighted row;
-    /// otherwise a no-movement contact is a play/pause TAP (a scrub-end is a no-op — the player persists).
-    /// Resets `playerStarted` so the next contact seeds a fresh scrub session.
-    private func resolvePlayerLift() {
-        clearPlayerHeldZones()
-        if playerStarted {
-            if playerMenuOpen {
-                delegate?.playerSelectMenuItem()
-            } else if !playerMoved {
-                delegate?.playerTogglePlayPause()
-            }
-        }
-        playerStarted = false
-        playerMoved = false
-    }
-
-    /// Track whether the player contact is held at a trackpad edge on each axis (with hysteresis), emitting
-    /// `playerHeldZoneChanged` only when the per-axis state changes — BOTH axes auto-repeat (seek + volume).
-    /// Reuses the shared `edgeAxis` hysteresis with the player's own `playerEdgeDX/DY` state.
-    private func updatePlayerEdges(_ c: CGPoint) {
-        let dx = edgeAxis(c.x, current: playerEdgeDX)
-        let dy = edgeAxis(c.y, current: playerEdgeDY)
-        guard dx != playerEdgeDX || dy != playerEdgeDY else { return }
-        playerEdgeDX = dx; playerEdgeDY = dy
-        delegate?.playerHeldZoneChanged(dx: dx, dy: dy)
-    }
-
-    private func clearPlayerHeldZones() {
-        guard playerEdgeDX != 0 || playerEdgeDY != 0 else { return }
-        playerEdgeDX = 0; playerEdgeDY = 0
-        delegate?.playerHeldZoneChanged(dx: 0, dy: 0)
-    }
-
-    private func emitPlayerSeek(forward: Bool) {
-        var dir = forward ? 1 : -1
-        if settings.reverseDirection { dir = -dir }
-        delegate?.playerSeek(dir)
-    }
-
-    private func emitPlayerVolume(up: Bool) {
-        var dir = up ? 1 : -1
-        if settings.reverseVerticalDirection { dir = -dir }
-        delegate?.playerVolume(dir)
-    }
 }

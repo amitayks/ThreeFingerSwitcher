@@ -128,7 +128,7 @@ final class AppSettings: ObservableObject {
 
     /// Normalized centroid travel to move the selection by one item — horizontally between items and
     /// vertically between grid rows (odometer, with carry). Also drives the Files navigator's depth /
-    /// highlight stepping and the media player's seek / volume stepping.
+    /// highlight stepping.
     @Published var launcherStepDistance: Double { didSet { persist(launcherStepDistance, Keys.launcherStepDistance) } }
 
     /// Normalized vertical travel on the band list to switch one band (odometer, with carry). Coarser
@@ -293,46 +293,6 @@ final class AppSettings: ObservableObject {
         if kept.count != filesRememberedLocations.count { filesRememberedLocations = kept }
     }
 
-    // MARK: - Built-in media player (opt-in; default OFF)
-
-    /// Opt-in to playing media files from the Files band in the built-in player. Like the clipboard /
-    /// device-link / Files opt-ins (and unlike the gesture opt-ins) it relocates no native gesture, needs
-    /// no re-login, and requests no new permission; there is NO `is…Effective` gate — the flip takes
-    /// effect immediately. When OFF, opening a media file behaves exactly as before (system default app).
-    /// Default OFF. Older settings have no key and decode with the opt-in OFF.
-    @Published var useBuiltInPlayer: Bool { didSet { defaults.set(useBuiltInPlayer, forKey: Keys.useBuiltInPlayer) } }
-
-    /// Per-media-kind default-open: when the opt-in is on, whether the built-in player handles video /
-    /// audio / images respectively (each defaults ON). A disabled kind falls through to the system app.
-    @Published var builtInPlayerHandlesVideo: Bool { didSet { defaults.set(builtInPlayerHandlesVideo, forKey: Keys.builtInPlayerHandlesVideo) } }
-    @Published var builtInPlayerHandlesAudio: Bool { didSet { defaults.set(builtInPlayerHandlesAudio, forKey: Keys.builtInPlayerHandlesAudio) } }
-    @Published var builtInPlayerHandlesImage: Bool { didSet { defaults.set(builtInPlayerHandlesImage, forKey: Keys.builtInPlayerHandlesImage) } }
-
-    /// The default playback engine (AVFoundation or libmpv). AVFoundation is the default; libmpv is the
-    /// alternative, also auto-offered when AVFoundation can't decode a file. Persisted by `rawValue`.
-    @Published var playerDefaultEngine: PlaybackEngineKind { didSet { defaults.set(playerDefaultEngine.rawValue, forKey: Keys.playerDefaultEngine) } }
-
-    /// Seconds per seek step (one two-finger out-and-back); auto-repeat issues more while held.
-    @Published var playerSeekStep: Double { didSet { persist(playerSeekStep, Keys.playerSeekStep) } }
-
-    /// Volume delta per step, in 0…1 units.
-    @Published var playerVolumeStep: Double { didSet { persist(playerVolumeStep, Keys.playerVolumeStep) } }
-
-    /// Resume a reopened file only when the saved position is at least this many seconds in (else start).
-    @Published var playerResumeThreshold: Double { didSet { persist(playerResumeThreshold, Keys.playerResumeThreshold) } }
-
-    /// Treat a saved position within this many seconds of the end as "finished" → start fresh.
-    @Published var playerNearEndMargin: Double { didSet { persist(playerNearEndMargin, Keys.playerNearEndMargin) } }
-
-    /// Whether the built-in player handles `kind` (the opt-in must also be on; checked by the caller).
-    func builtInPlayerHandles(_ kind: MediaKind) -> Bool {
-        switch kind {
-        case .video: return builtInPlayerHandlesVideo
-        case .audio: return builtInPlayerHandlesAudio
-        case .image: return builtInPlayerHandlesImage
-        }
-    }
-
     // MARK: - Per-app keyboard language (opt-in; default OFF)
 
     /// Opt-in to remembering and re-selecting the keyboard input source per application (bundle id),
@@ -436,15 +396,6 @@ final class AppSettings: ObservableObject {
         filesSortDirection = (defaults.object(forKey: Keys.filesSortDirection) as? String).flatMap(FilesSortDirection.init(rawValue:)) ?? Defaults.filesSortDirection
         filesDefaultOpen = (defaults.object(forKey: Keys.filesDefaultOpen) as? String).flatMap(FilesDefaultOpen.init(rawValue:)) ?? Defaults.filesDefaultOpen
         filesRowMetadata = (defaults.object(forKey: Keys.filesRowMetadata) as? Int).map(FilesRowMetadata.init(rawValue:)) ?? Defaults.filesRowMetadata
-        useBuiltInPlayer = defaults.object(forKey: Keys.useBuiltInPlayer) as? Bool ?? Defaults.useBuiltInPlayer
-        builtInPlayerHandlesVideo = defaults.object(forKey: Keys.builtInPlayerHandlesVideo) as? Bool ?? Defaults.builtInPlayerHandlesVideo
-        builtInPlayerHandlesAudio = defaults.object(forKey: Keys.builtInPlayerHandlesAudio) as? Bool ?? Defaults.builtInPlayerHandlesAudio
-        builtInPlayerHandlesImage = defaults.object(forKey: Keys.builtInPlayerHandlesImage) as? Bool ?? Defaults.builtInPlayerHandlesImage
-        playerDefaultEngine = (defaults.object(forKey: Keys.playerDefaultEngine) as? String).flatMap(PlaybackEngineKind.init(rawValue:)) ?? Defaults.playerDefaultEngine
-        playerSeekStep = defaults.object(forKey: Keys.playerSeekStep) as? Double ?? Defaults.playerSeekStep
-        playerVolumeStep = defaults.object(forKey: Keys.playerVolumeStep) as? Double ?? Defaults.playerVolumeStep
-        playerResumeThreshold = defaults.object(forKey: Keys.playerResumeThreshold) as? Double ?? Defaults.playerResumeThreshold
-        playerNearEndMargin = defaults.object(forKey: Keys.playerNearEndMargin) as? Double ?? Defaults.playerNearEndMargin
         keyboardLanguageEnabled = defaults.object(forKey: Keys.keyboardLanguageEnabled) as? Bool ?? Defaults.keyboardLanguageEnabled
         keyboardLanguageDefaultSourceID = defaults.object(forKey: Keys.keyboardLanguageDefaultSourceID) as? String ?? Defaults.keyboardLanguageDefaultSourceID
         keyboardLanguagePerSiteEnabled = defaults.object(forKey: Keys.keyboardLanguagePerSiteEnabled) as? Bool ?? Defaults.keyboardLanguagePerSiteEnabled
@@ -491,16 +442,6 @@ final class AppSettings: ObservableObject {
         filesDefaultOpen = Defaults.filesDefaultOpen
         filesRowMetadata = Defaults.filesRowMetadata
         filesRememberLocation = Defaults.filesRememberLocation   // a behavior tunable (back to default ON); the remembered map itself is preserved above
-        // Player tunables reset; `useBuiltInPlayer` (the opt-in) is a deliberate user choice and is
-        // intentionally NOT reset, mirroring the launcher / clipboard / files opt-in handling.
-        builtInPlayerHandlesVideo = Defaults.builtInPlayerHandlesVideo
-        builtInPlayerHandlesAudio = Defaults.builtInPlayerHandlesAudio
-        builtInPlayerHandlesImage = Defaults.builtInPlayerHandlesImage
-        playerDefaultEngine = Defaults.playerDefaultEngine
-        playerSeekStep = Defaults.playerSeekStep
-        playerVolumeStep = Defaults.playerVolumeStep
-        playerResumeThreshold = Defaults.playerResumeThreshold
-        playerNearEndMargin = Defaults.playerNearEndMargin
         // `aiCommandsEnabled` (a consent-gated opt-in that allows a multi-gigabyte download) and the
         // selected-model pin are a deliberate user choice, so they're intentionally NOT reset — mirrors
         // the launcher / clipboard opt-in handling.
@@ -530,7 +471,7 @@ final class AppSettings: ObservableObject {
         static let manageVerticalGesture = false   // opt-in; relocates Mission Control to four fingers
         static let enableLauncher = false          // opt-in; frees four-finger native gestures
         static let launcherActivationThreshold = 0.01   // same feather-light trigger as the switcher
-        static let launcherStepDistance = 0.04     // one item per ~4% travel; also Files depth/highlight + player seek/volume
+        static let launcherStepDistance = 0.04     // one item per ~4% travel; also Files depth/highlight
         static let launcherContextStepDistance = 0.09   // ~2.2× the item step; deliberate band switching
         static let dwellToArmDuration = 0.3        // quick tick; the charge stays readable
         static let showDiagnostics = false         // troubleshooting tools hidden from the menu by default
@@ -562,15 +503,6 @@ final class AppSettings: ObservableObject {
         static let filesSortDirection: FilesSortDirection = .ascending
         static let filesDefaultOpen: FilesDefaultOpen = .defaultApp
         static let filesRowMetadata: FilesRowMetadata = .date   // show the modified date beside the name
-        static let useBuiltInPlayer = false        // opt-in; plays media from the Files band in the built-in player
-        static let builtInPlayerHandlesVideo = true
-        static let builtInPlayerHandlesAudio = true
-        static let builtInPlayerHandlesImage = true
-        static let playerDefaultEngine: PlaybackEngineKind = .avFoundation   // AVFoundation default; libmpv the alternative
-        static let playerSeekStep = 10.0           // seconds per seek step (hold auto-repeats)
-        static let playerVolumeStep = 0.05         // 5% volume per step
-        static let playerResumeThreshold = 5.0     // resume only past 5s in
-        static let playerNearEndMargin = 10.0      // within 10s of the end → start fresh
         static let keyboardLanguageEnabled = false // opt-in; gates per-app input-source learn/apply (no re-login)
         static let keyboardLanguageDefaultSourceID = ""  // "" = no global default (pure learn-as-you-go)
         // Per-host memory inside browsers rides along by default when the keyboard-language master
@@ -629,15 +561,6 @@ final class AppSettings: ObservableObject {
         static let filesSortDirection = "filesSortDirection"
         static let filesDefaultOpen = "filesDefaultOpen"
         static let filesRowMetadata = "filesRowMetadata"
-        static let useBuiltInPlayer = "useBuiltInPlayer"
-        static let builtInPlayerHandlesVideo = "builtInPlayerHandlesVideo"
-        static let builtInPlayerHandlesAudio = "builtInPlayerHandlesAudio"
-        static let builtInPlayerHandlesImage = "builtInPlayerHandlesImage"
-        static let playerDefaultEngine = "playerDefaultEngine"
-        static let playerSeekStep = "playerSeekStep"
-        static let playerVolumeStep = "playerVolumeStep"
-        static let playerResumeThreshold = "playerResumeThreshold"
-        static let playerNearEndMargin = "playerNearEndMargin"
         static let keyboardLanguageEnabled = "keyboardLanguageEnabled"
         static let keyboardLanguageDefaultSourceID = "keyboardLanguageDefaultSourceID"
         static let keyboardLanguagePerSiteEnabled = "keyboardLanguagePerSiteEnabled"

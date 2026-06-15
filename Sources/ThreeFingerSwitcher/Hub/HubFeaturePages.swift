@@ -73,7 +73,7 @@ struct LauncherPage: View {
                     .disabled(!settings.enableLauncher)
                 LabeledSlider(title: "Item-step distance (one item per…)", value: $settings.launcherStepDistance,
                               range: 0.02...0.20, format: "%.3f",
-                              help: "Finger travel to move the selection by one item — horizontally between items in a band, and vertically between grid rows. Also drives the in-launcher Finder's depth/highlight stepping and the media player's seek/volume.")
+                              help: "Finger travel to move the selection by one item — horizontally between items in a band, and vertically between grid rows. Also drives the in-launcher Finder's depth/highlight stepping.")
                     .disabled(!settings.enableLauncher)
                 LabeledSlider(title: "Band-switch distance (one band per…)", value: $settings.launcherContextStepDistance,
                               range: 0.05...0.30, format: "%.3f",

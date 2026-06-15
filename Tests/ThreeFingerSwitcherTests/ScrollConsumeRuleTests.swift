@@ -50,4 +50,8 @@ final class ScrollConsumeRuleTests: XCTestCase {
     func test_consumes_atTwoFingers_whenSwitcherOpen_explicit() {
         XCTAssertTrue(AppCoordinator.shouldConsumeScroll(fingerCount: 2, launcherOpen: false, switcherOpen: true, canvasActive: false))
     }
+
+    func test_passesThrough_whenNoOverlay() {
+        XCTAssertFalse(AppCoordinator.shouldConsumeScroll(fingerCount: 2, launcherOpen: false, switcherOpen: false, canvasActive: false))
+    }
 }

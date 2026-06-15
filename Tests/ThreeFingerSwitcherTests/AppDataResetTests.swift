@@ -70,7 +70,7 @@ final class AppDataResetTests: XCTestCase {
 
     /// A throwaway `~/Library` under the temp dir, so `clear()`'s real, destructive filesystem deletions
     /// never touch the user's actual home (the Application Support root is hardcoded, NOT keyed by the
-    /// fake bundleID — without this seam the suite wiped the real clipboard/AI/player stores). Per test.
+    /// fake bundleID — without this seam the suite wiped the real clipboard/AI stores). Per test.
     private func tempLibrary() -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("AppDataResetTests-\(UUID())/Library", isDirectory: true)

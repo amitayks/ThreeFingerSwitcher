@@ -113,63 +113,6 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertTrue(reader.enableDeviceLink, "persists across instances")
     }
 
-    // MARK: - Built-in media player (spec: media-player / tunable-settings)
-
-    /// The player opt-in defaults OFF and persists; the per-kind handles default ON; the default engine
-    /// is AVFoundation. (tunable-settings: "Built-in player opt-in and tunables".)
-    func testBuiltInPlayerDefaultsAndPersistence() {
-        let writer = makeSettings()
-        XCTAssertFalse(writer.useBuiltInPlayer, "player opt-in must default off")
-        XCTAssertTrue(writer.builtInPlayerHandlesVideo)
-        XCTAssertTrue(writer.builtInPlayerHandlesAudio)
-        XCTAssertTrue(writer.builtInPlayerHandlesImage)
-        XCTAssertEqual(writer.playerDefaultEngine, .avFoundation, "AVFoundation is the default engine")
-
-        writer.useBuiltInPlayer = true
-        writer.builtInPlayerHandlesImage = false
-        writer.playerDefaultEngine = .libmpv
-        XCTAssertEqual(defaults.object(forKey: "useBuiltInPlayer") as? Bool, true, "writes the documented key")
-
-        let reader = AppSettings(defaults: defaults)
-        XCTAssertTrue(reader.useBuiltInPlayer, "persists across instances")
-        XCTAssertFalse(reader.builtInPlayerHandlesImage, "per-kind flag persists")
-        XCTAssertEqual(reader.playerDefaultEngine, .libmpv, "engine choice persists by rawValue")
-    }
-
-    /// The per-kind accessor maps `MediaKind` to the matching flag.
-    func testBuiltInPlayerHandlesAccessor() {
-        let settings = makeSettings()
-        settings.builtInPlayerHandlesVideo = true
-        settings.builtInPlayerHandlesAudio = false
-        XCTAssertTrue(settings.builtInPlayerHandles(.video))
-        XCTAssertFalse(settings.builtInPlayerHandles(.audio))
-        XCTAssertTrue(settings.builtInPlayerHandles(.image))
-    }
-
-    /// Settings written before the player existed decode with the opt-in OFF and the tunables at their
-    /// defaults, and are not reset (tunable-settings: "Legacy settings load with the player off").
-    func testOlderSettingsDecodeWithPlayerOffAndDefaults() {
-        // Simulate a pre-player suite that carries only an unrelated key.
-        defaults.set(true, forKey: "keepClipboardHistory")
-        let settings = AppSettings(defaults: defaults)
-        XCTAssertFalse(settings.useBuiltInPlayer, "absent key → opt-in off")
-        XCTAssertEqual(settings.playerSeekStep, AppSettings.Defaults.playerSeekStep, accuracy: eps)
-        XCTAssertEqual(settings.playerResumeThreshold, AppSettings.Defaults.playerResumeThreshold, accuracy: eps)
-        XCTAssertTrue(settings.keepClipboardHistory, "an unrelated existing setting is untouched")
-    }
-
-    /// `resetToDefaults` restores player tunables but leaves the opt-in (a deliberate choice) untouched.
-    func testResetToDefaultsRestoresPlayerTunablesButNotOptIn() {
-        let settings = makeSettings()
-        settings.useBuiltInPlayer = true
-        settings.playerSeekStep = 99
-        settings.builtInPlayerHandlesImage = false
-        settings.resetToDefaults()
-        XCTAssertTrue(settings.useBuiltInPlayer, "opt-in is a deliberate choice, not reset")
-        XCTAssertEqual(settings.playerSeekStep, AppSettings.Defaults.playerSeekStep, accuracy: eps)
-        XCTAssertTrue(settings.builtInPlayerHandlesImage, "behavior tunable returns to default")
-    }
-
     /// Spot-check the literal default values so a silent change to `Defaults` is caught.
     func testDefaultsEnumHasExpectedLiteralValues() {
         // The shipped gesture-feel numbers are the maintainer's dialed-in daily-use values

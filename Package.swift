@@ -65,7 +65,9 @@ let package = Package(
         // (from GemmaRuntime) at the model seam. Builds via `xcodebuild` (it transitively links MLX).
         .executableTarget(
             name: "ThreeFingerSwitcher",
-            dependencies: ["ThreeFingerSwitcherCore", "GemmaRuntime"],
+            dependencies: [
+                "ThreeFingerSwitcherCore", "GemmaRuntime"
+            ],
             path: "Sources/ThreeFingerSwitcherApp",
             swiftSettings: [
                 .swiftLanguageMode(.v5)

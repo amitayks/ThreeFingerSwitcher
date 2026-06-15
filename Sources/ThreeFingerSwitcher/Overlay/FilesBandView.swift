@@ -376,23 +376,21 @@ struct FilesBandView: View {
         .background(pickerGlassFill)
     }
 
-    /// One Open-With row: the application icon (the real bundle icon via `NSWorkspace`), its name, and a
-    /// "Default" marker on the file's default application. A leaf content row (the selection backing is the
-    /// single sliding pill, never a per-row fill).
+    /// One Open-With row: an external app (the real bundle icon, its name, and a "Default" marker on the
+    /// file's default app). A leaf content row (the selection backing is the single sliding pill, never a
+    /// per-row fill).
     @ViewBuilder
-    private func pickerRow(_ candidate: OpenWithCandidate) -> some View {
+    private func pickerRow(_ entry: OpenWithEntry) -> some View {
         HStack(spacing: 8) {
-            Image(nsImage: NSWorkspace.shared.icon(forFile: candidate.app.url.path))
-                .resizable()
-                .aspectRatio(contentMode: .fit)
+            pickerRowIcon(entry)
                 .frame(width: 22, height: 22)
-            Text(candidate.app.name)
+            Text(entry.label)
                 .font(.system(size: 13))
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .foregroundStyle(.primary)
             Spacer(minLength: 4)
-            if candidate.isDefault {
+            if entry.isDefault {
                 Text("Default")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.secondary)
@@ -405,6 +403,17 @@ struct FilesBandView: View {
         }
         .padding(.horizontal, 10)
         .frame(height: pickerRowHeight)
+    }
+
+    /// The leading glyph for a picker row: the real bundle icon for the external app.
+    @ViewBuilder
+    private func pickerRowIcon(_ entry: OpenWithEntry) -> some View {
+        switch entry {
+        case let .external(candidate):
+            Image(nsImage: NSWorkspace.shared.icon(forFile: candidate.app.url.path))
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+        }
     }
 
     /// The popup's glass fill: the availability-gated `glassEffect` (macOS 26+) with the `.ultraThinMaterial`
@@ -817,3 +826,4 @@ extension Color {
         self.init(.sRGB, red: r, green: g, blue: b, opacity: a)
     }
 }
+

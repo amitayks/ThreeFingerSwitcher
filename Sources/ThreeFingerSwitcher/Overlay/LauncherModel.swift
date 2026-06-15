@@ -19,13 +19,14 @@ final class LauncherModel: ObservableObject {
     /// and the `highlightedIndex` the user scrubs to. A value type so the whole sub-state publishes as one
     /// `@Published` change; equality drives the view's diffing.
     struct FilesPickerState: Equatable {
-        /// The applications that can open the file, in the system's order (the default is `isDefault`).
-        var candidates: [OpenWithCandidate]
-        /// The currently highlighted row (the app a lift would choose). Always a valid index while non-empty.
+        /// The picker rows: the external applications that can open the file, in the system's order (the
+        /// default external is `isDefault`).
+        var candidates: [OpenWithEntry]
+        /// The currently highlighted row (the entry a lift would choose). Always a valid index while non-empty.
         var highlightedIndex: Int
 
-        /// The highlighted candidate, or nil for an (defensively) empty list.
-        var highlighted: OpenWithCandidate? {
+        /// The highlighted entry, or nil for an (defensively) empty list.
+        var highlighted: OpenWithEntry? {
             candidates.indices.contains(highlightedIndex) ? candidates[highlightedIndex] : nil
         }
     }
@@ -272,10 +273,12 @@ final class LauncherModel: ObservableObject {
     /// landing the highlight on the **default** application (the one a plain open would launch) so the most
     /// likely choice is pre-selected; a fresh gesture then scrubs it. A no-op when `candidates` is empty
     /// (the coordinator surfaces a "no app" notice instead and never enters here).
-    func enterFilesPicker(_ candidates: [OpenWithCandidate]) {
-        guard !candidates.isEmpty else { return }
-        let start = candidates.firstIndex(where: \.isDefault) ?? 0
-        filesPicker = FilesPickerState(candidates: candidates, highlightedIndex: start)
+    func enterFilesPicker(_ entries: [OpenWithEntry]) {
+        guard !entries.isEmpty else { return }
+        // Land the highlight on the default external app (the one a plain open would launch) when present, so
+        // the most likely choice is pre-selected; otherwise the first row (a built-in entry).
+        let start = entries.firstIndex(where: \.isDefault) ?? 0
+        filesPicker = FilesPickerState(candidates: entries, highlightedIndex: start)
     }
 
     /// Move the picker highlight vertically: `dir > 0` (up) toward the top of the list, `dir < 0` (down)
@@ -290,9 +293,9 @@ final class LauncherModel: ObservableObject {
         filesPicker = picker
     }
 
-    /// The candidate a lift in picker mode would choose (the highlighted app), or nil when the picker
-    /// isn't open / is (defensively) empty. The coordinator opens the file with this app's URL.
-    func filesPickerSelected() -> OpenWithCandidate? {
+    /// The entry a lift in picker mode would choose (the highlighted row), or nil when the picker isn't open
+    /// / is (defensively) empty. The coordinator routes the chosen entry to its external app.
+    func filesPickerSelected() -> OpenWithEntry? {
         filesPicker?.highlighted
     }
 

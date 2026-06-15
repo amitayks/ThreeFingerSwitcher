@@ -7,7 +7,7 @@ import AppKit
 enum HubDestination: Hashable, CaseIterable {
     case overview
     case bands
-    case switcher, launcher, clipboard, files, player, ai, keyboardLanguage
+    case switcher, launcher, clipboard, files, ai, keyboardLanguage
     case devices
     case setup, general
 
@@ -19,7 +19,6 @@ enum HubDestination: Hashable, CaseIterable {
         case .launcher: return "Launcher"
         case .clipboard: return "Clipboard"
         case .files: return "Files"
-        case .player: return "Media Player"
         case .ai: return "AI Commands"
         case .keyboardLanguage: return "Keyboard Language"
         case .devices: return "Devices"
@@ -32,7 +31,6 @@ enum HubDestination: Hashable, CaseIterable {
     var sidebarTitle: String {
         switch self {
         case .switcher: return "Switcher"
-        case .player: return "Player"
         case .ai: return "AI"
         case .keyboardLanguage: return "Language"
         case .setup: return "Setup"
@@ -48,7 +46,6 @@ enum HubDestination: Hashable, CaseIterable {
         case .launcher: return "square.grid.3x3.fill"
         case .clipboard: return "doc.on.clipboard"
         case .files: return "folder"
-        case .player: return "play.rectangle.fill"
         case .ai: return "sparkles"
         case .keyboardLanguage: return "globe"
         case .devices: return "iphone.and.arrow.forward"
@@ -201,7 +198,7 @@ struct HubView: View {
                     railDivider
                     railButton(.bands)
                     railDivider
-                    railButton(.switcher); railButton(.launcher); railButton(.clipboard); railButton(.files); railButton(.player); railButton(.ai); railButton(.keyboardLanguage); railButton(.devices)
+                    railButton(.switcher); railButton(.launcher); railButton(.clipboard); railButton(.files); railButton(.ai); railButton(.keyboardLanguage); railButton(.devices)
                     railDivider
                     railButton(.setup); railButton(.general)
                 }
@@ -254,7 +251,6 @@ struct HubView: View {
         case .launcher: LauncherPage(settings: context.settings)
         case .clipboard: ClipboardPage(context: context)
         case .files: FilesPage(context: context)
-        case .player: PlayerPage(context: context)
         case .ai: AIPage(context: context)
         case .keyboardLanguage: KeyboardLanguagePage(context: context)
         case .devices: DevicesPage(context: context)

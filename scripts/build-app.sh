@@ -67,6 +67,29 @@ cp "$BIN_PATH/$PRODUCT" "$APP/Contents/MacOS/$PRODUCT"
 cp "Resources/Info.plist" "$APP/Contents/Info.plist"
 cp -R "$XCF_FRAMEWORK" "$APP/Contents/Frameworks/"
 
+# Embed any DYNAMIC framework slice the build emits as a loose .framework in the products dir (xcodebuild
+# copies dynamic dependencies there) — a dynamic framework missing from Contents/Frameworks = SIGKILL at
+# first use. Current dependencies are largely STATIC (linked into the binary → nothing to copy), so this is
+# normally a no-op; it only catches a dynamic slice if one ships. The already-copied OpenMultitouchSupport
+# XCF is skipped.
+for fw in "$BIN_PATH"/*.framework; do
+    [ -e "$fw" ] || continue
+    [ "$(basename "$fw")" = "OpenMultitouchSupportXCF.framework" ] && continue
+    echo "▸ embedding framework: $(basename "$fw")"
+    cp -R "$fw" "$APP/Contents/Frameworks/"
+    # Some binary frameworks ship Headers/ and Modules/ as REAL directories at the framework root (not
+    # symlinks into Versions/Current/). codesign rejects that — "unsealed contents present in the root
+    # directory of an embedded framework". They're compile-time only (never loaded at runtime), so strip
+    # them to leave a clean, signable, runtime-complete versioned bundle.
+    dest="$APP/Contents/Frameworks/$(basename "$fw")"
+    rm -rf "$dest/Headers" "$dest/Modules" "$dest/PrivateHeaders"
+done
+for dylib in "$BIN_PATH"/*.dylib; do
+    [ -e "$dylib" ] || continue
+    echo "▸ embedding dylib: $(basename "$dylib")"
+    cp "$dylib" "$APP/Contents/Frameworks/"
+done
+
 # SwiftPM resource bundles (e.g. mlx-swift_Cmlx.bundle, which holds default.metallib — MLX's compiled
 # Metal shaders). xcodebuild emits these into the products dir; they are NOT baked into the binary.
 # Each package finds its bundle via `Bundle.module`, whose first candidate is `Bundle.main.resourceURL`
@@ -112,9 +135,16 @@ if [ "${NOTARIZE:-}" = "1" ]; then
     RUNTIME_FLAG="--options runtime"
     TS_FLAG="--timestamp"
 fi
-# Sign nested framework first, then the binary, then the app — entitlements on the app code.
+# Sign nested frameworks first, then the binary, then the app — entitlements on the app code.
 codesign --force --sign "$SIGN_ID" $TS_FLAG $RUNTIME_FLAG \
     "$APP/Contents/Frameworks/OpenMultitouchSupportXCF.framework"
+# Sign any embedded dynamic frameworks/dylibs (no-op when all dependencies are statically linked).
+for nested in "$APP/Contents/Frameworks/"*.framework "$APP/Contents/Frameworks/"*.dylib; do
+    [ -e "$nested" ] || continue
+    [ "$(basename "$nested")" = "OpenMultitouchSupportXCF.framework" ] && continue
+    echo "▸ signing nested: $(basename "$nested")"
+    codesign --force --sign "$SIGN_ID" $TS_FLAG $RUNTIME_FLAG "$nested"
+done
 codesign --force --sign "$SIGN_ID" $TS_FLAG $RUNTIME_FLAG \
     --entitlements "Resources/ThreeFingerSwitcher.entitlements" \
     "$APP/Contents/MacOS/$PRODUCT"

@@ -75,32 +75,8 @@ final class AppCoordinator: GestureRecognizerDelegate {
             // opened document lands in the context the user was looking at, not the frontmost app at fire
             // time. The `activate` result is best-effort and intentionally discarded.
             _ = self?.capturedFrontApp?.activate(options: [])
-        },
-        // Built-in player routing (media-player): a playable media file plays IN the player when the
-        // opt-in is on AND the per-kind default-open is enabled — else it falls through to the system app.
-        mediaPlaybackRoute: { [weak self] entry in
-            guard let self, self.settings.useBuiltInPlayer,
-                  let kind = MediaKind.classify(entry),
-                  self.settings.builtInPlayerHandles(kind) else { return nil }
-            return kind
-        },
-        playMedia: { [weak self] entry, kind in
-            await self?.playerController.play(entry, kind: kind)
         }
     )
-
-    // Built-in media player (opt-in). The player is its OWN non-activating overlay (separate from the
-    // launcher, which dismisses on the lift-to-open) and a third sustained recognizer sub-state: while
-    // open it owns the trackpad. Engines are injected at the seam (`PlayerEngineInjection`) from main.swift.
-    private let playerOverlay = PlayerOverlay()
-    private lazy var playerController = PlayerController(
-        settings: settings,
-        store: PlaybackStateStore.shared,
-        availableEngines: PlayerEngineInjection.availableEngines,
-        makeEngine: { PlayerEngineInjection.engineFactory?($0) },
-        surface: playerOverlay,
-        setPlayerActive: { [weak self] active in self?.recognizer.playerActive = active },
-        setPlayerMenuOpen: { [weak self] open in self?.recognizer.playerMenuOpen = open })
 
     /// The last Files open that was fired (default open / Open-With), captured so the failure row's **Retry**
     /// can re-fire the identical open through `FileOpenService`. Set in `filesOpen`/`filesOpenWith`, replaced
@@ -984,9 +960,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
         if launcherOverlay.model.filesPicker != nil {
             defer { launcherOverlay.model.exitFilesPicker(); launcherOverlay.hide() }
             guard let entry = launcherOverlay.filesHighlightedEntry,
-                  let appURL = launcherOverlay.model.filesPickerSelected()?.app.url else { return }
+                  case let .external(candidate)? = launcherOverlay.model.filesPickerSelected() else { return }
             fireFilesOpen { [weak self] in
-                self?.fileOpenService.prepareOpenWith(entry, appURL: appURL).commit(afterFuse: Self.filesOpenFuse)
+                self?.fileOpenService.prepareOpenWith(entry, appURL: candidate.app.url)
+                    .commit(afterFuse: Self.filesOpenFuse)
             }
             return
         }
@@ -1025,14 +1002,15 @@ final class AppCoordinator: GestureRecognizerDelegate {
         // gesture keeps navigating (the popup, or the folder list when no picker was shown).
         defer { recognizer.rearmDrill() }
         guard let entry = launcherOverlay.filesHighlightedEntry else { return }
-        let candidates = fileOpenService.openWithCandidates(for: entry)
-        guard !candidates.isEmpty else {
-            // No app can open this file: surface a clean bounded failure (never silently no-op), keep the
-            // navigator open, and do NOT enter the picker.
+        // The picker lists the external apps that can open the file, in the system's order.
+        let entries = OpenWithEntries.build(externalApps: fileOpenService.openWithCandidates(for: entry))
+        guard !entries.isEmpty else {
+            // Nothing can open this file (no external app): surface a clean bounded failure (never silently
+            // no-op), keep the navigator open, no picker.
             fileOpenService.surfaceNoApplication(for: entry)
             return
         }
-        launcherOverlay.model.enterFilesPicker(candidates)
+        launcherOverlay.model.enterFilesPicker(entries)
     }
 
     /// A fresh deliberate four-finger horizontal swipe-away while drilled: discard.
@@ -1051,19 +1029,6 @@ final class AppCoordinator: GestureRecognizerDelegate {
         }
         launcherOverlay.hide()
     }
-
-    // MARK: - Player transport intents (forwarded to PlayerController while `playerActive`)
-    //
-    // The recognizer routes these only while the built-in player owns the trackpad (a third sustained
-    // modal sub-state). `PlayerController` owns the transport model, the action menu, and resume.
-
-    func playerSeek(_ direction: Int) { playerController.seek(direction) }
-    func playerVolume(_ direction: Int) { playerController.volume(direction) }
-    func playerTogglePlayPause() { playerController.togglePlayPause() }
-    func playerActionMenu() { playerController.openActionMenu() }
-    func playerSelectMenuItem() { playerController.selectMenuItem() }
-    func playerDismiss() { playerController.dismiss() }
-    func playerHeldZoneChanged(dx: Int, dy: Int) { playerController.heldZone(dx: dx, dy: dy) }
 
     /// Short pre-launch fuse on a committed Files open, so a discard issued within the window still defuses
     /// it (design D7). Tiny — the held → swipe-to-resolve UI (a longer visible hold) is the view stage; here

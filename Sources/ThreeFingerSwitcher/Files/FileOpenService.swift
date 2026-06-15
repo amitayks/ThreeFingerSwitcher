@@ -72,28 +72,14 @@ final class FileOpenService: ObservableObject {
     /// `frontAppProvider` — kept a bare closure here so the service (and its Core taxonomy) stays AppKit-free.
     private let activateFrontAppContext: () -> Void
 
-    /// The built-in-player routing decision (`media-player` spec: "Media-kind classification routes the
-    /// open"): given an entry, returns the `MediaKind` to play in the built-in player, or `nil` to fall
-    /// through to the system default app. The controller builds it from `AppSettings` (opt-in on AND the
-    /// per-kind default-open enabled); `nil` by default / in tests, so opens behave exactly as before.
-    private let mediaPlaybackRoute: (FileEntry) -> MediaKind?
-    /// Hand an entry to the built-in player (the controller wires it to `PlayerController.play`). Run via a
-    /// defusable `PendingOpen` exactly like a workspace open, so a four-finger discard before the fuse plays
-    /// nothing. No-op by default / in tests.
-    private let playMedia: (FileEntry, MediaKind) async -> Void
-
     /// The pending open awaiting its commit/cancel (the defusable held state). Retained so a `cancel()`
     /// (discard) can defuse it before its fuse fires; cleared after it commits, cancels, or its fuse lands.
     private(set) var pendingOpen: PendingOpen?
 
     init(workspace: FileWorkspace,
-         activateFrontAppContext: @escaping () -> Void = {},
-         mediaPlaybackRoute: @escaping (FileEntry) -> MediaKind? = { _ in nil },
-         playMedia: @escaping (FileEntry, MediaKind) async -> Void = { _, _ in }) {
+         activateFrontAppContext: @escaping () -> Void = {}) {
         self.workspace = workspace
         self.activateFrontAppContext = activateFrontAppContext
-        self.mediaPlaybackRoute = mediaPlaybackRoute
-        self.playMedia = playMedia
     }
 
     // MARK: - Open-With enumeration
@@ -132,17 +118,7 @@ final class FileOpenService: ObservableObject {
     /// any still-pending one (it is cancelled first), so only one open is ever in flight.
     @discardableResult
     func prepareOpen(_ entry: FileEntry) -> PendingOpen {
-        // Built-in-player branch: a playable media file the player should handle plays IN the player
-        // instead of launching the system app — but still as a defusable pending (a four-finger discard
-        // before the fuse plays nothing). A folder, a non-media file, or the opt-in being off falls
-        // straight through to the unchanged default-open path. Open-With (`prepareOpenWith`) is never
-        // routed here — it always opens externally.
-        if !entry.isDirectory, let kind = mediaPlaybackRoute(entry) {
-            return prepare { [weak self] in
-                await self?.performPlay(entry, kind: kind)
-            }
-        }
-        return prepare { [weak self] in
+        prepare { [weak self] in
             await self?.performOpenDefault(entry)
         }
     }
@@ -201,15 +177,6 @@ final class FileOpenService: ObservableObject {
         } catch {
             state = Self.failure(for: error, fallbackName: entry.name)
         }
-    }
-
-    /// Hand a media file to the built-in player. `prepare`'s commit has already run the captured-front-app
-    /// activation and set `.opening`, so this is just the handoff: the player owns its own observable
-    /// failure surface (`PlayerTransportModel`), so the open "landed" once the player took over (a player
-    /// load failure surfaces on the player, never as a false success here).
-    private func performPlay(_ entry: FileEntry, kind: MediaKind) async {
-        await playMedia(entry, kind)
-        state = .opened
     }
 
     /// Fire an Open-With of `file` using the app at `appURL` through the workspace, with the same
