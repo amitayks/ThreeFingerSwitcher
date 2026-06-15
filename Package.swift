@@ -13,10 +13,12 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/Kyome22/OpenMultitouchSupport.git", from: "4.0.0"),
-        // The shared device-link packages (wire contract / mirror store / pairing crypto), extracted to a
-        // standalone cross-platform package (macOS + iOS, no MLX) so the iOS companion app can consume the
-        // same code. Core depends on DeviceLinkProtocol from here.
-        .package(path: "../DeviceLinkKit"),
+        // The shared device-link packages (wire contract / mirror store / pairing crypto): a standalone
+        // cross-platform package (macOS + iOS, no MLX) so the iOS companion app can consume the same code.
+        // VENDORED in-repo at ./DeviceLinkKit (rather than a `../` sibling) so CI can resolve it — the
+        // sibling path only existed on the maintainer's machine and broke the release build. Keep this
+        // copy in sync with the standalone package if the iOS app consumes a separate copy.
+        .package(path: "DeviceLinkKit"),
         // The MLX/Gemma 4 runtime. Pulls mlx-swift / swift-transformers / mlx-swift-lm transitively.
         // Building anything that links this needs `xcodebuild` (Metal shaders) — see GemmaRuntime target.
         // PINNED to an exact revision (not `branch: "main"`): the upstream `main` drifts and has shipped
