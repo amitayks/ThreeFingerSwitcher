@@ -32,15 +32,23 @@ final class MacPairingCoordinator: ObservableObject {
         self.identity = identity
     }
 
-    /// Show a QR + advertise the pairing service, waiting to be scanned.
+    /// Show a QR + advertise the pairing service, waiting to be scanned. Start the listener FIRST so the
+    /// QR can carry the listener's bound port + this Mac's reachable address(es) — letting the scanner dial
+    /// directly (unicast) without mDNS/Bonjour discovery. The QR is published once the listener is ready.
     func showCode() {
         guard status == .idle else { return }
         coordLog.info("HOST showCode (id \(self.identity.id, privacy: .public))")
         secret = PairingQRPayload.makeSecret()
-        qrString = MacLocalIdentity.payload(device: identity, secret: secret).encodedString()
         status = .waiting
 
         let listener = MacPairingListener(serviceName: identity.id, queue: queue)
+        listener.onReady = { [weak self] port in
+            guard let self else { return }
+            let addresses = LocalAddresses.current()
+            coordLog.info("HOST endpoint [\(addresses.joined(separator: ", "), privacy: .public)]:\(port, privacy: .public)")
+            self.qrString = MacLocalIdentity.payload(device: self.identity, secret: self.secret,
+                                                     addresses: addresses, port: port).encodedString()
+        }
         listener.onChannel = { [weak self] channel in self?.adopt(channel) }
         listener.start()
         self.listener = listener
@@ -55,6 +63,10 @@ final class MacPairingCoordinator: ObservableObject {
     // MARK: - Exchange (main queue)
 
     private func adopt(_ channel: MacPairingChannel) {
+        guard self.channel == nil else {   // already pairing on a connection — ignore extras, don't clobber
+            coordLog.info("HOST ignoring extra scanner connection")
+            channel.close(); return
+        }
         self.channel = channel
         exchange = PairingExchange(role: .host, secret: secret,
                                    identity: identity, spkiFingerprint: MacLocalIdentity.fingerprint)

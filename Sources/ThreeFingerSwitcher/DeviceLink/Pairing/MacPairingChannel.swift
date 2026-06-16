@@ -88,13 +88,16 @@ final class MacPairingChannel: @unchecked Sendable {
     }
 }
 
-/// Advertises `_tfspair._tcp` under the Mac's id and accepts a scanner.
+/// Advertises `_tfspair._tcp` under the Mac's id and accepts a scanner. `onReady` delivers the listener's
+/// bound port so the shown QR can carry a directly-dialable endpoint (unicast, no mDNS needed).
 final class MacPairingListener: @unchecked Sendable {
     var onChannel: ((MacPairingChannel) -> Void)?  // main
+    var onReady: ((UInt16) -> Void)?               // main — fired once when ready + has a port
 
     private let serviceName: String
     private let queue: DispatchQueue
     private var listener: NWListener?
+    private var announcedPort = false
 
     init(serviceName: String, queue: DispatchQueue) {
         self.serviceName = serviceName
@@ -107,7 +110,15 @@ final class MacPairingListener: @unchecked Sendable {
             return
         }
         listener.service = NWListener.Service(name: serviceName, type: MacPairingChannel.serviceType)
-        listener.stateUpdateHandler = { state in pairingLog.info("listener state: \(String(describing: state), privacy: .public)") }
+        listener.stateUpdateHandler = { [weak self] state in
+            pairingLog.info("listener state: \(String(describing: state), privacy: .public)")
+            guard let self else { return }
+            if case .ready = state, !self.announcedPort, let port = listener.port?.rawValue {
+                self.announcedPort = true
+                pairingLog.info("listener: bound port \(port, privacy: .public)")
+                DispatchQueue.main.async { self.onReady?(port) }
+            }
+        }
         listener.newConnectionHandler = { [weak self] connection in
             guard let self else { connection.cancel(); return }
             pairingLog.info("listener: scanner CONNECTED")
@@ -116,6 +127,7 @@ final class MacPairingListener: @unchecked Sendable {
             DispatchQueue.main.async { self.onChannel?(channel) }
         }
         listener.start(queue: queue)
+        self.listener = listener
         pairingLog.info("listener: advertising _tfspair._tcp as \(self.serviceName, privacy: .public)")
     }
 

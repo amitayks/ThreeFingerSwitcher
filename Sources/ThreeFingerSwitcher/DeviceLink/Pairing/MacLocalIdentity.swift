@@ -22,8 +22,10 @@ enum MacLocalIdentity {
         Data(SHA256.hash(data: privateKey.publicKey.rawRepresentation))
     }
 
-    static func payload(device: DeviceIdentity, secret: Data) -> PairingQRPayload {
-        PairingQRPayload(device: device, secret: secret, spkiFingerprint: fingerprint)
+    static func payload(device: DeviceIdentity, secret: Data,
+                        addresses: [String] = [], port: UInt16? = nil) -> PairingQRPayload {
+        PairingQRPayload(device: device, secret: secret, spkiFingerprint: fingerprint,
+                         addresses: addresses, port: port)
     }
 
     // MARK: Keychain
