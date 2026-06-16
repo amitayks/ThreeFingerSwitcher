@@ -395,6 +395,13 @@ final class AppCoordinator: GestureRecognizerDelegate {
         refreshRowSwitchingGate()
         refreshClipboardMonitor()
         applySpacesRearrangeOnLaunchIfManaged()
+        // Render the switcher overlay once, off-screen, so the first trigger's continuous open-swipe
+        // animates the reel smoothly instead of stalling on a cold hosting view (first-session only).
+        overlay.prewarm()
+        // Pay ScreenCaptureKit's cold-start cost in the background NOW, so the first switcher session's
+        // captures don't stall the reel slide mid-animation (SCK stays warm process-wide thereafter —
+        // the reason only the first run stutters). No-op without Screen Recording permission.
+        Task { await thumbnails.warmUp() }
         // The First Touch wizard IS the first-run flow: it replaced the four one-shot consent
         // alerts (didPrompt* — set on the wizard's completion so they can never fire) and the
         // open-Hub-on-Setup fallback. Resume-aware: any interruption (relaunch, re-login, plain
@@ -591,8 +598,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
                      aboveMissionControl: missionControlOpen,
                      // Opted in but the relocation hasn't survived its re-login yet: the row dots
                      // dim with a pending glyph so the gated vertical axis explains itself.
-                     rowSwitchingPending: settings.manageVerticalGesture && !isSpaceRowSwitchingEffective)
-        prefetchCurrentRow()
+                     rowSwitchingPending: settings.manageVerticalGesture && !isSpaceRowSwitchingEffective,
+                     windowScale: CGFloat(settings.switcherWindowScale))
+        seedAllRows()         // every Space's cached previews present up front (no first-visit rebuild)
+        prefetchCurrentRow()  // + live capture of the visible Space
         startLivePreview()
     }
 
@@ -631,23 +640,29 @@ final class AppCoordinator: GestureRecognizerDelegate {
 
     func gestureDidStep(_ direction: Int) {
         guard overlay.isVisible else { return }
-        let count = overlay.model.windows.count
-        guard count > 0 else { return }
-        var idx = overlay.selectedColumn + direction
-        if settings.wrapAtEnds {
-            idx = ((idx % count) + count) % count
-        } else {
-            idx = min(max(idx, 0), count - 1)
-        }
-        overlay.updateColumn(idx)
+        guard overlay.model.windows.count > 0 else { return }
+        // Horizontal scrub moves WITHIN the current visual row of the grid (the model clamps/wraps).
+        overlay.moveHorizontal(direction, wrap: settings.wrapAtEnds)
         tickLivePreview()   // re-capture the newly highlighted window now, ahead of the next timer tick
     }
 
     func gestureDidStepRow(_ direction: Int) {
         guard overlay.isVisible else { return }
+        // Vertical scrub navigates the grid's visual rows; only a top/bottom-edge crossing switches Space.
+        switch overlay.moveVertical(direction) {
+        case .moved:
+            tickLivePreview()
+        case .atEdge(let spaceDelta):
+            switchSpace(by: spaceDelta)
+        }
+    }
+
+    /// Switch to an adjacent Space-row (from a grid-edge vertical scrub), clamping or wrapping per the
+    /// setting, and refresh thumbnails/live preview for the new Space exactly as before.
+    private func switchSpace(by delta: Int) {
         let count = overlay.rowCount
         guard count > 1 else { return }
-        var row = overlay.currentRow + direction
+        var row = overlay.currentRow + delta
         if settings.wrapAtEnds {
             row = ((row % count) + count) % count
         } else {
@@ -655,7 +670,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
         }
         guard row != overlay.currentRow else { return }
         overlay.updateRow(row)
-        prefetchCurrentRow()
+        prefetchCurrentRow()   // seed the new Space's CACHED thumbnails now (present for the slide)…
+        // …then freeze: async captures landing during the slide are buffered (so they can't snap it)
+        // and cut in once it settles. Must follow the seed above and precede the captures kicked below.
+        overlay.beginSlideFreeze()
         // The visible window set changed, so the live session's snapshot must be re-enumerated before
         // the next capture; then kick the newly highlighted window immediately.
         Task { await thumbnails.refreshLiveSession() }
@@ -681,6 +699,19 @@ final class AppCoordinator: GestureRecognizerDelegate {
         let windows = overlay.model.windows.filter { $0.id != hubID }
         thumbnails.seed(into: overlay.model, ids: windows.map(\.id))  // instant from cache (no icon-only flash)
         thumbnails.prefetch(windows)                                  // refresh only cleanly-visible windows
+    }
+
+    /// Seed cached thumbnails for EVERY Space's windows the moment the switcher opens — not just the
+    /// current row. The reel already builds every Space's cards eagerly, but their previews were
+    /// otherwise only seeded when a Space first became current, so its cards (and their highlight
+    /// border) re-rendered icon→thumbnail on first visit — the "rebuild on first visible" pop. With all
+    /// Spaces seeded up front, switching to any Space is a pure slide with nothing left to rebuild.
+    /// Off-screen Spaces can't be freshly captured anyway, so cache is their only preview source; the
+    /// seed is idempotent (identical frames don't republish), so re-seeding the current row is free.
+    private func seedAllRows() {
+        let hubID = hubWindow.map { CGWindowID($0.windowNumber) }
+        let allIDs = overlay.model.rows.flatMap { $0 }.map(\.id).filter { $0 != hubID }
+        thumbnails.seed(into: overlay.model, ids: allIDs)
     }
 
     /// Begin the live-preview loop for the open switcher: gated on the opt-in and the overlay actually

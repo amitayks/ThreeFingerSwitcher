@@ -16,7 +16,8 @@ final class SwitcherModelTests: XCTestCase {
     private func makeWindow(
         id: CGWindowID,
         onCurrentSpace: Bool = true,
-        spaceID: CGSSpaceID? = nil
+        spaceID: CGSSpaceID? = nil,
+        realFrame: CGRect = .zero
     ) -> WindowInfo {
         WindowInfo(
             id: id,
@@ -25,11 +26,23 @@ final class SwitcherModelTests: XCTestCase {
             title: "",
             appIcon: nil,
             frame: .zero,
+            realFrame: realFrame,
             axElement: nil,
             isOnCurrentSpace: onCurrentSpace,
             spaceID: spaceID,
             spaceIndex: 0
         )
+    }
+
+    /// A single Space of six square (300x300) windows. With canvas 250x400 the solve packs two cards
+    /// per visual row -> grid rows [[0,1],[2,3],[4,5]] (asserted in the navigation tests below).
+    private func sixSquareGridModel() -> SwitcherModel {
+        let model = SwitcherModel()
+        model.setCanvas(CGSize(width: 250, height: 400))
+        let square = CGRect(x: 0, y: 0, width: 300, height: 300)
+        let windows = (0..<6).map { makeWindow(id: CGWindowID(100 + $0), realFrame: square) }
+        model.setRows([windows], labels: ["1"], startRow: 0, column: 0)
+        return model
     }
 
     /// A 3-row grid: row0 has ids [10,11], row1 has ids [20,21,22], row2 has ids [30].
@@ -420,5 +433,252 @@ final class SwitcherModelTests: XCTestCase {
         XCTAssertTrue(model.thumbnails[1] === imageA)
         XCTAssertTrue(model.thumbnails[2] === imageB)
         XCTAssertEqual(model.thumbnails.count, 2)
+    }
+
+    // MARK: - Thumbnail freeze (per Space-switch slide)
+
+    func testFreezeBuffersThumbnailsInsteadOfPublishing() {
+        // While frozen (the reel slide is animating), a captured thumbnail must NOT publish — else it
+        // re-renders the grid mid-slide and snaps the animation.
+        let model = SwitcherModel()
+        let image = NSImage()
+
+        model.freezeThumbnails()
+        model.setThumbnail(image, for: 42)
+
+        XCTAssertNil(model.thumbnails[42], "a frozen thumbnail is buffered, not published")
+    }
+
+    func testFlushAppliesBufferedThumbnails() {
+        // Once the slide settles the buffered frames cut in together.
+        let model = SwitcherModel()
+        let imageA = NSImage()
+        let imageB = NSImage()
+
+        model.freezeThumbnails()
+        model.setThumbnail(imageA, for: 1)
+        model.setThumbnail(imageB, for: 2)
+        XCTAssertTrue(model.thumbnails.isEmpty, "nothing published while frozen")
+
+        model.flushThumbnails()
+        XCTAssertTrue(model.thumbnails[1] === imageA)
+        XCTAssertTrue(model.thumbnails[2] === imageB)
+    }
+
+    func testSeedBeforeFreezeStaysPublished() {
+        // A cached thumbnail seeded BEFORE the freeze is present for the slide (it slides with the card);
+        // only the captures that arrive after the freeze are buffered.
+        let model = SwitcherModel()
+        let seeded = NSImage()
+        let captured = NSImage()
+
+        model.setThumbnail(seeded, for: 1)   // seed (pre-freeze) -> published
+        model.freezeThumbnails()
+        model.setThumbnail(captured, for: 2) // capture during slide -> buffered
+
+        XCTAssertTrue(model.thumbnails[1] === seeded, "pre-freeze seed stays visible during the slide")
+        XCTAssertNil(model.thumbnails[2], "post-freeze capture is held back")
+
+        model.flushThumbnails()
+        XCTAssertTrue(model.thumbnails[2] === captured)
+    }
+
+    func testFreezeLatestBufferedFrameWinsPerID() {
+        // Two captures of the same window during one slide: the later frame is the one that cuts in.
+        let model = SwitcherModel()
+        let first = NSImage()
+        let second = NSImage()
+
+        model.freezeThumbnails()
+        model.setThumbnail(first, for: 7)
+        model.setThumbnail(second, for: 7)
+        model.flushThumbnails()
+
+        XCTAssertTrue(model.thumbnails[7] === second)
+    }
+
+    func testFlushIsIdempotentAndUnfreezes() {
+        // Flushing with nothing buffered is a no-op, and it clears the frozen flag so later thumbnails
+        // publish normally again.
+        let model = SwitcherModel()
+        model.freezeThumbnails()
+        model.flushThumbnails()                 // nothing buffered
+
+        let image = NSImage()
+        model.setThumbnail(image, for: 5)       // no longer frozen
+        XCTAssertTrue(model.thumbnails[5] === image)
+    }
+
+    func testSetRowsClearsFreezeAndBuffer() {
+        // A fresh show must never inherit a prior slide's freeze or its buffered frames.
+        let model = SwitcherModel()
+        model.freezeThumbnails()
+        model.setThumbnail(NSImage(), for: 99)  // buffered
+
+        model.setRows([[makeWindow(id: 1)]], labels: ["1"], startRow: 0, column: 0)
+
+        let fresh = NSImage()
+        model.setThumbnail(fresh, for: 1)       // should publish (not frozen) and not see id 99
+        XCTAssertTrue(model.thumbnails[1] === fresh)
+        XCTAssertNil(model.thumbnails[99], "stale buffered frame was dropped on re-show")
+    }
+
+    func testSeedThumbnailReplacesOnlyOnDifferentImage() {
+        // Re-seeding the SAME cached frame (e.g. the current row, already seeded for all rows on open)
+        // is a no-op so it doesn't needlessly republish/re-render; a different frame still replaces.
+        let model = SwitcherModel()
+        let a = NSImage()
+        let b = NSImage()
+
+        model.seedThumbnail(a, for: 1)
+        XCTAssertTrue(model.thumbnails[1] === a)
+        model.seedThumbnail(a, for: 1)   // identical re-seed
+        XCTAssertTrue(model.thumbnails[1] === a)
+        model.seedThumbnail(b, for: 1)   // different frame
+        XCTAssertTrue(model.thumbnails[1] === b)
+    }
+
+    func testSeedThumbnailBypassesActiveFreeze() {
+        // The fast-switch fix: a cached seed applied WHILE frozen (a previous switch's slide is still
+        // holding) must publish immediately, so the next Space's cached previews appear the instant it
+        // slides in rather than being withheld until the freeze flushes.
+        let model = SwitcherModel()
+        let cached = NSImage()
+
+        model.freezeThumbnails()
+        model.seedThumbnail(cached, for: 3)
+
+        XCTAssertTrue(model.thumbnails[3] === cached, "seed bypasses the freeze and publishes immediately")
+    }
+
+    func testSeedShownDuringSlideThenBufferedCaptureReplacesOnFlush() {
+        // Seed (cached) is visible for the slide; a live capture of the same window that lands mid-slide
+        // is buffered and replaces the seed only once the slide settles — no mid-slide content change.
+        let model = SwitcherModel()
+        let cached = NSImage()
+        let fresh = NSImage()
+
+        model.freezeThumbnails()
+        model.seedThumbnail(cached, for: 4)   // immediate
+        model.setThumbnail(fresh, for: 4)     // live capture during slide -> buffered
+
+        XCTAssertTrue(model.thumbnails[4] === cached, "cached frame stays visible through the slide")
+
+        model.flushThumbnails()
+        XCTAssertTrue(model.thumbnails[4] === fresh, "fresh capture replaces it after the slide settles")
+    }
+
+    // MARK: - Grid layout setup
+
+    func testGridSolvesTwoPerRow() {
+        // The deterministic six-square setup: two cards per visual row across three rows, stacked
+        // bottom-to-top so the first window (index 0) sits in the BOTTOM row. Visual top-to-bottom order
+        // is [[4,5],[2,3],[0,1]]; entry lands on window 0 at the bottom (currentGridRow == 2).
+        let model = sixSquareGridModel()
+        XCTAssertEqual(model.gridLayout.rows, [[4, 5], [2, 3], [0, 1]])
+        XCTAssertFalse(model.overflow)
+        XCTAssertEqual(model.selectedIndex, 0)
+        XCTAssertEqual(model.currentGridRow, 2)   // first window -> bottom row
+        XCTAssertEqual(model.col, 0)
+    }
+
+    // MARK: - moveHorizontal (within the visual row)
+
+    func testMoveHorizontalAdvancesWithinRow() {
+        let model = sixSquareGridModel()         // entry: bottom row [0,1], selectedIndex 0
+
+        model.moveHorizontal(1, wrap: false)
+
+        XCTAssertEqual(model.selectedIndex, 1)
+        XCTAssertEqual(model.currentGridRow, 2)
+        XCTAssertEqual(model.col, 1)
+    }
+
+    func testMoveHorizontalClampsAtRowEnd() {
+        let model = sixSquareGridModel()
+        model.moveHorizontal(1, wrap: false)   // -> index 1 (last in the bottom row)
+
+        model.moveHorizontal(1, wrap: false)   // clamp: stays on index 1, does NOT jump to another row
+
+        XCTAssertEqual(model.selectedIndex, 1)
+        XCTAssertEqual(model.currentGridRow, 2)
+    }
+
+    func testMoveHorizontalWrapsWithinRowOnly() {
+        let model = sixSquareGridModel()
+        model.moveHorizontal(1, wrap: false)   // index 1 (bottom row col 1)
+
+        model.moveHorizontal(1, wrap: true)    // wraps within the bottom row back to col 0
+
+        XCTAssertEqual(model.selectedIndex, 0)
+        XCTAssertEqual(model.currentGridRow, 2)
+    }
+
+    // MARK: - moveVertical (between rows; edge -> Space switch). First window is in the bottom row, so a
+    // swipe UP walks toward the top edge and a swipe DOWN from the bottom crosses to the previous Space.
+
+    func testMoveVerticalUpMovesToRowAboveFirstCard() {
+        let model = sixSquareGridModel()
+        model.moveHorizontal(1, wrap: false)   // bottom row [0,1], col 1
+
+        let result = model.moveVertical(1)     // up -> the row above
+
+        XCTAssertEqual(result, .moved)
+        XCTAssertEqual(model.currentGridRow, 1)
+        XCTAssertEqual(model.selectedIndex, 2)   // first card of the row above ([2,3])
+        XCTAssertEqual(model.col, 0)
+    }
+
+    func testMoveVerticalDownMovesToRowBelowFirstCard() {
+        let model = sixSquareGridModel()
+        model.setColumn(5)                      // top row [4,5], col 1
+
+        let result = model.moveVertical(-1)     // down -> the row below
+
+        XCTAssertEqual(result, .moved)
+        XCTAssertEqual(model.currentGridRow, 1)
+        XCTAssertEqual(model.selectedIndex, 2)   // first card of the row below ([2,3])
+    }
+
+    func testMoveVerticalUpAtTopRowReportsEdge() {
+        let model = sixSquareGridModel()
+        model.setColumn(4)                      // top row [4,5]
+
+        let result = model.moveVertical(1)      // up past the top
+
+        XCTAssertEqual(result, .atEdge(spaceDelta: 1))
+        XCTAssertEqual(model.selectedIndex, 4)   // selection unchanged
+    }
+
+    func testMoveVerticalDownAtBottomRowReportsEdge() {
+        let model = sixSquareGridModel()        // entry: bottom row [0,1], selectedIndex 0
+
+        let result = model.moveVertical(-1)     // down past the bottom
+
+        XCTAssertEqual(result, .atEdge(spaceDelta: -1))
+        XCTAssertEqual(model.selectedIndex, 0)   // selection unchanged
+    }
+
+    // MARK: - Entering a Space resets to the first window (bottom-left)
+
+    func testSetRowResetsGridToFirstWindowBottomLeft() {
+        // Two Spaces, each six squares; start on Space 0 up in the grid, switch Space -> first window
+        // (bottom-left of the new Space's grid).
+        let model = SwitcherModel()
+        model.setCanvas(CGSize(width: 250, height: 400))
+        let square = CGRect(x: 0, y: 0, width: 300, height: 300)
+        let spaceA = (0..<6).map { makeWindow(id: CGWindowID(100 + $0), spaceID: 1, realFrame: square) }
+        let spaceB = (0..<6).map { makeWindow(id: CGWindowID(200 + $0), spaceID: 2, realFrame: square) }
+        model.setRows([spaceA, spaceB], labels: ["1", "2"], startRow: 0, column: 0)
+        model.setColumn(5)                      // top row of Space 0
+        XCTAssertEqual(model.currentGridRow, 0)
+
+        model.setRow(1)                         // switch to Space 1
+
+        XCTAssertEqual(model.currentRow, 1)
+        XCTAssertEqual(model.selectedIndex, 0)
+        XCTAssertEqual(model.currentGridRow, 2)   // first window sits in the bottom row
+        XCTAssertEqual(model.col, 0)
+        XCTAssertEqual(model.windows.map(\.id).first, 200)
     }
 }

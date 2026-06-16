@@ -2,183 +2,183 @@ import XCTest
 import CoreGraphics
 @testable import ThreeFingerSwitcherCore
 
-/// Tests for `SwitcherLayout.contentWidth(for:withRowIndicator:)`.
-///
-/// The expected numbers are derived from the layout constants (asserted independently below):
-///   cardInnerWidth     = 200
-///   cardPadding        = 8   -> cardOuterWidth = 200 + 2*8       = 216
-///   interCardSpacing   = 14
-///   stripPadding       = 20  -> stripPadding*2                  = 40
-///   rowIndicatorGutter = 26
-///
-/// contentWidth(count) = stripPadding*2
-///                       + (withRowIndicator ? rowIndicatorGutter : 0)
-///                       + count * cardOuterWidth
-///                       + (count - 1) * interCardSpacing       (only when count > 0)
+/// Tests for the uniform-scale grid solve in `SwitcherLayout` (naturalSize / cardSizes / wrap /
+/// solveGrid). The solve gives every window one shared scale applied to its real frame, wraps the
+/// cards into rows that fill the canvas width, and picks the largest scale that still fits the canvas
+/// height (capped at `kMax`, floored per-card at `minCardHeight`).
 final class SwitcherLayoutTests: XCTestCase {
 
-    // Floating-point comparison tolerance; values are integral but keep it robust.
-    private let eps: CGFloat = 1e-9
+    private let eps: CGFloat = 1e-6
 
-    // MARK: - Constant sanity (pins the numbers the width math depends on)
+    // MARK: - naturalSize (D7 fallback chain)
 
-    func testLayoutConstantsHaveExpectedValues() {
-        // Arrange / Act / Assert
-        XCTAssertEqual(SwitcherLayout.cardInnerWidth, 200, accuracy: eps)
-        XCTAssertEqual(SwitcherLayout.cardPadding, 8, accuracy: eps)
-        XCTAssertEqual(SwitcherLayout.interCardSpacing, 14, accuracy: eps)
-        XCTAssertEqual(SwitcherLayout.stripPadding, 20, accuracy: eps)
-        XCTAssertEqual(SwitcherLayout.rowIndicatorGutter, 26, accuracy: eps)
-    }
-
-    func testCardOuterWidthEqualsInnerPlusTwicePadding() {
-        // cardOuterWidth = cardInnerWidth + 2 * cardPadding = 200 + 16 = 216
-        XCTAssertEqual(SwitcherLayout.cardOuterWidth, 216, accuracy: eps)
-        XCTAssertEqual(
-            SwitcherLayout.cardOuterWidth,
-            SwitcherLayout.cardInnerWidth + 2 * SwitcherLayout.cardPadding,
-            accuracy: eps
+    func testNaturalSizePrefersRealFrame() {
+        let n = SwitcherLayout.naturalSize(
+            realFrame: CGRect(x: 0, y: 0, width: 1600, height: 900),
+            frame: CGRect(x: 0, y: 0, width: 200, height: 100)
         )
+        XCTAssertEqual(n.width, 1600, accuracy: eps)
+        XCTAssertEqual(n.height, 900, accuracy: eps)
     }
 
-    // MARK: - count == 0
-
-    func testCountZeroWithoutRowIndicatorReturnsJustStripPadding() {
-        // stripPadding*2 = 40, no gutter, no cards.
-        let width = SwitcherLayout.contentWidth(for: 0)
-        XCTAssertEqual(width, 40, accuracy: eps)
-    }
-
-    func testCountZeroWithRowIndicatorAddsGutter() {
-        // stripPadding*2 + rowIndicatorGutter = 40 + 26 = 66.
-        let width = SwitcherLayout.contentWidth(for: 0, withRowIndicator: true)
-        XCTAssertEqual(width, 66, accuracy: eps)
-    }
-
-    func testCountZeroDefaultParameterMatchesExplicitFalse() {
-        // Default value of withRowIndicator is false.
-        XCTAssertEqual(
-            SwitcherLayout.contentWidth(for: 0),
-            SwitcherLayout.contentWidth(for: 0, withRowIndicator: false),
-            accuracy: eps
+    func testNaturalSizeFallsBackToDisplayedFrame() {
+        let n = SwitcherLayout.naturalSize(
+            realFrame: .zero,
+            frame: CGRect(x: 0, y: 0, width: 640, height: 480)
         )
+        XCTAssertEqual(n.width, 640, accuracy: eps)
+        XCTAssertEqual(n.height, 480, accuracy: eps)
     }
 
-    // MARK: - count == 1
-
-    func testCountOneWithoutRowIndicator() {
-        // 40 + 1*216 + 0*14 = 256.
-        let width = SwitcherLayout.contentWidth(for: 1)
-        XCTAssertEqual(width, 256, accuracy: eps)
+    func testNaturalSizeDefaultsWhenNoUsableFrame() {
+        let n = SwitcherLayout.naturalSize(realFrame: .zero, frame: .zero)
+        XCTAssertEqual(n, SwitcherLayout.defaultNaturalSize)
     }
 
-    func testCountOneWithRowIndicator() {
-        // 40 + 26 + 1*216 + 0*14 = 282.
-        let width = SwitcherLayout.contentWidth(for: 1, withRowIndicator: true)
-        XCTAssertEqual(width, 282, accuracy: eps)
+    // MARK: - cardSizes (uniform scale + floor)
+
+    func testCardSizesApplyUniformScale() {
+        let naturals = [CGSize(width: 1000, height: 800), CGSize(width: 500, height: 400)]
+        let sizes = SwitcherLayout.cardSizes(naturals: naturals, scale: 0.3)
+        XCTAssertEqual(sizes[0].width, 300, accuracy: eps)
+        XCTAssertEqual(sizes[0].height, 240, accuracy: eps)
+        XCTAssertEqual(sizes[1].width, 150, accuracy: eps)
+        XCTAssertEqual(sizes[1].height, 120, accuracy: eps)
     }
 
-    func testCountOneRowIndicatorDeltaIsExactlyGutter() {
-        // Turning the indicator on adds exactly rowIndicatorGutter (26) regardless of count.
-        let off = SwitcherLayout.contentWidth(for: 1, withRowIndicator: false)
-        let on = SwitcherLayout.contentWidth(for: 1, withRowIndicator: true)
-        XCTAssertEqual(on - off, SwitcherLayout.rowIndicatorGutter, accuracy: eps)
+    func testCardSizesFloorWidensProportionally() {
+        // 400x300 at scale 0.1 -> 40x30; height floors to minCardHeight, width scales by the same factor
+        // so the aspect (4:3) is preserved.
+        let sizes = SwitcherLayout.cardSizes(naturals: [CGSize(width: 400, height: 300)], scale: 0.1)
+        XCTAssertEqual(sizes[0].height, SwitcherLayout.minCardHeight, accuracy: eps)
+        let aspect = sizes[0].width / sizes[0].height
+        XCTAssertEqual(aspect, 400.0 / 300.0, accuracy: 1e-3)
     }
 
-    // MARK: - count == 2 (smallest case exercising interCardSpacing)
+    // MARK: - wrap (row breaks + content size)
 
-    func testCountTwoWithoutRowIndicator() {
-        // 40 + 2*216 + 1*14 = 40 + 432 + 14 = 486.
-        let width = SwitcherLayout.contentWidth(for: 2)
-        XCTAssertEqual(width, 486, accuracy: eps)
+    func testWrapBreaksRowsAtCanvasWidth() {
+        // Four 96-wide cards, spacing 16, canvas 250: 96 + 16 + 96 = 208 fits two; a third would be
+        // 208 + 16 + 96 = 320 > 250 -> wraps. So two per row.
+        let sizes = Array(repeating: CGSize(width: 96, height: 96), count: 4)
+        let (rows, content) = SwitcherLayout.wrap(sizes: sizes, canvasWidth: 250)
+        XCTAssertEqual(rows, [[0, 1], [2, 3]])
+        // content width = widest row = 96 + 16 + 96 = 208; height = 2 bands of 96 + one rowSpacing.
+        XCTAssertEqual(content.width, 208, accuracy: eps)
+        XCTAssertEqual(content.height, 96 * 2 + SwitcherLayout.gridRowSpacing, accuracy: eps)
     }
 
-    func testCountTwoWithRowIndicator() {
-        // 486 + 26 = 512.
-        let width = SwitcherLayout.contentWidth(for: 2, withRowIndicator: true)
-        XCTAssertEqual(width, 512, accuracy: eps)
+    func testWrapKeepsOrderAndSingleRowWhenItFits() {
+        let sizes = Array(repeating: CGSize(width: 96, height: 96), count: 3)
+        let (rows, _) = SwitcherLayout.wrap(sizes: sizes, canvasWidth: 1000)
+        XCTAssertEqual(rows, [[0, 1, 2]])
     }
 
-    // MARK: - count == N (general case)
-
-    func testCountFiveWithoutRowIndicator() {
-        // 40 + 5*216 + 4*14 = 40 + 1080 + 56 = 1176.
-        let width = SwitcherLayout.contentWidth(for: 5)
-        XCTAssertEqual(width, 1176, accuracy: eps)
+    func testWrapEmptyIsEmpty() {
+        let (rows, content) = SwitcherLayout.wrap(sizes: [], canvasWidth: 500)
+        XCTAssertTrue(rows.isEmpty)
+        XCTAssertEqual(content, .zero)
     }
 
-    func testCountFiveWithRowIndicator() {
-        // 1176 + 26 = 1202.
-        let width = SwitcherLayout.contentWidth(for: 5, withRowIndicator: true)
-        XCTAssertEqual(width, 1202, accuracy: eps)
+    // MARK: - wrap: balanced rows (minimax partition, not greedy)
+
+    func testWrapBalancesLonelyLastRow() {
+        // Five 96-wide cards in a canvas that fits four (96*4 + 16*3 = 432 <= 440, a fifth overflows):
+        // greedy would give a lonely [4][1]; balanced gives [3][2].
+        let sizes = Array(repeating: CGSize(width: 96, height: 96), count: 5)
+        let (rows, _) = SwitcherLayout.wrap(sizes: sizes, canvasWidth: 440)
+        XCTAssertEqual(rows, [[0, 1, 2], [3, 4]])
     }
 
-    func testCountTenWithoutRowIndicator() {
-        // 40 + 10*216 + 9*14 = 40 + 2160 + 126 = 2326.
-        let width = SwitcherLayout.contentWidth(for: 10)
-        XCTAssertEqual(width, 2326, accuracy: eps)
+    func testWrapNineCardsBalanceToThreeEvenRows() {
+        // Nine cards that fit four per row: greedy [4][4][1] -> balanced [3][3][3].
+        let sizes = Array(repeating: CGSize(width: 96, height: 96), count: 9)
+        let (rows, _) = SwitcherLayout.wrap(sizes: sizes, canvasWidth: 440)
+        XCTAssertEqual(rows, [[0, 1, 2], [3, 4, 5], [6, 7, 8]])
     }
 
-    func testCountTenWithRowIndicator() {
-        // 2326 + 26 = 2352.
-        let width = SwitcherLayout.contentWidth(for: 10, withRowIndicator: true)
-        XCTAssertEqual(width, 2352, accuracy: eps)
+    func testWrapLeavesAlreadyEvenRowsAlone() {
+        // Eight cards, four per row: greedy [4][4] is already balanced and is left unchanged.
+        let sizes = Array(repeating: CGSize(width: 96, height: 96), count: 8)
+        let (rows, _) = SwitcherLayout.wrap(sizes: sizes, canvasWidth: 440)
+        XCTAssertEqual(rows, [[0, 1, 2, 3], [4, 5, 6, 7]])
     }
 
-    // MARK: - Formula cross-checks (independent recomputation from the constants)
-
-    func testWidthMatchesFormulaAcrossRange() {
-        let strip = SwitcherLayout.stripPadding * 2
-        let outer = SwitcherLayout.cardOuterWidth
-        let inter = SwitcherLayout.interCardSpacing
-        let gutter = SwitcherLayout.rowIndicatorGutter
-
-        for count in 1...12 {
-            let n = CGFloat(count)
-            let expectedNoGutter = strip + n * outer + (n - 1) * inter
-            let expectedWithGutter = expectedNoGutter + gutter
-
-            XCTAssertEqual(
-                SwitcherLayout.contentWidth(for: count, withRowIndicator: false),
-                expectedNoGutter,
-                accuracy: eps,
-                "count=\(count) without row indicator"
-            )
-            XCTAssertEqual(
-                SwitcherLayout.contentWidth(for: count, withRowIndicator: true),
-                expectedWithGutter,
-                accuracy: eps,
-                "count=\(count) with row indicator"
-            )
-        }
+    func testWrapLeavesFineSingleRowAlone() {
+        // Four cards that all fit one row stay a single row (minimum rows == 1: never force a break).
+        let sizes = Array(repeating: CGSize(width: 96, height: 96), count: 4)
+        let (rows, _) = SwitcherLayout.wrap(sizes: sizes, canvasWidth: 440)
+        XCTAssertEqual(rows, [[0, 1, 2, 3]])
     }
 
-    func testRowIndicatorDeltaIsConstantGutterForAllCounts() {
-        for count in 0...8 {
-            let off = SwitcherLayout.contentWidth(for: count, withRowIndicator: false)
-            let on = SwitcherLayout.contentWidth(for: count, withRowIndicator: true)
-            XCTAssertEqual(
-                on - off,
-                SwitcherLayout.rowIndicatorGutter,
-                accuracy: eps,
-                "row-indicator delta should equal the gutter for count=\(count)"
-            )
-        }
+    // MARK: - solveGrid
+
+    func testSolvePreservesRelativeSizesWithOneScale() {
+        // A 1000x1000 and a 500x500 window in a roomy canvas: both at one scale -> 2:1 in both dims.
+        let naturals = [CGSize(width: 1000, height: 1000), CGSize(width: 500, height: 500)]
+        let layout = SwitcherLayout.solveGrid(naturals: naturals, canvas: CGSize(width: 2000, height: 600))
+        XCTAssertEqual(layout.sizes[0].width / layout.sizes[1].width, 2, accuracy: 1e-3)
+        XCTAssertEqual(layout.sizes[0].height / layout.sizes[1].height, 2, accuracy: 1e-3)
+        XCTAssertFalse(layout.overflowsVertically)
     }
 
-    func testWidthIsStrictlyMonotonicInCount() {
-        // Each additional card adds cardOuterWidth + interCardSpacing once count >= 1.
-        var previous = SwitcherLayout.contentWidth(for: 1)
-        for count in 2...12 {
-            let current = SwitcherLayout.contentWidth(for: count)
-            XCTAssertGreaterThan(current, previous, "width must increase with count (count=\(count))")
-            XCTAssertEqual(
-                current - previous,
-                SwitcherLayout.cardOuterWidth + SwitcherLayout.interCardSpacing,
-                accuracy: eps,
-                "per-card increment should be cardOuterWidth + interCardSpacing (count=\(count))"
-            )
-            previous = current
-        }
+    func testSolveCapsAtKMax() {
+        // One window, huge canvas: scale is capped at kMax (won't balloon to fill).
+        let layout = SwitcherLayout.solveGrid(
+            naturals: [CGSize(width: 1000, height: 800)],
+            canvas: CGSize(width: 4000, height: 3000)
+        )
+        XCTAssertEqual(layout.scale, SwitcherLayout.kMax, accuracy: 1e-3)
+        XCTAssertEqual(layout.sizes[0].height, 800 * SwitcherLayout.kMax, accuracy: 1e-2)
+    }
+
+    func testSolveFloorsTinyWindowToMinCardHeight() {
+        // A 100x100 window at kMax is 32pt tall -> floored to the readable minimum.
+        let layout = SwitcherLayout.solveGrid(
+            naturals: [CGSize(width: 100, height: 100)],
+            canvas: CGSize(width: 2000, height: 2000)
+        )
+        XCTAssertEqual(layout.sizes[0].height, SwitcherLayout.minCardHeight, accuracy: eps)
+    }
+
+    func testSolveProducesKnownGrid() {
+        // Six 300x300 windows, canvas 250 wide x 400 tall: at kMax each card is 96x96 (300*0.32),
+        // two fit per row, three rows fit the height. Stacked bottom-to-top (the first window lands in
+        // the bottom row), visual top-to-bottom order is [[4,5],[2,3],[0,1]], no overflow.
+        let naturals = Array(repeating: CGSize(width: 300, height: 300), count: 6)
+        let layout = SwitcherLayout.solveGrid(naturals: naturals, canvas: CGSize(width: 250, height: 400))
+        XCTAssertEqual(layout.rows, [[4, 5], [2, 3], [0, 1]])
+        XCTAssertEqual(layout.scale, SwitcherLayout.kMax, accuracy: 1e-3)
+        XCTAssertFalse(layout.overflowsVertically)
+    }
+
+    func testSolveFlagsVerticalOverflow() {
+        // Ten 300x300 windows, two per row -> five rows of >=96pt bands cannot fit a 100pt-tall canvas
+        // even at the floor: overflow flagged so the view scrolls.
+        let naturals = Array(repeating: CGSize(width: 300, height: 300), count: 10)
+        let layout = SwitcherLayout.solveGrid(naturals: naturals, canvas: CGSize(width: 250, height: 100))
+        XCTAssertTrue(layout.overflowsVertically)
+        XCTAssertGreaterThan(layout.contentSize.height, 100)
+    }
+
+    func testSolveEmptyForNoWindows() {
+        let layout = SwitcherLayout.solveGrid(naturals: [], canvas: CGSize(width: 800, height: 600))
+        XCTAssertEqual(layout, .empty)
+    }
+
+    // MARK: - Configurable window size (the Hub "Window size" slider)
+
+    func testSolveHonorsMaxScale() {
+        // One window in a roomy canvas: the scale equals the supplied cap, so a larger cap -> bigger
+        // cards and a smaller cap -> smaller cards (the slider's lever).
+        let naturals = [CGSize(width: 1000, height: 800)]
+        let canvas = CGSize(width: 4000, height: 3000)
+
+        let big = SwitcherLayout.solveGrid(naturals: naturals, canvas: canvas, maxScale: 0.40)
+        let small = SwitcherLayout.solveGrid(naturals: naturals, canvas: canvas, maxScale: 0.12)
+
+        XCTAssertEqual(big.scale, 0.40, accuracy: 1e-3)
+        XCTAssertEqual(small.scale, 0.12, accuracy: 1e-3)
+        XCTAssertGreaterThan(big.sizes[0].height, small.sizes[0].height)
     }
 }

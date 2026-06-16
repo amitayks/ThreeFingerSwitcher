@@ -15,6 +15,11 @@ struct SwitcherPage: View {
             HubSection {
                 ToggleRow(title: "Enable the window switcher", isOn: $settings.enabled)
             }
+            HubSection("Appearance") {
+                LabeledSlider(title: "Window size", value: $settings.switcherWindowScale,
+                              range: 0.5...2.0, format: "%.2f×",
+                              help: "Relative size of the window previews in the switcher grid. Larger renders bigger cards; smaller packs more in. Windows keep their true relative proportions.")
+            }
             HubSection("Sensitivity") {
                 LabeledSlider(title: "Activation threshold", value: $settings.activationThreshold,
                               range: 0.01...0.15, format: "%.3f",

@@ -90,6 +90,10 @@ final class AppSettings: ObservableObject {
     /// EMA smoothing factor (0..1) for centroid velocity. Higher = snappier, lower = smoother.
     @Published var velocitySmoothing: Double { didSet { persist(velocitySmoothing, Keys.velocitySmoothing) } }
 
+    /// Relative size of the windows in the switcher grid: a multiplier on the uniform-scale cap
+    /// (`SwitcherLayout.kMax`). 1.0 = default; larger renders the cards bigger, smaller more compact.
+    @Published var switcherWindowScale: Double { didSet { persist(switcherWindowScale, Keys.switcherWindowScale) } }
+
     /// Require exactly three fingers (true) vs. three-or-more (false).
     @Published var requireExactlyThree: Bool { didSet { defaults.set(requireExactlyThree, forKey: Keys.requireExactlyThree) } }
 
@@ -367,6 +371,7 @@ final class AppSettings: ObservableObject {
         wrapAtEnds = defaults.object(forKey: Keys.wrapAtEnds) as? Bool ?? Defaults.wrapAtEnds
         reverseDirection = defaults.object(forKey: Keys.reverseDirection) as? Bool ?? Defaults.reverseDirection
         velocitySmoothing = defaults.object(forKey: Keys.velocitySmoothing) as? Double ?? Defaults.velocitySmoothing
+        switcherWindowScale = defaults.object(forKey: Keys.switcherWindowScale) as? Double ?? Defaults.switcherWindowScale
         requireExactlyThree = defaults.object(forKey: Keys.requireExactlyThree) as? Bool ?? Defaults.requireExactlyThree
         rowStepDistance = defaults.object(forKey: Keys.rowStepDistance) as? Double ?? Defaults.rowStepDistance
         reverseVerticalDirection = defaults.object(forKey: Keys.reverseVerticalDirection) as? Bool ?? Defaults.reverseVerticalDirection
@@ -421,6 +426,7 @@ final class AppSettings: ObservableObject {
         wrapAtEnds = Defaults.wrapAtEnds
         reverseDirection = Defaults.reverseDirection
         velocitySmoothing = Defaults.velocitySmoothing
+        switcherWindowScale = Defaults.switcherWindowScale
         requireExactlyThree = Defaults.requireExactlyThree
         rowStepDistance = Defaults.rowStepDistance
         reverseVerticalDirection = Defaults.reverseVerticalDirection
@@ -476,6 +482,7 @@ final class AppSettings: ObservableObject {
         static let wrapAtEnds = false
         static let reverseDirection = false
         static let velocitySmoothing = 0.35
+        static let switcherWindowScale = 0.60    // 0.60× of SwitcherLayout.kMax
         static let requireExactlyThree = true
         static let rowStepDistance = 0.06       // 2× the horizontal step; deliberate up/down
         static let reverseVerticalDirection = false
@@ -535,6 +542,7 @@ final class AppSettings: ObservableObject {
         static let wrapAtEnds = "wrapAtEnds"
         static let reverseDirection = "reverseDirection"
         static let velocitySmoothing = "velocitySmoothing"
+        static let switcherWindowScale = "switcherWindowScale"
         static let requireExactlyThree = "requireExactlyThree"
         static let rowStepDistance = "rowStepDistance"
         static let reverseVerticalDirection = "reverseVerticalDirection"

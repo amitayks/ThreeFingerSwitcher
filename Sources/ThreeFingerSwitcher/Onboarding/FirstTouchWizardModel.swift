@@ -257,6 +257,11 @@ final class FirstTouchWizardModel: ObservableObject {
 
     // MARK: - Act I: the demo strip
 
+    /// The canvas the demo grid solves into — sized to the wizard's demo strip (the `SwitcherView` is
+    /// framed at ~`panelHeight * 0.85`, minus the grid's padding/title chrome) so the sample windows
+    /// land as one clean row rather than wrapping or clipping.
+    nonisolated static let demoCanvas = CGSize(width: 820, height: 108)
+
     /// Stylized sample "windows" — art, not fake apps — so the strip is alive before any permission.
     private func seedSampleDemo() {
         let cards: [(String, NSColor, NSColor)] = [
@@ -270,6 +275,7 @@ final class FirstTouchWizardModel: ObservableObject {
                        appIcon: nil, frame: .zero, axElement: nil,
                        isOnCurrentSpace: true, spaceID: nil, spaceIndex: 0)
         }
+        demo.setCanvas(Self.demoCanvas)   // size the grid solve to the wizard's demo strip
         demo.setRows([windows], labels: ["1"], startRow: 0, column: 1)
         for (index, card) in cards.enumerated() {
             demo.setThumbnail(Self.gradientArt(from: card.1, to: card.2), for: CGWindowID(910_000 + index))
@@ -292,6 +298,7 @@ final class FirstTouchWizardModel: ObservableObject {
         guard let row = rows.first, !row.isEmpty else { return }
         demoShowsRealWindows = true
         sceneUpgradePulse += 1   // the light sweep rides the cards' transformation
+        demo.setCanvas(Self.demoCanvas)   // keep the grid solve sized to the wizard's demo strip
         withAnimation(.easeInOut(duration: 0.32)) {
             demo.setRows([Array(row.prefix(4))], labels: ["1"], startRow: 0,
                          column: min(1, max(0, row.count - 1)))

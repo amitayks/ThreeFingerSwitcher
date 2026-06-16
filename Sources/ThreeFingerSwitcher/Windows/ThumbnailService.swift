@@ -14,7 +14,10 @@ final class ThumbnailService {
     private var cache: [CGWindowID: NSImage] = [:]
     private var cacheOrder: [CGWindowID] = []
     private let cacheLimit = 64
-    private let thumbnailMaxSize = CGSize(width: 320, height: 200)
+    /// Pixel budget for a captured thumbnail. Captures run at the window's NATIVE (Retina) resolution
+    /// capped to this, so a thumbnail downscaled into a large grid card stays sharp like Mission Control
+    /// rather than upscaling a small bitmap. (Was 320×200 — too soft for the window grid's larger cards.)
+    private let thumbnailMaxSize = CGSize(width: 1100, height: 700)
 
     private var inFlight: Set<CGWindowID> = []
 
@@ -33,11 +36,38 @@ final class ThumbnailService {
 
     func cached(_ id: CGWindowID) -> NSImage? { cache[id] }
 
+    /// Pay ScreenCaptureKit's one-time cold-start cost — framework init + XPC handshake + the first
+    /// `SCShareableContent` enumeration + the first `SCScreenshotManager` capture — in the BACKGROUND at
+    /// launch, so the FIRST switcher session doesn't stall mid-reel-slide on it (the first-run-only
+    /// stutter; SCK then stays warm for the whole process lifetime, which is why every later session is
+    /// smooth). No-op without Screen Recording permission (the live path re-tries on real use). The one
+    /// throwaway capture is tiny and discarded — it exists only to warm the screenshot pipeline, not the
+    /// cache. Best-effort: every failure is swallowed.
+    func warmUp() async {
+        guard CGPreflightScreenCaptureAccess() else { return }
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            guard let w = content.windows.first(where: { $0.windowLayer == 0 && $0.frame.width > 1 }) else { return }
+            let config = SCStreamConfiguration()
+            config.width = 32
+            config.height = 32
+            config.showsCursor = false
+            config.ignoreShadowsSingleWindow = true
+            let filter = SCContentFilter(desktopIndependentWindow: w)
+            _ = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+        } catch {
+            // Best-effort warmup; the real capture paths re-enumerate and re-try on use.
+        }
+    }
+
     /// Apply any cached thumbnails to the model immediately, so repeat showings render the
     /// preview instantly (instead of icon-only) while a fresh capture is in flight.
     func seed(into model: SwitcherModel, ids: [CGWindowID]) {
         for id in ids {
-            if let image = cache[id] { model.setThumbnail(image, for: id) }
+            // Seed via the immediate path: a cached frame must show the instant the Space slides in, even
+            // while a prior switch's slide freeze still holds (fast consecutive switches) — only LIVE
+            // captures landing mid-slide are the ones the freeze buffers.
+            if let image = cache[id] { model.seedThumbnail(image, for: id) }
         }
     }
 
@@ -250,18 +280,20 @@ final class ThumbnailService {
         }
     }
 
-    /// Shared single-window screenshot configuration used by both `capture` and `liveCapture`: scale
-    /// the window down to fit `thumbnailMaxSize`, no cursor, no surrounding shadow. Behavior-identical
-    /// across both paths so the fast live capture matches the enumeration capture pixel-for-pixel.
+    /// Shared single-window screenshot configuration used by both `capture` and `liveCapture`: capture
+    /// at the window's NATIVE (Retina) pixel resolution — `frame` (points) × the display's backing
+    /// scale — capped to `thumbnailMaxSize`, no cursor, no surrounding shadow. Capturing at native
+    /// pixels (not point size) keeps the thumbnail sharp when it is downscaled into a large grid card,
+    /// like Mission Control's live thumbnails. Behavior-identical across both paths so the fast live
+    /// capture matches the enumeration capture pixel-for-pixel.
     private func streamConfiguration(for scWindow: SCWindow) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
-        let scale = min(
-            thumbnailMaxSize.width / max(scWindow.frame.width, 1),
-            thumbnailMaxSize.height / max(scWindow.frame.height, 1),
-            1
-        )
-        config.width = max(Int(scWindow.frame.width * scale), 1)
-        config.height = max(Int(scWindow.frame.height * scale), 1)
+        let backing = NSScreen.main?.backingScaleFactor ?? 2
+        let nativeW = max(scWindow.frame.width * backing, 1)
+        let nativeH = max(scWindow.frame.height * backing, 1)
+        let fit = min(thumbnailMaxSize.width / nativeW, thumbnailMaxSize.height / nativeH, 1)
+        config.width = max(Int(nativeW * fit), 1)
+        config.height = max(Int(nativeH * fit), 1)
         config.showsCursor = false
         config.ignoreShadowsSingleWindow = true
         return config
