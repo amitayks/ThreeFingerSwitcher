@@ -78,6 +78,18 @@ final class DockHoverModel {
         return .open(pid: pid)
     }
 
+    /// A right-click at `cursor`: if it landed on a Dock app tile, the user is invoking that tile's native
+    /// action menu, which should own the stage — signal the controller to dismiss any popup and suppress
+    /// re-opening (whether or not a popup is currently shown, so it can't pop back up *behind* the menu).
+    /// A click off all tiles (the popup, the desktop) is a no-op, leaving the normal live-zone / grace
+    /// behavior in charge. Pure: the controller performs the teardown and suppression.
+    func rightClick(at cursor: CGPoint, tiles: [DockTile]) -> Decision {
+        guard Self.tile(at: cursor, in: tiles) != nil else { return .idle }
+        state = .idle
+        graceDeadline = nil
+        return .dismiss
+    }
+
     /// Force back to idle (e.g. the feature was disabled, or the user committed a window).
     func reset() {
         state = .idle

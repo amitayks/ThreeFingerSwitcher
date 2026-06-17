@@ -84,12 +84,20 @@ final class DockPreviewOverlayController {
     var isVisible: Bool { panel?.isVisible ?? false }
     var frame: CGRect { panel?.frame ?? .zero }
 
-    /// Show (or move) the popup at `rect`.
+    /// Show the popup at `rect` and order it to the front — for open / app-swap only.
     func show(at rect: CGRect) {
         let panel = self.panel ?? makePanel()
         self.panel = panel
         panel.setFrame(rect, display: true)
         panel.orderFrontRegardless()
+    }
+
+    /// Reposition the already-visible popup WITHOUT re-ordering it to the front — for the per-frame
+    /// reanchor (tracking magnification / tile motion). Re-fronting on every tick would yank the panel
+    /// back above a native Dock menu that the user just opened with a right-click; `setFrame` alone
+    /// leaves the z-order untouched. No-op if the panel was never created.
+    func move(to rect: CGRect) {
+        panel?.setFrame(rect, display: true)
     }
 
     /// Synchronous teardown (no deferred close — Space-switch ghost landmine).

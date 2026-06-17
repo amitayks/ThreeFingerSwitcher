@@ -35,6 +35,10 @@ final class DockPreviewController {
     private var snapshot: DockSnapshot?
     private var shownPID: pid_t?
     private var emptyPID: pid_t?
+    /// The tile whose native action menu we just opened with a right-click. While the cursor lingers on
+    /// this tile we suppress re-showing the popup (so a stray move doesn't pop it back up behind the open
+    /// menu); cleared the moment the cursor leaves the tile.
+    private var menuSuppressedPID: pid_t?
     private var currentWindows: [WindowInfo] = []
     private var lastCommitID: CGWindowID?
     /// Hover/dock-read/grace loop (AX-heavy, coarse cadence). The tab image is a one-shot static capture.
@@ -79,10 +83,12 @@ final class DockPreviewController {
         enabled = on
         if on {
             cursor.onMove = { [weak self] point in self?.handleCursor(point) }
+            cursor.onRightClick = { [weak self] point in self?.handleRightClick(point) }
             cursor.start()
         } else {
             cursor.stop()
             cursor.onMove = nil
+            cursor.onRightClick = nil
             dismiss()
         }
     }
@@ -97,6 +103,15 @@ final class DockPreviewController {
         let snap = reader.read()
         snapshot = snap
         let tiles = snap?.tiles ?? []
+
+        // Right-click suppression: while the cursor still rests on the tile whose native menu we just
+        // opened, do nothing — don't feed the hover model, don't re-show the popup (it would appear behind
+        // the menu). The moment the cursor leaves that tile, clear it and resume normal hover tracking.
+        if let pid = menuSuppressedPID {
+            if tiles.first(where: { $0.pid == pid })?.frame.contains(point) == true { return }
+            menuSuppressedPID = nil
+        }
+
         let popupFrame = overlay.isVisible ? overlay.frame : nil
         let decision = hover.feed(cursor: point, tiles: tiles, popupFrame: popupFrame, now: now())
 
@@ -116,6 +131,21 @@ final class DockPreviewController {
         }
 
         manageHoverTimer()
+    }
+
+    /// A right-click landed somewhere. If the preview is open and the click hit a Dock app tile, the user
+    /// is opening that tile's native action menu — dismiss the preview (restoring any peeked window) so
+    /// the menu owns the stage. The click itself is never consumed (passive monitor), so the native menu
+    /// opens unmodified.
+    private func handleRightClick(_ point: CGPoint) {
+        guard enabled else { return }
+        let tiles = reader.read()?.tiles ?? snapshot?.tiles ?? []
+        guard hover.rightClick(at: point, tiles: tiles) == .dismiss,
+              let pid = DockHoverModel.tile(at: point, in: tiles)?.pid else { return }
+        if overlay.isVisible { dismiss(restore: true) }
+        // The tile's native action menu is now opening; keep the popup closed for this tile until the
+        // cursor leaves it, so a stray move (cursor still on the icon) doesn't re-show it behind the menu.
+        menuSuppressedPID = pid
     }
 
     /// Open (or swap to) the preview for `pid`: enumerate its current-Space windows (incl. minimized),
@@ -177,7 +207,7 @@ final class DockPreviewController {
                                           maxWidth: snap.screenFrame.width)
         let anchor = DockHoverModel.anchorRect(for: tile.frame, orientation: snap.orientation,
                                                popupSize: size, screenFrame: snap.screenFrame)
-        overlay.show(at: anchor)
+        overlay.move(to: anchor)        // reposition only — never re-front (would stomp the native menu)
     }
 
     // MARK: - Peek & commit
@@ -249,6 +279,7 @@ final class DockPreviewController {
         currentWindows = []
         shownPID = nil
         emptyPID = nil
+        menuSuppressedPID = nil
         peekedID = nil
         restoreTarget = nil
         hover.reset()

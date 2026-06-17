@@ -134,4 +134,36 @@ final class DockHoverModelTests: XCTestCase {
         // Grace must have been cleared: a later sample past the OLD deadline still stays open.
         XCTAssertEqual(m.feed(cursor: CGPoint(x: 100, y: 120), tiles: tilesFixture, popupFrame: popup, now: 0.40), .open(pid: 1))
     }
+
+    // MARK: - Right-click yields to the native menu
+
+    func test_rightClick_overTileWhileOpen_dismisses() {
+        let m = DockHoverModel()
+        _ = m.feed(cursor: CGPoint(x: 25, y: 25), tiles: tilesFixture, popupFrame: nil, now: 0)  // open on tile 1
+        XCTAssertEqual(m.rightClick(at: CGPoint(x: 25, y: 25), tiles: tilesFixture), .dismiss)
+        XCTAssertEqual(m.state, .idle)
+    }
+
+    func test_rightClick_overAnotherTileWhileOpen_dismisses() {
+        // Right-clicking a different app's tile (its native menu is opening) also yields the popup.
+        let m = DockHoverModel()
+        _ = m.feed(cursor: CGPoint(x: 25, y: 25), tiles: tilesFixture, popupFrame: nil, now: 0)  // open on tile 1
+        XCTAssertEqual(m.rightClick(at: CGPoint(x: 85, y: 25), tiles: tilesFixture), .dismiss)    // tile 2
+    }
+
+    func test_rightClick_offAnyTile_isNoOp() {
+        let m = DockHoverModel()
+        _ = m.feed(cursor: CGPoint(x: 25, y: 25), tiles: tilesFixture, popupFrame: nil, now: 0)
+        // A right-click on the popup / empty space is not the tile menu → the popup stays open.
+        XCTAssertEqual(m.rightClick(at: CGPoint(x: 500, y: 500), tiles: tilesFixture), .idle)
+        XCTAssertEqual(m.state, .active(pid: 1))
+    }
+
+    func test_rightClick_onTileWhenNothingOpen_actsToSuppress() {
+        // Even with no popup open, a right-click on a tile signals dismiss/suppress, so the popup can't
+        // pop up behind the just-opened native menu on the next cursor move.
+        let m = DockHoverModel()
+        XCTAssertEqual(m.rightClick(at: CGPoint(x: 25, y: 25), tiles: tilesFixture), .dismiss)
+        XCTAssertEqual(m.state, .idle)
+    }
 }
