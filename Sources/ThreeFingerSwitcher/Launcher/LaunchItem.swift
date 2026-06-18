@@ -204,6 +204,25 @@ enum LaunchItemKind: Codable, Equatable {
     /// streaming preview canvas — it does NOT dismiss the overlay or complete on the lift. (Unlike
     /// `.clipboardEntry`, which remains synthetic/ephemeral — clipboard entries are captured data.)
     case aiCommand(AICommand)
+    /// A folder-bound "Open Claude Here" item. **Persisted, first-class band item** (like `.aiCommand`,
+    /// NOT synthetic like `.fileEntry`): authored on the Hub's Bands page and stored in the `Favorites`
+    /// record, so it can live in any band and move between bands. Firing it opens the user's default
+    /// terminal at `folder` and runs `command` — fire-and-forget, no mid-gesture picker.
+    /// `command` is the shell command(s) to run after `cd`-ing into the folder; **nil/empty means the
+    /// default, a bare `claude` session** — set it to configure the launch (e.g. `claude --resume`, or
+    /// extra setup lines), editable in the inspector like a `.script`. `claudePath` is the absolute path
+    /// to `claude` resolved at setup, used to run the exact binary for the *default* command (so it works
+    /// even if `claude` isn't on PATH); a custom `command` is run as written. Both are **Optional** so the
+    /// synthesized decoder uses `decodeIfPresent` and a record written before they existed still decodes
+    /// (the `.url`/`.action` precedent). See `ClaudeLauncher` for the no-new-permission terminal handoff.
+    case claudeProject(folder: URL, command: String? = nil, claudePath: String? = nil)
+    /// A folder-bound "Open in Terminal" item — the general sibling of `.claudeProject`. **Persisted,
+    /// first-class band item.** Firing it opens the user's default terminal at `folder` and runs
+    /// `command` (any shell command(s), e.g. `npm run dev`); an **empty** command just drops into an
+    /// interactive shell in the folder. Unlike `.claudeProject` it does no binary resolution / validation
+    /// — the command runs through a login+interactive shell, so whatever is on the user's PATH resolves.
+    /// Same no-new-permission terminal handoff (`TerminalLauncher`).
+    case terminalCommand(folder: URL, command: String)
 }
 
 /// A single launcher entry: stable identity + presentation + what it does.
@@ -221,7 +240,7 @@ struct LaunchItem: Codable, Equatable, Identifiable {
     /// True for kinds whose firing has side effects worth a success/failure notification.
     var isConsequential: Bool {
         switch kind {
-        case .script, .preset: return true
+        case .script, .preset, .claudeProject, .terminalCommand: return true
         // `.aiCommand` reports its own success/failure through the executor's canvas state, not the
         // launcher's fire notification, so it is not "consequential" in this sense. `.fileEntry`
         // never flows through `fire` (the Files band resolves it via its own open path).

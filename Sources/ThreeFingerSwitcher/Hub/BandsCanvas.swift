@@ -51,6 +51,8 @@ private enum SourceCategory: String, CaseIterable, Identifiable {
     case scripts = "Scripts"
     case actions = "Actions"
     case aiCommands = "AI Command"
+    case claudeProject = "Claude Project"
+    case terminal = "Open in Terminal"
     case presets = "Presets"
     var id: String { rawValue }
     var symbol: String {
@@ -62,13 +64,15 @@ private enum SourceCategory: String, CaseIterable, Identifiable {
         case .scripts: return "terminal.fill"
         case .actions: return "bolt.horizontal.fill"
         case .aiCommands: return "wand.and.stars"
+        case .claudeProject: return "sparkles"
+        case .terminal: return "terminal"
         case .presets: return "square.stack.3d.up.fill"
         }
     }
     /// The tile sublabel: immediate-add categories say "Add", browsable ones say "Browse".
     var hint: String {
         switch self {
-        case .urls, .scripts, .paths: return "Add"
+        case .urls, .scripts, .paths, .claudeProject, .terminal: return "Add"
         case .apps, .shortcuts, .actions, .aiCommands, .presets: return "Browse"
         }
     }
@@ -94,6 +98,10 @@ private struct SourcePicker: View {
     @Binding var selectedItemID: UUID?
     @Binding var autoFocusItemID: UUID?
     @State private var category: SourceCategory?
+    /// Open-Claude-Here setup state: resolving `claude` after a folder pick, and the bounded inline
+    /// error (e.g. claude-not-found) shown in the category index — never an `NSAlert`.
+    @State private var resolvingClaude = false
+    @State private var claudeError: ClaudeLaunchError?
 
     var body: some View {
         if let category {
@@ -104,24 +112,52 @@ private struct SourcePicker: View {
     }
 
     private var categoryIndex: some View {
-        LazyVGrid(columns: sourceGridColumns, spacing: 12) {
-            ForEach(SourceCategory.allCases) { cat in
-                Button { activate(cat) } label: {
-                    GridTile(title: cat.rawValue, subtitle: cat.hint) { SourceSymbol(name: cat.symbol) }
+        VStack(spacing: 8) {
+            if resolvingClaude { claudeResolvingBanner }
+            if let claudeError { claudeErrorBanner(claudeError) }
+            LazyVGrid(columns: sourceGridColumns, spacing: 12) {
+                ForEach(SourceCategory.allCases) { cat in
+                    Button { activate(cat) } label: {
+                        GridTile(title: cat.rawValue, subtitle: cat.hint) { SourceSymbol(name: cat.symbol) }
+                    }
+                    .buttonStyle(PickTileButtonStyle())
                 }
-                .buttonStyle(PickTileButtonStyle())
             }
         }
         .padding(12)
     }
 
-    /// URLs / Scripts / Files&Folders add an item immediately and open it for editing in the item panel
-    /// (Files pick a path first, since a file item needs one); the rest drill into a browser of candidates.
+    private var claudeResolvingBanner: some View {
+        HStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            Text("Looking for the “claude” command…").font(.callout).foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.12)))
+    }
+
+    private func claudeErrorBanner(_ error: ClaudeLaunchError) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            Text(error.errorDescription ?? "Couldn't add the Claude Project.")
+                .font(.callout).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            Button("Dismiss") { claudeError = nil }.buttonStyle(.borderless)
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.12)))
+    }
+
+    /// URLs / Scripts / Files / Claude Project add an item immediately (Files & Claude Project pick a
+    /// folder/path first, since they need one); the rest drill into a browser of candidates.
     private func activate(_ cat: SourceCategory) {
         switch cat {
         case .urls:    add(.newLink(), focus: true)
         case .scripts: add(.newScript(), focus: true)
         case .paths:   choosePath()
+        case .claudeProject: chooseClaudeFolder()
+        case .terminal: chooseTerminalFolder()
         default:       category = cat
         }
     }
@@ -134,6 +170,39 @@ private struct SourcePicker: View {
         if panel.runModal() == .OK, let url = panel.url {
             add(LaunchItem(title: url.lastPathComponent, icon: .fileIcon, kind: .path(url)), focus: true)
         }
+    }
+
+    /// Pick a project folder, then resolve `claude` off-main before adding the item — so we don't
+    /// silently add a non-working item. Claude-not-found surfaces as a bounded inline banner.
+    private func chooseClaudeFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "Choose a project folder to open in Claude."
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
+        claudeError = nil
+        resolvingClaude = true
+        Task {
+            let path = await Task.detached { ClaudeLauncher.resolveClaudePath() }.value
+            resolvingClaude = false
+            guard let path else { claudeError = .claudeNotFound; return }
+            add(ClaudeLauncher.makeItem(folder: folder, claudePath: path), focus: true)
+        }
+    }
+
+    /// Pick a folder and add a general Open-in-Terminal item — no resolution / validation; the command
+    /// is typed in the item panel afterward (blank = just open a shell there).
+    private func chooseTerminalFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "Choose a folder to open in a terminal."
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
+        add(TerminalLauncher.makeItem(folder: folder, command: ""), focus: true)
     }
 
     @ViewBuilder
@@ -151,7 +220,7 @@ private struct SourcePicker: View {
                 case .aiCommands: AICommandSource(store: store) { add($0) }
                 case .presets:   PresetComposer(store: store) { add($0) }
                 // Immediate-add sources never drill in (handled by `activate`); never reached.
-                case .urls, .scripts, .paths: EmptyView()
+                case .urls, .scripts, .paths, .claudeProject, .terminal: EmptyView()
                 }
             }
             .frame(height: 320)   // bound the inner browser so IT scrolls, not the outer bands column
@@ -763,6 +832,10 @@ private struct ItemInspector: View {
     @State private var address: String
     /// Local edit buffer for an inline script body (shell / AppleScript).
     @State private var scriptCode: String
+    /// Local edit buffer for the Claude Project command (shown defaulting to `claude`).
+    @State private var claudeCommand: String
+    /// Local edit buffer for the Open-in-Terminal command (blank = just open a shell).
+    @State private var terminalCommand: String
     /// Installed apps for the link "Open with" picker (loaded once on appear).
     @State private var installedApps: [AppCandidate] = []
     @FocusState private var focus: Field?
@@ -786,6 +859,16 @@ private struct ItemInspector: View {
             _scriptCode = State(initialValue: Self.inlineScriptText(body))
         } else {
             _scriptCode = State(initialValue: "")
+        }
+        if case let .claudeProject(_, command, _) = item.kind {
+            _claudeCommand = State(initialValue: command ?? "claude")
+        } else {
+            _claudeCommand = State(initialValue: "")
+        }
+        if case let .terminalCommand(_, command) = item.kind {
+            _terminalCommand = State(initialValue: command)
+        } else {
+            _terminalCommand = State(initialValue: "")
         }
     }
 
@@ -851,6 +934,12 @@ private struct ItemInspector: View {
                     screenshotClipboardControl(action: action, adjustment: adjustment, toClipboard: toClipboard ?? false)
                 }
             }
+            if case let .claudeProject(folder, _, claudePath) = item.kind {
+                claudeProjectEditor(folder, claudePath: claudePath)
+            }
+            if case let .terminalCommand(folder, _) = item.kind {
+                terminalEditor(folder)
+            }
             moveToBandControl
         }
         .formStyle(.grouped)
@@ -898,6 +987,129 @@ private struct ItemInspector: View {
             Spacer()
             Text(pathURL.path).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             Button("Choose…") { choosePath(current: pathURL) }
+        }
+    }
+
+    /// Claude Project editor: the bound folder (re-pickable), the editable command run after `cd`
+    /// (default `claude`, Script-style), and a read-only disclosure of the full generated `.command`
+    /// script — so you can both see and configure what runs under the hood.
+    @ViewBuilder
+    private func claudeProjectEditor(_ folder: URL, claudePath: String?) -> some View {
+        HStack {
+            Text("Folder")
+            Spacer()
+            Text(folder.path).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            Button("Choose…") { chooseClaudeProjectFolder(current: folder) }
+        }
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Command")
+            TextEditor(text: $claudeCommand)
+                .frame(minHeight: 60).font(.system(.body, design: .monospaced)).border(.quaternary)
+                .onChange(of: claudeCommand) { setClaudeCommand(claudeCommand) }
+            Text("Runs in your default terminal after “cd” into the folder. Leave as “claude” for a plain session, or add flags / setup lines (e.g. claude --resume).")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        DisclosureGroup("Generated script") {
+            ScrollView {
+                Text(ClaudeLauncher.commandScript(folder: folder,
+                                                  command: Self.normalizedClaudeCommand(claudeCommand),
+                                                  claudePath: claudePath))
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(6)
+            }
+            .frame(height: 120)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+        }
+    }
+
+    /// Normalize the inspector's command buffer for storage / preview: trimmed; the bare default
+    /// (`claude`, the friendly placeholder) becomes `nil` so a launch uses the resolved `claudePath`
+    /// (exact binary, works off-PATH) rather than re-running plain `claude`.
+    private static func normalizedClaudeCommand(_ text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (trimmed.isEmpty || trimmed == "claude") ? nil : trimmed
+    }
+
+    private func setClaudeCommand(_ value: String) {
+        guard case let .claudeProject(folder, _, claudePath) = item.kind else { return }
+        store.updateItem(item.id, inBand: bandID) {
+            $0.kind = .claudeProject(folder: folder, command: Self.normalizedClaudeCommand(value), claudePath: claudePath)
+        }
+    }
+
+    private func chooseClaudeProjectFolder(current: URL) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false
+        panel.directoryURL = current
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
+        let renaming = title.isEmpty || title == current.lastPathComponent
+        if renaming { title = folder.lastPathComponent }
+        // Update the folder immediately (preserve the command, clear the resolved path); re-resolve
+        // `claude` off-main and patch it back in.
+        store.updateItem(item.id, inBand: bandID) {
+            if case let .claudeProject(_, command, _) = $0.kind {
+                $0.kind = .claudeProject(folder: folder, command: command, claudePath: nil)
+            }
+            if renaming { $0.title = folder.lastPathComponent }
+        }
+        let id = item.id, band = bandID
+        Task {
+            let path = await Task.detached { ClaudeLauncher.resolveClaudePath() }.value
+            guard let path else { return }
+            store.updateItem(id, inBand: band) {
+                if case let .claudeProject(f, c, _) = $0.kind { $0.kind = .claudeProject(folder: f, command: c, claudePath: path) }
+            }
+        }
+    }
+
+    /// Open-in-Terminal editor: the bound folder (re-pickable), the command run after `cd` (blank =
+    /// just open a shell), and a read-only disclosure of the full generated `.command` script.
+    @ViewBuilder
+    private func terminalEditor(_ folder: URL) -> some View {
+        HStack {
+            Text("Folder")
+            Spacer()
+            Text(folder.path).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            Button("Choose…") { chooseTerminalProjectFolder(current: folder) }
+        }
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Command")
+            TextEditor(text: $terminalCommand)
+                .frame(minHeight: 60).font(.system(.body, design: .monospaced)).border(.quaternary)
+                .onChange(of: terminalCommand) { setTerminalCommand(terminalCommand) }
+            Text("Runs in your default terminal after “cd” into the folder (e.g. npm run dev). Leave blank to just open a shell there.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        DisclosureGroup("Generated script") {
+            ScrollView {
+                Text(TerminalLauncher.commandScript(folder: folder, command: terminalCommand))
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(6)
+            }
+            .frame(height: 120)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+        }
+    }
+
+    private func setTerminalCommand(_ value: String) {
+        guard case let .terminalCommand(folder, _) = item.kind else { return }
+        store.updateItem(item.id, inBand: bandID) { $0.kind = .terminalCommand(folder: folder, command: value) }
+    }
+
+    private func chooseTerminalProjectFolder(current: URL) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false
+        panel.directoryURL = current
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
+        let renaming = title.isEmpty || title == current.lastPathComponent
+        if renaming { title = folder.lastPathComponent }
+        store.updateItem(item.id, inBand: bandID) {
+            if case let .terminalCommand(_, command) = $0.kind { $0.kind = .terminalCommand(folder: folder, command: command) }
+            if renaming { $0.title = folder.lastPathComponent }
         }
     }
 
@@ -979,6 +1191,7 @@ private struct ItemInspector: View {
         case .url:    return 340
         case .script: return 360
         case .path:   return 250
+        case .claudeProject, .terminalCommand: return 400
         default:      break
         }
         if case let .action(action, _, _) = item.kind {
@@ -1424,7 +1637,7 @@ private func naturalIcon(for kind: LaunchItemKind) -> ItemIcon? {
     switch kind {
     case .app: return .appDefault
     case .path: return .fileIcon
-    case .url, .shortcut, .script, .action, .preset, .clipboardEntry, .fileEntry, .aiCommand: return nil
+    case .url, .shortcut, .script, .action, .preset, .clipboardEntry, .fileEntry, .aiCommand, .claudeProject, .terminalCommand: return nil
     }
 }
 
@@ -1648,6 +1861,8 @@ private func kindLabel(_ kind: LaunchItemKind) -> String {
     case .clipboardEntry: return "Clipboard"
     case .fileEntry: return "File Entry"
     case .aiCommand: return "AI Command"
+    case .claudeProject: return "Claude Project"
+    case .terminalCommand: return "Terminal"
     }
 }
 

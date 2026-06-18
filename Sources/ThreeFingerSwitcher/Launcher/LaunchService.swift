@@ -80,6 +80,69 @@ final class LaunchService {
             // other kind, this does NOT complete or dismiss on the lift — a fresh four-finger DOWN swipe
             // (commit) / horizontal swipe (discard) resolve it (see `LauncherOverlayController`).
             onAICommand(command)
+        case .claudeProject(let folder, let command, let claudePath):
+            launchClaude(folder: folder, command: command, claudePath: claudePath, title: item.title)
+        case .terminalCommand(let folder, let command):
+            launchTerminal(folder: folder, command: command, title: item.title)
+        }
+    }
+
+    // MARK: - Open Claude Here
+
+    /// Open the user's default terminal at `folder` and start Claude Code, via a self-deleting `.command`
+    /// file opened through the system default handler — **no new permission** (no Apple Events). The
+    /// process-spawning resolution + file write run off the main thread; the open + any failure
+    /// notification hop back to the main actor. A *successful* open needs no notification (the terminal
+    /// window is its own feedback); only failures surface (bounded, non-blocking — never an alert).
+    private func launchClaude(folder: URL, command: String?, claudePath: String?, title: String) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // Only the *default* (bare-claude) command uses the resolved binary path; a custom command is
+            // run as written (its `claude`, if any, resolves on the login shell's PATH). Prefer the path
+            // baked at setup; re-resolve if missing (the script also falls back to PATH for a stale path).
+            let isDefaultCommand = (command?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+            let resolved = isDefaultCommand ? (claudePath ?? ClaudeLauncher.resolveClaudePath()) : nil
+            let writeResult: Result<URL, ClaudeLaunchError>
+            do { writeResult = .success(try ClaudeLauncher.writeCommandFile(folder: folder, command: command, claudePath: resolved)) }
+            catch let error as ClaudeLaunchError { writeResult = .failure(error) }
+            catch { writeResult = .failure(.scriptWriteFailed(details: String(describing: error))) }
+
+            Task { @MainActor in
+                guard let self else { return }
+                switch writeResult {
+                case let .failure(error):
+                    self.notify(title: title, body: error.errorDescription ?? "Couldn't start Claude.", success: false)
+                case let .success(url):
+                    if !NSWorkspace.shared.open(url) {
+                        self.notify(title: title, body: ClaudeLaunchError.terminalOpenFailed(details: nil).errorDescription
+                                    ?? "Couldn't open your terminal to start Claude.", success: false)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Open the user's default terminal at `folder` and run `command` (the general "Open in Terminal"
+    /// item). Same no-permission `.command` handoff as `launchClaude`, without the claude resolution;
+    /// only failures surface (the terminal window is its own success feedback).
+    private func launchTerminal(folder: URL, command: String, title: String) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let writeResult: Result<URL, TerminalLaunchError>
+            do { writeResult = .success(try TerminalLauncher.writeCommandFile(folder: folder, command: command)) }
+            catch let error as TerminalLaunchError { writeResult = .failure(error) }
+            catch { writeResult = .failure(.scriptWriteFailed(details: String(describing: error))) }
+
+            Task { @MainActor in
+                guard let self else { return }
+                switch writeResult {
+                case let .failure(error):
+                    self.notify(title: title, body: error.errorDescription ?? "Couldn't open your terminal.", success: false)
+                case let .success(url):
+                    if !NSWorkspace.shared.open(url) {
+                        self.notify(title: title, body: TerminalLaunchError.terminalOpenFailed(details: nil).errorDescription
+                                    ?? "Couldn't open your terminal.", success: false)
+                    }
+                }
+            }
         }
     }
 
