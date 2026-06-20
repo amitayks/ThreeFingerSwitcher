@@ -38,7 +38,6 @@ struct SwitcherPage: View {
                 Toggle("Wrap around at the ends of the list", isOn: $settings.wrapAtEnds)
                 Toggle("Reverse direction", isOn: $settings.reverseDirection)
                 Toggle("Require exactly three fingers", isOn: $settings.requireExactlyThree)
-                Toggle("Live preview of the highlighted window", isOn: $settings.livePreviewEnabled)
             }
             // Space-row switching — a sub-feature of the switcher: slide up/down while it is open to move
             // between Spaces. Re-homed here from the former standalone Spaces page.

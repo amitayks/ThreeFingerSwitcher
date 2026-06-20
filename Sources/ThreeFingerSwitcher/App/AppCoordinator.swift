@@ -317,7 +317,6 @@ final class AppCoordinator: GestureRecognizerDelegate {
         launcherOverlay.model.onFilesRetryOpen = { [weak self] in self?.retryLastFilesOpen() }
         observeSleepWake()
         observeEnabledToggle()
-        observeLivePreviewToggle()
         observeSpacesRearrangeToggle()
         observeVerticalGestureToggle()
         observeLauncherToggle()
@@ -714,12 +713,12 @@ final class AppCoordinator: GestureRecognizerDelegate {
         thumbnails.seed(into: overlay.model, ids: allIDs)
     }
 
-    /// Begin the live-preview loop for the open switcher: gated on the opt-in and the overlay actually
-    /// being visible. Opens a live session (one SCShareableContent enumeration) and schedules a repeating
-    /// timer whose ticks re-capture only the highlighted window. Invalidates any prior timer first so it
-    /// is safe to call again (e.g. the opt-in flipping back on mid-overlay).
+    /// Begin the live-preview loop for the open switcher (live preview is unconditional — no setting).
+    /// Opens a live session (one SCShareableContent enumeration) and schedules a repeating timer whose
+    /// ticks re-capture only the highlighted window. Invalidates any prior timer first so it is safe to
+    /// call again.
     private func startLivePreview() {
-        guard settings.livePreviewEnabled, overlay.isVisible else { return }
+        guard overlay.isVisible else { return }
         livePreviewTimer?.invalidate()
         Task { await thumbnails.prepareLiveSession() }
         livePreviewTimer = Timer.scheduledTimer(withTimeInterval: Self.livePreviewCadence, repeats: true) { [weak self] _ in
@@ -737,30 +736,15 @@ final class AppCoordinator: GestureRecognizerDelegate {
     }
 
     /// One live-preview frame: re-capture ONLY the currently highlighted window so its card updates live.
-    /// Skips the synthetic Hub entry (excluded the same way `prefetchCurrentRow` does — its id is never
-    /// captured) and reads the logical frame exactly as prefetch does.
+    /// Driven by both the idle timer and the eager scrub-step kicks (`gestureDidStep` / `gestureDidStepRow`
+    /// / `switchSpace`). Skips the synthetic Hub entry (its id is never captured) and reads the logical
+    /// frame exactly as prefetch does.
     private func tickLivePreview() {
         guard let selected = overlay.model.selectedWindow else { return }
         let hubID = hubWindow.map { CGWindowID($0.windowNumber) }
         guard selected.id != hubID else { return }
         let logical = selected.realFrame.width > 1 ? selected.realFrame : selected.frame
         Task { await thumbnails.liveCapture(selected.id, logicalFrame: logical) }
-    }
-
-    /// React to the "Live preview" toggle: turning it OFF stops the loop immediately; turning it ON
-    /// starts it only if the switcher overlay is currently open (otherwise the next `gestureDidActivate`
-    /// will). `dropFirst()` skips the persisted initial value (a closed overlay at launch needs nothing);
-    /// uses the EMITTED value, not a re-read (the `@Published` willSet would still report the OLD value).
-    private func observeLivePreviewToggle() {
-        settings.$livePreviewEnabled
-            .dropFirst()
-            .sink { [weak self] on in
-                MainActor.assumeIsolated {
-                    guard let self else { return }
-                    if on { self.startLivePreview() } else { self.stopLivePreview() }
-                }
-            }
-            .store(in: &cancellables)
     }
 
     func gestureDidCommit() {

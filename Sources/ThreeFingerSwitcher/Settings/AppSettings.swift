@@ -148,11 +148,6 @@ final class AppSettings: ObservableObject {
     /// behind this toggle to keep the menu tidy.
     @Published var showDiagnostics: Bool { didSet { defaults.set(showDiagnostics, forKey: Keys.showDiagnostics) } }
 
-    /// Live-refresh the switcher's highlighted card: while the overlay is open the selected window is
-    /// re-captured on a fast cadence so its preview updates in near-real-time (one window at a time,
-    /// following the selection). Default ON; toggle off to show static one-shot thumbnails only.
-    @Published var livePreviewEnabled: Bool { didSet { defaults.set(livePreviewEnabled, forKey: Keys.livePreviewEnabled) } }
-
     // MARK: - Clipboard history (opt-in; default OFF)
 
     /// Opt-in to recording clipboard history and showing the launcher's Clipboard band. Unlike the
@@ -384,7 +379,6 @@ final class AppSettings: ObservableObject {
         launcherContextStepDistance = defaults.object(forKey: Keys.launcherContextStepDistance) as? Double ?? Defaults.launcherContextStepDistance
         dwellToArmDuration = defaults.object(forKey: Keys.dwellToArmDuration) as? Double ?? Defaults.dwellToArmDuration
         showDiagnostics = defaults.object(forKey: Keys.showDiagnostics) as? Bool ?? Defaults.showDiagnostics
-        livePreviewEnabled = defaults.object(forKey: Keys.livePreviewEnabled) as? Bool ?? Defaults.livePreviewEnabled
         keepClipboardHistory = defaults.object(forKey: Keys.keepClipboardHistory) as? Bool ?? Defaults.keepClipboardHistory
         enableDeviceLink = defaults.object(forKey: Keys.enableDeviceLink) as? Bool ?? Defaults.enableDeviceLink
         clipboardPaused = defaults.object(forKey: Keys.clipboardPaused) as? Bool ?? Defaults.clipboardPaused
@@ -438,7 +432,6 @@ final class AppSettings: ObservableObject {
         launcherContextStepDistance = Defaults.launcherContextStepDistance
         dwellToArmDuration = Defaults.dwellToArmDuration
         showDiagnostics = Defaults.showDiagnostics
-        livePreviewEnabled = Defaults.livePreviewEnabled
         // Clipboard tunables reset; `keepClipboardHistory`, the exclusion list, and the stored history
         // itself are a privacy choice and are intentionally NOT reset (mirrors the opt-in handling).
         clipboardRecentWindow = Defaults.clipboardRecentWindow
@@ -495,7 +488,6 @@ final class AppSettings: ObservableObject {
         static let launcherContextStepDistance = 0.09   // ~2.2× the item step; deliberate band switching
         static let dwellToArmDuration = 0.3        // quick tick; the charge stays readable
         static let showDiagnostics = false         // troubleshooting tools hidden from the menu by default
-        static let livePreviewEnabled = true       // show the in-flight preview while scrubbing (default ON)
         static let keepClipboardHistory = false    // opt-in; records copied content locally (privacy)
         static let enableDeviceLink = false        // opt-in; opens a local-network link to the phone (privacy)
         static let clipboardPaused = false
@@ -555,7 +547,6 @@ final class AppSettings: ObservableObject {
         static let launcherContextStepDistance = "launcherContextStepDistance"
         static let dwellToArmDuration = "dwellToArmDuration"
         static let showDiagnostics = "showDiagnostics"
-        static let livePreviewEnabled = "livePreviewEnabled"
         static let keepClipboardHistory = "keepClipboardHistory"
         static let enableDeviceLink = "enableDeviceLink"
         static let clipboardPaused = "clipboardPaused"
