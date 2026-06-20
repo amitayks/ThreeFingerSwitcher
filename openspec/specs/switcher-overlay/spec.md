@@ -182,16 +182,14 @@ The Hub window SHALL remain on the Space it was opened on (it SHALL NOT be made 
 
 ### Requirement: Live preview of the highlighted window
 
-Live preview SHALL remain **ON by default**: while the overlay is open the switcher SHALL continuously re-capture the currently highlighted window and update its card in near-real-time, so a window whose content is changing (video, a scrolling terminal, a running download) is shown live rather than as a single frozen snapshot. At most ONE window SHALL be live-captured at any instant — the highlighted one — and the live focus SHALL follow the selection as it scrubs across the row and between Space-rows.
-
-The live-preview setting SHALL fully gate **all** continuous re-capture — including the eager re-capture kicked on each scrub step, not only the idle timer — so when the setting is off, **no** window is re-captured during a gesture and the switcher shows stable last-good thumbnails. (No default flip and no migration: the default stays on; the setting only gains the property that off means off.)
+Live preview SHALL be **always on**: while the overlay is open the switcher SHALL continuously re-capture the currently highlighted window and update its card in near-real-time, so a window whose content is changing (video, a scrolling terminal, a running download) is shown live rather than as a single frozen snapshot. There SHALL be **no setting or toggle** to disable it. At most ONE window SHALL be live-captured at any instant — the highlighted one — and the live focus SHALL follow the selection as it scrubs across the row and between Space-rows.
 
 Live capture SHALL reuse the static thumbnail capture's degraded-frame safety gate (`isOffAllDisplays` / `isStripProxy` / `isDegradedCapture`): a window that is not cleanly presented — parked off every display (Stage-Manager set-aside), a Stage-Manager strip proxy, or the synthetic Hub entry — SHALL NOT be live-captured and SHALL retain its last good static frame. The cleanliness signals SHALL be evaluated against the window's **current** frame (a cheap per-window read), NOT a possibly-stale per-gesture snapshot, so a window that began animating after the snapshot is not captured on its stale full-size frame. Furthermore, while the highlighted window is **in motion** — its current frame still changing tick-to-tick, e.g. morphing between the Stage-Manager strip and the full stage, or animating to or from the Dock — it SHALL NOT be live-captured at all; its last good frame SHALL be retained until the frame holds still, so an in-flight ("sideways") frame is neither shown nor frozen onto its card by scrubbing away before it settles. Live preview SHALL NOT introduce any new permission; when Screen Recording access is absent it SHALL degrade silently to the existing static behavior.
 
-The live layer SHALL be additive over the first-frame bootstrap: opening the overlay still seeds cached static thumbnails and performs the existing one-shot row prefetch, and live re-capture refreshes the highlighted card on top of that. The entire behavior SHALL be gated on the live-preview setting; when the setting is disabled the switcher SHALL behave exactly as the static-only thumbnail strip.
+The live layer SHALL be additive over the first-frame bootstrap: opening the overlay still seeds cached static thumbnails and performs the existing one-shot row prefetch, and live re-capture refreshes the highlighted card on top of that.
 
 #### Scenario: Highlighted window updates live
-- **WHEN** the overlay is open with live preview enabled and the highlighted window's content changes
+- **WHEN** the overlay is open and the highlighted window's content changes
 - **THEN** the highlighted card's thumbnail refreshes to reflect the new content within the capture cadence, without re-creating the strip
 
 #### Scenario: Live focus follows the selection
@@ -199,8 +197,12 @@ The live layer SHALL be additive over the first-frame bootstrap: opening the ove
 - **THEN** the newly highlighted window becomes the live-captured one and the previously highlighted card retains its last captured frame
 
 #### Scenario: At most one window is live
-- **WHEN** the overlay is open with live preview enabled
+- **WHEN** the overlay is open
 - **THEN** only the currently highlighted window is being re-captured; all other cards hold their last captured (static) frame
+
+#### Scenario: No toggle to disable live preview
+- **WHEN** the user views the Switcher page of the configuration Hub
+- **THEN** there is no live-preview toggle, and live preview runs unconditionally whenever the overlay is open
 
 #### Scenario: Non-cleanly-presented windows never go live
 - **WHEN** the highlighted window is parked off every display, is a Stage-Manager strip proxy, or is the synthetic Hub entry
@@ -215,11 +217,6 @@ The live layer SHALL be additive over the first-frame bootstrap: opening the ove
 - **THEN** it is not live-captured while in motion and its card keeps its last good frame, for as long as the animation runs
 - **AND** scrubbing to another window before it settles does not leave an in-flight ("sideways") frame frozen on its card
 - **AND** once the window stops moving, the next tick captures a clean frame
-
-#### Scenario: Toggle off stops all scrub-time re-capture
-- **WHEN** live preview is disabled in settings and the user opens the switcher and scrubs across windows
-- **THEN** no window is re-captured during the gesture — neither by the idle timer nor on each scrub step — and each card shows its last good thumbnail
-- **AND** the switcher otherwise seeds and prefetches thumbnails exactly as before
 
 #### Scenario: Live capture stops on teardown
 - **WHEN** the gesture ends by commit, cancel, the touch engine stopping, the app resigning active, system sleep, or the app being disabled

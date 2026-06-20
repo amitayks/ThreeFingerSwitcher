@@ -73,7 +73,7 @@ The system SHALL display each window's thumbnail every time the overlay is shown
 
 The cleanliness signals SHALL be evaluated against the window's **current** frame — a cheap per-window read — NOT a possibly-stale per-gesture snapshot, so a window that began animating after the snapshot is judged on live geometry rather than its old full-size frame. The refresh SHALL ADDITIONALLY skip a window whose current frame is still **changing from tick to tick** (in motion / animating) — keeping its last good frame until the frame holds still — so a window morphing between the Stage-Manager strip and the full stage, or animating to or from the Dock, is never captured in flight even when its bounding geometry momentarily looks full-size.
 
-To prevent re-capturing a window at a moment it may be animating (the in-flight / "sideways" frame), the **one-shot refresh performed when the overlay is shown** SHALL NOT overwrite a window that already has a cached thumbnail: a previously-captured frame is retained and shown, and only a window with **no** cached frame is captured on that showing (still subject to the cleanliness signals). Continuous re-capture of the highlighted window to "stay current" remains the live-preview path (default on); the live-preview setting fully gates that continuous re-capture, so with it off no window is re-captured during a gesture.
+To prevent re-capturing a window at a moment it may be animating (the in-flight / "sideways" frame), the **one-shot refresh performed when the overlay is shown** SHALL NOT overwrite a window that already has a cached thumbnail: a previously-captured frame is retained and shown, and only a window with **no** cached frame is captured on that showing (still subject to the cleanliness signals). Continuous re-capture of the highlighted window to "stay current" is the **always-on live-preview path** (there is no setting to disable it).
 
 #### Scenario: Cached thumbnail shown on repeat gesture
 - **WHEN** the overlay is shown again for a window whose thumbnail was captured on an earlier gesture
@@ -82,7 +82,7 @@ To prevent re-capturing a window at a moment it may be animating (the in-flight 
 #### Scenario: Cleanly-visible window is captured on first sighting, then retained
 - **WHEN** the overlay is shown and a cleanly-visible current-Space window has no cached thumbnail yet
 - **THEN** its thumbnail is captured so the card shows a preview
-- **AND** on a later showing, a window that already has a cached thumbnail is shown from cache and is NOT re-captured by the one-shot refresh (so it cannot be grabbed mid-animation); continuous refresh of the highlighted window happens only via the live-preview path
+- **AND** on a later showing, a window that already has a cached thumbnail is shown from cache and is NOT re-captured by the one-shot refresh (so it cannot be grabbed mid-animation); continuous refresh of the highlighted window happens via the always-on live-preview path
 
 #### Scenario: Set-aside or off-display window keeps its clean cached thumbnail
 - **WHEN** the overlay is shown for a window that is set aside under Stage Manager, minimized, or otherwise parked off every display, and a clean thumbnail for it is already cached
