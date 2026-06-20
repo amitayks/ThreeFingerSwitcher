@@ -154,7 +154,10 @@ struct SwitcherView: View {
         }
     }
 
-    /// One window card at its solved size, filling its proportion (no `.fit` letterboxing). The
+    /// One window card at its solved size. The thumbnail is scaled to **fit** (letterbox) within the
+    /// card's real-proportion bounds, NOT cropped to fill: a clean capture (whose aspect matches the
+    /// card) still fills it edge-to-edge, while a wrong-aspect transitional / in-flight frame that
+    /// slipped past the capture-side gates is shown harmlessly reduced rather than smeared sideways. The
     /// selection highlight is keyed to the current Space + `selectedIndex` (one card at a time), so the
     /// moving highlight never strobes.
     @ViewBuilder
@@ -165,8 +168,8 @@ struct SwitcherView: View {
             if let thumb = model.thumbnails[window.id] {
                 Image(nsImage: thumb)
                     .resizable()
-                    .interpolation(.high)
-                    .aspectRatio(contentMode: .fill)
+                    .interpolation(.medium)
+                    .aspectRatio(contentMode: .fit)
                     .frame(width: size.width, height: size.height)
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             } else if let icon = window.appIcon {
