@@ -52,11 +52,18 @@ public enum Frame: Equatable, Sendable {
     case chunk(ChunkFrame)
     case itemEnd(UUID)
     case cancel(UUID)
+    /// First control frame of the authenticated link handshake: the sender's pinned long-lived X25519
+    /// public key (raw), a fresh per-connection ephemeral X25519 public key (raw), and its identity.
+    /// Carried in the clear (only public keys + identity); the receiver pin-verifies the static key.
+    case authHello(staticPub: Data, ephemeralPub: Data, identity: DeviceIdentity)
+    /// Second handshake frame: an HMAC over the session key proving the sender derived the same key
+    /// (and therefore holds the private key behind its pinned fingerprint). Constant-time verified.
+    case authConfirm(mac: Data)
 
-    /// The message id this frame belongs to, when it is item-scoped (nil for `hello`/`error`).
+    /// The message id this frame belongs to, when it is item-scoped (nil for `hello`/`error`/auth frames).
     public var messageID: UUID? {
         switch self {
-        case .hello, .error:
+        case .hello, .error, .authHello, .authConfirm:
             return nil
         case let .ack(id), let .itemEnd(id), let .cancel(id):
             return id
@@ -77,4 +84,6 @@ enum FrameType: UInt8 {
     case chunk = 5
     case itemEnd = 6
     case cancel = 7
+    case authHello = 8
+    case authConfirm = 9
 }

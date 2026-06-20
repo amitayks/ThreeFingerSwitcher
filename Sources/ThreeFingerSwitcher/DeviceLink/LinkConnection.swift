@@ -12,6 +12,9 @@ final class LinkConnection {
     var onHandshake: ((DeviceIdentity) -> Void)?
     /// A protocol/transport error (after which the connection is closed).
     var onError: ((Error) -> Void)?
+    /// The connection closed (cleanly or after an error) — fired once. Lets a registry drop the peer and
+    /// update online state on a peer disconnect, not just on a protocol error.
+    var onClose: (() -> Void)?
 
     private(set) var peer: DeviceIdentity?
 
@@ -48,6 +51,7 @@ final class LinkConnection {
         guard !closed else { return }
         closed = true
         transport.close()
+        onClose?()
     }
 
     // MARK: - Inbound
@@ -97,6 +101,7 @@ final class LinkConnection {
         guard !closed else { return }
         closed = true
         if let error { onError?(error) }
+        onClose?()
     }
 
     private func fail(_ error: Error) {

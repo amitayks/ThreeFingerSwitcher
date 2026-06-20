@@ -42,6 +42,10 @@ public enum LinkCodec {
             return (.itemEnd, try json.encode(IDBody(messageID: id)))
         case let .cancel(id):
             return (.cancel, try json.encode(IDBody(messageID: id)))
+        case let .authHello(staticPub, ephemeralPub, identity):
+            return (.authHello, try json.encode(AuthHelloBody(staticPub: staticPub, ephemeralPub: ephemeralPub, identity: identity)))
+        case let .authConfirm(mac):
+            return (.authConfirm, try json.encode(AuthConfirmBody(mac: mac)))
         }
     }
 
@@ -76,6 +80,11 @@ public enum LinkCodec {
                 return .itemEnd(try json.decode(IDBody.self, from: payload).messageID)
             case .cancel:
                 return .cancel(try json.decode(IDBody.self, from: payload).messageID)
+            case .authHello:
+                let body = try json.decode(AuthHelloBody.self, from: payload)
+                return .authHello(staticPub: body.staticPub, ephemeralPub: body.ephemeralPub, identity: body.identity)
+            case .authConfirm:
+                return .authConfirm(mac: try json.decode(AuthConfirmBody.self, from: payload).mac)
             }
         } catch let error as LinkProtocolError {
             throw error
@@ -105,6 +114,8 @@ public enum LinkCodec {
     struct HelloBody: Codable { var identity: DeviceIdentity; var version: ProtocolVersion }
     struct IDBody: Codable { var messageID: UUID }
     struct ErrorBody: Codable { var code: LinkProtocolError.Code }
+    struct AuthHelloBody: Codable { var staticPub: Data; var ephemeralPub: Data; var identity: DeviceIdentity }
+    struct AuthConfirmBody: Codable { var mac: Data }
 
     // MARK: Byte helpers
 

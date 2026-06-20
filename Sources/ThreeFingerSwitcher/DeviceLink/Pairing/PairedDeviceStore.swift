@@ -39,6 +39,19 @@ final class PairedDeviceStore {
         devices.contains { $0.pinnedSPKIHash == spkiHash }
     }
 
+    /// The set of pinned long-lived fingerprints — `SHA256(peer staticPub raw)` — fed to the
+    /// `LinkSession` handshake so an inbound connection is accepted only if its presented static key is
+    /// pinned (fail closed). The pin stored at pairing (`pinnedSPKIHash`) IS this fingerprint.
+    func pinnedFingerprints() -> Set<Data> {
+        Set(devices.map { $0.pinnedSPKIHash })
+    }
+
+    /// The paired device whose pinned fingerprint matches, if any — lets the link map a verified peer
+    /// fingerprint back to its stable pinned id/name for the per-peer registry and online state.
+    func device(forFingerprint fingerprint: Data) -> PairedDevice? {
+        devices.first { $0.pinnedSPKIHash == fingerprint }
+    }
+
     // MARK: Persistence
 
     private func load() {

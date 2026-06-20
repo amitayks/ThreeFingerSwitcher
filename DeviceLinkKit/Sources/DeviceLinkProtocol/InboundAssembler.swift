@@ -30,7 +30,7 @@ public struct InboundAssembler {
 
     public mutating func consume(_ frame: Frame) throws -> Output {
         switch frame {
-        case .hello, .ack, .error:
+        case .hello, .ack, .error, .authHello, .authConfirm:
             return .control(frame)
 
         case let .itemBegin(header):
