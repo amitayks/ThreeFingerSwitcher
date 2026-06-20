@@ -63,7 +63,12 @@ final class AppCoordinator: GestureRecognizerDelegate {
         onSpaceSwitch: { [weak self] in self?.focusFrontWindowAfterSpaceSwitch() },
         // An AI command hands off to the executor, which streams into the overlay's preview canvas.
         // Firing it does NOT dismiss the overlay (the overlay handles that exception).
-        onAICommand: { [weak self] command in self?.aiCommandExecutor.fire(command) }
+        onAICommand: { [weak self] command in self?.aiCommandExecutor.fire(command) },
+        // Persist the folder picked at fire time for a choose-folder-at-launch item, so its chooser
+        // re-opens there next time (the item is the single source of truth for its last-used folder).
+        onPromptedFolderChosen: { [weak self] itemID, bandID, folder in
+            self?.favoritesStore.updateItem(itemID, inBand: bandID) { $0.kind = $0.kind.withLastFolder(folder) }
+        }
     )
 
     /// Frontmost app captured at launcher-open time (target for `.action(.closeFrontWindow)`).
@@ -1141,7 +1146,11 @@ final class AppCoordinator: GestureRecognizerDelegate {
     private func setDeviceLink(_ on: Bool) {
         if on && isEnabled {
             guard deviceLinkService == nil else { return }
-            let service = DeviceLinkService(localIdentity: localDeviceIdentity)
+            let service = DeviceLinkService(
+                localIdentity: localDeviceIdentity,
+                staticKey: MacLocalIdentity.privateKey,
+                pinnedFingerprints: { [weak self] in self?.pairedDeviceStore.pinnedFingerprints() ?? [] },
+                device: { [weak self] fingerprint in self?.pairedDeviceStore.device(forFingerprint: fingerprint) })
             service.onItem = { [weak self] item in self?.receiveLinkItem(item) }
             do {
                 try service.start()
@@ -1164,11 +1173,13 @@ final class AppCoordinator: GestureRecognizerDelegate {
         clipboardStore.insert(entry)
     }
 
-    /// v1 outbound trigger: send the most recent clipboard entry to connected peers.
+    /// v1 outbound trigger: send the most recent clipboard entry to every online paired peer. Per-device
+    /// targeting (a picker over `send(_:to:)`) is a later change; `sendToAll` is the thin convenience over
+    /// the per-peer primitive until then.
     private func sendLatestClipboardToDevices() {
         guard let entry = clipboardStore.recentWindow(limit: 1).first,
               let item = try? linkOutboundAdapter.linkItem(from: entry, origin: localDeviceIdentity) else { return }
-        deviceLinkService?.send(item)
+        deviceLinkService?.sendToAll(item)
     }
 
     /// Push the tunables (retention, poll interval, exclusions) into the store/monitor. Does NOT read
