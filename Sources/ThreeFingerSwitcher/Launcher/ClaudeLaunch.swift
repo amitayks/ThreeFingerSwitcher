@@ -108,6 +108,13 @@ enum ClaudeLauncher {
                    kind: .claudeProject(folder: folder, claudePath: claudePath))
     }
 
+    /// The default appearance for a freshly-added **choose-folder-at-launch** Claude item: a `sparkles`
+    /// glyph and a generic title — it has no folder to name itself after (the folder is picked each run).
+    nonisolated static func makePromptItem(claudePath: String?) -> LaunchItem {
+        LaunchItem(title: "Claude (Pick Folder)", icon: .sfSymbol("sparkles"),
+                   kind: .claudeProjectPrompt(claudePath: claudePath))
+    }
+
     // MARK: - Resolution (spawns a shell — call OFF the main thread)
 
     /// Resolve the absolute path to `claude`, or `nil` if it can't be found. Tries an interactive login

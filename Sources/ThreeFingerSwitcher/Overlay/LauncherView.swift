@@ -219,8 +219,8 @@ struct LauncherView: View {
             case .preset: return "square.stack.3d.up.fill"
             case .script: return "terminal.fill"
             case .aiCommand: return "sparkles"
-            case .claudeProject: return "terminal.fill"
-            case .terminalCommand: return "terminal.fill"
+            case .claudeProject, .claudeProjectPrompt: return "terminal.fill"
+            case .terminalCommand, .terminalCommandPrompt: return "terminal.fill"
             default: return nil
             }
         }()

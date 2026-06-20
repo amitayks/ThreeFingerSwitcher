@@ -223,6 +223,34 @@ enum LaunchItemKind: Codable, Equatable {
     /// — the command runs through a login+interactive shell, so whatever is on the user's PATH resolves.
     /// Same no-new-permission terminal handoff (`TerminalLauncher`).
     case terminalCommand(folder: URL, command: String)
+    /// The **choose-folder-at-launch** sibling of `.claudeProject`: instead of a folder bound at setup,
+    /// firing it presents a native folder chooser (opening at `lastFolder`, or the home folder when nil)
+    /// and launches Claude in the selected folder — otherwise identical to `.claudeProject` (same
+    /// `command`/`claudePath` semantics, same no-permission handoff). The selected folder is remembered
+    /// back into `lastFolder` for next time. All values **Optional** so the synthesized decoder uses
+    /// `decodeIfPresent` (the `.url`/`.action` precedent). See `LaunchService.fire` (prompt path).
+    case claudeProjectPrompt(lastFolder: URL? = nil, command: String? = nil, claudePath: String? = nil)
+    /// The **choose-folder-at-launch** sibling of `.terminalCommand`: firing presents a native folder
+    /// chooser (opening at `lastFolder`, or home when nil) and runs `command` in the selected folder,
+    /// which is then remembered into `lastFolder`. `command` follows the `.terminalCommand` contract (an
+    /// empty command drops into a bare interactive shell). `lastFolder` Optional for decode-safety.
+    case terminalCommandPrompt(lastFolder: URL? = nil, command: String = "")
+}
+
+extension LaunchItemKind {
+    /// For the choose-folder-at-launch kinds, return the same kind with its remembered `lastFolder`
+    /// replaced (preserving command/claudePath); any other kind is returned unchanged. Used by the
+    /// fire-time persist write-back, and the inspector's "Clear". Pure, for unit testing.
+    func withLastFolder(_ folder: URL?) -> LaunchItemKind {
+        switch self {
+        case let .claudeProjectPrompt(_, command, claudePath):
+            return .claudeProjectPrompt(lastFolder: folder, command: command, claudePath: claudePath)
+        case let .terminalCommandPrompt(_, command):
+            return .terminalCommandPrompt(lastFolder: folder, command: command)
+        default:
+            return self
+        }
+    }
 }
 
 /// A single launcher entry: stable identity + presentation + what it does.
@@ -240,7 +268,7 @@ struct LaunchItem: Codable, Equatable, Identifiable {
     /// True for kinds whose firing has side effects worth a success/failure notification.
     var isConsequential: Bool {
         switch kind {
-        case .script, .preset, .claudeProject, .terminalCommand: return true
+        case .script, .preset, .claudeProject, .terminalCommand, .claudeProjectPrompt, .terminalCommandPrompt: return true
         // `.aiCommand` reports its own success/failure through the executor's canvas state, not the
         // launcher's fire notification, so it is not "consequential" in this sense. `.fileEntry`
         // never flows through `fire` (the Files band resolves it via its own open path).

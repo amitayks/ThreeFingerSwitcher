@@ -85,4 +85,13 @@ final class LaunchServiceLogicTests: XCTestCase {
         let fav = Favorites(bands: [band])
         XCTAssertEqual(LaunchService.presetFireOrder(preset, in: fav).map(\.id), [a.id], "dangling references are skipped")
     }
+
+    func testPromptStartDirectoryPrefersLastFolderElseHome() {
+        let home = URL(fileURLWithPath: "/Users/me")
+        let last = URL(fileURLWithPath: "/tmp/proj")
+        XCTAssertEqual(LaunchService.promptStartDirectory(lastFolder: last, home: home), last,
+                       "the chooser opens at the remembered last folder when set")
+        XCTAssertEqual(LaunchService.promptStartDirectory(lastFolder: nil, home: home), home,
+                       "and at home when no folder has been chosen yet")
+    }
 }

@@ -53,6 +53,8 @@ private enum SourceCategory: String, CaseIterable, Identifiable {
     case aiCommands = "AI Command"
     case claudeProject = "Claude Project"
     case terminal = "Open in Terminal"
+    case claudeProjectPrompt = "Claude (Pick Folder)"
+    case terminalPrompt = "Terminal (Pick Folder)"
     case presets = "Presets"
     var id: String { rawValue }
     var symbol: String {
@@ -66,13 +68,15 @@ private enum SourceCategory: String, CaseIterable, Identifiable {
         case .aiCommands: return "wand.and.stars"
         case .claudeProject: return "sparkles"
         case .terminal: return "terminal"
+        case .claudeProjectPrompt: return "sparkles"
+        case .terminalPrompt: return "terminal"
         case .presets: return "square.stack.3d.up.fill"
         }
     }
     /// The tile sublabel: immediate-add categories say "Add", browsable ones say "Browse".
     var hint: String {
         switch self {
-        case .urls, .scripts, .paths, .claudeProject, .terminal: return "Add"
+        case .urls, .scripts, .paths, .claudeProject, .terminal, .claudeProjectPrompt, .terminalPrompt: return "Add"
         case .apps, .shortcuts, .actions, .aiCommands, .presets: return "Browse"
         }
     }
@@ -158,6 +162,8 @@ private struct SourcePicker: View {
         case .paths:   choosePath()
         case .claudeProject: chooseClaudeFolder()
         case .terminal: chooseTerminalFolder()
+        case .claudeProjectPrompt: addClaudePromptItem()
+        case .terminalPrompt: addTerminalPromptItem()
         default:       category = cat
         }
     }
@@ -205,6 +211,24 @@ private struct SourcePicker: View {
         add(TerminalLauncher.makeItem(folder: folder, command: ""), focus: true)
     }
 
+    /// Add a choose-folder-at-launch Claude item — no setup folder (the folder is picked each time it
+    /// runs). Resolve `claude` off-main like the fixed variant so we don't add a non-working item.
+    private func addClaudePromptItem() {
+        claudeError = nil
+        resolvingClaude = true
+        Task {
+            let path = await Task.detached { ClaudeLauncher.resolveClaudePath() }.value
+            resolvingClaude = false
+            guard let path else { claudeError = .claudeNotFound; return }
+            add(ClaudeLauncher.makePromptItem(claudePath: path), focus: true)
+        }
+    }
+
+    /// Add a choose-folder-at-launch Open-in-Terminal item — no setup folder, no resolution.
+    private func addTerminalPromptItem() {
+        add(TerminalLauncher.makePromptItem(), focus: true)
+    }
+
     @ViewBuilder
     private func categoryBrowser(_ cat: SourceCategory) -> some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -220,7 +244,7 @@ private struct SourcePicker: View {
                 case .aiCommands: AICommandSource(store: store) { add($0) }
                 case .presets:   PresetComposer(store: store) { add($0) }
                 // Immediate-add sources never drill in (handled by `activate`); never reached.
-                case .urls, .scripts, .paths, .claudeProject, .terminal: EmptyView()
+                case .urls, .scripts, .paths, .claudeProject, .terminal, .claudeProjectPrompt, .terminalPrompt: EmptyView()
                 }
             }
             .frame(height: 320)   // bound the inner browser so IT scrolls, not the outer bands column
@@ -862,10 +886,14 @@ private struct ItemInspector: View {
         }
         if case let .claudeProject(_, command, _) = item.kind {
             _claudeCommand = State(initialValue: command ?? "claude")
+        } else if case let .claudeProjectPrompt(_, command, _) = item.kind {
+            _claudeCommand = State(initialValue: command ?? "claude")
         } else {
             _claudeCommand = State(initialValue: "")
         }
         if case let .terminalCommand(_, command) = item.kind {
+            _terminalCommand = State(initialValue: command)
+        } else if case let .terminalCommandPrompt(_, command) = item.kind {
             _terminalCommand = State(initialValue: command)
         } else {
             _terminalCommand = State(initialValue: "")
@@ -939,6 +967,12 @@ private struct ItemInspector: View {
             }
             if case let .terminalCommand(folder, _) = item.kind {
                 terminalEditor(folder)
+            }
+            if case let .claudeProjectPrompt(lastFolder, _, claudePath) = item.kind {
+                claudePromptEditor(lastFolder: lastFolder, claudePath: claudePath)
+            }
+            if case let .terminalCommandPrompt(lastFolder, _) = item.kind {
+                terminalPromptEditor(lastFolder: lastFolder)
             }
             moveToBandControl
         }
@@ -1113,6 +1147,72 @@ private struct ItemInspector: View {
         }
     }
 
+    // MARK: Choose-folder-at-launch editors (no setup folder; the folder is picked each run)
+
+    /// Claude (Pick Folder) editor: the remembered last folder (Clear-able) plus the editable command.
+    @ViewBuilder
+    private func claudePromptEditor(lastFolder: URL?, claudePath: String?) -> some View {
+        promptFolderRow(lastFolder: lastFolder)
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Command")
+            TextEditor(text: $claudeCommand)
+                .frame(minHeight: 60).font(.system(.body, design: .monospaced)).border(.quaternary)
+                .onChange(of: claudeCommand) { setClaudePromptCommand(claudeCommand) }
+            Text("Runs in your default terminal after “cd” into the folder you pick. Leave as “claude” for a plain session, or add flags / setup lines (e.g. claude --resume).")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    /// Terminal (Pick Folder) editor: the remembered last folder (Clear-able) plus the editable command.
+    @ViewBuilder
+    private func terminalPromptEditor(lastFolder: URL?) -> some View {
+        promptFolderRow(lastFolder: lastFolder)
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Command")
+            TextEditor(text: $terminalCommand)
+                .frame(minHeight: 60).font(.system(.body, design: .monospaced)).border(.quaternary)
+                .onChange(of: terminalCommand) { setTerminalPromptCommand(terminalCommand) }
+            Text("Runs in your default terminal after “cd” into the folder you pick (e.g. npm run dev). Leave blank to just open a shell there.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    /// The folder row for a choose-folder-at-launch item: there is no bound folder — the chooser opens at
+    /// the remembered last folder (or home), shown here with a Clear to forget it.
+    @ViewBuilder
+    private func promptFolderRow(lastFolder: URL?) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Folder")
+                Spacer()
+                if let lastFolder {
+                    Text(lastFolder.path).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    Button("Clear") { clearPromptLastFolder() }
+                } else {
+                    Text("home folder").foregroundStyle(.secondary)
+                }
+            }
+            Text(lastFolder == nil
+                 ? "You pick the folder each time you run this; the chooser opens at your home folder."
+                 : "You pick the folder each time you run this; the chooser opens at the folder above (your last pick). Clear to start from home.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private func setClaudePromptCommand(_ value: String) {
+        guard case let .claudeProjectPrompt(lastFolder, _, claudePath) = item.kind else { return }
+        store.updateItem(item.id, inBand: bandID) {
+            $0.kind = .claudeProjectPrompt(lastFolder: lastFolder, command: Self.normalizedClaudeCommand(value), claudePath: claudePath)
+        }
+    }
+    private func setTerminalPromptCommand(_ value: String) {
+        guard case let .terminalCommandPrompt(lastFolder, _) = item.kind else { return }
+        store.updateItem(item.id, inBand: bandID) { $0.kind = .terminalCommandPrompt(lastFolder: lastFolder, command: value) }
+    }
+    private func clearPromptLastFolder() {
+        store.updateItem(item.id, inBand: bandID) { $0.kind = $0.kind.withLastFolder(nil) }
+    }
+
     /// Script editor: the body type, plus an inline code editor or a file chooser.
     @ViewBuilder
     private func scriptEditor(_ body: ScriptBody) -> some View {
@@ -1191,7 +1291,7 @@ private struct ItemInspector: View {
         case .url:    return 340
         case .script: return 360
         case .path:   return 250
-        case .claudeProject, .terminalCommand: return 400
+        case .claudeProject, .terminalCommand, .claudeProjectPrompt, .terminalCommandPrompt: return 400
         default:      break
         }
         if case let .action(action, _, _) = item.kind {
@@ -1637,7 +1737,7 @@ private func naturalIcon(for kind: LaunchItemKind) -> ItemIcon? {
     switch kind {
     case .app: return .appDefault
     case .path: return .fileIcon
-    case .url, .shortcut, .script, .action, .preset, .clipboardEntry, .fileEntry, .aiCommand, .claudeProject, .terminalCommand: return nil
+    case .url, .shortcut, .script, .action, .preset, .clipboardEntry, .fileEntry, .aiCommand, .claudeProject, .terminalCommand, .claudeProjectPrompt, .terminalCommandPrompt: return nil
     }
 }
 
@@ -1863,6 +1963,8 @@ private func kindLabel(_ kind: LaunchItemKind) -> String {
     case .aiCommand: return "AI Command"
     case .claudeProject: return "Claude Project"
     case .terminalCommand: return "Terminal"
+    case .claudeProjectPrompt: return "Claude (Pick Folder)"
+    case .terminalCommandPrompt: return "Terminal (Pick Folder)"
     }
 }
 

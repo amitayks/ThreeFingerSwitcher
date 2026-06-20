@@ -42,6 +42,13 @@ enum TerminalLauncher {
                    kind: .terminalCommand(folder: folder, command: command))
     }
 
+    /// The default appearance for a freshly-added **choose-folder-at-launch** Open-in-Terminal item: a
+    /// `terminal` glyph and a generic title (the folder is picked each time it runs).
+    nonisolated static func makePromptItem() -> LaunchItem {
+        LaunchItem(title: "Terminal (Pick Folder)", icon: .sfSymbol("terminal"),
+                   kind: .terminalCommandPrompt())
+    }
+
     /// The self-deleting `.command` script: `cd` into `folder`, then run `command` through a login+
     /// interactive shell (so the user's profile PATH applies). An **empty** command drops into an
     /// interactive login shell in the folder instead of running anything. The first line removes the

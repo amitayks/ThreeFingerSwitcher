@@ -195,4 +195,51 @@ final class LaunchItemTests: XCTestCase {
         XCTAssertEqual(fav.item(withID: target.id), target)
         XCTAssertNil(fav.item(withID: UUID()))
     }
+
+    // MARK: - Choose-folder-at-launch kinds
+
+    func testPromptKindsRoundTrip() throws {
+        let kinds: [LaunchItemKind] = [
+            .claudeProjectPrompt(lastFolder: URL(fileURLWithPath: "/tmp/proj"), command: "claude --resume", claudePath: "/usr/local/bin/claude"),
+            .claudeProjectPrompt(),                                                   // all defaults → nil
+            .terminalCommandPrompt(lastFolder: URL(fileURLWithPath: "/tmp/proj"), command: "npm run dev"),
+            .terminalCommandPrompt(),                                                 // nil folder, empty command
+        ]
+        for kind in kinds {
+            let item = LaunchItem(title: "t", icon: .sfSymbol("sparkles"), kind: kind)
+            let back = try JSONDecoder().decode(LaunchItem.self, from: JSONEncoder().encode(item))
+            XCTAssertEqual(back, item, "prompt kind round-trips: \(kind)")
+        }
+    }
+
+    /// A choose-folder-at-launch record written before `lastFolder` existed (key absent) decodes with
+    /// `lastFolder == nil`, mirroring the `.url` legacy precedent (so future saved bands keep working).
+    func testPromptKindDecodesWithoutLastFolder() throws {
+        let item = LaunchItem(title: "C", icon: .sfSymbol("sparkles"),
+                              kind: .claudeProjectPrompt(lastFolder: URL(fileURLWithPath: "/tmp/x"), command: nil, claudePath: nil))
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(item)) as? [String: Any])
+        var kind = try XCTUnwrap(json["kind"] as? [String: Any])
+        var payload = try XCTUnwrap(kind["claudeProjectPrompt"] as? [String: Any])
+        payload.removeValue(forKey: "lastFolder")
+        kind["claudeProjectPrompt"] = payload
+        json["kind"] = kind
+        let stripped = try JSONSerialization.data(withJSONObject: json)
+        let decoded = try JSONDecoder().decode(LaunchItem.self, from: stripped)
+        guard case let .claudeProjectPrompt(lastFolder, _, _) = decoded.kind else { return XCTFail("kind is .claudeProjectPrompt") }
+        XCTAssertNil(lastFolder, "a record with no lastFolder key decodes to nil")
+    }
+
+    func testWithLastFolderRewritesPromptKindsAndPreservesOthers() {
+        let folder = URL(fileURLWithPath: "/tmp/picked")
+        let claude = LaunchItemKind.claudeProjectPrompt(lastFolder: nil, command: "claude --resume", claudePath: "/bin/claude")
+        guard case let .claudeProjectPrompt(f1, c1, p1) = claude.withLastFolder(folder) else { return XCTFail("claude prompt") }
+        XCTAssertEqual(f1, folder); XCTAssertEqual(c1, "claude --resume"); XCTAssertEqual(p1, "/bin/claude")
+
+        let term = LaunchItemKind.terminalCommandPrompt(lastFolder: folder, command: "npm run dev")
+        guard case let .terminalCommandPrompt(f2, c2) = term.withLastFolder(nil) else { return XCTFail("terminal prompt") }
+        XCTAssertNil(f2, "withLastFolder(nil) clears the remembered folder"); XCTAssertEqual(c2, "npm run dev")
+
+        let path = LaunchItemKind.path(URL(fileURLWithPath: "/tmp"))
+        XCTAssertEqual(path.withLastFolder(folder), path, "non-prompt kinds are returned unchanged")
+    }
 }

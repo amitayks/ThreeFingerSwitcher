@@ -34,19 +34,26 @@ final class LaunchService {
     /// command does NOT dismiss the overlay (the order-out-before-fire rule does not apply) — the
     /// overlay handles that exception itself (see `LauncherOverlayController.end`).
     private let onAICommand: (AICommand) -> Void
+    /// Called after the user picks a folder for a choose-folder-at-launch item (`.claudeProjectPrompt` /
+    /// `.terminalCommandPrompt`) — `(itemID, bandID, chosenFolder)`. Wired by the coordinator to persist
+    /// the folder back onto the item (its remembered last folder). Injected like `onAICommand` so
+    /// `LaunchService` stays decoupled/testable; no-op by default / in tests.
+    private let onPromptedFolderChosen: (UUID, UUID, URL) -> Void
 
     init(favoritesProvider: @escaping () -> Favorites,
          mover: WindowRelocating? = nil,
          goToWindow: @escaping (pid_t) -> Bool = { _ in false },
          frontAppProvider: @escaping () -> NSRunningApplication? = { NSWorkspace.shared.frontmostApplication },
          onSpaceSwitch: @escaping () -> Void = {},
-         onAICommand: @escaping (AICommand) -> Void = { _ in }) {
+         onAICommand: @escaping (AICommand) -> Void = { _ in },
+         onPromptedFolderChosen: @escaping (UUID, UUID, URL) -> Void = { _, _, _ in }) {
         self.favoritesProvider = favoritesProvider
         self.mover = mover ?? NullWindowMover()
         self.goToWindow = goToWindow
         self.frontAppProvider = frontAppProvider
         self.onSpaceSwitch = onSpaceSwitch
         self.onAICommand = onAICommand
+        self.onPromptedFolderChosen = onPromptedFolderChosen
     }
 
     // MARK: - Fire
@@ -84,7 +91,42 @@ final class LaunchService {
             launchClaude(folder: folder, command: command, claudePath: claudePath, title: item.title)
         case .terminalCommand(let folder, let command):
             launchTerminal(folder: folder, command: command, title: item.title)
+        case let .claudeProjectPrompt(lastFolder, command, claudePath):
+            promptFolderThenLaunch(lastFolder: lastFolder, item: item, band: band) { [weak self] folder in
+                self?.launchClaude(folder: folder, command: command, claudePath: claudePath, title: item.title)
+            }
+        case let .terminalCommandPrompt(lastFolder, command):
+            promptFolderThenLaunch(lastFolder: lastFolder, item: item, band: band) { [weak self] folder in
+                self?.launchTerminal(folder: folder, command: command, title: item.title)
+            }
         }
+    }
+
+    /// Pure: where the fire-time folder chooser opens — the item's remembered `lastFolder` if set, else
+    /// the user's `home` folder. Extracted for unit testing.
+    nonisolated static func promptStartDirectory(lastFolder: URL?, home: URL) -> URL {
+        lastFolder ?? home
+    }
+
+    /// Present a native folder chooser for a choose-folder-at-launch item (opening at its last-used
+    /// folder, or home), then on a selection run `launch(folder)` AND remember the folder back onto the
+    /// item via `onPromptedFolderChosen`. A cancel is a no-op (not an error). The accessory app is briefly
+    /// activated so the panel comes forward and is interactive (the overlay has already ordered out by
+    /// fire time).
+    private func promptFolderThenLaunch(lastFolder: URL?, item: LaunchItem, band: ContextBand,
+                                        launch: (URL) -> Void) {
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Open"
+        panel.message = "Choose a folder for “\(item.title)”"
+        panel.directoryURL = Self.promptStartDirectory(
+            lastFolder: lastFolder, home: FileManager.default.homeDirectoryForCurrentUser)
+        guard panel.runModal() == .OK, let folder = panel.url else { return }   // cancel → no-op
+        launch(folder)
+        onPromptedFolderChosen(item.id, band.id, folder)
     }
 
     // MARK: - Open Claude Here
