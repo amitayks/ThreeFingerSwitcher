@@ -195,18 +195,7 @@ final class LaunchService {
     /// focus). Uses only the already-held Accessibility permission (the synthesized ⌘V). The chosen
     /// entry becomes the current clipboard. A stale file reference is harmless (it just won't paste).
     private func pasteEntry(_ entry: ClipboardEntry) {
-        var writes = Self.pasteboardWrites(for: entry)
-        writes = Self.expandImageFormats(writes)         // offer both PNG + TIFF for broad image paste
-        Self.appendColorTextFallback(&writes, entry: entry)   // hex text for a copied color
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        if !writes.isEmpty {
-            let pbItem = NSPasteboardItem()
-            for write in writes {
-                pbItem.setData(write.data, forType: NSPasteboard.PasteboardType(write.uti))
-            }
-            pb.writeObjects([pbItem])
-        }
+        Self.writeToPasteboard(entry)
         guard let app = frontApp() else { return }
         // The non-activating overlay never took key focus, so the captured app is still frontmost;
         // re-assert activation defensively, then synthesize ⌘V to its process.
@@ -214,6 +203,28 @@ final class LaunchService {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self] in
             self?.postKey(0x09, flags: .maskCommand, toPid: app.processIdentifier)   // ⌘V (V = 0x09)
         }
+    }
+
+    /// Write a `ClipboardEntry`'s representations onto a pasteboard (default `NSPasteboard.general`),
+    /// with the same image PNG+TIFF expansion and color/path plain-text fallbacks `pasteEntry` uses —
+    /// but WITHOUT synthesizing a ⌘V. The single reusable writer for "make this entry the clipboard":
+    /// the launcher's paste path calls it (then pastes), and the device-link receive path calls it to
+    /// auto-paste a received item (no key synthesis). An entry with no inline bytes writes nothing.
+    /// `nonisolated` + pasteboard-injectable so it's callable off the launcher and unit-testable.
+    @discardableResult
+    nonisolated static func writeToPasteboard(_ entry: ClipboardEntry,
+                                              to pasteboard: NSPasteboard = .general) -> Bool {
+        var writes = pasteboardWrites(for: entry)
+        writes = expandImageFormats(writes)            // offer both PNG + TIFF for broad image paste
+        appendColorTextFallback(&writes, entry: entry) // hex text for a copied color
+        pasteboard.clearContents()
+        guard !writes.isEmpty else { return false }
+        let pbItem = NSPasteboardItem()
+        for write in writes {
+            pbItem.setData(write.data, forType: NSPasteboard.PasteboardType(write.uti))
+        }
+        pasteboard.writeObjects([pbItem])
+        return true
     }
 
     /// Pure: the (UTI, bytes) representations to restore for `entry`, skipping any unmaterialized
@@ -257,7 +268,7 @@ final class LaunchService {
     /// Ensure an image on the pasteboard offers **both** PNG and TIFF, so apps that want one or the
     /// other accept the paste (capture may have stored only one). AppKit conversion, kept out of the
     /// pure `pasteboardWrites`. A no-op for non-image writes or undecodable data.
-    private static func expandImageFormats(_ writes: [(uti: String, data: Data)]) -> [(uti: String, data: Data)] {
+    nonisolated private static func expandImageFormats(_ writes: [(uti: String, data: Data)]) -> [(uti: String, data: Data)] {
         var out = writes
         let hasPNG = out.contains { $0.uti == ClipboardUTI.png }
         let hasTIFF = out.contains { $0.uti == ClipboardUTI.tiff }
@@ -270,7 +281,7 @@ final class LaunchService {
     }
 
     /// Add a hex (`#RRGGBB`) plain-text fallback for a copied color, so it pastes into a text field.
-    private static func appendColorTextFallback(_ writes: inout [(uti: String, data: Data)], entry: ClipboardEntry) {
+    nonisolated private static func appendColorTextFallback(_ writes: inout [(uti: String, data: Data)], entry: ClipboardEntry) {
         guard entry.kind == .color,
               !writes.contains(where: { $0.uti == ClipboardUTI.plainText }),
               let data = entry.representations[ClipboardUTI.color]?.inlineData,

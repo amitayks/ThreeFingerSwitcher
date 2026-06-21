@@ -19,6 +19,8 @@ final class AppCoordinator: GestureRecognizerDelegate {
     private lazy var windowService = WindowService(mru: mru, focus: focus, settings: settings)
     private let thumbnails = ThumbnailService()
     private let overlay = OverlayController()
+    /// The transient on-receive notch HUD (success/failure feedback for inbound device-link items).
+    private lazy var receiveHUD = ReceiveHUDController()
     private let touchEngine = TouchEngine()
     private lazy var recognizer = GestureRecognizer(settings: settings)
     let spacesRearrange = SpacesRearrangeConfig()
@@ -45,6 +47,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
     // Four-finger launcher.
     private let favoritesStore = FavoritesStore.shared
     private let launcherOverlay = LauncherOverlayController()
+    /// The interactive screen-region picker (vision capture). Shown after a `screenRegion` AI command
+    /// dismisses the launcher; on a drag it captures the region and re-opens the canvas, on a
+    /// click-without-drag it cancels (`screen-region-picker`).
+    private let regionPicker = RegionPickerOverlay()
     private lazy var launchService = LaunchService(
         favoritesProvider: { [weak self] in self?.favoritesStore.favorites ?? Favorites() },
         mover: SpaceWindowMover(),
@@ -299,6 +305,27 @@ final class AppCoordinator: GestureRecognizerDelegate {
             Task { @MainActor in try? await self?.aiCommandExecutor.commit() }
         }
         launcherOverlay.onDiscardCanvas = { [weak self] in self?.aiCommandExecutor.cancel() }
+        // Screen-region (vision) command: the launcher already dismissed to reveal the desktop. Run the
+        // interactive region picker; on a drag, capture the designated region and re-open the canvas
+        // firing the executor with the captured image (the executor maps a permission gap → .failed and an
+        // unavailable capture → .noInput). A click-without-drag cancels — no canvas, nothing generated; the
+        // captured front app already retains focus (both the launcher and the picker are non-activating).
+        launcherOverlay.onScreenRegionCommand = { [weak self] command in
+            guard let self else { return }
+            self.regionPicker.show { [weak self] resolution in
+                guard let self else { return }
+                switch resolution {
+                case .cancel:
+                    break   // defused — the front app was never deactivated, so there is nothing to restore
+                case let .region(rect):
+                    Task { @MainActor in
+                        let outcome = await self.selectionService.captureScreenRegion(rect)
+                        self.launcherOverlay.showCanvas(for: command)
+                        self.aiCommandExecutor.fire(command, screenCapture: outcome)
+                    }
+                }
+            }
+        }
         // When the canvas opens, put the recognizer in canvas-resolution mode so a FRESH four-finger
         // swipe resolves it (horizontal = discard, down = apply) instead of re-opening the launcher.
         launcherOverlay.onCanvasStateChanged = { [weak self] active in
@@ -438,6 +465,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         overlay.hide()
         stopPreviewRefresh()
         launcherOverlay.cancel()
+        receiveHUD.hide()
         clipboardMonitor.stop()
         isEnabled = false
         settings.enabled = false
@@ -913,11 +941,16 @@ final class AppCoordinator: GestureRecognizerDelegate {
     func launcherCanvasResolve(dx: Int, dy: Int) {
         guard launcherOverlay.canvasActive else { return }
         if dy < 0 {
-            launcherOverlay.resolveCanvasCommit()   // swipe DOWN → apply (replace / paste / run task)
+            // Swipe DOWN → apply — but ONLY when the canvas is scrolled to the TOP. Otherwise the same
+            // two-finger pan is the user SCROLLING the response/thinking back up (the native scroll already
+            // handled it), so it must not insert the result. Reaching the top by scrolling down therefore
+            // never commits; only a fresh down-swipe while already at the top applies.
+            guard aiCommandExecutor.canvasAtTop else { return }
+            launcherOverlay.resolveCanvasCommit()   // at top → apply (replace / paste / run task)
         } else if dx != 0 {
             launcherOverlay.discardCanvas()          // horizontal swipe → discard
         }
-        // dy > 0 (up) → no-op
+        // dy > 0 (up) → no-op (scrolls the canvas toward the tail to read more)
     }
 
     func launcherEdgeChanged(dx: Int, dy: Int) {
@@ -1151,8 +1184,23 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// A received item → `ClipboardEntry` (files written to the inbox) → the existing store. Runs on the
     /// main queue (the service hops there before calling `onItem`).
     private func receiveLinkItem(_ item: LinkItem) {
-        guard let entry = try? linkInboundAdapter.entry(from: item) else { return }
-        clipboardStore.insert(entry)
+        do {
+            let entry = try linkInboundAdapter.entry(from: item)
+            clipboardStore.insert(entry)
+            // Auto-paste: make the received item the system clipboard so it's immediately pasteable. Reuse
+            // the launcher's pasteboard writer (PNG+TIFF / color-hex / path fallbacks), without synthesizing
+            // a ⌘V. Then suppress the monitor's re-capture of THIS write by its `changeCount`, so the
+            // already-inserted `.peer(deviceName:)` entry keeps its origin/`capturedAt` and no duplicate is
+            // recorded. Suppression is a no-op when clipboard history is off (the monitor isn't polling).
+            LaunchService.writeToPasteboard(entry)
+            clipboardMonitor.suppressSelfWrite(changeCount: NSPasteboard.general.changeCount)
+            // Fire-and-forget feedback — the LAST, non-throwing step, so a HUD problem can never break
+            // receive/storage. On the failure path (a malformed representation / unwritable file, which
+            // `entry(from:)` throws) the same HUD surfaces what was previously a silent drop.
+            receiveHUD.show(kind: item.kind, from: item.origin?.name, success: true)
+        } catch {
+            receiveHUD.show(kind: item.kind, from: item.origin?.name, success: false)
+        }
     }
 
     /// v1 outbound trigger: send the most recent clipboard entry to every online paired peer. Per-device

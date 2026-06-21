@@ -60,4 +60,72 @@ final class ClipboardMonitorTests: XCTestCase {
 
         XCTAssertEqual(store.count, 1, "re-capturing identical content does not duplicate")
     }
+
+    // MARK: - Self-write suppression (auto-paste of a received item)
+
+    /// A peer entry already in the store + our own pasteboard write (suppressed by its `changeCount`) is
+    /// NOT re-captured on the next poll, and the peer entry keeps its `.peer` origin.
+    func testSuppressedSelfWriteIsNotRecaptured() {
+        let pb = pasteboard()
+        let store = ClipboardStore(directory: tempDir())
+        let monitor = ClipboardMonitor(store: store, pasteboard: pb, sourceAppProvider: { nil })
+
+        // Simulate the receive path: a `.peer` entry is inserted, then we write it to the board.
+        let peer = ClipboardEntry(capturedAt: Date(timeIntervalSince1970: 1000),
+                                  kind: .text, key: "from iPhone",
+                                  representations: [ClipboardUTI.plainText: .inline(Data("from iPhone".utf8))],
+                                  fingerprint: "text:from iPhone",
+                                  origin: .peer(deviceName: "iPhone"))
+        store.insert(peer)
+        pb.clearContents()
+        pb.setString("from iPhone", forType: .string)   // our own write
+
+        monitor.suppressSelfWrite(changeCount: pb.changeCount)
+        monitor.poll()
+
+        XCTAssertEqual(store.count, 1, "the self-write is not captured as a second entry")
+        XCTAssertEqual(store.recentWindow(limit: 1).first?.origin, .peer(deviceName: "iPhone"),
+                       "the peer entry keeps its origin/capturedAt (no self-capture overwrote it)")
+        XCTAssertEqual(store.recentWindow(limit: 1).first?.capturedAt, Date(timeIntervalSince1970: 1000))
+    }
+
+    /// Suppression matches exactly ONE `changeCount`: if a *newer* (real user) copy lands before the
+    /// poll, the suppression doesn't match and that copy IS captured (no lost captures).
+    func testNewerChangeBeforePollIsStillCaptured() {
+        let pb = pasteboard()
+        let store = ClipboardStore(directory: tempDir())
+        let monitor = ClipboardMonitor(store: store, pasteboard: pb, sourceAppProvider: { nil })
+
+        pb.setString("our write", forType: .string)
+        let suppressed = pb.changeCount
+        monitor.suppressSelfWrite(changeCount: suppressed)
+
+        // A real user copy lands before the poll → newer changeCount.
+        pb.clearContents()
+        pb.setString("user copy", forType: .string)
+        XCTAssertNotEqual(pb.changeCount, suppressed)
+
+        monitor.poll()
+
+        XCTAssertEqual(store.recentWindow(limit: 1).first?.key, "user copy",
+                       "a real copy that superseded the suppressed change is still captured")
+    }
+
+    /// Suppression is one-shot: after consuming it, the very next genuine change is captured normally.
+    func testSuppressionIsOneShot() {
+        let pb = pasteboard()
+        let store = ClipboardStore(directory: tempDir())
+        let monitor = ClipboardMonitor(store: store, pasteboard: pb, sourceAppProvider: { nil })
+
+        pb.setString("self write", forType: .string)
+        monitor.suppressSelfWrite(changeCount: pb.changeCount)
+        monitor.poll()                       // consumes (skips) the suppression
+        XCTAssertTrue(store.isEmpty)
+
+        pb.clearContents()
+        pb.setString("real copy", forType: .string)
+        monitor.poll()                       // next change is captured
+
+        XCTAssertEqual(store.recentWindow(limit: 1).first?.key, "real copy")
+    }
 }

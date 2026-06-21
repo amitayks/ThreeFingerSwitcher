@@ -22,6 +22,14 @@ final class ClipboardMonitor {
 
     private var timer: Timer?
     private var lastChangeCount: Int
+    /// One pasteboard `changeCount` to skip capturing (a self-write we just made, e.g. auto-pasting a
+    /// received item). On the next poll, if the board's `changeCount` equals this, we advance
+    /// `lastChangeCount` without capturing and clear the suppression — so the already-recorded entry
+    /// keeps its origin/`capturedAt`. A *newer* change arriving first means a real user copy happened in
+    /// between, so the suppression is dropped without skipping it (that copy is still captured). Nil = no
+    /// pending suppression. Safe whether or not the monitor is running (a stopped monitor catches it up
+    /// on `start()` / next `poll()`).
+    private var suppressedChangeCount: Int?
 
     init(store: ClipboardStore,
          pasteboard: NSPasteboard = .general,
@@ -55,9 +63,30 @@ final class ClipboardMonitor {
         timer = t
     }
 
-    private func poll() {
+    /// Tell the monitor to ignore exactly ONE upcoming pasteboard change — the one we are about to make
+    /// (or just made) ourselves. Pass the `changeCount` read right after writing to `NSPasteboard.general`.
+    /// On the next poll, if the board is still at that exact count, we advance past it without capturing
+    /// (so a received item's `.peer` origin/`capturedAt` survive — no self-capture). If a *different*
+    /// (newer) change lands first, a real user copy intervened, so we drop the suppression and capture
+    /// normally. Idempotent and safe whether or not the monitor is running.
+    func suppressSelfWrite(changeCount: Int) {
+        suppressedChangeCount = changeCount
+    }
+
+    /// Visible for testing: a single poll tick (the timer also calls this). Honors the self-write
+    /// suppression, then captures on a genuine change.
+    func poll() {
         guard !isPaused else { return }
         let current = pasteboard.changeCount
+        if let suppressed = suppressedChangeCount {
+            suppressedChangeCount = nil
+            if current == suppressed {
+                // Our own write — advance past it without capturing, so the peer entry keeps its origin.
+                lastChangeCount = current
+                return
+            }
+            // A different (newer) change arrived first: a real user copy. Fall through and capture it.
+        }
         guard current != lastChangeCount else { return }
         lastChangeCount = current
         capture()
