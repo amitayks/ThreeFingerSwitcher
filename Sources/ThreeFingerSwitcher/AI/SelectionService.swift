@@ -75,6 +75,15 @@ final class SelectionService: SelectionProviding {
         Self.normalized(pasteboard.string())
     }
 
+    /// The CURRENT clipboard image as PNG bytes for a vision command (spec: "Read the current clipboard
+    /// image as vision input"). Reads the live pasteboard's best image representation (PNG, else TIFF)
+    /// and normalizes it to PNG so the runtime always gets the PNG bytes its image processor decodes.
+    /// nil when the clipboard holds no image, or its bytes can't be decoded — so the executor reports
+    /// "no input" rather than running the model on nothing. No synthesis, no clipboard clobber.
+    func readClipboardImage() -> Data? {
+        Self.normalizedPNG(from: pasteboard.imageData())
+    }
+
     // MARK: - Write output
 
     /// Replace the front app's selected text with `text`: set `AXSelectedText` on the focused element
@@ -104,26 +113,31 @@ final class SelectionService: SelectionProviding {
 
     // MARK: - Screen capture
 
-    /// Capture the screen as PNG bytes for a vision command (spec: "Screen-region capture for vision
-    /// input"), reusing the held Screen Recording permission. Returns nil when Screen Recording is not
-    /// granted or capture fails, so the executor reports "no input" rather than running the model on
-    /// nothing.
+    /// Capture the designated screen rectangle as PNG bytes for a vision command (spec `screen-region-picker`
+    /// / "Screen-region capture for vision input"), reusing the held Screen Recording permission. `rect` is
+    /// the picker's selection in **Cocoa global (bottom-left)** coordinates; capture is confined to the
+    /// display under that rectangle and excludes the app's own overlay windows. Returns `.permissionDenied`
+    /// when Screen Recording is not granted (a named gap, surfaced as a clear `.failed`, not "no input");
+    /// `.unavailable` for an empty rect / no matching display / capture failure (plain "no input"). A
+    /// cancelled pick never reaches here — the picker resolves a cancel without calling capture.
     ///
-    /// NOTE: the interactive region-PICKER overlay is a LATER slice (tasks phase 12). This captures the
-    /// main display as a basic, working floor; the picker will refine *which* region without changing
-    /// this seam.
-    func captureScreenRegion() async -> ScreenCaptureOutcome {
-        // A missing Screen-Recording grant is a NAMED permission gap, not "no input" — surface it so
-        // the canvas can point the user at the right System Settings pane (spec: D5 / permission fix).
+    /// v1 scopes a pick to a single display (the one containing the rect); a cross-display rectangle is
+    /// clamped to that display. Capture is at point resolution (sufficient for the vision model).
+    func captureScreenRegion(_ rect: CGRect) async -> ScreenCaptureOutcome {
         guard screenRecordingGranted() else { return .permissionDenied }
+        guard rect.width >= 1, rect.height >= 1 else { return .unavailable }
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            guard let display = content.displays.first else { return .unavailable }
+            // The display whose Cocoa frame contains the rect's center (single-display v1), else the first.
+            guard let (display, frameCocoa) = displayContaining(rect, in: content.displays)
+                    ?? firstDisplay(in: content.displays) else { return .unavailable }
+            let local = Self.displayLocalRect(forGlobalCocoa: rect, displayFrameCocoa: frameCocoa)
             let config = SCStreamConfiguration()
-            config.width = display.width
-            config.height = display.height
+            config.sourceRect = local                 // crop to the designated rectangle (display-local, top-left)
+            config.width = Int(local.width.rounded())
+            config.height = Int(local.height.rounded())
             config.showsCursor = false
-            // Exclude our own non-activating overlay so it never appears in the captured region.
+            // Exclude our own non-activating overlay (incl. the picker) so it never appears in the capture.
             let ours = content.windows.filter { $0.owningApplication?.processID == getpid() }
             let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: ours)
             let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
@@ -132,6 +146,26 @@ final class SelectionService: SelectionProviding {
         } catch {
             return .unavailable   // no display, capture failed, or cancelled → plain "no input".
         }
+    }
+
+    /// The `SCDisplay` whose Cocoa screen frame contains `rect`'s center, paired with that frame, or nil
+    /// when none matches. Effectful only in resolving each display's `NSScreen` frame.
+    private func displayContaining(_ rect: CGRect, in displays: [SCDisplay]) -> (SCDisplay, CGRect)? {
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        for display in displays {
+            if let frame = Self.cocoaFrame(forDisplayID: display.displayID), frame.contains(center) {
+                return (display, frame)
+            }
+        }
+        return nil
+    }
+
+    /// The first display paired with its Cocoa frame (fallback when no display contains the rect center).
+    private func firstDisplay(in displays: [SCDisplay]) -> (SCDisplay, CGRect)? {
+        guard let display = displays.first, let frame = Self.cocoaFrame(forDisplayID: display.displayID) else {
+            return nil
+        }
+        return (display, frame)
     }
 
     // MARK: - Pure decision helpers (unit-tested; no system access)
@@ -157,6 +191,37 @@ final class SelectionService: SelectionProviding {
     nonisolated static func pngData(from cgImage: CGImage) -> Data? {
         let rep = NSBitmapImageRep(cgImage: cgImage)
         return rep.representation(using: .png, properties: [:])
+    }
+
+    /// Pure: convert a rectangle in Cocoa **global (bottom-left)** screen coordinates into the coordinate
+    /// space `SCStreamConfiguration.sourceRect` expects — relative to the display's **top-left** origin —
+    /// given that display's Cocoa frame. The x offset is within the display; the y is flipped (distance
+    /// from the display's top). Factored out so the handedness flip is unit-tested without a real display.
+    nonisolated static func displayLocalRect(forGlobalCocoa rect: CGRect, displayFrameCocoa: CGRect) -> CGRect {
+        CGRect(x: rect.minX - displayFrameCocoa.minX,
+               y: displayFrameCocoa.maxY - rect.maxY,
+               width: rect.width, height: rect.height)
+    }
+
+    /// The Cocoa screen frame (bottom-left) for a `CGDirectDisplayID`, by matching `NSScreen`'s
+    /// `NSScreenNumber`. Effectful (reads `NSScreen.screens`); nil when no screen matches.
+    nonisolated static func cocoaFrame(forDisplayID id: CGDirectDisplayID) -> CGRect? {
+        let key = NSDeviceDescriptionKey("NSScreenNumber")
+        return NSScreen.screens.first { ($0.deviceDescription[key] as? NSNumber)?.uint32Value == id }?.frame
+    }
+
+    /// Pure: normalize the pasteboard's best image representation to PNG bytes. Returns nil for no data;
+    /// passes already-PNG bytes through untouched (by the 8-byte PNG signature, no re-encode); otherwise
+    /// decodes via `NSBitmapImageRep` (e.g. a TIFF-only clipboard) and re-encodes to PNG. nil when the
+    /// bytes can't be decoded — so undecodable clipboard data surfaces as "no input", never garbage to
+    /// the model. Isolated from the effectful read so the format handling is unit-tested headless.
+    nonisolated static func normalizedPNG(from raw: Data?) -> Data? {
+        guard let raw, !raw.isEmpty else { return nil }
+        // PNG signature: 89 50 4E 47 0D 0A 1A 0A — already PNG, hand it back without a re-encode.
+        let pngSignature: [UInt8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+        if raw.count >= 8, Array(raw.prefix(8)) == pngSignature { return raw }
+        guard let rep = NSBitmapImageRep(data: raw) else { return nil }   // e.g. TIFF → decode…
+        return rep.representation(using: .png, properties: [:])           // …and re-encode to PNG.
     }
 
     // MARK: - Accessibility (effectful; verified on-device)
@@ -273,6 +338,10 @@ protocol PasteboardAccess {
     var changeCount: Int { get }
     /// The current plain-text string, or nil when none.
     func string() -> String?
+    /// The current best image representation as raw bytes (PNG when present, else TIFF), or nil when
+    /// the clipboard holds no image. Normalization to PNG happens above this seam (in `SelectionService`),
+    /// so this stays a thin pasteboard read and the format handling is unit-tested headless.
+    func imageData() -> Data?
     /// Replace the pasteboard with a single plain-text string (for the paste path).
     func setString(_ text: String)
     /// An opaque snapshot of the full pasteboard contents, for later restore.
@@ -297,6 +366,8 @@ struct SystemPasteboard: PasteboardAccess {
     var changeCount: Int { pb.changeCount }
 
     func string() -> String? { pb.string(forType: .string) }
+
+    func imageData() -> Data? { pb.data(forType: .png) ?? pb.data(forType: .tiff) }
 
     func setString(_ text: String) {
         pb.clearContents()

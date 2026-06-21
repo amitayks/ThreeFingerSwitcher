@@ -144,6 +144,13 @@ final class AICommandTests: XCTestCase {
                        "a screenRegion command needs a vision-capable model")
     }
 
+    func testClipboardImageRequiresVision() {
+        let command = AICommand(name: "Describe Clipboard Image", icon: .emoji("🖼"), input: .clipboardImage,
+                                promptTemplate: "What's in this image?", output: .previewOnly)
+        XCTAssertEqual(command.requiredCapabilities, [.vision],
+                       "a clipboardImage command needs a vision-capable model, statically — like screenRegion")
+    }
+
     func testTextInputsRequireOnlyText() {
         for input: InputSource in [.selection, .clipboard, .none] {
             let command = AICommand(name: "C", icon: .emoji("✨"), input: input,

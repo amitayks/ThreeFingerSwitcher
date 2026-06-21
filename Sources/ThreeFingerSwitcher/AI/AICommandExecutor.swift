@@ -86,6 +86,12 @@ final class AICommandExecutor: ObservableObject {
     /// active command declares no language parameter — drives whether the canvas shows the dropdown
     /// and what it shows selected. Resolved on every `fire` from persistence → declared default.
     @Published private(set) var activeLanguage: String?
+    /// Whether the canvas's scrollable content is scrolled to the TOP — written by the canvas view from
+    /// its scroll position, read by the resolve gate so a fresh **down** swipe commits ONLY when there's
+    /// nothing more to scroll up to (otherwise the down-swipe is a scroll, not an apply). Not `@Published`
+    /// (it's a gate input the view writes, not state the view renders) so updating it never re-renders the
+    /// canvas. Reset to `true` on every `fire` (fresh content starts at the top).
+    var canvasAtTop = true
 
     private let modelManager: ModelManager
     private let selection: SelectionProviding
@@ -106,6 +112,11 @@ final class AICommandExecutor: ObservableObject {
     private(set) var activeCommand: AICommand?
     /// The streaming task, retained so `cancel()` / a new fire can stop it (horizontal discard swipe).
     private var generationTask: Task<Void, Never>?
+    /// For a `screenRegion` command, the capture outcome supplied at fire time by the region picker
+    /// (the picker captures the designated rectangle BEFORE the canvas opens — the executor never
+    /// captures the screen itself). Retained across a same-command language re-run (`setLanguage`) so the
+    /// re-translate reuses the captured image. `nil` for non-vision commands.
+    private var presuppliedCapture: ScreenCaptureOutcome?
 
     init(modelManager: ModelManager,
          selection: SelectionProviding,
@@ -135,9 +146,16 @@ final class AICommandExecutor: ObservableObject {
     /// Start executing `command`: acquire its input, resolve the template, select + load the model,
     /// and stream the result into `state`. Returns immediately; progress is observed via `state`.
     /// Cancels any in-flight generation first (a new fire supersedes the old).
-    func fire(_ command: AICommand) {
+    ///
+    /// `screenCapture` is the region picker's capture outcome for a `screenRegion` command (the picker
+    /// captures the designated rectangle before this fire); `nil` for non-vision commands and for the
+    /// no-image overload. The outcome (not raw bytes) is passed so the executor maps a permission gap →
+    /// `.failed` and an unavailable capture → `.noInput` itself, keeping the error taxonomy in one place.
+    func fire(_ command: AICommand, screenCapture: ScreenCaptureOutcome? = nil) {
         cancel()
         thinking = ""   // clear any previous run's reasoning before the new fire streams its own
+        canvasAtTop = true   // fresh content starts at the top (so a first down-swipe can apply)
+        presuppliedCapture = screenCapture
         activeCommand = command
         // Resolve the active runtime language up front (persisted choice → declared default → nil), so
         // the canvas dropdown reflects it even while loading / in the `.unavailable` state.
@@ -175,7 +193,8 @@ final class AICommandExecutor: ObservableObject {
         let inputText = await acquireInput(for: command.input)
 
         // An input-requiring command with nothing acquired surfaces "no input" and does NOT call the
-        // model (spec). `.none` requires no input; `screenRegion` carries its input as image bytes.
+        // model (spec). `.none` requires no input; the image sources (`screenRegion`, `clipboardImage`)
+        // carry their input as image bytes, acquired in step 3.
         if requiresTextInput(command.input),
            (inputText ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             // Whitespace-only counts as empty: never run the model on effectively-empty input.
@@ -188,21 +207,30 @@ final class AICommandExecutor: ObservableObject {
         context.inputText = inputText
         let prompt = PromptTemplate.resolve(command.promptTemplate, with: context, activeLanguage: activeLanguage)
 
-        // 3) Optional image for a screen-region (vision) command. A missing Screen-Recording grant is
-        // surfaced as a clear `.failed` that names the permission (not silently as "no input").
+        // 3) Optional image for a vision command. A `screenRegion` command's image was captured by the
+        // region picker BEFORE this fire and handed in as `presuppliedCapture`; the executor maps that
+        // outcome (a missing Screen-Recording grant → a clear `.failed` naming the permission, not
+        // silently "no input"). A `clipboardImage` reads the live pasteboard image here (no permission,
+        // no synthesis): no image is plain "no input". An image source never falls back to text.
         var image: Data?
         if command.input == .screenRegion {
-            switch await selection.captureScreenRegion() {
+            switch presuppliedCapture {
             case let .captured(data):
                 image = data
             case .permissionDenied:
                 state = .failed(message: "Screen Recording permission is required for this command. "
                     + "Enable it in System Settings ▸ Privacy & Security ▸ Screen Recording.")
                 return
-            case .unavailable:
-                state = .noInput
+            case .unavailable, .none:
+                state = .noInput   // cancelled / no capture supplied → "no input" (no model run)
                 return
             }
+        } else if command.input == .clipboardImage {
+            guard let data = selection.readClipboardImage() else {
+                state = .noInput   // no image on the clipboard → "no input"; the model is not invoked
+                return
+            }
+            image = data
         }
 
         // 4) Select + load the model for the command's capabilities (capability-based routing).
@@ -372,7 +400,9 @@ final class AICommandExecutor: ObservableObject {
               case .languageChoice? = command.runtimeParameter,
               language != activeLanguage else { return }
         saveLanguage(command.id, language)
-        fire(command)   // re-reads the just-persisted language via `resolvedLanguage`
+        // Re-read the just-persisted language via `resolvedLanguage`; re-pass the picker's capture so a
+        // vision re-translate (e.g. "Translate Image Text") reuses the captured image, not a blank one.
+        fire(command, screenCapture: presuppliedCapture)
     }
 
     // MARK: - Input acquisition
@@ -388,17 +418,17 @@ final class AICommandExecutor: ObservableObject {
             return selection.readClipboardText()   // fallback when the selection is empty/blank
         case .clipboard:
             return selection.readClipboardText()
-        case .screenRegion, .none:
+        case .clipboardImage, .screenRegion, .none:
             return nil
         }
     }
 
-    /// Whether a source needs non-empty text before the model may run (`screenRegion` carries an
-    /// image, not text; `none` needs nothing).
+    /// Whether a source needs non-empty text before the model may run (the image sources
+    /// `clipboardImage` / `screenRegion` carry an image, not text; `none` needs nothing).
     private func requiresTextInput(_ source: InputSource) -> Bool {
         switch source {
         case .selection, .clipboard: return true
-        case .screenRegion, .none: return false
+        case .clipboardImage, .screenRegion, .none: return false
         }
     }
 

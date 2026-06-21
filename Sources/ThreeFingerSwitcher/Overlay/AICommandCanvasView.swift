@@ -27,6 +27,10 @@ struct AICommandCanvasView: View {
     /// When the model's reasoning FIRST became non-empty — anchors the live elapsed timer. Set once per
     /// fire (cleared when thinking goes empty on a re-run/discard), so the timer counts from first token.
     @State private var thinkingStart: Date?
+    /// When reasoning FINISHED — the moment the response began (or generation otherwise completed). Once
+    /// set, the elapsed readout FREEZES at this value instead of ticking forever (the timer must stop once
+    /// the model is done thinking + answering). Cleared with `thinkingStart` on a re-run/discard.
+    @State private var thinkingEnd: Date?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -51,16 +55,38 @@ struct AICommandCanvasView: View {
             footerHint
         }
         .padding(.top, 6)
-        // Anchor the elapsed timer to the moment thinking first appears; clear it when thinking resets
-        // (a fresh fire / discard empties `executor.thinking`), so the next run times from scratch.
-        // Also collapse the Thinking section on reset so a previously-expanded run doesn't leak its
-        // expanded state into the next fire (keeps the collapsed-by-default behavior).
+        // Anchor the elapsed timer to the moment thinking first appears; clear it (and the frozen end)
+        // when thinking resets (a fresh fire / discard empties `executor.thinking`), so the next run times
+        // from scratch. Also collapse the Thinking section on reset so a previously-expanded run doesn't
+        // leak its expanded state into the next fire (keeps the collapsed-by-default behavior).
         .onChange(of: executor.thinking.isEmpty) { _, isEmpty in
             thinkingStart = isEmpty ? nil : (thinkingStart ?? Date())
-            if isEmpty { thinkingExpanded = false }
+            if isEmpty { thinkingExpanded = false; thinkingEnd = nil }
+        }
+        // Freeze the elapsed timer the moment reasoning finishes (the response begins, or generation
+        // otherwise completes) — set once, so it stops ticking instead of counting forever.
+        .onChange(of: reasoningFinished) { _, finished in
+            if finished, thinkingStart != nil, thinkingEnd == nil { thinkingEnd = Date() }
+        }
+        // Update the resolve gate: a fresh DOWN swipe applies only when every scrollable region is at its
+        // top (so scrolling the response/thinking never inserts). The reduce ANDs all reporters.
+        .onPreferenceChange(CanvasAtTopKey.self) { atTop in
+            executor.canvasAtTop = atTop
         }
         .onAppear {
             if !executor.thinking.isEmpty, thinkingStart == nil { thinkingStart = Date() }
+            if reasoningFinished, thinkingStart != nil, thinkingEnd == nil { thinkingEnd = Date() }
+        }
+    }
+
+    /// Whether the model has finished REASONING: false while loading or while only thinking is streaming
+    /// (the response is still empty); true once the response begins streaming or any terminal state is
+    /// reached. Drives the one-shot freeze of the elapsed timer.
+    private var reasoningFinished: Bool {
+        switch executor.state {
+        case .idle, .loadingModel: return false
+        case let .streaming(partial): return !partial.isEmpty   // response started → thinking is done
+        default: return true                                    // ready / review / declined / failed / …
         }
     }
 
@@ -102,7 +128,7 @@ struct AICommandCanvasView: View {
                     .foregroundStyle(tint)
                     .opacity(0.55 + 0.45 * (0.5 + 0.5 * sin(phase * 2.6)))
             }
-            Text("Thinking…")
+            Text(reasoningFinished ? "Thought" : "Thinking…")
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(.secondary)
             elapsedLabel
@@ -114,15 +140,23 @@ struct AICommandCanvasView: View {
         .contentShape(Rectangle())   // the whole row is tappable, not just the glyphs
     }
 
-    /// A live elapsed readout, recomputed ~10×/s off a `TimelineView` so the user sees it ticking. Shows
-    /// "3.2s" under a minute, "mm:ss" beyond, anchored at `thinkingStart`.
+    /// A live elapsed readout. While reasoning is in flight it recomputes ~10×/s off a `TimelineView` so
+    /// the user sees it ticking; once `thinkingEnd` is set it FREEZES at the final duration (stops
+    /// counting). Shows "3.2s" under a minute, "mm:ss" beyond, anchored at `thinkingStart`.
     @ViewBuilder
     private var elapsedLabel: some View {
         if let start = thinkingStart {
-            TimelineView(.periodic(from: .now, by: 0.1)) { ctx in
-                Text(Self.elapsedString(ctx.date.timeIntervalSince(start)))
+            if let end = thinkingEnd {
+                // Frozen: reasoning finished — show the final duration, no longer ticking.
+                Text(Self.elapsedString(end.timeIntervalSince(start)))
                     .font(.system(size: 11, weight: .regular).monospacedDigit())
                     .foregroundStyle(.secondary)
+            } else {
+                TimelineView(.periodic(from: .now, by: 0.1)) { ctx in
+                    Text(Self.elapsedString(ctx.date.timeIntervalSince(start)))
+                        .font(.system(size: 11, weight: .regular).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -141,20 +175,35 @@ struct AICommandCanvasView: View {
     private var thinkingExpandedBody: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                BidiText(text: executor.thinking, fontSize: 12, color: .secondaryLabelColor)
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                Color.clear.frame(height: 1).id(Self.thinkingTailID)   // scroll anchor at the bottom
+                VStack(spacing: 0) {
+                    Color.clear.frame(height: 1).id(Self.thinkingHeadID)   // top anchor
+                    BidiText(text: executor.thinking, fontSize: 12, color: .secondaryLabelColor)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                    Color.clear.frame(height: 1).id(Self.thinkingTailID)   // bottom anchor
+                }
+                .background(atTopReporter(space: Self.thinkingScrollSpace))
             }
             .frame(maxHeight: 160)
+            .coordinateSpace(name: Self.thinkingScrollSpace)
             .onChange(of: executor.thinking) {
+                // Follow the tail only WHILE reasoning is still streaming, so the user watches it grow.
+                guard !reasoningFinished else { return }
                 withAnimation(.easeOut(duration: 0.15)) {
                     proxy.scrollTo(Self.thinkingTailID, anchor: .bottom)
+                }
+            }
+            .onChange(of: reasoningFinished) { _, finished in
+                // When reasoning ends, rest at the TOP (read from the start, and so the box reports at-top
+                // and never blocks the commit gate from a stale tail position).
+                if finished {
+                    withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(Self.thinkingHeadID, anchor: .top) }
                 }
             }
         }
     }
 
-    /// Stable id for the bottom scroll anchor of the expanded reasoning.
+    /// Stable ids for the top / bottom scroll anchors of the expanded reasoning.
+    private static let thinkingHeadID = "ai-thinking-head"
     private static let thinkingTailID = "ai-thinking-tail"
 
     // MARK: Header
@@ -336,8 +385,23 @@ struct AICommandCanvasView: View {
         ScrollView {
             BidiText(text: text, fontSize: 14)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
+                .background(atTopReporter(space: Self.resultScrollSpace))
+        }
+        .coordinateSpace(name: Self.resultScrollSpace)
+    }
+
+    /// A 0-impact background probe that reports whether `space`'s scroll content is at its TOP, via
+    /// `CanvasAtTopKey`. Placed as the content's background so its `minY` in the scroll's coordinate space
+    /// is the content top's offset: 0 at the top, negative once scrolled down (small epsilon for rounding).
+    private func atTopReporter(space: String) -> some View {
+        GeometryReader { geo in
+            Color.clear.preference(key: CanvasAtTopKey.self,
+                                   value: geo.frame(in: .named(space)).minY >= -2)
         }
     }
+
+    private static let resultScrollSpace = "ai-canvas-result-scroll"
+    private static let thinkingScrollSpace = "ai-canvas-thinking-scroll"
 
     /// The armed-confirmation review: the parsed action's concrete fields, before the commit fires the
     /// side effect (spec: "displays the parsed action's concrete fields before it can be committed").
@@ -415,6 +479,16 @@ struct AICommandCanvasView: View {
     private func centered<C: View>(@ViewBuilder _ content: () -> C) -> some View {
         VStack(spacing: 10) { content() }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// Reports whether the canvas's scrollable content is at its TOP. Each scrollable region contributes a
+/// boolean; `reduce` ANDs them, so the combined value is true only when EVERY region is at its top — the
+/// condition under which a fresh down-swipe applies the result (otherwise the down-swipe is a scroll).
+private struct CanvasAtTopKey: PreferenceKey {
+    static let defaultValue = true
+    static func reduce(value: inout Bool, nextValue: () -> Bool) {
+        value = value && nextValue()
     }
 }
 

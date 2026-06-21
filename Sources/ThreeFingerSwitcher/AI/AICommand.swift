@@ -19,6 +19,11 @@ enum InputSource: String, Codable, Equatable, Sendable, CaseIterable {
     case selection
     /// The current clipboard contents.
     case clipboard
+    /// The current clipboard IMAGE — the live pasteboard image, normalized to PNG — fed to the vision
+    /// model (requires a `.vision`-capable model). A distinct source from `.clipboard` (not a
+    /// polymorphic text-or-image) so `requiredCapabilities` stays static. On-demand: copying an image
+    /// never auto-fires; the user runs a `clipboardImage` command and it reads the clipboard image.
+    case clipboardImage
     /// A captured screen region, fed to the vision model (requires a `.vision`-capable model).
     case screenRegion
     /// No input — the prompt template stands alone.
@@ -176,10 +181,12 @@ struct AICommand: Codable, Equatable, Identifiable, Sendable {
     }
 
     /// The runtime capabilities this command needs (drives capability-based model selection in the
-    /// executor): a `screenRegion` input requires a `.vision` model; everything else is `.text`.
+    /// executor): the image inputs (`screenRegion`, `clipboardImage`) require a `.vision` model;
+    /// everything else is `.text`. Derived STATICALLY from the input source — never from runtime
+    /// clipboard contents — so model selection stays content-independent.
     var requiredCapabilities: Set<Modality> {
         switch input {
-        case .screenRegion: return [.vision]
+        case .screenRegion, .clipboardImage: return [.vision]
         case .selection, .clipboard, .none: return [.text]
         }
     }

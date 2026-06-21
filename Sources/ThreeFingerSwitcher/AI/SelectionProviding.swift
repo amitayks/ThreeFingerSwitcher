@@ -30,9 +30,17 @@ protocol SelectionProviding {
     /// The current clipboard text, or nil when the clipboard holds no text.
     func readClipboardText() -> String?
 
-    /// Capture a screen region as encoded image bytes for a vision command, distinguishing a named
-    /// Screen-Recording permission gap from an ordinary unavailable (see `ScreenCaptureOutcome`).
-    func captureScreenRegion() async -> ScreenCaptureOutcome
+    /// The current clipboard IMAGE as PNG bytes for a vision command, or nil when the clipboard holds
+    /// no image (or undecodable image data). Reads the LIVE pasteboard — symmetric with
+    /// `readClipboardText()`, not the stored clipboard history — and reuses already-held access (no new
+    /// permission). A nil here is a "no input" state, never a permission gap.
+    func readClipboardImage() -> Data?
+
+    // NOTE: screen-region capture is NOT on this executor seam. A `screenRegion` command's image is
+    // captured by the interactive region picker BEFORE the canvas opens, and handed to the executor as a
+    // pre-supplied `ScreenCaptureOutcome` via `fire(_:screenCapture:)` — the executor never captures the
+    // screen itself. The region capture lives on the concrete `SelectionService.captureScreenRegion(_:)`,
+    // called by the picker orchestration.
 
     /// Replace the front app's selected text with `text` (AX set when settable, else paste-on-fire).
     /// Returns whether the replace actually LANDED (not merely whether it was attempted) — a `false`

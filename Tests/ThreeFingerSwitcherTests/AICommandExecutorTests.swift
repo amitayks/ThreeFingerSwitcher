@@ -18,28 +18,23 @@ final class AICommandExecutorTests: XCTestCase {
     private final class FakeSelectionProvider: SelectionProviding {
         var selectedText: String?
         var clipboardText: String?
-        var screenRegionData: Data?
-        var screenCaptureOutcome: ScreenCaptureOutcome?
+        var clipboardImageData: Data?
         var replaceLands = true
         var pasteLands = true
 
         private(set) var replacedWith: [String] = []
         private(set) var pastedAtCursor: [String] = []
-        private(set) var screenCaptureCount = 0
 
-        init(selectedText: String? = nil, clipboardText: String? = nil, screenRegionData: Data? = nil) {
+        init(selectedText: String? = nil, clipboardText: String? = nil) {
             self.selectedText = selectedText
             self.clipboardText = clipboardText
-            self.screenRegionData = screenRegionData
         }
 
         func readSelectedText() async -> String? { selectedText }
         func readClipboardText() -> String? { clipboardText }
-        func captureScreenRegion() async -> ScreenCaptureOutcome {
-            screenCaptureCount += 1
-            if let outcome = screenCaptureOutcome { return outcome }
-            return screenRegionData.map { .captured($0) } ?? .unavailable
-        }
+        func readClipboardImage() -> Data? { clipboardImageData }
+        // Screen-region capture is no longer on this seam: the picker captures the region and the
+        // capture outcome is handed to `executor.fire(_:screenCapture:)`.
 
         @discardableResult
         func replaceSelection(_ text: String) async -> Bool { replacedWith.append(text); return replaceLands }
@@ -330,6 +325,41 @@ final class AICommandExecutorTests: XCTestCase {
         await waitUntil { executor.state == .noInput }
         XCTAssertEqual(executor.state, .noInput)
         XCTAssertTrue(selection.replacedWith.isEmpty, "no model run means no output write")
+    }
+
+    // MARK: - Clipboard image (vision input)
+
+    func testClipboardImageFeedsVisionRequest() async throws {
+        let runtime = CapturingLLMRuntime()
+        let manager = try await loadedManager(anyRuntime: runtime)
+        let imageBytes = Data([0x89, 0x50, 0x4E, 0x47, 0x01, 0x02])   // stand-in PNG bytes
+        let selection = FakeSelectionProvider()
+        selection.clipboardImageData = imageBytes
+        let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                         dispatcher: FakeTaskDispatcher())
+
+        let command = AICommand(name: "Describe Clipboard Image", icon: .emoji("🖼"), input: .clipboardImage,
+                                promptTemplate: "What is in this image?", output: .previewOnly)
+        executor.fire(command)
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+        XCTAssertEqual(runtime.lastRequest?.image, imageBytes,
+                       "the clipboard image is carried on the request as the vision image input")
+        XCTAssertEqual(runtime.lastRequest?.requiresVision, true, "the request is a vision request")
+    }
+
+    func testClipboardImageWithNoImageSurfacesNoInputAndDoesNotInvokeModel() async throws {
+        let runtime = CapturingLLMRuntime()
+        let manager = try await loadedManager(anyRuntime: runtime)
+        let selection = FakeSelectionProvider()   // clipboardImageData is nil — nothing on the clipboard
+        let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                         dispatcher: FakeTaskDispatcher())
+
+        let command = AICommand(name: "Describe Clipboard Image", icon: .emoji("🖼"), input: .clipboardImage,
+                                promptTemplate: "What is in this image?", output: .previewOnly)
+        executor.fire(command)
+        await waitUntil { executor.state == .noInput }
+        XCTAssertEqual(executor.state, .noInput, "no clipboard image → a clean no-input state")
+        XCTAssertNil(runtime.lastRequest, "the model is not invoked when there is no image")
     }
 
     // MARK: - previewOnly writes nothing
@@ -696,20 +726,49 @@ final class AICommandExecutorTests: XCTestCase {
         XCTAssertEqual(executor.state, .ready(result: "hello"), "the result is unchanged")
     }
 
-    // MARK: - Screen-region with no capture surfaces no-input
+    // MARK: - Screen-region capture outcomes (picker pre-supplies the capture)
 
-    func testScreenRegionWithNoCaptureSurfacesNoInput() async throws {
+    func testScreenRegionWithUnavailableCaptureSurfacesNoInput() async throws {
         let stub = StubLLMRuntime(scriptedTokens: ["nope"], interTokenDelayNanos: 0)
         let manager = try await loadedManager(runtime: stub, capabilities: [.text, .vision])
-        let selection = FakeSelectionProvider(screenRegionData: nil) // capture unavailable
+        let selection = FakeSelectionProvider()
         let executor = AICommandExecutor(modelManager: manager, selection: selection,
                                          dispatcher: FakeTaskDispatcher())
 
         let command = AICommand(name: "Describe", icon: .emoji("👁"), input: .screenRegion,
                                 promptTemplate: "What's here?", output: .previewOnly)
-        executor.fire(command)
+        executor.fire(command, screenCapture: .unavailable)   // picker captured nothing
         await waitUntil { executor.state == .noInput }
-        XCTAssertEqual(executor.state, .noInput, "a screen-region command with no capture is no-input")
+        XCTAssertEqual(executor.state, .noInput, "an unavailable capture is no-input")
+    }
+
+    func testScreenRegionWithNoSuppliedCaptureSurfacesNoInput() async throws {
+        let stub = StubLLMRuntime(scriptedTokens: ["nope"], interTokenDelayNanos: 0)
+        let manager = try await loadedManager(runtime: stub, capabilities: [.text, .vision])
+        let selection = FakeSelectionProvider()
+        let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                         dispatcher: FakeTaskDispatcher())
+
+        let command = AICommand(name: "Describe", icon: .emoji("👁"), input: .screenRegion,
+                                promptTemplate: "What's here?", output: .previewOnly)
+        executor.fire(command)   // no capture supplied at all (defensive) → no-input, no model run
+        await waitUntil { executor.state == .noInput }
+        XCTAssertEqual(executor.state, .noInput, "a screen-region fire with no supplied capture is no-input")
+    }
+
+    func testScreenRegionWithCapturedImageStreamsResult() async throws {
+        let runtime = CapturingLLMRuntime()
+        let manager = try await loadedManager(anyRuntime: runtime)
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x09])
+        let executor = AICommandExecutor(modelManager: manager, selection: FakeSelectionProvider(),
+                                         dispatcher: FakeTaskDispatcher())
+
+        let command = AICommand(name: "Describe", icon: .emoji("👁"), input: .screenRegion,
+                                promptTemplate: "What's here?", output: .previewOnly)
+        executor.fire(command, screenCapture: .captured(png))
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+        XCTAssertEqual(runtime.lastRequest?.image, png, "the picker's captured region is the vision image")
+        XCTAssertEqual(runtime.lastRequest?.requiresVision, true)
     }
 
     // MARK: - Honesty (D5): a non-landed replaceSelection surfaces .failed, not .committed
@@ -780,12 +839,11 @@ final class AICommandExecutorTests: XCTestCase {
         let stub = StubLLMRuntime(scriptedTokens: ["nope"], interTokenDelayNanos: 0)
         let manager = try await loadedManager(runtime: stub, capabilities: [.text, .vision])
         let selection = FakeSelectionProvider()
-        selection.screenCaptureOutcome = .permissionDenied
         let executor = AICommandExecutor(modelManager: manager, selection: selection,
                                          dispatcher: FakeTaskDispatcher())
         let command = AICommand(name: "Describe", icon: .emoji("👁"), input: .screenRegion,
                                 promptTemplate: "What's here?", output: .previewOnly)
-        executor.fire(command)
+        executor.fire(command, screenCapture: .permissionDenied)   // picker hit a Screen-Recording gap
         await waitUntil { if case .failed = executor.state { return true }; return false }
         guard case let .failed(message) = executor.state else {
             return XCTFail("a permission gap must surface .failed (not .noInput), got \(executor.state)")

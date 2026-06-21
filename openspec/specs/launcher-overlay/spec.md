@@ -114,6 +114,8 @@ Lifting the fingers SHALL fire the currently armed item; if no item is armed, li
 
 An **AI command item** is an exception to the order-out-before-fire rule: firing it does NOT dismiss the overlay. Instead, firing **begins the command and opens its streaming preview canvas**, leaving the overlay visible; the command then resolves through the AI command preview-and-commit behavior (a fresh four-finger **down** swipe commits, a fresh four-finger **horizontal** swipe discards) rather than completing on this first lift. Because the firing lift has already raised the fingers, the canvas is resolved by a *new* swipe, never by re-lifting; a stray lift while the canvas is open is a no-op. The order-out-before-fire rule continues to apply to items that complete on lift (launches, Space switches, paste-on-fire).
 
+A **screen-region (vision) command** is a further exception **within** the AI-command exception: because it must reveal the desktop so the user can designate a region, firing it **does** order the overlay out first (like a completing action), then presents the interactive region picker. The streaming preview canvas opens only **after** a region is captured, and the command then resolves through the normal preview-and-commit behavior. If the picker is **cancelled** (a click without a drag), no canvas opens, nothing is generated, and the captured front app is restored.
+
 #### Scenario: Armed lift fires
 - **WHEN** an item is armed and the fingers lift
 - **THEN** that item is fired and the overlay hides
@@ -133,6 +135,14 @@ An **AI command item** is an exception to the order-out-before-fire rule: firing
 #### Scenario: Armed AI command lift opens the preview canvas
 - **WHEN** an armed AI command item is lifted
 - **THEN** the command begins, the overlay stays visible, and its streaming preview canvas appears instead of the overlay dismissing
+
+#### Scenario: Armed screen-region command dismisses the overlay then picks
+- **WHEN** an armed screen-region (vision) AI command item is lifted
+- **THEN** the overlay is dismissed, the interactive region picker is presented over the revealed desktop, and the preview canvas opens only after a region is captured
+
+#### Scenario: Cancelled region pick opens no canvas
+- **WHEN** the region picker is cancelled by a click without a drag
+- **THEN** no preview canvas opens, nothing is generated, and the captured front app is restored
 
 ### Requirement: Context-band visual encoding
 The launcher SHALL render the band strip as a **vertical list of band icons on the left** (icons only, never names), with the **active** band's icon drawn in its band color and the rest colorless. It SHALL render each item as an icon plus a short label tinted/accented by its context band color, and SHALL visually distinguish item kinds (e.g. a badge for presets, a marker for scripts). Each band's icon is user-configurable; the Clipboard band uses a dedicated preset icon.

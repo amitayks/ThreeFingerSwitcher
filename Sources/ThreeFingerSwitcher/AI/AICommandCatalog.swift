@@ -241,11 +241,16 @@ private extension AICommandCatalog {
                template: "{input}"),
     ]
 
-    // MARK: Vision (input `.screenRegion`, output `.previewOnly` — these need a vision model, landed separately)
+    // MARK: Vision (output `.previewOnly` — these need a vision model). Image comes from a captured
+    // screen region (`.screenRegion`) or the live clipboard image (`.clipboardImage`, on-demand).
 
     static let vision: [Entry] = [
         preset(.vision, "What Is This?", icon: "questionmark.circle", input: .screenRegion, output: .previewOnly,
                template: "What is shown here? Answer concisely."),
+        preset(.vision, "Describe Clipboard Image", icon: "photo", input: .clipboardImage, output: .previewOnly,
+               template: "What is shown in this image? Answer concisely."),
+        preset(.vision, "Clipboard Image → Text (OCR)", icon: "doc.text.viewfinder", input: .clipboardImage, output: .previewOnly,
+               template: "Transcribe all the text shown in this image exactly. Return only the text."),
         preset(.vision, "Extract Text (OCR)", icon: "text.viewfinder", input: .screenRegion, output: .previewOnly,
                template: "Transcribe all the text shown here exactly. Return only the text."),
         preset(.vision, "Explain This Chart", icon: "chart.bar", input: .screenRegion, output: .previewOnly,

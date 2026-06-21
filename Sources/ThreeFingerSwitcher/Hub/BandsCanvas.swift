@@ -2203,6 +2203,7 @@ private func aiInputLabel(_ s: InputSource) -> String {
     switch s {
     case .selection: return "Selected text"
     case .clipboard: return "Clipboard"
+    case .clipboardImage: return "Clipboard image (vision)"
     case .screenRegion: return "Screen region (vision)"
     case .none: return "No input"
     }

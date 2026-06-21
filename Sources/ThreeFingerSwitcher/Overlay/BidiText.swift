@@ -35,7 +35,11 @@ struct BidiText: NSViewRepresentable {
     var color: NSColor = .labelColor
 
     func makeNSView(context: Context) -> NSTextView {
-        let textView = NSTextView()
+        // A plain NSTextView does NOT report a usable `intrinsicContentSize` height, so SwiftUI sizes it to
+        // the viewport and the enclosing ScrollView never overflows (it rubber-bands "as if at the
+        // bottom"). `FittingTextView` reports its laid-out text height, so a long body grows past the
+        // viewport and the ScrollView actually scrolls.
+        let textView = FittingTextView()
         textView.isEditable = false
         textView.isSelectable = false
         textView.drawsBackground = false                 // transparent over the overlay
@@ -114,6 +118,28 @@ struct BidiText: NSViewRepresentable {
             para.alignment = rtl ? .right : .left
             storage.addAttribute(.paragraphStyle, value: para, range: enclosingRange)
         }
+    }
+}
+
+/// A non-scrolling `NSTextView` that reports its **laid-out text height** as the intrinsic content
+/// height, so SwiftUI sizes it to the wrapped content (not the viewport) and the enclosing `ScrollView`
+/// overflows + scrolls for long bodies. Height is computed at the current container width (which tracks
+/// the view width), so it reflects the actual wrapping; width stays `noIntrinsicMetric` (the parent
+/// decides width). `invalidateIntrinsicContentSize()` on each text update re-queries it as tokens stream.
+private final class FittingTextView: NSTextView {
+    override var intrinsicContentSize: NSSize {
+        guard let layoutManager, let textContainer else { return super.intrinsicContentSize }
+        layoutManager.ensureLayout(for: textContainer)
+        let height = layoutManager.usedRect(for: textContainer).height
+        return NSSize(width: NSView.noIntrinsicMetric, height: ceil(height))
+    }
+
+    /// This text view is NOT inside an NSScrollView — the enclosing SwiftUI `ScrollView` owns scrolling.
+    /// A bare NSTextView otherwise SWALLOWS scroll-wheel events (it has no clip view to move), so the
+    /// SwiftUI ScrollView never sees them and the body appears unscrollable. Forward them up so the host
+    /// ScrollView scrolls.
+    override func scrollWheel(with event: NSEvent) {
+        nextResponder?.scrollWheel(with: event)
     }
 }
 

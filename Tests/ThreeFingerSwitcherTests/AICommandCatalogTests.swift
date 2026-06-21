@@ -53,14 +53,28 @@ final class AICommandCatalogTests: XCTestCase {
 
     // MARK: - Category conventions
 
-    func testVisionPresetsArePreviewOnlyScreenRegion() {
+    func testVisionPresetsArePreviewOnlyImageInputs() {
         let vision = AICommandCatalog.commands(in: .vision)
         XCTAssertFalse(vision.isEmpty, "the vision category ships presets")
         for command in vision {
-            XCTAssertEqual(command.input, .screenRegion,
-                           "vision preset \(command.name) reads a screen region")
+            XCTAssertTrue([.screenRegion, .clipboardImage].contains(command.input),
+                          "vision preset \(command.name) reads an image source (screen region or clipboard image)")
+            XCTAssertEqual(command.requiredCapabilities, [.vision],
+                           "vision preset \(command.name) requires a vision-capable model")
             XCTAssertEqual(command.output, .previewOnly,
                            "vision preset \(command.name) is preview-only")
+        }
+    }
+
+    func testVisionCategoryShipsAClipboardImagePreset() {
+        let vision = AICommandCatalog.commands(in: .vision)
+        let clipboardImage = vision.filter { $0.input == .clipboardImage }
+        XCTAssertFalse(clipboardImage.isEmpty,
+                       "the Vision category ships at least one clipboard-image preset (analyze a copied image)")
+        for command in clipboardImage {
+            XCTAssertFalse(command.name.isEmpty, "preset has a name")
+            XCTAssertFalse(command.promptTemplate.isEmpty, "preset \(command.name) has a prompt template")
+            XCTAssertEqual(command.output, .previewOnly, "clipboard-image preset \(command.name) is preview-only")
         }
     }
 

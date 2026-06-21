@@ -33,6 +33,11 @@ final class LauncherOverlayController {
     /// coordinator before `show`; the panel's `LauncherView` is built with it (the panel is recreated
     /// fresh on every `show`, so a late-set executor is picked up on the next open).
     var executor: AICommandExecutor?
+    /// Called when an armed **screen-region** (vision) AI command is lifted: the launcher has already been
+    /// dismissed (to reveal the desktop), and the coordinator now runs the region picker, captures the
+    /// designated region, and on capture re-opens the canvas via `showCanvas(for:)` while firing the
+    /// executor with the captured image. A cancelled pick opens no canvas (the front app is restored).
+    var onScreenRegionCommand: ((AICommand) -> Void)?
     /// Enable/download wiring for the canvas's `.unavailable` state (configuration-hub). Set by the
     /// coordinator before `show`; picked up when the panel's `LauncherView` is (re)built on each open.
     var aiAvailability: AICanvasAvailability?
@@ -86,6 +91,25 @@ final class LauncherOverlayController {
         // (`.bands`), so the drill stays OFF until a horizontal step crosses in — a lift on the Files icon
         // dismisses like any other band (refinement 1).
         syncFilesDrillState()
+    }
+
+    /// Open the AI preview canvas DIRECTLY for `command`, with the launcher otherwise dismissed — the
+    /// screen-region picker flow's re-entry. The launcher closed to reveal the desktop, the user dragged a
+    /// region, and the canvas now opens to stream the vision result. Creates a fresh panel straight in
+    /// canvas mode and wires the resolution gestures, mirroring the canvas side of `end()`'s AI path; the
+    /// executor is fired by the coordinator (which holds the captured image), so this only presents the
+    /// canvas. The panel is recreated fresh (as on every open), so it binds the current Space — never a
+    /// ghost on a later Space switch.
+    func showCanvas(for command: AICommand) {
+        endEdgeAutoScroll()
+        canvasDiscardAccum = 0
+        let panel = self.panel ?? makePanel()
+        self.panel = panel
+        model.enterCanvas(command)
+        onCanvasStateChanged?(true)        // → recognizer enters canvas-resolution mode (swipe to resolve)
+        layout(panel, animated: false)     // canvas metrics
+        panel.orderFrontRegardless()
+        setCanvasInteractive(true)         // canvas is interactive for its whole life (scroll / pills)
     }
 
     /// Re-publish whether the Files directory **drill** is engaged so the coordinator can flip the
@@ -251,6 +275,17 @@ final class LauncherOverlayController {
         if case let .aiCommand(command) = item.kind {
             endEdgeAutoScroll()
             canvasDiscardAccum = 0
+            // Case 2a: a SCREEN-REGION (vision) command is a further exception WITHIN the AI-command
+            // exception (launcher-overlay spec): it must reveal the desktop so the user can drag a region,
+            // so it DISMISSES the launcher first (like a completing action) and hands off to the region-
+            // picker orchestration. That captures the designated region and re-opens the canvas via
+            // `showCanvas(for:)`; a cancelled pick opens no canvas. `onFire` is NOT called here — the
+            // coordinator fires the executor with the captured image.
+            if command.input == .screenRegion {
+                hide()                          // synchronous dismiss → reveal the desktop (ghost-safe)
+                onScreenRegionCommand?(command)
+                return true
+            }
             model.enterCanvas(command)
             onCanvasStateChanged?(true)   // → recognizer enters canvas-resolution mode (swipe to resolve)
             if let panel { layout(panel, animated: true) }   // grow to the canvas metrics
