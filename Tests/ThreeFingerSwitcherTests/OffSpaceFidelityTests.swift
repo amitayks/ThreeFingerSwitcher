@@ -135,72 +135,51 @@ final class OffSpaceFidelityTests: XCTestCase {
             realFrame: CGRect(x: 0, y: 33, width: 1511, height: 949)))
     }
 
-    // MARK: - Motion gate (capture only after the frame holds still for N consecutive ticks)
+    // MARK: - Refresh sweep: capture cleanly-presented windows, skip degraded ones
 
-    func testFirstObservationDefers() {
-        // No prior record → count resets to 0, not settled (defer; the seeded frame shows meanwhile).
-        let step = ThumbnailService.liveSettleStep(
-            previous: nil, current: CGRect(x: 100, y: 100, width: 800, height: 600), settleTicks: 2)
-        XCTAssertEqual(step.stableTicks, 0)
-        XCTAssertFalse(step.settled)
-    }
-
-    func testStableTicksAccumulateUntilThreshold() {
-        // Same frame each tick: the count climbs and only settles once it reaches the threshold, so the
-        // first ticks after a window settles (its pixel-morph tail) are not captured.
-        let f = CGRect(x: 100, y: 100, width: 800, height: 600)
-        let t1 = ThumbnailService.liveSettleStep(previous: nil, current: f, settleTicks: 2)
-        XCTAssertEqual(t1.stableTicks, 0); XCTAssertFalse(t1.settled)
-        let t2 = ThumbnailService.liveSettleStep(previous: (f, t1.stableTicks), current: f, settleTicks: 2)
-        XCTAssertEqual(t2.stableTicks, 1); XCTAssertFalse(t2.settled)   // not yet
-        let t3 = ThumbnailService.liveSettleStep(previous: (f, t2.stableTicks), current: f, settleTicks: 2)
-        XCTAssertEqual(t3.stableTicks, 2); XCTAssertTrue(t3.settled)    // reached threshold → capture
-    }
-
-    func testFrameChangeResetsStableTicks() {
-        // A changed frame (still mid-morph / resizing) resets the count, so the in-flight frame and the
-        // tail can't be captured — even after a long prior stable run.
-        let f = CGRect(x: 100, y: 100, width: 800, height: 600)
-        let stayed = ThumbnailService.liveSettleStep(previous: (f, 5), current: f, settleTicks: 2)
-        XCTAssertTrue(stayed.settled)                                   // was stable long enough
-        let moved = ThumbnailService.liveSettleStep(
-            previous: (f, 5),
-            current: CGRect(x: 100, y: 100, width: 820, height: 600),   // frame changed since last tick
-            settleTicks: 2)
-        XCTAssertEqual(moved.stableTicks, 0)
-        XCTAssertFalse(moved.settled)
-    }
-
-    // MARK: - One-shot prefetch: never clobber a good cached frame
-
-    func testPrefetchSkipsWindowThatAlreadyHasCachedFrame() {
-        // A previously-seen window keeps its good cached frame — never re-captured (possibly mid-
-        // animation) at open. This is the bystander "sideways" fix (e.g. Terminal after an app switch).
-        let f = CGRect(x: 100, y: 100, width: 800, height: 600)
-        XCTAssertFalse(ThumbnailService.shouldPrefetchCapture(
-            hasCachedFrame: true, displayedFrame: f, realFrame: f, displayUnion: display))
-    }
-
-    func testPrefetchCapturesNeverSeenCleanWindow() {
-        // A never-seen, cleanly-presented window is captured on first sighting.
+    func testRefreshCapturesCleanlyPresentedWindow() {
+        // A cleanly-presented window is captured. A cached frame is no longer a reason to skip — the sweep
+        // re-captures to stay fresh and self-heal; the pure gate just checks how the window is presented.
         let f = CGRect(x: 100, y: 100, width: 800, height: 600)
         XCTAssertTrue(ThumbnailService.shouldPrefetchCapture(
-            hasCachedFrame: false, displayedFrame: f, realFrame: f, displayUnion: display))
+            displayedFrame: f, realFrame: f, displayUnion: display))
     }
 
-    func testPrefetchSkipsStripProxyEvenWhenNeverSeen() {
-        // A never-seen window that is a Stage-Manager strip proxy is still skipped (degraded).
+    func testRefreshSkipsStripProxy() {
+        // A Stage-Manager strip proxy would capture as the tilted strip → skipped, served from cache/icon.
         XCTAssertFalse(ThumbnailService.shouldPrefetchCapture(
-            hasCachedFrame: false,
             displayedFrame: CGRect(x: 16, y: 164, width: 160, height: 184),
             realFrame: CGRect(x: 0, y: 33, width: 1512, height: 949), displayUnion: display))
     }
 
-    func testPrefetchSkipsOffDisplayWindowEvenWhenNeverSeen() {
-        // A never-seen window parked off every display is skipped (degraded set-aside).
+    func testRefreshSkipsOffDisplayWindow() {
+        // A window parked off every display (Stage-Manager set-aside) is skipped (degraded).
         let f = CGRect(x: -2000, y: 100, width: 800, height: 600)
         XCTAssertFalse(ThumbnailService.shouldPrefetchCapture(
-            hasCachedFrame: false, displayedFrame: f, realFrame: f, displayUnion: display))
+            displayedFrame: f, realFrame: f, displayUnion: display))
+    }
+
+    // MARK: - Motion gate: discard a frame grabbed while the window is animating
+
+    func testStillFrameIsNotInMotion() {
+        // Identical bounds immediately before and after the capture → the window is settled → keep the frame.
+        let f = CGRect(x: 100, y: 100, width: 800, height: 600)
+        XCTAssertFalse(ThumbnailService.frameMovedDuringCapture(before: f, after: f))
+    }
+
+    func testMovedFrameIsInMotion() {
+        // A frame change across the capture (Stage-Manager morph / Dock genie) marks it in-motion → discard,
+        // so the tilted "sideways" frame never replaces the last good one.
+        let before = CGRect(x: 100, y: 100, width: 800, height: 600)
+        XCTAssertTrue(ThumbnailService.frameMovedDuringCapture(
+            before: before, after: CGRect(x: 100, y: 100, width: 812, height: 600)))   // 12px wider mid-morph
+    }
+
+    func testEvenOnePixelShiftIsInMotion() {
+        // The gate is exact: even a 1px origin shift during the animation is enough to reject the frame.
+        let before = CGRect(x: 100, y: 100, width: 800, height: 600)
+        XCTAssertTrue(ThumbnailService.frameMovedDuringCapture(
+            before: before, after: CGRect(x: 101, y: 100, width: 800, height: 600)))
     }
 
     // MARK: - Capture sizing bounded to the display target
@@ -224,5 +203,13 @@ final class OffSpaceFidelityTests: XCTestCase {
             cap: CGSize(width: 600, height: 400))
         XCTAssertEqual(dims.width, 400)        // 200 × 2, unscaled
         XCTAssertEqual(dims.height, 300)       // 150 × 2, unscaled
+    }
+
+    // MARK: - Periodic refresh cadence
+
+    func testPreviewRefreshIntervalIsSlowNotLive() {
+        // The visible row refreshes on a slow "slowly but surely" sweep, NOT the old 0.1s live loop —
+        // guards against a regression back to a per-tick highlight capture.
+        XCTAssertGreaterThanOrEqual(AppCoordinator.previewRefreshInterval, 0.5)
     }
 }

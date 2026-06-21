@@ -23,27 +23,6 @@ final class ThumbnailService {
 
     private var inFlight: Set<CGWindowID> = []
 
-    /// Per-gesture "live session" cache: while a switcher gesture is held, the visible row's window can
-    /// be re-captured every frame via `liveCapture` WITHOUT re-enumerating SCShareableContent each time
-    /// (the enumeration in `capture` is the expensive part). `prepareLiveSession` snapshots the windows
-    /// and display union once at gesture start; `refreshLiveSession` re-snapshots when the visible row
-    /// changes; `endLiveSession` drops it. `.null` union makes the degraded checks no-op, as elsewhere.
-    private var liveWindows: [CGWindowID: SCWindow] = [:]
-    private var liveDisplayUnion: CGRect = .null
-
-    /// How many consecutive ticks (at the live-preview cadence) a window's frame must be UNCHANGED before
-    /// a fresh live capture is allowed. The bounds settle a beat BEFORE the pixels finish the Stage-Manager
-    /// perspective/aspect morph, so a 1-tick "held still" check can still grab that tilted tail; requiring
-    /// a few stable ticks (~0.3 s at the 0.1 s cadence) lets the morph fully land first. The seeded
-    /// last-good frame shows meanwhile, so the card is never blank. Tunable from `TFS_THUMB_LOG` data.
-    static let liveSettleTicks = 3
-
-    /// Per-session record of each window's last-observed live frame AND how many consecutive ticks it has
-    /// been unchanged, for the motion gate: the highlighted window is live-captured only once its frame has
-    /// held still for `liveSettleTicks` ticks — so neither an in-flight Stage-Manager / Dock morph NOR its
-    /// just-settled-but-still-tilted tail frame is captured. Cleared in `endLiveSession`.
-    private var liveBoundsSeen: [CGWindowID: (frame: CGRect, stableTicks: Int)] = [:]
-
     /// When set (env var `TFS_THUMB_LOG`), each capture logs its ScreenCaptureKit frame next to the
     /// window's logical frame so the set-aside/off-screen "degraded" signal can be confirmed and the
     /// thresholds in `isDegradedCapture` tuned against real data (see the change's task 1.2 / 1.3).
@@ -86,37 +65,50 @@ final class ThumbnailService {
         }
     }
 
-    /// One-shot (re)capture of the given windows when the overlay is shown, CACHE-FIRST: a window that
-    /// ALREADY has a cached frame is NOT re-captured — its good frame is kept (never clobbered by a
-    /// possibly mid-animation open-time capture), and a window that is not cleanly presented right now is
-    /// likewise skipped, so its cached/icon (applied via `seed`) shows instead of a degraded image. Only
-    /// a never-seen, cleanly-presented window is captured here; continuous refresh of the highlighted
-    /// window is the live path's job. The `inFlight` guard prevents duplicate concurrent captures.
-    ///
-    /// A window parked off every display (Stage Manager set-aside) would only capture as the tilted
-    /// strip proxy, so it is skipped here and served from cache via `seed` (the caller applies `seed`
-    /// before this, keeping the prior cached thumbnail visible). Off-Space-but-on-screen windows still
-    /// capture, preserving live off-Space previews. Minimized windows never reach this point —
-    /// `snapshot()`'s `isSwitchable` excludes them.
+    /// Refresh previews for the given windows — re-capture every cleanly-presented window from a SINGLE
+    /// `SCShareableContent` enumeration. Run both on overlay open (immediate first frame for the whole
+    /// visible row) and repeatedly from the periodic preview-refresh timer. Unlike the old cache-first
+    /// prefetch, a window that ALREADY has a cached frame IS re-captured (the cached frame shows meanwhile
+    /// via `seed`) — this is what keeps the row fresh and lets a slipped-through frame self-heal on the next
+    /// sweep. A window that is not cleanly presented — parked off every display (Stage-Manager set-aside) or
+    /// a Stage-Manager strip proxy — is skipped and served from cache/icon instead. The `inFlight` guard
+    /// gives per-window back-pressure so an in-flight capture is never duplicated. Off-Space-but-on-screen
+    /// windows still capture; minimized windows never reach here (`snapshot()`'s `isSwitchable` excludes them).
     func prefetch(_ windows: [WindowInfo]) {
         guard CGPreflightScreenCaptureAccess() else { return }
+        let targets = windows.filter { !inFlight.contains($0.id) }
+        guard !targets.isEmpty else { return }
+        Task { await self.refreshBatch(targets) }
+    }
+
+    /// Capture every cleanly-presented window in `windows` from ONE shared `SCShareableContent` enumeration
+    /// (the enumeration is the expensive part — paying it once per sweep instead of once per window is the
+    /// batch win). Each window is degraded-gated against its fresh enumerated frame and captured as a
+    /// concurrent child task, self-paced by `inFlight`.
+    private func refreshBatch(_ windows: [WindowInfo]) async {
         let displayUnion = Self.displayUnion()
-        for w in windows where !inFlight.contains(w.id) {
-            // Skip a window that already has a good cached frame (never clobber it with a possibly
-            // mid-animation open-time capture — the bystander "sideways" case: a window like Terminal
-            // captured while Stage Manager is still settling after an app switch), and skip a window
-            // whose capture would be a degraded proxy ((a) parked off every display, or (b) a
-            // Stage-Manager strip thumbnail). `seed` already shows the cached/icon for all of these;
-            // only a never-seen, cleanly-presented window is captured. Continuous refresh of the
-            // highlighted window stays on the live path.
-            guard Self.shouldPrefetchCapture(hasCachedFrame: cache[w.id] != nil,
-                                             displayedFrame: w.frame, realFrame: w.realFrame,
-                                             displayUnion: displayUnion) else { continue }
-            inFlight.insert(w.id)
-            // Pass the real (AX) frame as the logical frame so capture()'s degraded check compares the
-            // SCK frame against the TRUE size (a backstop if a strip proxy slips past the checks above).
+        let content: SCShareableContent
+        do {
+            content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        } catch {
+            return  // Enumeration failed (permission, transient): leave cached frames in place.
+        }
+        let byID = Dictionary(content.windows.map { ($0.windowID, $0) }, uniquingKeysWith: { _, new in new })
+        for w in windows {
+            guard !inFlight.contains(w.id) else { continue }
+            // Skip a not-cleanly-presented window (parked off every display, or a Stage-Manager strip
+            // proxy); `seed` already shows its cached/icon. Pass the real (AX) frame as the logical frame
+            // so the degraded check compares the SCK frame against the TRUE size.
+            guard Self.shouldPrefetchCapture(displayedFrame: w.frame, realFrame: w.realFrame,
+                                             displayUnion: displayUnion),
+                  let scWindow = byID[w.id] else { continue }
             let logical = w.realFrame.width > 1 ? w.realFrame : w.frame
-            Task { await self.capture(w.id, logicalFrame: logical, displayUnion: displayUnion) }
+            // Capture sequentially (each window awaited before the next): the visible row is bounded and a
+            // single screenshot is cheap, so the whole sweep lands well within the refresh interval, while
+            // `inFlight` still guards an overlapping sweep from re-capturing the same window.
+            inFlight.insert(w.id)
+            await captureWindow(scWindow, id: w.id, logicalFrame: logical, displayUnion: displayUnion)
+            inFlight.remove(w.id)
         }
     }
 
@@ -177,22 +169,21 @@ final class ThumbnailService {
             || displayedFrame.height / realFrame.height < cleanScaleThreshold
     }
 
-    /// Pure: whether the one-shot open prefetch should capture this window. Skip when it ALREADY has a
-    /// cached frame (don't clobber a good frame with a possibly mid-animation open-time capture — the
-    /// bystander "sideways" case), or when its presentation is degraded (parked off all displays, or a
-    /// Stage-Manager strip proxy). Only a never-seen, cleanly-presented window is captured. Pure, for
-    /// unit testing.
-    static func shouldPrefetchCapture(hasCachedFrame: Bool, displayedFrame: CGRect,
-                                      realFrame: CGRect, displayUnion: CGRect) -> Bool {
-        if hasCachedFrame { return false }
+    /// Pure: whether a refresh sweep should capture this window. Capture every cleanly-presented window —
+    /// a cached frame is NOT a reason to skip (re-capturing is what keeps the row fresh and self-healing);
+    /// skip only a not-cleanly-presented window (parked off all displays, or a Stage-Manager strip proxy),
+    /// which would capture as the tilted strip and is served from cache/icon instead. Pure, for unit testing.
+    static func shouldPrefetchCapture(displayedFrame: CGRect, realFrame: CGRect, displayUnion: CGRect) -> Bool {
         if isOffAllDisplays(displayedFrame, displayUnion: displayUnion) { return false }
         if isStripProxy(displayedFrame: displayedFrame, realFrame: realFrame) { return false }
         return true
     }
 
-    /// The window's CURRENT bounds via a cheap single-id `CGWindowList` query — used to gate live capture
-    /// on LIVE geometry (not the per-gesture `prepareLiveSession` snapshot) and to detect motion. Returns
-    /// nil when the window is gone or the query yields no bounds (the caller falls back to the snapshot).
+    /// The window's CURRENT bounds via a cheap single-id `CGWindowList` query — a LIVE read (not the
+    /// sweep's `SCShareableContent` snapshot), so it tracks an in-flight Stage-Manager / Dock animation
+    /// frame by frame. Used as the motion gate's before/after-capture probe and to gate the degraded check
+    /// on the freshest geometry. Returns nil when the window is gone or yields no bounds (callers fall back
+    /// to the snapshot frame).
     static func liveBounds(of id: CGWindowID) -> CGRect? {
         guard let infoList = CGWindowListCopyWindowInfo([.optionIncludingWindow], id) as? [[String: Any]],
               let info = infoList.first,
@@ -203,20 +194,13 @@ final class ThumbnailService {
         return rect
     }
 
-    /// Pure motion gate: given the previously-recorded `(frame, stableTicks)` and the window's current
-    /// live frame, returns the updated consecutive-stable-tick count and whether a capture is allowed now.
-    /// A capture is allowed only once the frame has been UNCHANGED for `settleTicks` consecutive ticks
-    /// (waiting past both the bounds animation and the pixel-morph tail); any change — or a first
-    /// observation — resets the count to 0. Pure, for unit testing.
-    static func liveSettleStep(previous: (frame: CGRect, stableTicks: Int)?, current: CGRect,
-                               settleTicks: Int) -> (stableTicks: Int, settled: Bool) {
-        let count: Int
-        if let previous, previous.frame == current {
-            count = previous.stableTicks + 1
-        } else {
-            count = 0
-        }
-        return (count, count >= settleTicks)
+    /// Pure motion gate: a capture is "sideways" (mid-animation → discard) when the window's frame changed
+    /// across the capture. The Stage-Manager perspective tilt and the Dock genie ONLY happen while the
+    /// window's frame is animating, so a frame that is identical immediately before and after the capture is
+    /// settled (and never tilted); any change — even 1px — means the pixels were grabbed mid-motion. Exact
+    /// `CGRect` inequality, so it adds no latency for a still window. Pure, for unit testing.
+    static func frameMovedDuringCapture(before: CGRect, after: CGRect) -> Bool {
+        before != after
     }
 
     func clear() {
@@ -263,112 +247,58 @@ final class ThumbnailService {
         return out.joined(separator: "\n")
     }
 
-    /// Open a per-gesture live session: enumerate SCShareableContent ONCE and snapshot every window by
-    /// id, so `liveCapture` can re-capture the highlighted window each frame without paying for the
-    /// enumeration again. Degrades silently (clears state) when Screen Recording permission is missing.
-    func prepareLiveSession() async {
-        guard CGPreflightScreenCaptureAccess() else {
-            endLiveSession()
-            return
-        }
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            liveWindows = Dictionary(content.windows.map { ($0.windowID, $0) }, uniquingKeysWith: { _, new in new })
-            liveDisplayUnion = Self.displayUnion()
-        } catch {
-            endLiveSession()
-        }
-    }
-
-    /// Re-enumerate the live-session snapshot (same work as `prepareLiveSession`), for when the visible
-    /// row changes and the highlighted window's SCWindow may not be in the existing snapshot.
-    func refreshLiveSession() async {
-        await prepareLiveSession()
-    }
-
-    /// Drop the live-session snapshot at gesture end.
-    func endLiveSession() {
-        liveWindows = [:]
-        liveDisplayUnion = .null
-        liveBoundsSeen = [:]
-    }
-
-    /// Fast per-frame capture of a single highlighted window during a held gesture, reusing the
-    /// `prepareLiveSession` snapshot instead of re-enumerating SCShareableContent. `inFlight` provides
-    /// back-pressure (self-pacing): a frame requested while one is still in flight is dropped, never
-    /// queued. If the id is missing from the snapshot we fall back to the enumeration path so coverage
-    /// is never lost.
-    ///
-    /// Two gates run on the window's CURRENT bounds (a cheap single-id `CGWindowList` read), not the
-    /// possibly-stale snapshot: the **motion gate** withholds capture until the frame has held still for
-    /// `liveSettleTicks` consecutive ticks (past the in-flight Stage-Manager / Dock morph AND its
-    /// just-settled-but-still-tilted tail), keeping the last good frame meanwhile — so a transitional
-    /// "sideways" frame is never captured nor frozen by scrubbing away; the **degraded gate** then runs
-    /// against that same fresh frame. Both fall back to the snapshot only when the live read is unavailable.
-    func liveCapture(_ id: CGWindowID, logicalFrame: CGRect) async {
-        if inFlight.contains(id) { return }
-
-        let liveFrame = Self.liveBounds(of: id)
-        if let liveFrame {
-            // Motion gate: capture only once the frame has held still for `liveSettleTicks` consecutive
-            // ticks (past the bounds animation AND the pixel-morph tail). While it moves — or in the brief
-            // settle tail — keep the last good frame; a changed frame resets the count.
-            let step = Self.liveSettleStep(previous: liveBoundsSeen[id], current: liveFrame, settleTicks: Self.liveSettleTicks)
-            liveBoundsSeen[id] = (liveFrame, step.stableTicks)
-            guard step.settled else { return }
-        }
-
-        guard let scWindow = liveWindows[id] else {
-            await capture(id, logicalFrame: logicalFrame, displayUnion: Self.displayUnion())
-            return
-        }
+    /// One-shot capture of a single window by id: enumerate, find the window, then capture it through the
+    /// shared `captureWindow` (degraded + motion gated). Used by the Dock preview after it fronts and settles
+    /// a window — the shared motion gate also protects it, dropping a frame grabbed while the window is still
+    /// animating forward (the last good frame holds until it settles). `inFlight` self-paces (a call for an
+    /// id already in flight is dropped). Degrades silently without Screen Recording permission.
+    func captureOne(_ id: CGWindowID, logicalFrame: CGRect) async {
+        guard CGPreflightScreenCaptureAccess(), !inFlight.contains(id) else { return }
         inFlight.insert(id)
         defer { inFlight.remove(id) }
-
-        // Gate on the FRESH live frame when available; fall back to the snapshot frame otherwise.
-        let gateFrame = liveFrame ?? scWindow.frame
-        if frameLoggingEnabled {
-            NSLog("[TFS-thumb] liveCapture id=\(id) gate=\(gateFrame) live=\(liveFrame.map { "\($0)" } ?? "nil") snap=\(scWindow.frame) onScreen=\(scWindow.isOnScreen) logical=\(logicalFrame)")
-        }
-        // Don't overwrite a good cached thumbnail with a degraded capture — keep the last good frame.
-        if Self.isDegradedCapture(scFrame: gateFrame, logicalFrame: logicalFrame, displayUnion: liveDisplayUnion) {
-            return
-        }
-
-        do {
-            let config = streamConfiguration(for: scWindow)
-            let filter = SCContentFilter(desktopIndependentWindow: scWindow)
-            let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-            if frameLoggingEnabled {
-                NSLog("[TFS-thumb] liveCapture id=\(id) STORED image=\(cgImage.width)x\(cgImage.height) (config=\(config.width)x\(config.height))")
-            }
-            let image = NSImage(cgImage: cgImage, size: NSSize(width: config.width, height: config.height))
-            store(id, image)
-            onThumbnail?(id, image)
-        } catch {
-            // Window gone or capture failed: leave the cached frame untouched.
-        }
-    }
-
-    private func capture(_ id: CGWindowID, logicalFrame: CGRect, displayUnion: CGRect) async {
-        defer { inFlight.remove(id) }
-
+        let displayUnion = Self.displayUnion()
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
             guard let scWindow = content.windows.first(where: { $0.windowID == id }) else { return }
+            await captureWindow(scWindow, id: id, logicalFrame: logicalFrame, displayUnion: displayUnion)
+        } catch {
+            // Enumeration failed (permission, transient): leave the cached frame untouched.
+        }
+    }
 
-            if frameLoggingEnabled {
-                NSLog("[TFS-thumb] capture id=\(id) sc=\(scWindow.frame) onScreen=\(scWindow.isOnScreen) logical=\(logicalFrame)")
-            }
-            // Don't overwrite a good cached thumbnail with a degraded capture — a Stage-Manager
-            // set-aside strip proxy or an off-screen frame. Keep the cached image or icon instead.
-            if Self.isDegradedCapture(scFrame: scWindow.frame, logicalFrame: logicalFrame, displayUnion: displayUnion) {
-                return
-            }
-
+    /// Capture a single already-enumerated `SCWindow` and store + notify on success — but only when the frame
+    /// is both cleanly presented AND still. Two complementary gates keep a bad ("sideways") frame from ever
+    /// replacing the last good one, so nothing degraded is rendered even for one tick:
+    ///   • degraded gate (`isDegradedCapture`) on the window's FRESH live frame — rejects a static-degraded
+    ///     window (Stage-Manager set-aside strip, or parked off every display);
+    ///   • motion gate — the live frame is read just before AND just after the capture, and if it moved
+    ///     across the capture the window was mid-animation (Stage-Manager morph / Dock genie / app-switch
+    ///     settle), so the grabbed pixels are the tilted frame and are DISCARDED.
+    /// On either rejection nothing is stored, so the cached/last-good frame stays until a later sweep lands a
+    /// clean one. A still, cleanly-presented window passes both immediately (no added latency). Non-throwing;
+    /// the caller owns `inFlight` bookkeeping.
+    private func captureWindow(_ scWindow: SCWindow, id: CGWindowID, logicalFrame: CGRect, displayUnion: CGRect) async {
+        let frameBefore = Self.liveBounds(of: id) ?? scWindow.frame
+        if frameLoggingEnabled {
+            NSLog("[TFS-thumb] capture id=\(id) before=\(frameBefore) sc=\(scWindow.frame) onScreen=\(scWindow.isOnScreen) logical=\(logicalFrame)")
+        }
+        if Self.isDegradedCapture(scFrame: frameBefore, logicalFrame: logicalFrame, displayUnion: displayUnion) {
+            return
+        }
+        do {
             let config = streamConfiguration(for: scWindow)
             let filter = SCContentFilter(desktopIndependentWindow: scWindow)
             let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            // Motion gate: a frame change across the capture means the window was animating — the grabbed
+            // pixels are the tilted "sideways" frame. Discard so the last good frame is kept; a later sweep
+            // re-captures it once settled.
+            let frameAfter = Self.liveBounds(of: id) ?? frameBefore
+            if Self.frameMovedDuringCapture(before: frameBefore, after: frameAfter) {
+                if frameLoggingEnabled {
+                    NSLog("[TFS-thumb] capture id=\(id) DISCARDED in-motion (\(frameBefore) → \(frameAfter))")
+                }
+                return
+            }
             if frameLoggingEnabled {
                 NSLog("[TFS-thumb] capture id=\(id) STORED image=\(cgImage.width)x\(cgImage.height) (config=\(config.width)x\(config.height))")
             }
@@ -376,7 +306,7 @@ final class ThumbnailService {
             store(id, image)
             onThumbnail?(id, image)
         } catch {
-            // Permission denied, window gone, or capture failed: leave the placeholder in place.
+            // Window gone or capture failed: leave the cached frame untouched.
         }
     }
 
@@ -391,7 +321,7 @@ final class ThumbnailService {
         return (max(Int(nativeW * fit), 1), max(Int(nativeH * fit), 1))
     }
 
-    /// Shared single-window screenshot configuration used by both `capture` and `liveCapture`: capture
+    /// Shared single-window screenshot configuration used by `captureWindow`: capture
     /// sized by `captureDimensions` (native pixels bounded to `thumbnailMaxSize`, the display target),
     /// no cursor, no surrounding shadow. Behavior-identical across both paths so the fast live capture
     /// matches the enumeration capture pixel-for-pixel.

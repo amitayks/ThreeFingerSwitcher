@@ -241,7 +241,7 @@ final class DockPreviewController {
         captureTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(Int(delay * 1000)))
             guard let self, !Task.isCancelled, self.peekedID == id else { return }
-            await self.thumbnails.liveCapture(id, logicalFrame: logical)   // one-shot; cache-first safety
+            await self.thumbnails.captureOne(id, logicalFrame: logical)    // one-shot; degraded-gated safety
         }
     }
 
