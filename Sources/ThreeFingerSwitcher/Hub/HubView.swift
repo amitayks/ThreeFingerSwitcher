@@ -74,6 +74,24 @@ final class HubContext {
     let models: ModelManager
     let permissions: PermissionsService
 
+    /// The gesture-preview rehearse seam (§2.3 / §2.4): a `HubGesturePreview` binds its `liveDots` to
+    /// this controller's published dots and registers as the active rehearse target on appear. The
+    /// coordinator routes the touch feed in and consults its `ownsGestures` to suppress the real
+    /// recognizer while rehearsing. Wired by `AppCoordinator.makeHubContext`.
+    var rehearse: HubRehearseController?
+
+    // §11.2 Real demo content — the SAME providers the First Touch wizard uses (`WizardContext`),
+    // so the Hub previews render the actual switcher/launcher seeded with the user's real windows +
+    // bands. Wired by `AppCoordinator.makeHubContext` (copied from `makeWizardContext`). No new
+    // permission: `realWindowRows`/`launcherBands` read already-available state, and `seedThumbnails`
+    // reuses the granted Screen Recording (degrades to icons when not granted).
+    /// The user's real windows (one row per Space-row); empty ⇒ the holder falls back to sample art.
+    var realWindowRows: () -> [[WindowInfo]] = { [] }
+    /// Seed/prefetch live thumbnails into the passed demo model (post-Screen-Recording reveal).
+    var seedThumbnails: (SwitcherModel) -> Void = { _ in }
+    /// The launcher's bands for the current toggles (favorites + AI/Clipboard when on).
+    var launcherBands: (_ clipboardOn: Bool, _ aiOn: Bool) -> [ContextBand] = { _, _ in [] }
+
     // Clipboard feature page.
     var onClearClipboard: (_ includingPinned: Bool) -> Void = { _ in }
 
@@ -247,8 +265,8 @@ struct HubView: View {
         switch nav.selection ?? .overview {
         case .overview: OverviewPage(context: context, nav: nav)
         case .bands: BandsPage(context: context)
-        case .switcher: SwitcherPage(settings: context.settings)
-        case .launcher: LauncherPage(settings: context.settings)
+        case .switcher: SwitcherPage(context: context)
+        case .launcher: LauncherPage(context: context)
         case .clipboard: ClipboardPage(context: context)
         case .files: FilesPage(context: context)
         case .ai: AIPage(context: context)

@@ -59,6 +59,9 @@ struct FilesBandView: View {
         // overlay (not a replacement) so the column stays visible behind it, matching the user's "a popup
         // list opened over what I was looking at" vision.
         .overlay { openWithPicker }
+        // The +1-finger ACTION MENU buds in over the navigator the same way (files & folders). "Open in ▸"
+        // within it exits to the Open-With grid; the two popups are never both open.
+        .overlay { actionMenuPopup }
         // A failed open surfaces as a BOUNDED, non-blocking row pinned to the bottom of the navigator —
         // never an app-modal alert (spec: failures are observable, never silent; bounded + non-blocking). It
         // buds in over the column (the navigator stays usable behind it) and recedes on Dismiss / a fresh open.
@@ -353,7 +356,7 @@ struct FilesBandView: View {
                 // The single sliding selection pill BEHIND the rows (drawn first = at the back), offset by
                 // the picker index exactly like the folder list's highlight — never re-created per row.
                 if picker.highlighted != nil {
-                    OpenWithRowHighlight(color: tint)
+                    FilesRowHighlight(token: model.armingToken, armed: model.armed, dwell: model.dwell, color: tint)
                         .frame(height: pickerRowHeight)
                         .frame(maxWidth: .infinity)
                         .padding(.horizontal, 4)
@@ -371,8 +374,11 @@ struct FilesBandView: View {
             }
         }
         .padding(10)
-        .frame(width: pickerWidth)
-        .frame(maxHeight: pickerMaxHeight)
+        // Fit the grid to its content — width to the widest app name (a wider trailing allowance when a
+        // "Default" badge is present), height to its rows.
+        .frame(width: popupWidth(labels: picker.candidates.map(\.label), header: "Open With",
+                                 trailing: picker.candidates.contains(where: \.isDefault) ? 64 : 16),
+               height: popupHeight(rowCount: picker.candidates.count))
         .background(pickerGlassFill)
     }
 
@@ -429,11 +435,170 @@ struct FilesBandView: View {
         }
     }
 
-    /// The popup's fixed metrics: a comfortable single-column width and a per-row height a touch taller than
-    /// a folder row (it carries an app icon), capped so a long association list scrolls-safe inside the band.
-    private var pickerWidth: CGFloat { 280 }
+    /// The popup's row metrics: a per-row height a touch taller than a folder row (it carries an app icon),
+    /// and a height cap so a pathologically long association list stays bounded inside the band. Width and
+    /// height are otherwise fit to content (`popupWidth` / `popupHeight`).
     private var pickerRowHeight: CGFloat { 32 }
     private var pickerMaxHeight: CGFloat { 360 }
+
+    // MARK: - Action menu (the +1-finger menu of actions, budded over the navigator)
+
+    /// The action-menu popup: a bounded, BubbleMorph-entrance list of the actions for the highlighted entry
+    /// (`model.filesActionMenu`), centered over the navigator — the SAME single-sliding-highlight pattern as
+    /// the Open-With picker, scrubbed vertically and resolved on lift. "Open in ▸" exits this and enters the
+    /// app grid; the menu and the picker are never both open.
+    @ViewBuilder
+    private var actionMenuPopup: some View {
+        ZStack {
+            if let menu = model.filesActionMenu {
+                actionMenuPanel(menu)
+                    .transition(.bubbleMorph())
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .animation(BubbleMorph.spring, value: model.filesActionMenu != nil)
+    }
+
+    /// The menu body: a header naming the entry, then the action rows behind the single sliding pill (the
+    /// same layering as the picker / folder list — never a per-row fill, so scrubbing never strobes).
+    @ViewBuilder
+    private func actionMenuPanel(_ menu: LauncherModel.FilesActionMenuState) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: menu.entry.isDirectory ? "folder" : "doc")
+                    .font(.system(size: 12))
+                    .foregroundStyle(tint)
+                Text(menu.entry.name)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 4)
+            }
+            .padding(.horizontal, 4)
+
+            ZStack(alignment: .top) {
+                if menu.highlighted != nil {
+                    FilesRowHighlight(token: model.armingToken, armed: model.armed, dwell: model.dwell, color: tint)
+                        .frame(height: pickerRowHeight)
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 4)
+                        .offset(y: CGFloat(menu.highlightedIndex) * pickerRowHeight)
+                        .animation(.easeOut(duration: 0.14), value: menu.highlightedIndex)
+                }
+                VStack(spacing: 0) {
+                    ForEach(menu.rows) { row in
+                        actionMenuRow(row)
+                            .frame(height: pickerRowHeight)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .top)
+            }
+        }
+        .padding(10)
+        // Fit the menu to its content — width to the widest label, height to its rows (not a fixed box).
+        .frame(width: popupWidth(labels: menu.rows.map { Self.menuRowLabel($0) }, header: menu.entry.name, trailing: 26),
+               height: popupHeight(rowCount: menu.rows.count))
+        .background(pickerGlassFill)
+    }
+
+    /// Fit a popup's WIDTH to its content (the requested behavior, shared by the action menu and the Open-With
+    /// grid): the widest row `labels` rendered at the real 13pt menu font, plus the leading glyph/icon, the
+    /// inter-spacing, a `trailing` allowance (the action menu's chevron / the picker's "Default" badge), and
+    /// the paddings — measured against the `header` too, and clamped to a sensible range. A definite width
+    /// keeps the single sliding highlight (`maxWidth: .infinity`) spanning cleanly.
+    private func popupWidth(labels: [String], header: String, trailing: CGFloat) -> CGFloat {
+        func textWidth(_ s: String, _ font: NSFont) -> CGFloat {
+            (s as NSString).size(withAttributes: [.font: font]).width
+        }
+        let rowFont = NSFont.systemFont(ofSize: 13)
+        let headerFont = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        // Row: glyph/icon(22) + spacing(8) + label + trailing + row h-padding(20).
+        let widestRow = labels.map { textWidth($0, rowFont) + 22 + 8 + trailing + 20 }.max() ?? 0
+        // Header: icon(12) + spacing(6) + text + slack(16).
+        let headerW = textWidth(header, headerFont) + 12 + 6 + 16
+        let content = max(widestRow, headerW) + 20   // panel h-padding (10 each side)
+        return min(max(content, Self.popupMinWidth), Self.popupMaxWidth)
+    }
+
+    /// Fit a popup's HEIGHT to its `rowCount`: the header + the rows (each `pickerRowHeight`) + the VStack
+    /// spacing + the panel's vertical padding — so the panel is exactly as tall as its content, clamped to the
+    /// safety cap (`pickerMaxHeight`) for a pathologically long list. Shared by both popups.
+    private func popupHeight(rowCount: Int) -> CGFloat {
+        let header: CGFloat = 18, vstackSpacing: CGFloat = 6, vPadding: CGFloat = 20
+        let content = header + vstackSpacing + CGFloat(max(rowCount, 1)) * pickerRowHeight + vPadding
+        return min(content, pickerMaxHeight)
+    }
+
+    private static let popupMinWidth: CGFloat = 170
+    private static let popupMaxWidth: CGFloat = 340
+
+    /// One action-menu row: a glyph + label, with a disclosure chevron on "Open in ▸" (which descends into
+    /// the app grid). A leaf row — the selection backing is the single sliding pill.
+    @ViewBuilder
+    private func actionMenuRow(_ row: FilesMenuRow) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: Self.menuRowGlyph(row))
+                .font(.system(size: 13))
+                .foregroundStyle(tint)
+                .frame(width: 22, height: 22)
+            Text(Self.menuRowLabel(row))
+                .font(.system(size: 13))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .foregroundStyle(.primary)
+            Spacer(minLength: 4)
+            if case .action(.openIn) = row {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(height: pickerRowHeight)
+    }
+
+    /// The human label for a menu row (a tool row names the tool; "Open in…" is the app grid).
+    static func menuRowLabel(_ row: FilesMenuRow) -> String {
+        switch row {
+        case let .tool(_, tool): return "Open in \(tool.name)"
+        case let .action(action):
+            switch action {
+            case .copyAsPath:      return "Copy as Path"
+            case .copy:            return "Copy"
+            case .cut:             return "Cut"
+            case .pasteInto:       return "Paste"
+            case .openIn:          return "Open in…"
+            case .delete:          return "Delete"
+            case .openInTerminals: return "Open in Terminal"
+            case .openInEditor:    return "Open in Editor"
+            case .revealInFinder:  return "Reveal in Finder"
+            case .addToFavorites:  return "Add to Favorites"
+            case .copyName:        return "Copy Name"
+            }
+        }
+    }
+
+    /// The SF Symbol for a menu row.
+    static func menuRowGlyph(_ row: FilesMenuRow) -> String {
+        switch row {
+        case let .tool(action, _):
+            return action == .openInEditor ? "chevron.left.forward.slash.chevron.right" : "terminal"
+        case let .action(action):
+            switch action {
+            case .copyAsPath:      return "doc.on.clipboard"
+            case .copy:            return "doc.on.doc"
+            case .cut:             return "scissors"
+            case .pasteInto:       return "arrow.down.doc"
+            case .openIn:          return "arrow.up.forward.app"
+            case .delete:          return "trash"
+            case .openInTerminals: return "terminal"
+            case .openInEditor:    return "chevron.left.forward.slash.chevron.right"
+            case .revealInFinder:  return "magnifyingglass"
+            case .addToFavorites:  return "star"
+            case .copyName:        return "textformat"
+            }
+        }
+    }
 
     // MARK: - Failure row (a failed open, surfaced bounded + non-blocking)
 
@@ -747,11 +912,14 @@ private struct FolderPeek: View {
 
 // MARK: - The sliding row highlight (Files band)
 
-/// The Files band's list-row dwell highlight: a Liquid Glass pill that starts nearly clear and tints over
-/// the dwell, then locks when armed — a clone of `ClipboardBandView.RowHighlight` (which is `private` to
-/// that file). A single persistent view that **slides** between rows (the caller offsets it by index), so
-/// scrubbing never strobes (design D8). `token` re-charges the pill per selection; it carries the existing
-/// linear-charge / ease-out-arm motion vocabulary unchanged (no bubble-morph, no new haptics).
+/// The Files band's dwell highlight, shared by the folder list **and** the sub-column popups (the action menu
+/// and the Open-With / app grid): a Liquid Glass pill that starts nearly clear and tints over the dwell, then
+/// locks when armed — a clone of `ClipboardBandView.RowHighlight` (which is `private` to that file). A single
+/// persistent view that **slides** between rows (the caller offsets it by index), so scrubbing never strobes
+/// (design D8). `token` re-charges the pill per selection; it carries the existing linear-charge /
+/// ease-out-arm motion vocabulary unchanged (no bubble-morph; the arm haptic lives in the controller). The
+/// charge is the always-present arm signal now that a Files lift fires only when armed
+/// (add-files-band-dwell-arm).
 private struct FilesRowHighlight: View {
     let token: Int
     let armed: Bool
@@ -778,26 +946,6 @@ private struct FilesRowHighlight: View {
     private func restart() {
         intensity = 0
         withAnimation(.linear(duration: dwell)) { intensity = 1 }
-    }
-}
-
-// MARK: - The sliding row highlight (Open-With picker)
-
-/// The Open-With popup's selection pill: a static Liquid Glass pill that **slides** between app rows (the
-/// caller offsets it by the picker index), so scrubbing the popup never strobes (design D8). Unlike the
-/// list's `FilesRowHighlight` it does NOT charge over a dwell — the picker resolves on the lift (lift-to-
-/// choose), not by arming — so it is a fixed-intensity selection backing, availability-gated like every
-/// glass site with a `.regularMaterial` fallback.
-private struct OpenWithRowHighlight: View {
-    let color: Color
-
-    var body: some View {
-        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
-        if #available(macOS 26.0, *) {
-            Color.clear.glassEffect(.regular.tint(color.opacity(0.34)), in: shape)
-        } else {
-            shape.fill(color.opacity(0.30)).background(shape.fill(.regularMaterial))
-        }
     }
 }
 

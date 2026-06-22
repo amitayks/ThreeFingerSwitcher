@@ -9,24 +9,327 @@ import AppKit
 // Sections, top to bottom: opt-in · Roots (the entry column) · Appearance · Behavior.
 
 struct FilesPage: View {
+    /// Stable identity for this page's gesture preview (see `SwitcherPage.previewToken`).
+    static let previewToken = UUID()
+
     let context: HubContext
     @ObservedObject private var settings: AppSettings
+
+    /// §11.5 — the REAL launcher showing its FILES band: a `LauncherView` over the user's actual bands with
+    /// a synthetic Files band appended (the last band, like Clipboard / AI), driven by `filesJourney`
+    /// (`bandJourney(bandFraction: 0.66, inSurface: .lift)`) — the full path: 4-finger open → 2-finger
+    /// traverse to the Files band → land/lift to open. The Files band here is a STATIC seeded band (the user's
+    /// configured roots, no live `FilesColumnController` / drill controller — keeping the preview a pure,
+    /// presentation-only seeded model). The holder's `scrub` traverses toward the Files band (the last band)
+    /// in sync with the traverse stroke.
+    @StateObject private var demo: HubLauncherDemo
+    @StateObject private var driver: HubDemoDriver
+    @State private var seeded = false
+    /// The hover-demo override pushed into the preview's driver by the drill-resolution binding rows:
+    /// hovering a row demos that action's currently-bound excursion as a directed candidate gesture. `nil`
+    /// ⇒ the base open→band→lift journey. (Driven form — mirrors the AI page's `demoGesture` bridge.)
+    @State private var demoGesture: GesturePose.DemoGesture?
+    /// The excursion the hovered binding row maps to — stashed by the picker's `demoAxis` closure (an
+    /// event-handler call) so the `demo` closure can build the matching directed candidate gesture. The
+    /// shared `HubBindingPicker` speaks `GesturePose.Axis`; this bridges its hover signal to the driven
+    /// preview's `DemoGesture` candidate without changing the component (the AI page's exact idiom).
+    @State private var hoveredExcursion: GestureBindings.FilesExcursion?
 
     init(context: HubContext) {
         self.context = context
         _settings = ObservedObject(wrappedValue: context.settings)
+        let holder = HubLauncherDemo()
+        _demo = StateObject(wrappedValue: holder)
+        _driver = StateObject(wrappedValue: HubDemoDriver(
+            gesture: Self.filesJourney,
+            onScrub: { [weak holder] centroid in holder?.scrub(centroid) },
+            onOpen: { [weak holder] in holder?.open() },
+            onDismiss: { [weak holder] in holder?.dismiss() }))
+    }
+
+    /// The preview's attract journey: open the four-finger launcher → traverse to the Files band → land
+    /// and lift to open. The hover-demo override (`demoGesture`) plays a candidate drill excursion instead.
+    private static let filesJourney = GesturePose.bandJourney(bandFraction: 0.66, inSurface: .lift)
+
+    /// The coarse axis a Files-drill excursion sweeps along — the `GesturePose.Axis` the shared
+    /// `HubBindingPicker` component expects from `demoAxis`. The two lift excursions land-and-open (the
+    /// journey's in-surface tail is a dwell-and-lift, no directional travel → `nil` = no axis), while the
+    /// four-finger horizontal discard demos a sideways move.
+    private func axis(for excursion: GestureBindings.FilesExcursion) -> GesturePose.Axis? {
+        switch excursion {
+        case .lift, .plusOneFingerLift: return nil
+        case .fourFingerHorizontal:     return .horizontal
+        }
+    }
+
+    /// Map a Files-drill excursion to the directed candidate gesture its hover-demo should play. The two
+    /// lift excursions replay the full land-and-open journey (their in-surface tail is a dwell-and-lift);
+    /// the four-finger horizontal discard demos a decisive four-finger sideways stroke (the dismiss
+    /// finger-count grammar — four fingers discard an open surface).
+    private func candidate(for excursion: GestureBindings.FilesExcursion) -> GesturePose.DemoGesture {
+        switch excursion {
+        case .lift, .plusOneFingerLift:
+            return Self.filesJourney
+        case .fourFingerHorizontal:
+            // A standalone four-finger leftward discard stroke (carries the hand angle/bow + a lift + loop).
+            let mid: CGFloat = 0.5
+            return GesturePose.DemoGesture(strokes: [
+                GesturePose.Stroke(fingers: 4,
+                                   from: CGPoint(x: 0.78, y: mid),
+                                   to: CGPoint(x: 0.22, y: mid))
+            ], liftGap: 0.6)
+        }
+    }
+
+    /// Seed once with the user's real bands + a synthetic Files band appended as the LAST band, then point
+    /// the holder's scrub at the last band (the Files band) so the traverse stroke lands on it. Degrades
+    /// gracefully through `HubPreviewModels` (the real bands always; sample roots when none are configured).
+    private func seedIfNeeded() {
+        guard !seeded else { return }
+        seeded = true
+        let models = HubPreviewModels(realWindowRows: context.realWindowRows,
+                                      seedThumbnails: context.seedThumbnails,
+                                      launcherBands: context.launcherBands)
+        // The user's real bands (clipboard / AI off here — this page demos the Files band), then a static
+        // Files band appended last, built from the configured roots (no live drill controller).
+        let base = models.makeLauncherModel(clipboardOn: false, aiOn: false,
+                                            dwell: settings.dwellToArmDuration)
+        demo.seed(from: appendingFilesBand(to: base), traverseToLastBand: true)
+    }
+
+    /// Build a fresh `LauncherModel` that is `base` plus a synthetic **Files band** appended as the last
+    /// band — a STATIC seeded band (no `FilesColumnController`), its column the user's configured roots (or
+    /// sample folders when none are set), so the demo's "traverse to the Files band" lands on a real-looking
+    /// Files band. The Files band's sentinel id / tint / icon come from `FilesBandBuilder`, so it reads
+    /// exactly like the live band; only the live drill is omitted (this is presentation-only).
+    private func appendingFilesBand(to base: LauncherModel) -> LauncherModel {
+        let filesBand = FilesBandBuilder.build(currentColumn: sampleFilesColumn())
+        var bands = base.bands
+        var names = base.bandNames
+        var colors = base.bandColors
+        var icons = base.bandIcons
+        bands.append(filesBand.items)
+        names.append(filesBand.name)
+        colors.append(filesBand.color)
+        icons.append(filesBand.resolvedIcon)
+        let filesIndex = bands.count - 1
+
+        let model = LauncherModel()
+        model.dwell = base.dwell
+        model.setBands(bands, names: names, colors: colors, icons: icons,
+                       startBand: 0, column: 0,
+                       clipboardBandIndex: base.clipboardBandIndex,
+                       filesBandIndex: filesIndex)
+        return model
+    }
+
+    /// The Files band's current-column entries for the demo: each configured root as a folder `FileEntry`
+    /// (the band's first column is its roots). Falls back to a few common folders so the band reads alive
+    /// when the user has not configured any roots yet — degrading gracefully like the rest of the Hub demos.
+    private func sampleFilesColumn() -> [FileEntry] {
+        let paths = settings.filesRoots.isEmpty
+            ? ["~/Desktop", "~/Documents", "~/Downloads", "~/Pictures"].map { ($0 as NSString).expandingTildeInPath }
+            : settings.filesRoots
+        return paths.map { path in
+            let url = URL(fileURLWithPath: path)
+            let name = url.lastPathComponent.isEmpty ? path : url.lastPathComponent
+            return FileEntry(url: url, name: name, isDirectory: true,
+                             modificationDate: nil, kind: .folder)
+        }
     }
 
     var body: some View {
         HubPage(HubDestination.files.title,
                 subtitle: "A four-finger Files band — pilot your local folders, preview, and open by trackpad.") {
-            HubSection(footnote: "Adds a local-only column navigator as a band in the four-finger launcher: drill into your folders horizontally, highlight vertically, lift to open (or add a finger for Open-With). Reads the local filesystem on demand — no new permission, no logout, nothing copied off this Mac. Off by default.") {
-                ToggleRow(title: "Show a Files band in the launcher", isOn: $settings.filesBandEnabled)
+            HubSection(footnote: "Adds a local-only column navigator as a band in the four-finger launcher: drill into your folders horizontally, highlight vertically, lift to deliver the item to the app you came from — or open it (your choice) — and add a finger for the action menu. Reads the local filesystem on demand — no new permission, no logout, nothing copied off this Mac. Off by default.") {
+                HubFeatureHeader(
+                    preview: HubGesturePreview(driver: driver) {
+                        FilesDemoMiniature(demo: demo)
+                    },
+                    icon: HubDestination.files.systemImage,
+                    title: HubDestination.files.title,
+                    subtitle: "Pilot your local folders, preview, and open them by trackpad.",
+                    isOn: $settings.filesBandEnabled,
+                    rehearseToken: Self.previewToken,
+                    rehearseController: context.rehearse
+                )
+                .onAppear { seedIfNeeded() }
+                .onChange(of: demoGesture) { _, new in driver.hoverGesture = new }
             }
 
+            drillBindingSection
+            actionMenuSection
             rootsSection
             appearanceSection
             behaviorSection
+        }
+    }
+
+    // MARK: - Action menu (the +1-finger menu — what it offers, per type)
+
+    /// The configuration for the action menu a `+1`-finger lift opens over the highlighted item: what a lift
+    /// itself does (deliver vs open), the per-type item lists (add / remove / reorder from the catalog), and
+    /// which detected terminals/editors appear under "Open in". Persists live via `AppSettings`.
+    private var actionMenuSection: some View {
+        HubSection("Action menu",
+                   footnote: "A +1-finger lift opens an action menu over the highlighted item. Choose what a plain lift does, customize the menu for files and folders, and pick which terminals/editors it can open folders in. Defaults match the built-in menus.") {
+            Picker("When you lift on an item", selection: $settings.filesLiftAction) {
+                ForEach(FilesLiftAction.allCases) { Text(liftActionLabel($0)).tag($0) }
+            }
+            Text(settings.filesLiftAction == .deliver
+                 ? "Lifting delivers the item to the app you came from — its path into a text field, the file into Finder. Add a finger for the action menu."
+                 : "Lifting opens the item (file → default app, folder → Finder). Add a finger for the action menu.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Divider()
+            menuEditor(title: "File menu", isFolder: false)
+            Divider()
+            menuEditor(title: "Folder menu", isFolder: true)
+            Divider()
+            toolsCuration
+        }
+        .disabled(!settings.filesBandEnabled)
+    }
+
+    /// One per-type menu editor: the ordered catalog items (reorder / remove), plus an "Add item" menu of the
+    /// catalog actions not already present. Mirrors `rootsSection`'s row affordances.
+    @ViewBuilder
+    private func menuEditor(title: String, isFolder: Bool) -> some View {
+        let items = isFolder ? settings.filesActionMenu.folderItems : settings.filesActionMenu.fileItems
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.callout)
+            ForEach(Array(items.enumerated()), id: \.element) { index, action in
+                HStack(spacing: 8) {
+                    Image(systemName: FilesBandView.menuRowGlyph(.action(action)))
+                        .foregroundStyle(.secondary).frame(width: 18)
+                    Text(FilesBandView.menuRowLabel(.action(action))).font(.callout)
+                    Spacer(minLength: 8)
+                    Button { moveMenuItem(isFolder: isFolder, index: index, by: -1) } label: { Image(systemName: "chevron.up") }
+                        .buttonStyle(.borderless).foregroundStyle(.secondary).disabled(index == 0).help("Move up")
+                    Button { moveMenuItem(isFolder: isFolder, index: index, by: 1) } label: { Image(systemName: "chevron.down") }
+                        .buttonStyle(.borderless).foregroundStyle(.secondary).disabled(index == items.count - 1).help("Move down")
+                    Button { removeMenuItem(isFolder: isFolder, action: action) } label: { Image(systemName: "minus.circle.fill") }
+                        .buttonStyle(.borderless).foregroundStyle(.secondary).help("Remove from this menu")
+                }
+                .contentShape(Rectangle())
+            }
+            let available = FilesMenuAction.allCases.filter { !items.contains($0) }
+            if !available.isEmpty {
+                Menu {
+                    ForEach(available) { action in
+                        Button { addMenuItem(isFolder: isFolder, action: action) } label: {
+                            Label(FilesBandView.menuRowLabel(.action(action)),
+                                  systemImage: FilesBandView.menuRowGlyph(.action(action)))
+                        }
+                    }
+                } label: { Label("Add item", systemImage: "plus") }
+                .menuStyle(.borderlessButton).fixedSize()
+            }
+        }
+    }
+
+    /// The detected terminals/editors, each toggleable — disabling one drops it from the folder menu's tool
+    /// rows and the folder "Open in" grid (curation = "all detected, minus the disabled").
+    private var toolsCuration: some View {
+        let tools = installedTools(FilesToolCatalog.terminals, role: .terminal)
+            + installedTools(FilesToolCatalog.editors, role: .editor)
+        return VStack(alignment: .leading, spacing: 6) {
+            Text("Open folders in").font(.callout)
+            if tools.isEmpty {
+                Text("No supported terminals or editors detected on this Mac.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            ForEach(tools) { tool in
+                Toggle(isOn: toolEnabledBinding(tool.bundleID)) {
+                    Label(tool.name, systemImage: tool.role == .editor
+                          ? "chevron.left.forward.slash.chevron.right" : "terminal")
+                }
+            }
+        }
+    }
+
+    /// The catalog tools of `role` that are actually installed (a bundle-id probe), with the user's
+    /// enable state applied — used only to render the curation toggles.
+    private func installedTools(_ seeds: [(bundleID: String, name: String)], role: FilesTool.Role) -> [FilesTool] {
+        seeds.compactMap { seed in
+            guard NSWorkspace.shared.urlForApplication(withBundleIdentifier: seed.bundleID) != nil else { return nil }
+            return FilesTool(bundleID: seed.bundleID, name: seed.name, role: role,
+                             enabled: !settings.filesToolsDisabled.contains(seed.bundleID))
+        }
+    }
+
+    private func toolEnabledBinding(_ bundleID: String) -> Binding<Bool> {
+        Binding(get: { !settings.filesToolsDisabled.contains(bundleID) },
+                set: { on in
+                    if on { settings.filesToolsDisabled.removeAll { $0 == bundleID } }
+                    else if !settings.filesToolsDisabled.contains(bundleID) { settings.filesToolsDisabled.append(bundleID) }
+                })
+    }
+
+    private func addMenuItem(isFolder: Bool, action: FilesMenuAction) {
+        var menu = settings.filesActionMenu
+        if isFolder { menu.folderItems.append(action) } else { menu.fileItems.append(action) }
+        settings.filesActionMenu = menu
+    }
+
+    private func removeMenuItem(isFolder: Bool, action: FilesMenuAction) {
+        var menu = settings.filesActionMenu
+        if isFolder { menu.folderItems.removeAll { $0 == action } } else { menu.fileItems.removeAll { $0 == action } }
+        settings.filesActionMenu = menu
+    }
+
+    private func moveMenuItem(isFolder: Bool, index: Int, by delta: Int) {
+        var menu = settings.filesActionMenu
+        var list = isFolder ? menu.folderItems : menu.fileItems
+        let target = index + delta
+        guard list.indices.contains(index), list.indices.contains(target) else { return }
+        list.swapAt(index, target)
+        if isFolder { menu.folderItems = list } else { menu.fileItems = list }
+        settings.filesActionMenu = menu
+    }
+
+    private func liftActionLabel(_ a: FilesLiftAction) -> String {
+        switch a {
+        case .deliver: return "Deliver it to the front app"
+        case .open:    return "Open it"
+        }
+    }
+
+    // MARK: - Drill resolution bindings (7.2)
+
+    /// Map the Files drill's three resolution actions — open / Open-With / discard — onto its excursion
+    /// vocabulary (lift · +1-finger lift · four-finger sideways), via the shared `HubBindingPicker`.
+    /// Choosing routes through the pure `FilesDrillBinding.assigning(_:to:)`, which keeps the map one-to-one
+    /// (picking a taken move swaps it). Defaults to today's behavior; hovering a row demos it in the preview.
+    private var drillBindingSection: some View {
+        HubSection("Resolve gestures",
+                   footnote: "Choose which trackpad move runs the lift action, opens the action menu, or discards the highlighted item while the Files band is open. Each move maps to one action — picking a taken move swaps it. A discard never closes a running app. Hover a row to preview the move above.") {
+            HubBindingPicker(
+                actions: GestureBindings.FilesAction.allCases,
+                excursions: GestureBindings.FilesExcursion.allCases,
+                actionLabel: HubBindingLabels.filesAction,
+                excursionLabel: HubBindingLabels.files,
+                current: { settings.gestureBindings.filesDrill.excursion(for: $0) },
+                assign: { excursion, action in
+                    settings.gestureBindings.filesDrill = settings.gestureBindings.filesDrill.assigning(excursion, to: action)
+                },
+                demoAxis: { excursion in
+                    // Stash the hovered excursion (event-handler context) so `demo` can build the matching
+                    // directed candidate; return the coarse axis the component expects (nil for a lift).
+                    hoveredExcursion = excursion
+                    return axis(for: excursion)
+                },
+                demo: { _ in
+                    // The component signals enter (it just called `demoAxis`) / exit (nil). On enter, build a
+                    // directed candidate for the hovered excursion; on exit, clear the override. Lift
+                    // excursions have a nil axis but a real candidate (the land-and-open journey), so key the
+                    // enter/exit off `hoveredExcursion` being set rather than the axis being non-nil.
+                    demoGesture = hoveredExcursion.map { candidate(for: $0) }
+                    hoveredExcursion = nil
+                }
+            )
+            .disabled(!settings.filesBandEnabled)
         }
     }
 
@@ -141,9 +444,11 @@ struct FilesPage: View {
             Picker("When you open a file", selection: $settings.filesDefaultOpen) {
                 ForEach(FilesDefaultOpen.allCases) { Text(defaultOpenLabel($0)).tag($0) }
             }
-            Text(settings.filesDefaultOpen == .openWith
-                 ? "Lifting on a file opens the Open-With chooser. (Folders always open as a Finder window.)"
-                 : "Lifting on a file opens it in its default app. Add a finger for the Open-With chooser. (Folders always open as a Finder window.)")
+            Text("Applies when the lift action above is set to Open. "
+                 + (settings.filesDefaultOpen == .openWith
+                    ? "Opening a file shows the Open-With chooser."
+                    : "Opening a file launches its default app.")
+                 + " (Folders always open as a Finder window; the action menu’s “Open in ▸” is always available.)")
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -300,5 +605,25 @@ struct FilesPage: View {
         case .defaultApp: return "Open in the default app"
         case .openWith: return "Show the Open-With chooser"
         }
+    }
+}
+
+// MARK: - §11.5 Files demo miniature (the real launcher, showing the Files band)
+
+/// The §11.5 Files-page miniature: the **real** `LauncherView` over the holder's seeded model (the user's
+/// bands + a synthetic Files band appended last), scaled to a tasteful Hub mini and launched in / receded
+/// with the holder's `launched` flag — a soft morph, exactly like the Launcher / Clipboard / AI demo
+/// miniatures (and the onboarding playground). It takes no hits (the preview disables hit-testing). The
+/// `HubDemoDriver` traverses the band selection to the Files band in sync with the demonstrated journey.
+private struct FilesDemoMiniature: View {
+    @ObservedObject var demo: HubLauncherDemo
+
+    var body: some View {
+        LauncherView(model: demo.model, executor: nil, availability: nil)
+            .scaleEffect(0.5)
+            .frame(width: 360, height: 150)
+            .opacity(demo.launched ? 1 : 0.14)
+            .scaleEffect(demo.launched ? 1 : 0.95)
+            .animation(.easeInOut(duration: 0.3), value: demo.launched)
     }
 }

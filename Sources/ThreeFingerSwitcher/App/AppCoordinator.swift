@@ -104,6 +104,18 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// prepare→commit path runs verbatim on a retry.
     private var lastFilesOpen: (() -> Void)?
 
+    /// When the Open-With app grid was reached via the action menu's "Open in ▸", the entry it was opened
+    /// for — so a discard backs out to the **action menu** (one level), not straight to the folder list.
+    /// Nil when the picker isn't open or was opened directly.
+    private var filesPickerOriginEntry: FileEntry?
+
+    /// A pending **Cut** (move-on-Paste, Finder ⌘X): the file(s) cut and the pasteboard `changeCount` at cut
+    /// time. The next `pasteInto` MOVES them only while `NSPasteboard.general.changeCount` still equals this
+    /// (the pasteboard is still that cut); a Copy or any other write since bumps the count → the cut is
+    /// superseded and Paste copies. Cleared after the move (or when superseded). Coordinator state, so a cut
+    /// persists across launcher sessions until consumed — matching Finder.
+    private var pendingCut: (sources: [URL], changeCount: Int)?
+
     // Clipboard history (opt-in; the synthetic Clipboard band + the background recorder).
     private let clipboardStore = ClipboardStore.shared
     private lazy var clipboardMonitor = ClipboardMonitor(store: clipboardStore)
@@ -225,6 +237,10 @@ final class AppCoordinator: GestureRecognizerDelegate {
     // The unified configuration Hub: one reusable window, its navigation state, and the wiring context.
     private var hubWindow: NSWindow?
     private let hubNav = HubNavigation()
+    /// The Hub gesture-preview rehearse seam (§2.3 / §2.4): at most one previewed page registers as the
+    /// active rehearse target; this controller publishes the live fingertips and the ownership verdict.
+    /// Shared between the touch feed (below) and every `HubGesturePreview` via `HubContext`.
+    private let hubRehearse = HubRehearseController()
     private lazy var hubContext: HubContext = makeHubContext()
     /// The Space the Hub was last presented on (captured in `showHub`). Used to place the synthetic
     /// Hub switcher entry on its own Space-row — the Hub deliberately does NOT join all Spaces, so it
@@ -265,12 +281,42 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// untouched; this only mirrors frames).
     var onWizardTouchFrame: ((TouchFrame) -> Void)?
 
+    /// Tap on the touch stream for the Hub's gesture-preview **rehearse** seam (§2.3). Unlike the wizard
+    /// mirror this is NOT read-only: while a Hub preview is the active rehearse target with ≥2 fingers
+    /// down, the frame is routed here and the recognizer is SKIPPED (`hubPreviewOwnsGestures`), so
+    /// rehearsing never fires the real feature. `HubRehearseController` extracts the live fingertips.
+    var onHubPreviewTouchFrame: ((TouchFrame) -> Void)?
+
+    /// The Hub-preview analogue of `wizardOwnsGestures`: true while a Hub preview is being rehearsed on
+    /// the real trackpad (a preview is the active target AND ≥2 fingers are down). When true, the touch
+    /// frame is routed to the preview and `recognizer.feed(_:)` is skipped — the gate closes (and normal
+    /// feeding resumes) the instant the fingers lift or the preview loses focus. Guarded against the
+    /// wizard so the two ownerships never both apply (their windows are never up together, but defensive).
+    ///
+    /// FAIL-SAFE on the Hub window's key state: suppression can ONLY happen while the Hub is the **key
+    /// window** (the user is actively in front of it, i.e. genuinely rehearsing). If the Hub is closed or
+    /// merely backgrounded, this is false no matter what — so a registration that went stale (SwiftUI
+    /// `.onDisappear` is unreliable on window close) can never keep swallowing the switcher/launcher after
+    /// the Hub is gone. Reading `isKeyWindow` here is consistent with `wizardOwnsGestures` reading
+    /// `wizardWindow?.isVisible` on the same frame path.
+    private var hubPreviewOwnsGestures: Bool {
+        guard hubWindow?.isKeyWindow == true else { return false }
+        return !wizardOwnsGestures && hubRehearse.ownsGestures
+    }
+
     init() {
         recognizer.delegate = self
         touchEngine.onFrame = { [weak self] frame in
-            self?.currentFingerCount = frame.fingerCount
-            self?.recognizer.feed(frame)
-            self?.onWizardTouchFrame?(frame)
+            guard let self else { return }
+            self.currentFingerCount = frame.fingerCount
+            // The wizard's live-hand act still mirrors every frame (read-only). The Hub rehearse seam
+            // also always sees the frame (so its ≥2-finger gate + lift-clear stay accurate), but it
+            // additionally OWNS the gesture while rehearsing: when it does, the real recognizer is
+            // skipped so the rehearsal can't open the launcher / switch a window / fire a command.
+            self.onWizardTouchFrame?(frame)
+            self.onHubPreviewTouchFrame?(frame)
+            guard !self.hubPreviewOwnsGestures else { return }
+            self.recognizer.feed(frame)
         }
         scrollTap.consumePredicate = { [weak self] in
             guard let self else { return false }
@@ -934,23 +980,54 @@ final class AppCoordinator: GestureRecognizerDelegate {
         launcherOverlay.cancel()
     }
 
+    /// The action a canvas resolve excursion resolves to, once the binding is consulted. `commit` is
+    /// further gated by `canvasAtTop` at the call site (binding-independent); `discard`/`ignore` are not.
+    enum CanvasResolveDecision: Equatable { case commit, discard, ignore }
+
+    /// Pure decision: given the recognizer's axis-locked excursion (exactly one of `dx`/`dy` non-zero) and
+    /// the user's `canvas` binding, resolve which action it performs (`add-gesture-previews-and-bindings`
+    /// §9.3). The recognizer's sign convention is fixed: `dy<0 → swipeDown`, `dy>0 → swipeUp`,
+    /// `dx<0 → swipeLeft`, `dx>0 → swipeRight`. The rule (reproducing today's defaults and honoring any
+    /// remap): the excursion bound to commit → commit; to ignore → ignore; to dismiss → discard; the one
+    /// spare (unbound) excursion → discard if HORIZONTAL ("any horizontal = dismiss"), ignore if VERTICAL.
+    static func canvasResolveDecision(
+        dx: Int, dy: Int, binding: GestureBindings.CanvasBinding
+    ) -> CanvasResolveDecision {
+        let performed: GestureBindings.CanvasExcursion?
+        if dy < 0 { performed = .swipeDown }
+        else if dy > 0 { performed = .swipeUp }
+        else if dx < 0 { performed = .swipeLeft }
+        else if dx > 0 { performed = .swipeRight }
+        else { performed = nil }
+        guard let performed else { return .ignore }
+
+        if performed == binding.commit { return .commit }
+        if performed == binding.ignore { return .ignore }
+        if performed == binding.dismiss { return .discard }
+        // The one spare (unbound) excursion: a HORIZONTAL spare discards, a VERTICAL spare is ignored.
+        return (performed == .swipeLeft || performed == .swipeRight) ? .discard : .ignore
+    }
+
     /// A fresh TWO-finger swipe while the AI preview canvas is open resolves it (change
-    /// `positional-navigation`, D5 — 4 fingers open/dismiss the platform, 2 fingers act within it): a DOWN
-    /// swipe applies the result (`dy == -1` — "bring it into the document"), a horizontal swipe discards.
-    /// An UP swipe (`dy == +1`) is intentionally ignored so a stray upward motion never throws it away.
+    /// `positional-navigation`, D5 — 4 fingers open/dismiss the platform, 2 fingers act within it). The
+    /// recognizer has already axis-locked; the performed excursion is mapped to an action through the
+    /// user's **configured canvas binding** (`add-gesture-previews-and-bindings` §9.3). Defaults reproduce
+    /// today's grammar exactly: down = commit-at-top, up = ignore, left = dismiss, spare (right) = discard.
     func launcherCanvasResolve(dx: Int, dy: Int) {
         guard launcherOverlay.canvasActive else { return }
-        if dy < 0 {
-            // Swipe DOWN → apply — but ONLY when the canvas is scrolled to the TOP. Otherwise the same
-            // two-finger pan is the user SCROLLING the response/thinking back up (the native scroll already
-            // handled it), so it must not insert the result. Reaching the top by scrolling down therefore
-            // never commits; only a fresh down-swipe while already at the top applies.
+        switch AppCoordinator.canvasResolveDecision(dx: dx, dy: dy, binding: settings.gestureBindings.canvas) {
+        case .commit:
+            // The commit-bound excursion applies — but ONLY when the canvas is scrolled to the TOP. Off the
+            // top the same two-finger pan is the user SCROLLING the response/thinking back up (the native
+            // scroll already handled it), so it must not insert the result. This at-top guard is
+            // binding-independent: it holds for whatever excursion is bound to commit.
             guard aiCommandExecutor.canvasAtTop else { return }
             launcherOverlay.resolveCanvasCommit()   // at top → apply (replace / paste / run task)
-        } else if dx != 0 {
-            launcherOverlay.discardCanvas()          // horizontal swipe → discard
+        case .discard:
+            launcherOverlay.discardCanvas()
+        case .ignore:
+            break                                   // no-op (e.g. default up scrolls toward the tail)
         }
-        // dy > 0 (up) → no-op (scrolls the canvas toward the tail to read more)
     }
 
     func launcherEdgeChanged(dx: Int, dy: Int) {
@@ -966,15 +1043,17 @@ final class AppCoordinator: GestureRecognizerDelegate {
 
     /// Horizontal drill while the Files band is current: descend / ascend the directory tree (the
     /// direction is already reverse-adjusted in the recognizer). Forwarded to the overlay, which routes it
-    /// into the navigator and reprojects the band. No edge auto-repeat / dwell here — a Files entry
-    /// resolves on the lift, not by arming.
+    /// into the navigator and reprojects the band, then **recharges the dwell-to-arm** on the new row
+    /// (`filesManageDwell` — add-files-band-dwell-arm): a Files lift fires only when the row has armed.
     ///
     /// While the Open-With picker is open it is **vertical-only** (the apps are a single scrubbable column),
     /// so a depth step is ignored — horizontal must not drill folders out from under the open popup.
     func filesDepth(_ direction: Int) {
         guard launcherOverlay.isVisible else { return }
-        if launcherOverlay.model.filesPicker != nil { return }   // the picker is vertical-only
+        // A popup (the Open-With grid or the action menu) is vertical-only — depth doesn't drill the tree.
+        if launcherOverlay.model.filesPicker != nil || launcherOverlay.model.filesActionMenu != nil { return }
         launcherOverlay.filesDepth(direction)
+        launcherOverlay.filesManageDwell()   // descend/ascend lands on a new row → recharge the dwell-to-arm
     }
 
     /// Vertical highlight move while the Files band is current (reverse-adjusted upstream): an up-step at
@@ -984,11 +1063,16 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// list), not the folder list — the popup is what the user is navigating.
     func filesHighlight(_ direction: Int) {
         guard launcherOverlay.isVisible else { return }
-        if launcherOverlay.model.filesPicker != nil {
+        // Route the vertical scrub to whichever popup is open (action menu, then Open-With grid), else the
+        // folder list — a popup is what the user is navigating while it is up.
+        if launcherOverlay.model.filesActionMenu != nil {
+            launcherOverlay.model.filesActionMenuMove(direction)
+        } else if launcherOverlay.model.filesPicker != nil {
             launcherOverlay.model.filesPickerMove(direction)
-            return
+        } else {
+            launcherOverlay.filesHighlight(direction)
         }
-        launcherOverlay.filesHighlight(direction)
+        launcherOverlay.filesManageDwell()   // recharge the dwell-to-arm on the row/cell we landed on
     }
 
     /// The resolving lift with no added finger. Two cases:
@@ -1004,9 +1088,13 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// from here. A no-op (dismiss only) when nothing is highlighted (empty column / empty picker).
     func filesOpen() {
         guard launcherOverlay.isVisible else { return }
+        // DWELL GATE (mirrors the launcher's `end()`): a committing Files lift fires only when the highlighted
+        // row has armed (rested past the dwell); an unarmed scrub-and-lift just DISMISSES, acting on nothing.
+        // One gate covers every committing branch below — picker app, menu row, and the default deliver/open.
+        guard launcherOverlay.model.armed else { launcherOverlay.hide(); return }
         // Picker open: the lift chooses the highlighted app and Open-Withs the file with it.
         if launcherOverlay.model.filesPicker != nil {
-            defer { launcherOverlay.model.exitFilesPicker(); launcherOverlay.hide() }
+            defer { filesPickerOriginEntry = nil; launcherOverlay.model.exitFilesPicker(); launcherOverlay.hide() }
             guard let entry = launcherOverlay.filesHighlightedEntry,
                   case let .external(candidate)? = launcherOverlay.model.filesPickerSelected() else { return }
             fireFilesOpen { [weak self] in
@@ -1015,11 +1103,54 @@ final class AppCoordinator: GestureRecognizerDelegate {
             }
             return
         }
-        defer { launcherOverlay.hide() }
-        guard let entry = launcherOverlay.filesHighlightedEntry else { return }
-        fireFilesOpen { [weak self] in
-            self?.fileOpenService.prepareOpen(entry).commit(afterFuse: Self.filesOpenFuse)
+        // Action menu open: a lift COMMITS the highlighted row ("Open in ▸" descends into the app grid; a
+        // tool row opens the folder in that terminal/editor; any other action runs its effect).
+        if let menu = launcherOverlay.model.filesActionMenu {
+            filesCommitMenuRow(menu)
+            return
         }
+        // Picker closed: perform the configured lift action on the highlighted entry — DELIVER it to the
+        // captured front app (the default — `files-contextual-delivery`) or OPEN it (file → default app,
+        // folder → Finder window). Open dismisses immediately (the defusable held open fires after a fuse);
+        // deliver keeps the navigator up until the async paste lands, so a no-front-app failure surfaces as
+        // a bounded row (mirroring `surfaceNoApplication` — `hide()` destroys the panel synchronously, so a
+        // failure can only show while the navigator is still open), and hides on success.
+        guard let entry = launcherOverlay.filesHighlightedEntry else { launcherOverlay.hide(); return }
+        switch settings.filesLiftAction {
+        case .open:
+            launcherOverlay.hide()
+            fireFilesOpen { [weak self] in
+                self?.fileOpenService.prepareOpen(entry).commit(afterFuse: Self.filesOpenFuse)
+            }
+        case .deliver:
+            filesDeliver(entry)
+        }
+    }
+
+    /// Deliver the highlighted entry to the captured front app (the default lift — `files-contextual-delivery`):
+    /// write the dual-representation payload (path string + file reference) and synthesize a paste, so a text
+    /// target receives the **path** and a Finder window receives the **file** — no context detection on our
+    /// side. On success the navigator dismisses; when there is **no captured front app** to deliver into, the
+    /// delivery surfaces a **bounded, non-blocking** failure row (never a false "Done", never an alert) and the
+    /// navigator stays open with the drill re-armed so the user can retry or discard. The keystroke landing
+    /// itself is unobservable, so a successful attempt is "delivered," not a confirmed paste.
+    private func filesDeliver(_ entry: FileEntry) {
+        let payload = FilesDelivery.payload(for: entry)
+        let deliver: () -> Void = { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                if await self.selectionService.deliverFile(url: payload.url, path: payload.path) {
+                    self.launcherOverlay.hide()
+                } else {
+                    self.launcherOverlay.model.filesOpenFailure = LauncherModel.FilesOpenFailure(
+                        headline: "Couldn't deliver — no app was frontmost to receive it.", details: nil)
+                    self.recognizer.rearmDrill()   // keep navigation alive for another try / discard
+                    self.launcherOverlay.filesRearmDwell()   // a re-lift must re-dwell first (Retry bypasses)
+                }
+            }
+        }
+        lastFilesOpen = deliver   // the failure row's Retry re-runs the identical delivery
+        deliver()
     }
 
     /// Capture `open` as the retryable last Files open (so the failure row's Retry re-runs the identical
@@ -1030,35 +1161,256 @@ final class AppCoordinator: GestureRecognizerDelegate {
         open()
     }
 
-    /// The resolving lift after a relative +1 finger: open the **Open-With picker** for the highlighted
-    /// **file**. Resolves the applications that can open it (`openWithCandidates(for:)`) and, when there is
-    /// at least one, enters the navigable picker (the user scrubs vertically and lifts to choose — see
-    /// `filesOpen`) and **re-arms** the recognizer's drill so a fresh gesture scrubs the popup (the firing
-    /// lift already raised the fingers). When NO installed app can open the file, nothing is presented:
-    /// instead the failure is surfaced as observable bounded state (`FileOpenService.surfaceNoApplication`,
-    /// the clean `noApplicationForFile` headline) and the navigator stays open. A folder has no Open-With,
-    /// so an empty list there is treated the same way. A no-op when the picker is already open (a stray +1
-    /// inside the popup must not reset it).
+    /// The resolving lift after a relative +1 finger: open the **action menu** for the highlighted file or
+    /// folder (`files-action-menu`). Builds the per-type rows (the configured menu + the live pasteboard /
+    /// installed-tools context) and enters the navigable menu (the user scrubs vertically and lifts to commit
+    /// — see `filesOpen`/`filesCommitMenuRow`), then **re-arms** the drill so a fresh gesture scrubs the popup
+    /// (the firing lift already raised the fingers). A no-op when a popup is already open (a stray +1 inside
+    /// it must not reset it). The method name is retained because it is the recognizer's `+1`-finger delegate
+    /// hook; its action is now "open the menu" (Open-With folds in as the menu's "Open in ▸").
     func filesOpenWith() {
         guard launcherOverlay.isVisible else { return }
-        // Already picking: a stray +1-finger lift inside the popup must not reset it — but the recognizer
-        // latched this lift as resolved, so re-arm the drill so the popup stays scrubbable by the next
-        // gesture (otherwise navigation would freeze on a dead session).
-        guard launcherOverlay.model.filesPicker == nil else { recognizer.rearmDrill(); return }
-        // Every path below keeps the navigator open (it either presents the picker or surfaces a notice),
-        // and the firing +1 lift latched the drill as resolved — so re-arm unconditionally so the next
-        // gesture keeps navigating (the popup, or the folder list when no picker was shown).
+        // Already in a popup: a stray +1 must not reset it — re-arm so it stays scrubbable (the lift latched
+        // the drill as resolved). The dwell is NOT recharged here (the same popup row stays highlighted).
+        guard launcherOverlay.model.filesPicker == nil, launcherOverlay.model.filesActionMenu == nil else {
+            recognizer.rearmDrill(); return
+        }
+        // DWELL GATE: the menu opens only over an armed row — a quick scrub-and-`+1`-lift dismisses, never
+        // popping a menu you didn't dwell on (the `+1`-finger morph itself moved no highlight, so the arm the
+        // user charged on this row is the same arm gating it here).
+        guard launcherOverlay.model.armed else { launcherOverlay.hide(); return }
         defer { recognizer.rearmDrill() }
         guard let entry = launcherOverlay.filesHighlightedEntry else { return }
-        // The picker lists the external apps that can open the file, in the system's order.
-        let entries = OpenWithEntries.build(externalApps: fileOpenService.openWithCandidates(for: entry))
+        let rows = buildActionMenuRows(for: entry)
+        guard !rows.isEmpty else { return }   // defensive — the default menus always have at least one row
+        launcherOverlay.model.enterFilesActionMenu(entry: entry, rows: rows)
+        launcherOverlay.filesManageDwell()   // entering the menu lands on row 0 → a fresh dwell there
+    }
+
+    /// Resolve the configured action menu into the concrete rows for `entry`, applying live context: whether
+    /// the pasteboard holds a file (gates Paste-into) and the installed, user-curated terminals/editors.
+    private func buildActionMenuRows(for entry: FileEntry) -> [FilesMenuRow] {
+        let hasFile = NSPasteboard.general.canReadObject(forClasses: [NSURL.self],
+                                                         options: [.urlReadingFileURLsOnly: true])
+        let tools = detectFilesTools()
+        return settings.filesActionMenu.visibleRows(for: entry, pasteboardHasFile: hasFile,
+                                                    terminals: tools.terminals, editors: tools.editors)
+    }
+
+    /// Probe which catalog terminals/editors are installed (`NSWorkspace.urlForApplication(withBundleIdentifier:)`)
+    /// and apply the user's curation (`filesToolsDisabled`). No new permission — a bundle-id lookup.
+    private func detectFilesTools() -> (terminals: [FilesTool], editors: [FilesTool]) {
+        let disabled = Set(settings.filesToolsDisabled)
+        func detect(_ seeds: [(bundleID: String, name: String)], role: FilesTool.Role) -> [FilesTool] {
+            seeds.compactMap { seed in
+                guard NSWorkspace.shared.urlForApplication(withBundleIdentifier: seed.bundleID) != nil else { return nil }
+                return FilesTool(bundleID: seed.bundleID, name: seed.name, role: role,
+                                 enabled: !disabled.contains(seed.bundleID))
+            }
+        }
+        return (detect(FilesToolCatalog.terminals, role: .terminal),
+                detect(FilesToolCatalog.editors, role: .editor))
+    }
+
+    /// Commit the highlighted action-menu row. "Open in ▸" descends into the Open-With app grid (remembering
+    /// it came from the menu, so a discard backs out to the menu); a tool row opens the folder in that
+    /// terminal/editor; any other action runs its effect (which dismisses, or surfaces a bounded failure).
+    private func filesCommitMenuRow(_ menu: LauncherModel.FilesActionMenuState) {
+        guard let row = menu.highlighted else {
+            launcherOverlay.model.exitFilesActionMenu(); recognizer.rearmDrill(); return
+        }
+        let entry = menu.entry
+        switch row {
+        case .action(.openIn):
+            launcherOverlay.model.exitFilesActionMenu()
+            filesPickerOriginEntry = entry
+            presentOpenWithPicker(for: entry)
+        case let .tool(_, tool):
+            openEntry(entry, inToolBundleID: tool.bundleID)
+            launcherOverlay.hide()
+        case let .action(action):
+            performMenuAction(action, on: entry)
+        }
+    }
+
+    /// Present the Open-With **app grid** for `entry`: for a **file**, the apps that can open it (default
+    /// indicated); for a **folder**, the folder-openers (Finder + the curated editors/terminals). When the
+    /// candidate list is empty, surface the bounded `noApplicationForFile` notice and keep the navigator
+    /// open. Always re-arms the drill so a fresh gesture scrubs the grid.
+    private func presentOpenWithPicker(for entry: FileEntry) {
+        // Entering the grid lands on the default app (or, on empty candidates, drops back to the folder row) —
+        // recharge the dwell so the landing cell must itself be dwelled before a lift opens it.
+        defer { recognizer.rearmDrill(); launcherOverlay.filesManageDwell() }
+        let candidates = entry.isDirectory
+            ? folderOpenerCandidates()
+            : fileOpenService.openWithCandidates(for: entry)
+        let entries = OpenWithEntries.build(externalApps: candidates)
         guard !entries.isEmpty else {
-            // Nothing can open this file (no external app): surface a clean bounded failure (never silently
-            // no-op), keep the navigator open, no picker.
             fileOpenService.surfaceNoApplication(for: entry)
             return
         }
         launcherOverlay.model.enterFilesPicker(entries)
+    }
+
+    /// The "Open in ▸" candidates for a **folder**: Finder (the default), then the installed, enabled
+    /// editors and terminals — a folder has no LaunchServices opener list of its own (which is exactly why
+    /// the menu was empty on folders before). Each opens the folder with that app via `prepareOpenWith`.
+    private func folderOpenerCandidates() -> [OpenWithCandidate] {
+        var candidates: [OpenWithCandidate] = []
+        if let finder = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.finder") {
+            candidates.append(OpenWithCandidate(app: AppCandidate(url: finder), isDefault: true))
+        }
+        let tools = detectFilesTools()
+        for tool in (tools.editors + tools.terminals) where tool.enabled {
+            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: tool.bundleID) {
+                candidates.append(OpenWithCandidate(app: AppCandidate(url: url), isDefault: false))
+            }
+        }
+        return candidates
+    }
+
+    /// Open the entry's folder (a folder itself, or a file's containing folder) as `bundleID`'s working
+    /// directory — the ‹terminals› / Open-in-‹editor› rows. Reuses the no-new-permission `NSWorkspace.open`
+    /// handoff; most terminals/editors set a folder argument as their CWD.
+    private func openEntry(_ entry: FileEntry, inToolBundleID bundleID: String) {
+        let folder = entry.isDirectory ? entry.url : entry.url.deletingLastPathComponent()
+        guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+            surfaceFilesFailure(.openFailed(name: entry.name, details: "That app isn’t installed."))
+            return
+        }
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = true   // the user chose this tool — bring it forward
+        NSWorkspace.shared.open([folder], withApplicationAt: appURL, configuration: config) { [weak self] _, error in
+            guard let error else { return }
+            Task { @MainActor in
+                self?.surfaceFilesFailure(.openFailed(name: entry.name, details: String(describing: error)))
+            }
+        }
+    }
+
+    /// Run a non-navigation menu action and resolve the navigator. The copy/reveal/name/favorite actions
+    /// complete the interaction (dismiss); Paste-into keeps the navigator open on failure (a bounded row +
+    /// retry), and the copies land in clipboard history via the live monitor (no manual insert).
+    private func performMenuAction(_ action: FilesMenuAction, on entry: FileEntry) {
+        let pb = NSPasteboard.general
+        switch action {
+        case .copyAsPath:
+            pendingCut = nil                        // an explicit copy supersedes any pending cut
+            pb.clearContents()
+            pb.setString(entry.url.standardizedFileURL.path, forType: .string)
+            launcherOverlay.hide()
+        case .copy:
+            pendingCut = nil
+            pb.clearContents()
+            pb.writeObjects([entry.url as NSURL])   // the file/folder OBJECT (paste-in-Finder copies it)
+            launcherOverlay.hide()
+        case .cut:
+            // Mark for move: write the object like Copy, then record the cut keyed on the pasteboard's NEW
+            // change-count, so the next Paste moves it only while the pasteboard is still this cut.
+            pb.clearContents()
+            pb.writeObjects([entry.url as NSURL])
+            pendingCut = (sources: [entry.url], changeCount: pb.changeCount)
+            launcherOverlay.hide()
+        case .copyName:
+            pendingCut = nil
+            pb.clearContents()
+            pb.setString(entry.name, forType: .string)
+            launcherOverlay.hide()
+        case .revealInFinder:
+            NSWorkspace.shared.activateFileViewerSelecting([entry.url])
+            launcherOverlay.hide()
+        case .addToFavorites:
+            addEntryToFavorites(entry)
+            launcherOverlay.hide()
+        case .pasteInto:
+            pasteIntoFolder(for: entry)
+        case .delete:
+            deleteEntry(entry)
+        case .openIn, .openInTerminals, .openInEditor:
+            // openIn descends (handled in `filesCommitMenuRow`); the tool groups expand to `.tool` rows, so
+            // a bare `.action` here is an unreachable fallthrough — dismiss to be safe.
+            launcherOverlay.hide()
+        }
+    }
+
+    /// Paste-into: put the pasteboard's file(s) INTO the target folder (a highlighted folder, or a file's
+    /// containing folder) — **dual-mode**: a **move** when fulfilling a pending Cut (the pasteboard is still
+    /// that cut), else a **copy**; **keep-both** on conflict (auto-rename) either way, never overwriting.
+    /// Dismisses on success; on failure surfaces a bounded `pasteFailed` row and keeps the navigator open
+    /// (re-armed). File URLs only in v1.
+    private func pasteIntoFolder(for entry: FileEntry) {
+        // Capture the paste as the retryable last action, so the failure row's Retry re-pastes (not a stale
+        // open). Keep-both makes a re-paste safe (it never overwrites).
+        let paste: () -> Void = { [weak self] in self?.performPasteInto(for: entry) }
+        lastFilesOpen = paste
+        paste()
+    }
+
+    private func performPasteInto(for entry: FileEntry) {
+        let destination = entry.isDirectory ? entry.url : entry.url.deletingLastPathComponent()
+        let sources = (NSPasteboard.general.readObjects(forClasses: [NSURL.self],
+                       options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+        guard !sources.isEmpty else {
+            surfaceFilesFailure(.pasteFailed(name: destination.lastPathComponent,
+                                             details: "The clipboard holds no file to paste."))
+            recognizer.rearmDrill(); return
+        }
+        // MOVE iff the live pasteboard is still the pending cut (its change-count is unchanged); otherwise
+        // COPY. Any Copy / external write since the Cut bumps the count → the cut is superseded → we copy.
+        let isMove = pendingCut.map { $0.changeCount == NSPasteboard.general.changeCount } ?? false
+        let fm = FileManager.default
+        do {
+            var taken = Set((try? fm.contentsOfDirectory(atPath: destination.path)) ?? [])
+            for source in sources {
+                let unique = FilesPasteName.uniqueName(for: source.lastPathComponent, existing: taken)
+                let target = destination.appendingPathComponent(unique)
+                if isMove { try fm.moveItem(at: source, to: target) }
+                else      { try fm.copyItem(at: source, to: target) }
+                taken.insert(unique)
+            }
+            if isMove { pendingCut = nil }   // the cut is consumed by the move
+            launcherOverlay.hide()
+        } catch {
+            surfaceFilesFailure(.pasteFailed(name: destination.lastPathComponent, details: String(describing: error)))
+            recognizer.rearmDrill()
+        }
+    }
+
+    /// Delete: move the entry to the **Trash** (recoverable from Finder) — never a permanent `removeItem`.
+    /// Dismisses on success (the entry is simply gone on the next listing); on failure surfaces a bounded
+    /// `trashFailed` row and keeps the navigator open (re-armed). Committed by the dwell-armed lift, so a
+    /// stray scrub-and-lift never deletes (`add-files-band-dwell-arm`).
+    private func deleteEntry(_ entry: FileEntry) {
+        let delete: () -> Void = { [weak self] in self?.performDelete(for: entry) }
+        lastFilesOpen = delete   // the failure row's Retry re-tries the trash
+        delete()
+    }
+
+    private func performDelete(for entry: FileEntry) {
+        do {
+            try FileManager.default.trashItem(at: entry.url, resultingItemURL: nil)
+            launcherOverlay.hide()
+        } catch {
+            surfaceFilesFailure(.trashFailed(name: entry.name, details: String(describing: error)))
+            recognizer.rearmDrill()
+        }
+    }
+
+    /// Add `entry` to the launcher as a persistent favorite (`.path` opens it in its default handler) — the
+    /// opt-in "Add to Favorites" item, bridging the Files band back into the launcher. Lands in the home
+    /// band, else the first band, else a fresh "Files" band.
+    private func addEntryToFavorites(_ entry: FileEntry) {
+        let item = LaunchItem(title: entry.name, icon: .fileIcon, kind: .path(entry.url))
+        let fav = favoritesStore.favorites
+        let bandID = fav.homeBandID ?? fav.bands.first?.id ?? favoritesStore.addBand(name: "Files")
+        favoritesStore.addItem(item, toBand: bandID)
+    }
+
+    /// Surface a Files-band action failure as the existing bounded, non-blocking row (clean headline + opt-in
+    /// copyable details) — never an alert, never raw text in a headline.
+    private func surfaceFilesFailure(_ error: FileActionError) {
+        launcherOverlay.model.filesOpenFailure = LauncherModel.FilesOpenFailure(
+            headline: error.errorDescription ?? "Something went wrong.", details: error.copyableDetails)
     }
 
     /// A fresh deliberate four-finger horizontal swipe-away while drilled: discard.
@@ -1070,9 +1422,24 @@ final class AppCoordinator: GestureRecognizerDelegate {
     func filesDiscard() {
         guard launcherOverlay.isVisible else { return }
         fileOpenService.cancelPending()
+        // Action menu open: back out to the folder list (navigator stays).
+        if launcherOverlay.model.filesActionMenu != nil {
+            launcherOverlay.model.exitFilesActionMenu()
+            recognizer.rearmDrill()
+            launcherOverlay.filesManageDwell()        // landed back on the folder row → recharge its dwell
+            return
+        }
         if launcherOverlay.model.filesPicker != nil {
-            launcherOverlay.model.exitFilesPicker()   // back to the folder list; navigator stays open
-            recognizer.rearmDrill()                   // a fresh gesture resumes folder navigation
+            launcherOverlay.model.exitFilesPicker()
+            // If the grid was reached via the action menu's "Open in ▸", back out ONE level — re-open the
+            // menu — rather than dropping straight to the folder list.
+            if let origin = filesPickerOriginEntry {
+                filesPickerOriginEntry = nil
+                let rows = buildActionMenuRows(for: origin)
+                if !rows.isEmpty { launcherOverlay.model.enterFilesActionMenu(entry: origin, rows: rows) }
+            }
+            recognizer.rearmDrill()                   // a fresh gesture resumes navigation
+            launcherOverlay.filesManageDwell()        // landed back on the menu / folder row → recharge
             return
         }
         launcherOverlay.hide()
@@ -2244,13 +2611,48 @@ final class AppCoordinator: GestureRecognizerDelegate {
                 window.setContentSize(NSSize(width: 1160, height: 720))
                 window.center()
             }
+            // Authoritatively pause the self-playing gesture previews whenever the Hub leaves the screen
+            // and resume them when it returns. The window + its SwiftUI tree are kept alive for reuse, so
+            // SwiftUI's `.onDisappear` is unreliable on close/miniaturize — without this the previews'
+            // 30 Hz `HubDemoDriver` loops keep ticking after the Hub is closed, driving the demo models +
+            // re-rendering the offscreen overlay on the main run loop and starving the real
+            // switcher/launcher gesture. Registered once (the window is reused), scoped to THIS window.
+            let nc = NotificationCenter.default
+            for name in [NSWindow.willCloseNotification, NSWindow.didMiniaturizeNotification] {
+                nc.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.pauseHubPreviews() }
+                }
+            }
+            nc.addObserver(forName: NSWindow.didDeminiaturizeNotification, object: window, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.resumeHubPreviews() }
+            }
             hubWindow = window
         }
         present(hubWindow)
+        // Re-arm the previews in case the Hub was previously closed/minimized (the window — and so the
+        // paused drivers — are reused). Idempotent: a no-op on the first open (no drivers mounted yet;
+        // their own `.onAppear` starts them) and when already running.
+        resumeHubPreviews()
         // Remember which Space the Hub now lives on so the synthetic switcher entry lands in that
         // Space's row. `present` activates + makes the Hub key on the current Space, so the current
         // Space is where it is now visible (the Hub does not join all Spaces).
         hubSpaceID = SpaceService.currentModel()?.currentSpaceIDs.first
+    }
+
+    /// Pause the Hub's self-playing gesture previews (and clear any rehearse target) — called when the
+    /// Hub leaves the screen. Stops every `HubDemoDriver` loop via the authoritative notification so none
+    /// can keep running on the main run loop after the Hub is gone, and resets the rehearse controller so
+    /// no stale target lingers (belt-and-suspenders alongside the `hubPreviewOwnsGestures` `isKeyWindow`
+    /// fail-safe).
+    private func pauseHubPreviews() {
+        NotificationCenter.default.post(name: .hubPreviewsPause, object: nil)
+        hubRehearse.reset()
+    }
+
+    /// Resume the previews when the Hub returns to the screen (reopen / deminiaturize). `HubDemoDriver`
+    /// restart is idempotent — the loop only re-arms if it had been stopped.
+    private func resumeHubPreviews() {
+        NotificationCenter.default.post(name: .hubPreviewsResume, object: nil)
     }
 
     /// Wire the Hub's references and callbacks once. Closures are weak-self so the context never
@@ -2262,6 +2664,58 @@ final class AppCoordinator: GestureRecognizerDelegate {
                              clipboard: clipboardStore,
                              models: modelManager,
                              permissions: permissions)
+        // §2.3 rehearse seam: hand the shared rehearse controller to the previewed pages (each
+        // `HubGesturePreview` binds its `liveDots` to it and registers as the active target), and route
+        // the touch feed into it. Contacts are mapped to normalized points HERE (the `OMSTouchData`
+        // boundary) so `HubRehearseController` stays Core-pure. An empty frame (lift) ingests as 0
+        // fingers → the gate closes (dots clear, recognizer resumes).
+        ctx.rehearse = hubRehearse
+        onHubPreviewTouchFrame = { [weak self] frame in
+            let contacts = frame.contacts.map { CGPoint(x: CGFloat($0.position.x), y: CGFloat($0.position.y)) }
+            self?.hubRehearse.ingest(fingerCount: frame.fingerCount, contacts: contacts)
+        }
+        // §11.2 Real demo content for the gesture previews — the SAME providers `makeWizardContext`
+        // wires, so the Hub renders the real switcher/launcher seeded with the user's content. No new
+        // permission (these read already-available state / reuse granted Screen Recording).
+        ctx.realWindowRows = { [weak self] in
+            guard let self else { return [] }
+            // The user's actual windows, current Space first. One row is enough for the mini.
+            let snapshot = self.windowService.snapshot()
+            let current = snapshot.filter(\.isOnCurrentSpace)
+            return [current.isEmpty ? snapshot : current]
+        }
+        ctx.seedThumbnails = { [weak self] model in
+            guard let self else { return }
+            // PRODUCTION semantics (mirrors `makeWizardContext.seedThumbnails`): live-capture every
+            // cleanly-presented window now, leaving parked/set-aside ones as icon+title until a later
+            // sweep can capture them. Two delayed sweeps retry the cards still missing an image. The
+            // wizard sweeps re-capture `self.wizardModel?.demo`; here the PASSED `model` IS the Hub's
+            // switcher demo model, so the retries weakly target IT.
+            let windows = model.windows
+            self.thumbnails.seed(into: model, ids: windows.map(\.id))
+            self.thumbnails.prefetch(windows)
+            for delay in [0.7, 2.0] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak model] in
+                    guard let self, let model else { return }
+                    let missing = windows.filter { model.thumbnails[$0.id] == nil }
+                    guard !missing.isEmpty else { return }
+                    self.thumbnails.seed(into: model, ids: missing.map(\.id))
+                    self.thumbnails.prefetch(missing)
+                }
+            }
+        }
+        ctx.launcherBands = { [weak self] clipboardOn, aiOn in
+            guard let self else { return [] }
+            let clipboard: ContextBand? = clipboardOn ? {
+                let entries = self.clipboardStore.recentWindow(limit: self.settings.clipboardRecentWindow)
+                return ClipboardBandBuilder.build(
+                    from: entries.isEmpty ? WizardSampleContent.clipboardEntries() : entries)
+            }() : nil
+            return WizardTourBands.compose(userBands: self.favoritesStore.favorites.bands,
+                                           aiOn: aiOn,
+                                           seededAIBand: AIBand.seededBand,
+                                           clipboardBand: clipboard)
+        }
         // Clipboard.
         ctx.onClearClipboard = { [weak self] includingPinned in self?.clipboardStore.clear(includingPinned: includingPinned) }
         // AI.

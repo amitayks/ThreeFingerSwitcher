@@ -64,7 +64,8 @@ final class FilesDrillRecognizerTests: XCTestCase {
         step: Double = 0.1,
         axisLockRatio: Double = 1.4,
         reverseDirection: Bool = false,
-        reverseVerticalDirection: Bool = false
+        reverseVerticalDirection: Bool = false,
+        filesDrill: GestureBindings.FilesDrillBinding = .default
     ) -> AppSettings {
         let defaults = UserDefaults(suiteName: "ThreeFingerSwitcherTests.\(UUID().uuidString)")!
         let settings = AppSettings(defaults: defaults)
@@ -73,6 +74,7 @@ final class FilesDrillRecognizerTests: XCTestCase {
         settings.axisLockRatio = axisLockRatio
         settings.reverseDirection = reverseDirection
         settings.reverseVerticalDirection = reverseVerticalDirection
+        settings.gestureBindings.filesDrill = filesDrill      // the configured drill resolution binding
         return settings
     }
 
@@ -317,5 +319,84 @@ final class FilesDrillRecognizerTests: XCTestCase {
         feed(rec, x: 0.20, y: 0.50, fingers: 4)    // horizontal sweep → discard (drill), not launcher
         XCTAssertFalse(d.didLauncherActivate, "a fresh four-finger contact during drill never opens the launcher")
         XCTAssertEqual(d.discardCount, 1)
+    }
+
+    // MARK: - Configured drill binding maps the physical excursion to the bound intent (§9.4)
+
+    // The recognizer detects only the PHYSICAL excursion (a plain lift, a relative +1-finger lift, a fresh
+    // four-finger horizontal swipe-away); which intent it fires is the user's configured `filesDrill`
+    // binding. The default binding reproduces today's grammar; a remap fires the swapped intents.
+
+    func test_defaultBinding_plainLift_emitsOpen() {
+        // Default: lift → open.
+        let (rec, d) = makeDrillRecognizer(makeSettings(filesDrill: .default))
+        feed(rec, x: 0.50, y: 0.50, fingers: 2)    // seed
+        feed(rec, x: 0.50, y: 0.50, fingers: 0)    // plain lift
+        XCTAssertEqual(d.openCount, 1)
+        XCTAssertEqual(d.openWithCount, 0)
+        XCTAssertEqual(d.discardCount, 0)
+    }
+
+    func test_defaultBinding_plusOneLift_emitsOpenWith() {
+        // Default: +1-finger lift → Open-With.
+        let (rec, d) = makeDrillRecognizer(makeSettings(filesDrill: .default))
+        feed(rec, x: 0.50, y: 0.50, fingers: 2)    // seed; relaxed baseline = 2
+        feed(rec, x: 0.50, y: 0.50, fingers: 3)    // relative +1 → latch the +1-finger-lift excursion
+        feed(rec, x: 0.50, y: 0.50, fingers: 0)    // lift
+        XCTAssertEqual(d.openWithCount, 1)
+        XCTAssertEqual(d.openCount, 0)
+    }
+
+    func test_defaultBinding_fourFingerHorizontal_emitsDiscard() {
+        // Default: four-finger horizontal swipe-away → discard.
+        let (rec, d) = makeDrillRecognizer(makeSettings(filesDrill: .default))
+        feed(rec, x: 0.50, y: 0.50, fingers: 4)    // seed at four (the arming posture)
+        feed(rec, x: 0.20, y: 0.50, fingers: 4)    // horizontal sweep-away
+        XCTAssertEqual(d.discardCount, 1)
+        XCTAssertEqual(d.openCount, 0)
+        XCTAssertEqual(d.openWithCount, 0)
+    }
+
+    func test_remappedBinding_liftDiscards_andFourFingerOpens() {
+        // Swap lift and four-finger horizontal: `assigning(.lift, to: .discard)` gives discard the lift
+        // excursion and open inherits the four-finger horizontal (the one-to-one swap). So now a PLAIN
+        // LIFT discards and a FOUR-FINGER HORIZONTAL swipe-away opens — the physical move is unchanged, the
+        // intent is swapped purely by the binding.
+        let remap = GestureBindings.FilesDrillBinding.default.assigning(.lift, to: .discard)
+        XCTAssertEqual(remap.discard, .lift, "precondition: discard now bound to the lift excursion")
+        XCTAssertEqual(remap.open, .fourFingerHorizontal, "precondition: open now bound to four-finger horizontal")
+
+        // A plain lift now fires discard (NOT open).
+        let (rec1, d1) = makeDrillRecognizer(makeSettings(filesDrill: remap))
+        feed(rec1, x: 0.50, y: 0.50, fingers: 2)   // seed
+        feed(rec1, x: 0.50, y: 0.50, fingers: 0)   // plain lift → discard
+        XCTAssertEqual(d1.discardCount, 1, "the lift now discards")
+        XCTAssertEqual(d1.openCount, 0, "the lift no longer opens")
+        XCTAssertEqual(d1.openWithCount, 0)
+
+        // A four-finger horizontal swipe-away now fires open (NOT discard).
+        let (rec2, d2) = makeDrillRecognizer(makeSettings(filesDrill: remap))
+        feed(rec2, x: 0.50, y: 0.50, fingers: 4)   // seed at four
+        feed(rec2, x: 0.20, y: 0.50, fingers: 4)   // horizontal sweep-away → open
+        XCTAssertEqual(d2.openCount, 1, "the four-finger swipe now opens")
+        XCTAssertEqual(d2.discardCount, 0, "the four-finger swipe no longer discards")
+        XCTAssertEqual(d2.openWithCount, 0)
+    }
+
+    func test_remappedBinding_plusOneLiftFiresSwappedIntent() {
+        // Swap Open-With and open: `assigning(.lift, to: .openWith)` gives Open-With the lift excursion and
+        // open inherits the +1-finger lift. So a relative +1-finger lift now OPENS, and a plain lift now
+        // fires OPEN-WITH.
+        let remap = GestureBindings.FilesDrillBinding.default.assigning(.lift, to: .openWith)
+        XCTAssertEqual(remap.openWith, .lift)
+        XCTAssertEqual(remap.open, .plusOneFingerLift)
+
+        let (rec, d) = makeDrillRecognizer(makeSettings(filesDrill: remap))
+        feed(rec, x: 0.50, y: 0.50, fingers: 2)    // seed; baseline = 2
+        feed(rec, x: 0.50, y: 0.50, fingers: 3)    // relative +1 → +1-finger-lift excursion
+        feed(rec, x: 0.50, y: 0.50, fingers: 0)    // lift → now OPEN (the +1-finger lift is bound to open)
+        XCTAssertEqual(d.openCount, 1, "the +1-finger lift now opens")
+        XCTAssertEqual(d.openWithCount, 0, "and no longer fires Open-With")
+        XCTAssertEqual(d.discardCount, 0)
     }
 }

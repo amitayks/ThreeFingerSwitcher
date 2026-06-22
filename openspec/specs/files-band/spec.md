@@ -82,35 +82,46 @@ The Files band SHALL maintain a **navigation stack**: an ordered list of **ances
 
 ### Requirement: Open a file or folder in the current Space
 
-Committing the **default open** of a highlighted entry SHALL open it for real: a **file** opens in its default application, a **folder** opens as a real Finder window. The opened window SHALL appear on the **current Space** (it SHALL NOT teleport the user to another Space or app), and the open SHALL target the **front application captured when the launcher opened**, never whichever app is frontmost at the instant of firing (the overlay is non-activating). A failed open SHALL surface as an observable failure (see *Failures are observable, never silent*), never a silent false success.
+Opening a highlighted entry SHALL open it for real: a **file** opens in its default application, a **folder** opens as a real Finder window. Open is an **action reached from the action menu** (and is the action a user MAY rebind the lift to); it is **no longer the default lift resolution** — the default lift **delivers** the entry to the captured front app (see *files-contextual-delivery*). The opened window SHALL appear on the **current Space** (it SHALL NOT teleport the user to another Space or app), and the open SHALL target the **front application captured when the launcher opened**, never whichever app is frontmost at the instant of firing (the overlay is non-activating). A failed open SHALL surface as an observable failure (see *Failures are observable, never silent*), never a silent false success.
 
 #### Scenario: Opening a file launches its default app on the current Space
-- **WHEN** the user commits the default open on a highlighted file
+
+- **WHEN** the user commits "Open" on a highlighted file
 - **THEN** the file opens in its default application and the resulting window appears on the current Space
 
 #### Scenario: Opening a folder opens a Finder window
-- **WHEN** the user commits the default open on a highlighted folder
+
+- **WHEN** the user commits "Open" on a highlighted folder
 - **THEN** that folder opens as a Finder window on the current Space
 
 #### Scenario: Open targets the captured front app, not this overlay
+
 - **WHEN** an open is committed from the non-activating overlay
 - **THEN** the action targets the app that was frontmost when the launcher opened, not the overlay
 
+#### Scenario: Open is not the default lift
+
+- **WHEN** the user lifts on a highlighted entry with the default lift binding
+- **THEN** the entry is delivered to the captured front app (not opened); Open is performed only when chosen from the action menu or when lift is explicitly rebound to open
+
 ### Requirement: Open With the relevant applications
 
-The Files band SHALL offer an **Open-With** action for the highlighted **file** that lists **only the applications capable of opening that file** (not the full installed-apps list), with the file's **default application indicated**. Choosing an application SHALL open the file with that application, on the current Space, targeting the captured front-app context. The relevant-apps list SHALL be derived from the system's association of applications to that file and SHALL be computed **on demand** for the highlighted file.
+The Files band SHALL offer **Open With** as the **"Open in ▸"** item of the action menu, reachable for **both files and folders**. For a **file** it SHALL list **only the applications capable of opening that file** (not the full installed-apps list), with the file's **default application indicated**; for a **folder** it SHALL list folder-openers (Finder plus the curated editors/terminals). The candidate list SHALL be presented as a **scrubbable grid** (the app-drawer presentation) navigated by trackpad in both axes and resolved on lift. Choosing an application SHALL open the entry with that application, on the current Space, targeting the captured front-app context. The file's relevant-apps list SHALL be derived from the system's association of applications to that file and SHALL be computed **on demand**.
 
-#### Scenario: Open-With lists only capable apps
-- **WHEN** the user invokes Open-With on a highlighted file
-- **THEN** the presented list contains only applications that can open that file, with the default app indicated
+#### Scenario: Open-With lists only capable apps for a file
+
+- **WHEN** the user opens "Open in ▸" on a highlighted file
+- **THEN** the presented grid contains only applications that can open that file, with the default app indicated
 
 #### Scenario: Choosing an app opens the file with it
-- **WHEN** the user selects an application from the Open-With list and commits
+
+- **WHEN** the user highlights an application in the grid and lifts
 - **THEN** the file opens with the chosen application on the current Space
 
-#### Scenario: Open-With is offered for files, not folders
+#### Scenario: Open-With is now offered for folders too
+
 - **WHEN** the highlighted entry is a folder
-- **THEN** the Open-With action is not offered for it (its default open is a Finder window)
+- **THEN** "Open in ▸" is offered and lists folder-openers (Finder and the curated editors/terminals), rather than being absent
 
 ### Requirement: Defusable open
 
@@ -138,9 +149,86 @@ All Files-band side effects (directory listing, open, Open-With) SHALL map any u
 
 ### Requirement: Local-only, non-destructive scope
 
-The Files band v1 SHALL be **navigation and open only**: it SHALL NOT move, rename, delete, trash, copy, or tag files, and SHALL NOT read network or iCloud-placeholder locations. These are explicit non-goals; the navigator never mutates the filesystem.
+The Files band SHALL remain **local-only** and SHALL NOT read network or iCloud-placeholder locations. Its filesystem mutations SHALL be bounded to **recoverable, non-overwriting** operations — it SHALL never cause **irreversible data loss**. Specifically the band MAY:
 
-#### Scenario: No destructive operations are exposed
+- **copy a file into** a folder (Paste after Copy) — **keep-both** on conflict (auto-rename);
+- **move a file into** a folder (Paste after **Cut**) — **keep-both** on conflict (auto-rename), relocating the source (not destroying it);
+- **move an entry to the Trash** (**Delete**) — recoverable from the Finder Trash.
+
+The band SHALL NOT **permanently delete** (it trashes, never `removeItem`), **overwrite** (every copy/move keeps both on conflict), **rename in place**, or **tag** any file or folder. All navigation, delivery, copy-to-clipboard, and open actions remain non-mutating. These are the only widenings of the original navigate-and-open scope, and each is recoverable.
+
+#### Scenario: Mutations are bounded to copy-in, move-in, and trash
+
+- **WHEN** the user acts in the Files band
+- **THEN** the only operations that touch the filesystem are copy-into-folder, move-into-folder (Cut→Paste), and move-to-Trash (Delete)
+
+#### Scenario: No permanent delete or overwrite is exposed
+
 - **WHEN** the user navigates the Files band
-- **THEN** no available action moves, renames, deletes, or otherwise mutates any file or folder
+- **THEN** no available action permanently deletes (Delete trashes, recoverably), overwrites (copies/moves keep both on conflict), renames in place, or tags any file or folder
+
+#### Scenario: Network and iCloud locations stay out of scope
+
+- **WHEN** the user configures or navigates roots
+- **THEN** only local entries are listed; network and iCloud-placeholder locations are not read
+
+### Requirement: Dwell-to-arm gates Files-band resolution
+
+The Files band SHALL arm by **dwell**, like every other launcher surface (mirroring *launcher-overlay → Dwell-to-arm with feedback*). Resting the highlight on a row — in the navigator **or** in any sub-column (the action menu, the Open-With picker, the "Open in ▸" app grid) — for at least the configured dwell-to-arm duration SHALL **arm** that row. Arming SHALL be signalled by the existing best-effort haptic **arm tick** and a visual **charge-ring** that fills over the dwell duration and locks when armed. Moving the highlight — a highlight step, a depth descend/ascend, an async re-list that shifts the highlighted row, or a sub-column move — SHALL **reset the dwell and disarm**. Holding at the trackpad edge (auto-drill / highlight auto-repeat) SHALL re-charge on every step, so it never arms mid-scroll. Adding the `+1` finger SHALL NOT reset the dwell (it does not change the highlighted item); **entering** a sub-column SHALL begin a fresh dwell on its first row.
+
+This **supersedes** the band's prior resolve-on-lift-without-arming behavior, and supersedes the band's "add no new haptics" note **for the arm moment only** — the arm tick is the product's existing single haptic ("moments of arrival"), not a new pattern; no per-scrub, per-descend, or per-commit haptics are added. The dwell duration is the same `dwellToArmDuration` that governs the rest of the launcher (no Files-specific setting).
+
+#### Scenario: Dwell arms the highlighted row
+
+- **WHEN** the highlight rests on a Files row for at least the dwell duration
+- **THEN** the row becomes armed, the arm haptic fires (if available), and the charge-ring shows armed
+
+#### Scenario: Charge-ring tracks partial dwell
+
+- **WHEN** the highlight has rested on a row for less than the dwell duration
+- **THEN** the charge-ring is partially filled and the row is not armed
+
+#### Scenario: Moving the highlight disarms
+
+- **WHEN** a row is armed and the user steps the highlight, descends/ascends, or scrubs a sub-column to another row
+- **THEN** the previous row disarms, its ring empties, and the new row begins its own dwell
+
+#### Scenario: Auto-drill never arms mid-scroll
+
+- **WHEN** the user holds at the trackpad edge and the tree auto-drills (or the highlight auto-repeats)
+- **THEN** the dwell re-charges on every step and no row arms until the motion settles
+
+#### Scenario: Adding the +1 finger preserves the arm
+
+- **WHEN** a row is armed and the user adds the `+1` finger without moving the highlight
+- **THEN** the row stays armed (the dwell is not reset)
+
+### Requirement: Files lift fires only when armed
+
+A **committing** Files lift SHALL fire **only when the highlighted row is armed**; if no row is armed, lifting SHALL **dismiss the overlay** without acting (mirroring *launcher-overlay → Lift fires only when armed*). This SHALL apply to every committing resolution — the default lift (**deliver** to the captured front app, or **open** when the lift is rebound), the `+1`-finger lift (**open the action menu**), and a **lift that commits a sub-column row** (an action-menu row, an Open-With / app-grid app). A quick scrub-and-lift (no dwell) SHALL therefore never deliver, open, open the menu, or commit a row. The four-finger **discard** (back-out) SHALL **never** be gated by arm — it backs out one level (or dismisses) armed or not, and SHALL NOT terminate a running application (the *Defusable open* rule is unchanged). The arm gate SHALL sit **before** the action fires, so the existing defuse window and observable-failure behavior are unchanged.
+
+#### Scenario: Armed lift acts
+
+- **WHEN** a Files row is armed and the fingers lift
+- **THEN** the committing action fires (deliver / open / open-menu / commit the row) and the overlay resolves as before
+
+#### Scenario: Unarmed lift dismisses
+
+- **WHEN** the fingers lift while no Files row is armed
+- **THEN** the overlay hides and nothing is delivered, opened, or committed
+
+#### Scenario: Scrub-and-lift never delivers
+
+- **WHEN** the user scrubs onto a file and lifts before the dwell completes
+- **THEN** nothing is delivered to the front app and the overlay dismisses
+
+#### Scenario: The +1-finger menu requires an armed row
+
+- **WHEN** the user adds the `+1` finger and lifts on a row that has not armed
+- **THEN** the action menu does not open and the overlay dismisses
+
+#### Scenario: Discard is never gated by arm
+
+- **WHEN** the user issues the four-finger discard while no row is armed
+- **THEN** the back-out / dismiss happens normally and no running application is terminated
 

@@ -111,6 +111,27 @@ final class SelectionService: SelectionProviding {
         return await paste(text, into: app)
     }
 
+    /// Deliver a Files-band entry to the captured front app (`files-contextual-delivery`): write the
+    /// **dual-representation** item (the path string AND the file reference), re-assert the (non-activating)
+    /// front app, synthesize ⌘V, then RESTORE the user's prior clipboard — so a text target receives the
+    /// **path** and a Finder window receives the **file**, with no context detection on our side and the
+    /// user's clipboard left exactly as it was. Returns whether a paste was attempted: `false` only when
+    /// there is no front app to act into, which the caller surfaces as a bounded failure (never a false
+    /// "Done"). The keystroke landing itself can't be observed, so a `true` means *attempted*, not confirmed.
+    @discardableResult
+    func deliverFile(url: URL, path: String) async -> Bool {
+        guard let app = frontApp() else { return false }
+        let saved = pasteboard.snapshot()
+        pasteboard.setFileDelivery(url: url, path: path)
+        // Give activation a beat to settle before the keystroke (matches `paste`).
+        try? await Task.sleep(nanoseconds: 40_000_000)
+        pasteKeystroke(app)   // re-assert front app + synthesize ⌘V (injectable for tests)
+        // Let the paste consume the pasteboard before we restore the prior contents.
+        try? await Task.sleep(nanoseconds: 80_000_000)
+        pasteboard.restore(saved)
+        return true
+    }
+
     // MARK: - Screen capture
 
     /// Capture the designated screen rectangle as PNG bytes for a vision command (spec `screen-region-picker`
@@ -344,6 +365,9 @@ protocol PasteboardAccess {
     func imageData() -> Data?
     /// Replace the pasteboard with a single plain-text string (for the paste path).
     func setString(_ text: String)
+    /// Replace the pasteboard with a single item carrying BOTH a file reference and its path string, so a
+    /// text target consumes the path and a Finder window consumes the file (`files-contextual-delivery`).
+    func setFileDelivery(url: URL, path: String)
     /// An opaque snapshot of the full pasteboard contents, for later restore.
     func snapshot() -> PasteboardSnapshot
     /// Restore a previously captured snapshot, leaving the user's clipboard as it was.
@@ -372,6 +396,14 @@ struct SystemPasteboard: PasteboardAccess {
     func setString(_ text: String) {
         pb.clearContents()
         pb.setString(text, forType: .string)
+    }
+
+    func setFileDelivery(url: URL, path: String) {
+        pb.clearContents()
+        let item = NSPasteboardItem()
+        item.setString(path, forType: .string)            // text targets (terminal/editor) consume this
+        item.setString(url.absoluteString, forType: .fileURL)  // Finder consumes this (copies the file in)
+        pb.writeObjects([item])
     }
 
     func snapshot() -> PasteboardSnapshot {

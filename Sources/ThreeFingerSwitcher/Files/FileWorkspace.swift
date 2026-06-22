@@ -100,6 +100,15 @@ enum FileActionError: Error, Equatable {
     case openFailed(name: String, details: String?)
     /// No installed application can open this file, so there is nothing to open it with.
     case noApplicationForFile(name: String)
+    /// A Paste-into copy could not complete (e.g. permission denied, the destination is read-only, or the
+    /// source was removed). `name` is the destination folder's display name; `details` is opt-in copyable
+    /// text (the raw `FileManager`/OS error). The band's single mutating op (`files-action-menu`).
+    case pasteFailed(name: String, details: String?)
+    /// A Delete (move-to-Trash) could not complete (e.g. permission denied, or the item was already removed).
+    /// `name` is the entry's display name; `details` is opt-in copyable text (the raw `FileManager`/OS error).
+    /// The band only ever **trashes** (recoverable) — there is no permanent-delete error because there is no
+    /// permanent delete.
+    case trashFailed(name: String, details: String?)
 }
 
 /// Self-describing, user-facing messages for every case — clean per-case sentences, so the "clean path"
@@ -115,6 +124,10 @@ extension FileActionError: LocalizedError {
             return "Couldn't open “\(name)”. It may have been moved or removed."
         case let .noApplicationForFile(name):
             return "No app on this Mac can open “\(name)”."
+        case let .pasteFailed(name, _):
+            return "Couldn't paste into “\(name)”. You may not have permission, or it was moved."
+        case let .trashFailed(name, _):
+            return "Couldn't move “\(name)” to the Trash. You may not have permission, or it was already removed."
         }
     }
 
@@ -125,6 +138,8 @@ extension FileActionError: LocalizedError {
         case let .folderUnreadable(_, details): return details
         case let .openFailed(_, details): return details
         case .noApplicationForFile: return nil
+        case let .pasteFailed(_, details): return details
+        case let .trashFailed(_, details): return details
         }
     }
 }

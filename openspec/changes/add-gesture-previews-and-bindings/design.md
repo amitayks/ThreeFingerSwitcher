@@ -36,8 +36,8 @@ So "let the user decide what each move does" is a mapping-table + UI problem; th
 ## Decisions
 
 **1. `HubGesturePreview` — three states over one pure driver.**
-A reusable view: a live overlay miniature on top, a `FingerDotsPad` below. Driven by a generalized pose function `GesturePose.pose(phase:fingers:axis:)` — `attractPose` lifted into MLX-free Core and parameterized by **finger count** (2/3/4 fingertips) and **axis** (horizontal ping-pong, vertical, or a scripted excursion for a one-shot demo). States:
-  - **Attract** (idle): loops the surface's *currently-bound* gesture; the miniature reacts (highlight moves / a commit flashes).
+A reusable view: a live overlay miniature on top, a `FingerDotsPad` below. Driven by a generalized pose function `GesturePose.pose(phase:fingers:axis:)` — `attractPose` lifted into MLX-free Core and parameterized by **finger count** (2/3/4 fingertips) and **axis** (horizontal ping-pong, vertical, or a **scripted sequence** of keyframed excursions). The scripted form is what the band pages need: a single demo loop that plays **four-finger open → traverse to the target band → the band's in-surface gesture**, not one excursion. States:
+  - **Attract** (idle): loops the surface's *currently-bound* gesture (for band pages, the full open→band→in-surface journey); the miniature reacts (launcher opens, bands step past, highlight moves, a commit flashes).
   - **Hover-demo**: when the user hovers a binding dropdown option, the loop switches to that *candidate* excursion so they see the move before choosing it.
   - **Rehearse**: real ≥2-finger touch replaces the ghost; the dots track the contacts and a bound excursion plays its **result** in the miniature (text commits / dismiss), exactly the wizard's takeover.
   *Alternative considered:* a pre-rendered video per gesture (literal macOS parity) — rejected; we already render the real overlays, and live reaction (hover + rehearse) is the whole point.
@@ -62,7 +62,7 @@ The canvas **at-top commit guard** (`canvasAtTop` — a down-swipe mid-scroll is
 Each gesture page's leading `ToggleRow` enable becomes the Overview `featureRow` row (icon + title + subtitle + `.switch`), placed under the preview. Everything below it (the existing `LabeledSlider` / `Picker` / buttons) is unchanged — same bindings, same look. This is the "below the preview, a toggle like the home page" ask, scoped to the master enable only.
 
 **7. Per-page composition (workflow-shaped).**
-The preview + toggle is added page-by-page so implementation fans out cleanly: Switcher, Launcher, Clipboard, Files, AI each get the preview + switch toggle; Files and AI additionally get their resolution-binding dropdowns; the Switcher gets its direction dropdowns. Clipboard's "gesture" is the four-finger launcher landing on the last band (no own resolution binding) — it gets the preview + toggle only.
+The preview + toggle is added page-by-page so implementation fans out cleanly: Switcher, Launcher, Clipboard, Files, AI each get the preview + switch toggle; Files and AI additionally get their resolution-binding dropdowns; the Switcher gets its direction dropdowns. The three **band** pages (Clipboard, Files, AI) all open from the four-finger launcher and traverse to their band — their preview demos that full path (open → band → in-surface gesture). Clipboard has no own resolution binding, so it gets the preview (full path) + toggle only.
 
 ## Risks / Trade-offs
 
@@ -72,9 +72,12 @@ The preview + toggle is added page-by-page so implementation fans out cleanly: S
 - **Switcher direction now has two homes (reverse toggles vs. binding)** → fold them: the binding is the single source; the old toggles become a view onto it (no duplicate persisted keys).
 - **Gestureless pages look inconsistent until the later refactor** → accepted and explicit (out of scope); those pages keep today's header.
 
-## Open Questions
+## Resolved Decisions (from exploration)
 
-- Should the rehearse state also let the user *commit a new binding by performing it* (do the move → "bind commit to this"), or is hover-to-demo + dropdown enough for v1? (Lean: dropdown is the editor; rehearse only previews/reacts.)
-- Clipboard/Files/AI share the four-finger activation — do their previews show the **activation** (4-finger swipe to the band) or jump straight to the **in-surface** gesture? (Lean: show activation briefly, then the in-surface gesture, for the band pages.)
-- Exact pad/​miniature sizing inside a Hub `HubSection` card (the wizard sizes for a 960×640 stage; the Hub detail column is narrower) — pick a default, tune in run-verify.
-- Does the switcher preview warrant the live window-grid miniature (needs fabricated window data in the Hub) or a lighter abstract scene? (Lean: lighter scene for switcher; full miniatures for launcher/AI where demo models already exist.)
+- **The dropdown is the only binding editor.** The rehearse state previews/reacts but never commits a binding — the user does not "bind by performing." Hover-to-demo + dropdown is the editor.
+- **Band-page previews demonstrate the full path: four fingers → navigate to the band.** Clipboard, Files, and AI all begin from the four-finger launcher activation and then step across to their band; the demo loop plays that whole journey (open → traverse to the target band), and only then the band's in-surface gesture (Files lift-to-open, AI canvas resolve). The preview is not a single excursion for these pages — it is a short choreographed sequence.
+- **Switcher uses a lighter abstract scene, not a live window-grid miniature.** No fabricated window data in the Hub for the switcher; launcher/AI keep their fuller miniatures (the wizard already builds demo models for those).
+
+## Open Questions (tuning, not design)
+
+- **Pad / miniature sizing inside a `HubSection` card.** The wizard sizes its strip for a fixed 960×640 stage and scales the real overlay views (`PlaygroundAct`'s `tourSize`/`tourScale`/`playScale`) to fit; the Hub's detail column is narrower and variable (`minWidth 540` minus the sidebar). Pick a sensible default scale/frame for the Hub and tune it in run-verify — there is no paper-derivable value. The "lighter switcher scene" decision removes the switcher from this problem (no oversized intrinsic width); only the launcher/AI miniatures need the scale dance.

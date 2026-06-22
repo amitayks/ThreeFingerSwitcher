@@ -31,6 +31,25 @@ final class LauncherModel: ObservableObject {
         }
     }
 
+    /// The held **action menu** sub-state for the Files band (`files-action-menu`): the rows for the
+    /// highlighted `entry` that the menu excursion (the `+1`-finger lift) opened, plus the highlighted row.
+    /// A transient popup budded over the column navigator — scrubbed vertically, resolved on lift (commit the
+    /// row) / horizontal swipe (back out). Mirrors `FilesPickerState`; `entry` is retained so a back-out from
+    /// the app grid (entered via "Open in") can rebuild the menu.
+    struct FilesActionMenuState: Equatable {
+        /// The entry the menu acts on (file or folder).
+        var entry: FileEntry
+        /// The concrete, ordered rows (already resolved by `FilesActionMenu.visibleRows`).
+        var rows: [FilesMenuRow]
+        /// The highlighted row a lift would commit. Always valid while `rows` is non-empty.
+        var highlightedIndex: Int
+
+        /// The highlighted row, or nil for an (defensively) empty menu.
+        var highlighted: FilesMenuRow? {
+            rows.indices.contains(highlightedIndex) ? rows[highlightedIndex] : nil
+        }
+    }
+
     /// A failed Files-band open, surfaced as observable bounded state (spec: "Failures are observable, never
     /// silent"). Carries the clean, bounded `headline` (the `FileActionError` sentence — never raw error
     /// text) and the opt-in copyable `details` (the raw OS/workspace text, surfaced only behind a "Show
@@ -90,6 +109,13 @@ final class LauncherModel: ObservableObject {
     /// routed to the picker (vs. the folder list) by the coordinator whenever it is non-nil.
     @Published var filesPicker: FilesPickerState?
 
+    /// The held **action menu** sub-state (`files-action-menu`): the rows a `+1`-finger lift opened over the
+    /// highlighted file/folder. Nil when not open. `FilesBandView` observes this to render the popup; the
+    /// coordinator routes highlight/lift/discard to it (vs. the folder list / the Open-With picker) while
+    /// non-nil. The menu and the Open-With picker are never both open — "Open in ▸" exits the menu and enters
+    /// the picker.
+    @Published var filesActionMenu: FilesActionMenuState?
+
     /// The current failed Files-band open, mirrored from `FileOpenService.State` by the coordinator's state
     /// sink (set on `.failed`, cleared to nil on `.idle`/`.opening`/`.opened`). When non-nil, `FilesBandView`
     /// renders a **bounded, non-blocking** failure row at the bottom of the navigator (headline + opt-in
@@ -108,6 +134,12 @@ final class LauncherModel: ObservableObject {
     /// coordinator (which re-prepares/commits it on `FileOpenService`, so a transient failure can be
     /// retried without re-navigating). Wired by `AppCoordinator`; nil (no-op) when nothing can be retried.
     var onFilesRetryOpen: (() -> Void)?
+
+    /// Called when an **async** directory listing lands and reprojects the Files band (the column was a cache
+    /// miss and has now filled / shifted the highlight). The controller wires this to recharge the dwell-to-arm
+    /// on the newly-available row, so a freshly-descended folder never arms a stale/empty highlight. Fired only
+    /// from the async `onColumnChanged` path (synchronous moves recharge through the controller already).
+    var onFilesProjectionChanged: (() -> Void)?
 
     /// When non-nil, the launcher is showing the AI streaming preview canvas for the fired command
     /// (the grid is replaced by the canvas; the overlay stays visible, non-activating). Cleared when
@@ -170,6 +202,7 @@ final class LauncherModel: ObservableObject {
         bindFilesColumn(filesColumn)
         self.canvasCommand = nil
         self.filesPicker = nil
+        self.filesActionMenu = nil
         self.filesOpenFailure = nil
         self.sessionPinToggles = []
         self.currentBand = clamp(startBand, 0, max(bands.count - 1, 0))
@@ -207,7 +240,10 @@ final class LauncherModel: ObservableObject {
     /// location persistence is driven separately, inline from the horizontal drill.) Idempotent — called
     /// from `setBands` whenever the controller is (re)assigned.
     private func bindFilesColumn(_ controller: FilesColumnController?) {
-        controller?.onColumnChanged = { [weak self] in self?.reprojectFilesBand() }
+        controller?.onColumnChanged = { [weak self] in
+            self?.reprojectFilesBand()
+            self?.onFilesProjectionChanged?()   // async landing → recharge the dwell on the new row
+        }
     }
 
     /// Reproject the Files band's items from the controller's current column (the navigator's
@@ -303,6 +339,33 @@ final class LauncherModel: ObservableObject {
     /// to the folder list — the column stays open (the coordinator does not dismiss on a picker discard).
     func exitFilesPicker() {
         filesPicker = nil
+    }
+
+    // MARK: - Files action menu (the +1-finger menu, budded over the navigator)
+
+    /// Open the action menu over `entry` with the resolved `rows` (already built by `FilesActionMenu`).
+    /// Lands the highlight on the first row. A no-op for an empty menu (the coordinator never enters here).
+    func enterFilesActionMenu(entry: FileEntry, rows: [FilesMenuRow]) {
+        guard !rows.isEmpty else { return }
+        filesActionMenu = FilesActionMenuState(entry: entry, rows: rows, highlightedIndex: 0)
+    }
+
+    /// Move the action-menu highlight vertically (same convention as the picker/folder list — reverse-vertical
+    /// already applied upstream). Clamps at both ends. A no-op when the menu isn't open.
+    func filesActionMenuMove(_ dir: Int) {
+        guard dir != 0, var menu = filesActionMenu else { return }
+        let next = clamp(menu.highlightedIndex - dir, 0, max(menu.rows.count - 1, 0))
+        guard next != menu.highlightedIndex else { return }
+        menu.highlightedIndex = next
+        filesActionMenu = menu
+    }
+
+    /// The row a lift in menu mode would commit (the highlighted row), or nil when the menu isn't open.
+    func filesActionMenuSelected() -> FilesMenuRow? { filesActionMenu?.highlighted }
+
+    /// Leave the action menu (a row was committed, or a discard backed out of it).
+    func exitFilesActionMenu() {
+        filesActionMenu = nil
     }
 
     // MARK: - Navigation (pure)
@@ -444,7 +507,7 @@ final class LauncherModel: ObservableObject {
     private func applyCurrentBand(column: Int) {
         // Switching bands abandons any open Open-With picker — it belongs to the Files band's column, so
         // leaving (or re-entering) the band drops it rather than leaving a stale popup floating.
-        if !currentBandIsFiles { filesPicker = nil }
+        if !currentBandIsFiles { filesPicker = nil; filesActionMenu = nil }
         items = bands.indices.contains(currentBand) ? bands[currentBand] : []
         // The Files band's selection follows the navigator's live highlight (the source of truth for its
         // column), so switching back to it lands on the row the user left — not column 0.

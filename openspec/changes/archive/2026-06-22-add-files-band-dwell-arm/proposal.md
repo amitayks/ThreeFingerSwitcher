@@ -1,0 +1,32 @@
+## Why
+
+The Files band is the **one launcher surface that fires on contact**. Every other surface dwells-to-arm: land the selection on an item, hold it past `dwellToArmDuration` (~0.5s), feel the haptic tick + watch the charge-ring lock, and *only then* does a lift fire it — a quick scrub-and-lift just dismisses (`launcher-overlay` → *Dwell-to-arm with feedback* / *Lift fires only when armed*). The Files drill skips all of it on purpose — `AppCoordinator.filesDepth` is even commented *"No edge auto-repeat / dwell here — a Files entry resolves on the lift, not by arming"* — so `GestureRecognizer.resolveFilesDrillLift` fires `filesOpen()` / `filesOpenWith()` the instant the fingers drop, with no arm gate.
+
+Now that lift **delivers a file into the app you came from** and the `+1`-finger lift **opens an action menu** (`add-files-band-actions`), firing-on-contact is a liability: a fast scrub-and-lift pastes a half-chosen file into your editor, or pops a menu you didn't mean to open. The fix is parity — the Files band should arm exactly like the rest of the launcher, so the dwell + haptic is the universal "lifting now will act" contract everywhere.
+
+## What Changes
+
+- **The Files drill arms by dwell, like every other launcher surface.** Resting the highlight on a row charges the ring over `dwellToArmDuration`; at the end it **arms** (the existing best-effort haptic tick + the ring locks). Moving the highlight (a `filesHighlight` step, a `filesDepth` descend/ascend, or an async re-list that shifts the row) **resets the dwell and disarms**. Auto-drill at the trackpad edge re-charges on every step, so holding at the edge never arms mid-scroll.
+- **A Files lift fires only when armed.** `filesOpen()` (deliver / open) and `filesOpenWith()` (open the action menu) fire **only if the highlighted row is armed**; an unarmed lift **dismisses the launcher** without acting — exactly the launcher's *Lift fires only when armed*. The `+1`-finger morph does **not** reset the dwell (adding a finger doesn't change the highlighted item), so the natural flow is: dwell on the file → arm → add a finger → lift → the menu opens, armed.
+- **Every Files lift-to-commit surface is gated, not just the navigator.** The action-menu rows, the Open-With picker, and the "Open in ▸" app grid each charge-and-arm their highlighted row the same way; a row commits on lift only when armed, scrubbing to it re-charges, and an unarmed lift dismisses. Entering a sub-column lands on a fresh row and starts a fresh dwell.
+- **The charge-ring comes to the Files highlight.** The single sliding `FilesRowHighlight` (and the sub-column highlights) gains the launcher's charge-ring fill + armed-lock visual — the primary, always-present arm signal (the haptic is the best-effort secondary). This is a **fill overlay on the existing highlight, not a per-row spring** (the documented `FilesRowHighlight` morph landmine is untouched).
+- **The four-finger discard is never gated.** Discard / back-out works armed or not — only the *committing* lifts require the arm. Nothing terminates a running app (the existing defuse rule is unchanged).
+- **No new setting, no Hub change, no new permission, no gesture relocation.** It reuses the existing `dwellToArmDuration`, the `DwellArmDriver` timer + arm haptic, and the `model.armed` semantics. The recognizer's excursion detection is unchanged — the arm **gate** lives in the coordinator/controller layer, exactly where the launcher's armed-gate lives (`end()`), never pushed into the pure recognizer.
+
+## Capabilities
+
+### Modified Capabilities
+
+- `files-band`: the drill **resolution grammar** gains a **dwell-to-arm gate** (new requirements) mirroring `launcher-overlay`. Resting on a row (navigator or any sub-column) charges + arms (haptic + ring); a committing lift (deliver / open / open-menu / commit-row) fires **only when armed**, an unarmed lift **dismisses**, moving resets the dwell, and the four-finger discard stays ungated. This **supersedes** the band's prior "resolves on lift, not by arming" behavior and its "add no new haptics" note **for the arm moment** (the arm tick is the existing product haptic — *moments of arrival* — not a new pattern; no other Files haptics are added).
+
+## Impact
+
+- **Code (MLX-free Core + app):**
+  - **Arm gate:** the coordinator's `filesOpen()` / `filesOpenWith()` (and the sub-column commits `filesCommitMenuRow` / picker-commit) check an armed flag before acting; an unarmed lift calls `hide()`. The recognizer (`resolveFilesDrillLift` / `resolveFilesDrillExcursion`) is **unchanged** — it still fires the same delegate intents.
+  - **Dwell driver:** restart the dwell on every highlight/depth/column change and every sub-column move (`filesHighlight`, `filesDepth`, `filesActionMenuMove`, `filesPickerMove`, app-grid scrub, and the async re-list that re-feeds the column); arm via the existing `DwellArmDriver.charge` → set armed + `hapticTick()`. Reuse `LauncherOverlayController`'s `dwellDriver` + `model.armed` semantics rather than a parallel timer.
+  - **Arm-state hygiene:** `rearmDrill` (the menu-open re-arm and the delivery-failure re-arm) and every sub-column enter/leave start **unarmed** (re-charge from zero) so no stale armed flag fires an unintended action.
+  - **Visual:** the charge-ring fill + armed-lock on `FilesRowHighlight` and the sub-column highlights in `FilesBandView` (reusing the launcher ring's rendering).
+- **Reuse, not rebuild:** `DwellArmDriver`, `model.armed`/`arming`/`beginArming()`/`setArmed()`/`disarm()`, `dwellToArmDuration`, and the launcher's charge-ring view.
+- **Depends on `add-files-band-actions`** (the deliver + action-menu resolutions this change gates). The spec delta only **ADDs** requirements to `files-band` (it doesn't modify the requirements `add-files-band-actions` modifies), so it validates independently and composes whichever archives first.
+- **MLX-free Core:** the arm-gate logic and dwell-reset triggers are pure-ish coordinator/controller wiring, compile-verified by `swift build`/`xcodebuild` and exercised where the state machine is unit-testable; the live haptic + ring + paste/open need the real app (user run-verify).
+- **Out of scope:** any new haptic *pattern* beyond the existing arm tick; a per-surface dwell setting (one global `dwellToArmDuration`); changing the recognizer's excursion detection; the four-finger discard's behavior; the defuse fuse.

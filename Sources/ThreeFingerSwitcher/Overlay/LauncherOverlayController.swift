@@ -71,6 +71,10 @@ final class LauncherOverlayController {
         model.dwell = dwell
         model.onPinToggle = onTogglePin
         model.clipboardPinStepThreshold = clipboardPinSteps
+        // A late async directory listing can shift which Files row is highlighted (a freshly-descended,
+        // not-yet-cached folder fills in) — recharge the dwell on the new row so it never arms a stale/empty
+        // highlight. Identity-keyed, so a listing that preserves the highlight is a no-op.
+        model.onFilesProjectionChanged = { [weak self] in self?.filesManageDwell() }
         model.setBands(bands.map(\.items),
                        names: bands.map(\.name),
                        colors: bands.map(\.color),
@@ -179,9 +183,10 @@ final class LauncherOverlayController {
     /// One depth step while the Files band is current (the recognizer's `filesDepth`): RIGHT (`dir > 0`)
     /// descends into the highlighted folder, LEFT ascends (or, at the roots list, escapes to the band
     /// list). The direction is already reverse-adjusted upstream, exactly like grid/clipboard horizontal
-    /// travel; the model routes it to the directory drill because the Files band is current. Unlike a grid
-    /// step this does NOT dwell-to-arm — a Files entry resolves on the drill's lift (`filesOpen` /
-    /// `filesOpenWith`), not by charging an arm ring. A descend / ascend never changes the active band
+    /// travel; the model routes it to the directory drill because the Files band is current. A descend/ascend
+    /// lands on a new row, which **recharges the dwell-to-arm** (the coordinator calls `filesManageDwell` after
+    /// the move — add-files-band-dwell-arm): the Files lift (`filesOpen` / `filesOpenWith`) fires only when the
+    /// highlighted row has armed, mirroring the launcher. A descend / ascend never changes the active band
     /// (still the Files band), so the panel size is stable across drilling — no re-fit needed.
     ///
     /// The one focus change here is the LEFT-at-roots ESCAPE: it crosses the cursor to the band rail
@@ -196,7 +201,8 @@ final class LauncherOverlayController {
 
     /// One highlight step while the Files band is current (the recognizer's `filesHighlight`): UP
     /// (`dir > 0`) moves toward the top, DOWN toward the bottom (reverse-adjusted upstream). An up-step at
-    /// the top of the column simply clamps (no search to overflow into). No dwell-to-arm (see `filesDepth`).
+    /// the top of the column simply clamps (no search to overflow into). The new row recharges the
+    /// dwell-to-arm (see `filesDepth`; the coordinator calls `filesManageDwell` after the move).
     /// The fixed container height (refinement 3) is stable across rows — the list scrolls inside to follow the
     /// highlight — so no panel re-fit is needed. The drill is re-synced anyway (idempotent), matching the
     /// other step paths.
@@ -453,7 +459,18 @@ final class LauncherOverlayController {
 
     /// After any navigation step: arm the selected app (restart dwell) when the cursor is on a grid
     /// item; disarm when it's on the band list (band titles don't fire).
+    ///
+    /// The Files drill (and its sub-columns) share the SAME dwell timer + arm state but key the restart on
+    /// the highlighted *thing* changing rather than the grid index (`filesManageDwell`), so route there
+    /// while a Files surface is engaged. The cross-IN (`stepHorizontal` flips `focus` to `.grid` on the
+    /// Files band) and the edge-tick both reach here, so the landing row and the auto-drill reset funnel
+    /// through one mechanism with the drill's own moves.
     private func manageDwell() {
+        if model.filesDrillEngaged || model.filesPicker != nil || model.filesActionMenu != nil {
+            filesManageDwell()
+            return
+        }
+        filesArming.reset()             // left every Files surface → a later re-entry charges from scratch
         dwellDriver.cancel()
         if model.focus == .grid, model.selectedItem != nil {
             startDwell()
@@ -477,6 +494,46 @@ final class LauncherOverlayController {
         // Best-effort haptic tick (S-OQ1). Harmless if the Taptic Engine doesn't actuate; the
         // charge-ring is the primary, always-present arm signal.
         DwellArmDriver.hapticTick()
+    }
+
+    // MARK: - Dwell-to-arm (Files drill + sub-columns)
+
+    /// The identity-keyed restart decision (pure, `FilesDwellArming`): the controller feeds it the highlighted
+    /// Files thing's identity and acts on `.restart` / `.keep` / `.disarm`.
+    private var filesArming = FilesDwellArming()
+
+    /// Files analogue of `manageDwell()`: (re)charge the shared dwell-to-arm whenever the highlighted Files
+    /// thing changes — a folder row, or an open sub-column's row (action menu / Open-With grid). Resting past
+    /// `dwell` then arms (haptic + the same charge pill the launcher uses). Identity-keyed (via
+    /// `FilesDwellArming`), so it is safe to call after every Files move and on async re-list landings: it does
+    /// NOTHING while the same thing stays highlighted, which is exactly why the `+1`-finger morph (it moves no
+    /// highlight, the recognizer emits no step) preserves the arm. An empty column disarms. The lift gate
+    /// (`AppCoordinator.filesOpen` / `filesOpenWith`) reads `model.armed`, mirroring the launcher's `end()`.
+    func filesManageDwell() {
+        let inFilesSurface = model.filesDrillEngaged || model.filesPicker != nil || model.filesActionMenu != nil
+        guard inFilesSurface else { dwellDriver.cancel(); model.disarm(); filesArming.reset(); return }
+        switch filesArming.update(identity: filesArmIdentityNow()) {
+        case .keep:
+            break                          // same thing → let the running dwell (or settled arm) continue
+        case .disarm:
+            dwellDriver.cancel(); model.disarm()
+        case .restart:
+            dwellDriver.cancel()
+            model.beginArming()
+            dwellDriver.charge(after: dwell) { [weak self] in self?.arm() }
+        }
+    }
+
+    /// Force a fresh Files dwell even if the highlighted thing is unchanged — for the re-arm seams where the
+    /// drill is restarted in place (a delivery that failed and kept the navigator open). A bare
+    /// `filesManageDwell` would `.keep` there (same identity); resetting guarantees the user must re-dwell
+    /// before another committing lift fires (task 2.3).
+    func filesRearmDwell() { filesArming.reset(); filesManageDwell() }
+
+    private func filesArmIdentityNow() -> String? {
+        if let menu = model.filesActionMenu { return "menu:\(menu.highlightedIndex)" }
+        if let picker = model.filesPicker { return "picker:\(picker.highlightedIndex)" }
+        return model.filesColumn?.highlightedEntry?.id
     }
 
     // MARK: - Panel

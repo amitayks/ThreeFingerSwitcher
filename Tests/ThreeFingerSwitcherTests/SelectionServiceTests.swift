@@ -49,6 +49,16 @@ final class SelectionServiceTests: XCTestCase {
             changeCount += 1
         }
 
+        private(set) var fileDeliveries: [(url: URL, path: String)] = []
+        func setFileDelivery(url: URL, path: String) {
+            fileDeliveries.append((url, path))
+            current = PasteboardSnapshot(items: [[
+                NSPasteboard.PasteboardType.string.rawValue: Data(path.utf8),
+                NSPasteboard.PasteboardType.fileURL.rawValue: Data(url.absoluteString.utf8)
+            ]])
+            changeCount += 1
+        }
+
         func snapshot() -> PasteboardSnapshot { current }
 
         func restore(_ snapshot: PasteboardSnapshot) {
@@ -86,6 +96,39 @@ final class SelectionServiceTests: XCTestCase {
         SelectionService(frontAppProvider: { frontApp },
                          pasteboard: pasteboard,
                          pasteKeystroke: fired)
+    }
+
+    // MARK: - deliverFile() — dual-representation write + clipboard restore
+
+    /// Delivering a file writes BOTH representations (path string + file URL) in one go and restores the
+    /// user's prior clipboard, mirroring the text-paste round-trip (`files-contextual-delivery`).
+    func testDeliverFileWritesBothRepsAndRestoresClipboard() async {
+        guard let app = realFrontApp() else { return }   // headless guard: no other running app
+        let pb = FakePasteboard()
+        pb.seedString("user's prior clipboard")          // what the user had copied
+        var firedPid: pid_t?
+        let svc = makeService(pasteboard: pb, frontApp: app, fired: { firedPid = $0.processIdentifier })
+
+        let attempted = await svc.deliverFile(url: URL(fileURLWithPath: "/tmp/a.txt"), path: "/tmp/a.txt")
+
+        XCTAssertTrue(attempted, "a paste was attempted into the front app")
+        XCTAssertEqual(pb.fileDeliveries.count, 1)
+        XCTAssertEqual(pb.fileDeliveries.first?.path, "/tmp/a.txt", "the path rep is written for text targets")
+        XCTAssertEqual(pb.fileDeliveries.first?.url, URL(fileURLWithPath: "/tmp/a.txt"), "the file ref for Finder")
+        XCTAssertEqual(firedPid, app.processIdentifier, "the keystroke targeted the captured front app")
+        XCTAssertEqual(pb.string(), "user's prior clipboard", "the user's clipboard is restored after delivery")
+        XCTAssertEqual(pb.restoreCount, 1)
+    }
+
+    /// With no front app, delivery does nothing and reports not-attempted — the caller surfaces a bounded
+    /// failure, never a false success, never a clipboard touch.
+    func testDeliverFileWithNoFrontAppReportsFalse() async {
+        let pb = FakePasteboard()
+        let svc = makeService(pasteboard: pb, frontApp: nil)
+        let attempted = await svc.deliverFile(url: URL(fileURLWithPath: "/tmp/a.txt"), path: "/tmp/a.txt")
+        XCTAssertFalse(attempted, "no front app → not attempted")
+        XCTAssertTrue(pb.fileDeliveries.isEmpty, "no pasteboard write")
+        XCTAssertEqual(pb.restoreCount, 0, "and no clipboard touch")
     }
 
     // MARK: - normalized() — empty/whitespace = no selection

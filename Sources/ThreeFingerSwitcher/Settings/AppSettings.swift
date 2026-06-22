@@ -84,8 +84,21 @@ final class AppSettings: ObservableObject {
     /// Wrap around at the ends of the list instead of clamping.
     @Published var wrapAtEnds: Bool { didSet { defaults.set(wrapAtEnds, forKey: Keys.wrapAtEnds) } }
 
-    /// Invert slide direction (slide right → previous instead of next).
-    @Published var reverseDirection: Bool { didSet { defaults.set(reverseDirection, forKey: Keys.reverseDirection) } }
+    /// The user's resolution-gesture bindings for the three remappable surfaces (the AI canvas resolve,
+    /// the Files-drill resolution, and the switcher per-axis scrub directions). Persisted as a single
+    /// JSON blob (`Data` is plist-native, mirroring `FavoritesStore`) so the per-surface vocabularies
+    /// stay co-versioned. Defaults to exactly today's behavior. The switcher axes are the single source
+    /// of truth for the former `reverseDirection` / `reverseVerticalDirection` booleans, which are now
+    /// computed accessors onto this binding (no duplicate persisted keys).
+    @Published var gestureBindings: GestureBindings { didSet { persist(gestureBindings, Keys.gestureBindings) } }
+
+    /// Invert slide direction (slide right → previous instead of next). A computed view onto the
+    /// switcher's **windows** axis binding (`gesture-bindings`, the single source of truth) — existing
+    /// consumers keep reading/writing this boolean unchanged while persistence lives in `gestureBindings`.
+    var reverseDirection: Bool {
+        get { gestureBindings.switcher.windowsAxis.isReversed }
+        set { gestureBindings.switcher.windowsAxis = .init(reversed: newValue) }
+    }
 
     /// EMA smoothing factor (0..1) for centroid velocity. Higher = snappier, lower = smoother.
     @Published var velocitySmoothing: Double { didSet { persist(velocitySmoothing, Keys.velocitySmoothing) } }
@@ -101,8 +114,13 @@ final class AppSettings: ObservableObject {
     /// so horizontal scrubbing jitter doesn't flip rows.
     @Published var rowStepDistance: Double { didSet { persist(rowStepDistance, Keys.rowStepDistance) } }
 
-    /// Invert vertical direction (slide up → previous Space-row instead of next).
-    @Published var reverseVerticalDirection: Bool { didSet { defaults.set(reverseVerticalDirection, forKey: Keys.reverseVerticalDirection) } }
+    /// Invert vertical direction (slide up → previous Space-row instead of next). A computed view onto
+    /// the switcher's **Spaces** axis binding (`gesture-bindings`, the single source of truth) — existing
+    /// consumers keep reading/writing this boolean unchanged while persistence lives in `gestureBindings`.
+    var reverseVerticalDirection: Bool {
+        get { gestureBindings.switcher.spacesAxis.isReversed }
+        set { gestureBindings.switcher.spacesAxis = .init(reversed: newValue) }
+    }
 
     /// Post-commit self-healing focus watchdog. Verifies that the raised window actually became
     /// key shortly after commit and, if not, runs a bounded recovery so the user never has to
@@ -275,6 +293,20 @@ final class AppSettings: ObservableObject {
     /// An `OptionSet` persisted as its `Int` `rawValue` (mirrors `DangerZoneSelection`).
     @Published var filesRowMetadata: FilesRowMetadata { didSet { defaults.set(filesRowMetadata.rawValue, forKey: Keys.filesRowMetadata) } }
 
+    /// What the Files-band **lift** (the drill's primary resolve excursion) does on commit: `deliver`
+    /// (default) pastes the highlighted entry into the captured front app (`files-contextual-delivery`);
+    /// `open` opens it (file → default app per `filesDefaultOpen`, folder → Finder window). Orthogonal to
+    /// `filesDefaultOpen`, which only refines what an *open* of a file does. Persisted by `rawValue`.
+    @Published var filesLiftAction: FilesLiftAction { didSet { defaults.set(filesLiftAction.rawValue, forKey: Keys.filesLiftAction) } }
+
+    /// The user-configurable Files **action-menu** contents, per entry type (`files-action-menu`). Persisted
+    /// as a JSON blob (like `gestureBindings`); defaults to the specified per-type menus.
+    @Published var filesActionMenu: FilesActionMenu { didSet { persistCodable(filesActionMenu, Keys.filesActionMenu) } }
+
+    /// Bundle ids of detected terminals/editors the user has **disabled** from the action menu. The curated
+    /// set is "all detected tools, minus these," so default empty = every detected tool enabled.
+    @Published var filesToolsDisabled: [String] { didSet { defaults.set(filesToolsDisabled, forKey: Keys.filesToolsDisabled) } }
+
     /// The remembered deepest path last navigated to inside `rootPath`, or nil if none has been recorded
     /// yet (cold start, or the root was just added).
     func rememberedLocation(forRoot rootPath: String) -> String? { filesRememberedLocations[rootPath] }
@@ -364,12 +396,24 @@ final class AppSettings: ObservableObject {
         axisLockRatio = defaults.object(forKey: Keys.axisLockRatio) as? Double ?? Defaults.axisLockRatio
         stepDistance = defaults.object(forKey: Keys.stepDistance) as? Double ?? Defaults.stepDistance
         wrapAtEnds = defaults.object(forKey: Keys.wrapAtEnds) as? Bool ?? Defaults.wrapAtEnds
-        reverseDirection = defaults.object(forKey: Keys.reverseDirection) as? Bool ?? Defaults.reverseDirection
+        // Gesture bindings: decode the JSON blob, else default to today's behavior. The former
+        // `reverseDirection` / `reverseVerticalDirection` booleans (if a prior install wrote them) are
+        // folded into the switcher axes so an upgrade preserves the user's reverse choices. Built in a
+        // local first (read-modify-write can't touch the stored property mid-init) and assigned once.
+        var bindings = AppSettings.loadGestureBindings(defaults, Keys.gestureBindings)
+        if defaults.data(forKey: Keys.gestureBindings) == nil {
+            if let legacyH = defaults.object(forKey: Keys.reverseDirection) as? Bool {
+                bindings.switcher.windowsAxis = .init(reversed: legacyH)
+            }
+            if let legacyV = defaults.object(forKey: Keys.reverseVerticalDirection) as? Bool {
+                bindings.switcher.spacesAxis = .init(reversed: legacyV)
+            }
+        }
+        gestureBindings = bindings
         velocitySmoothing = defaults.object(forKey: Keys.velocitySmoothing) as? Double ?? Defaults.velocitySmoothing
         switcherWindowScale = defaults.object(forKey: Keys.switcherWindowScale) as? Double ?? Defaults.switcherWindowScale
         requireExactlyThree = defaults.object(forKey: Keys.requireExactlyThree) as? Bool ?? Defaults.requireExactlyThree
         rowStepDistance = defaults.object(forKey: Keys.rowStepDistance) as? Double ?? Defaults.rowStepDistance
-        reverseVerticalDirection = defaults.object(forKey: Keys.reverseVerticalDirection) as? Bool ?? Defaults.reverseVerticalDirection
         focusWatchdogEnabled = defaults.object(forKey: Keys.focusWatchdogEnabled) as? Bool ?? Defaults.focusWatchdogEnabled
         manageSpacesRearrange = defaults.object(forKey: Keys.manageSpacesRearrange) as? Bool ?? Defaults.manageSpacesRearrange
         manageVerticalGesture = defaults.object(forKey: Keys.manageVerticalGesture) as? Bool ?? Defaults.manageVerticalGesture
@@ -406,6 +450,9 @@ final class AppSettings: ObservableObject {
         filesSortDirection = (defaults.object(forKey: Keys.filesSortDirection) as? String).flatMap(FilesSortDirection.init(rawValue:)) ?? Defaults.filesSortDirection
         filesDefaultOpen = (defaults.object(forKey: Keys.filesDefaultOpen) as? String).flatMap(FilesDefaultOpen.init(rawValue:)) ?? Defaults.filesDefaultOpen
         filesRowMetadata = (defaults.object(forKey: Keys.filesRowMetadata) as? Int).map(FilesRowMetadata.init(rawValue:)) ?? Defaults.filesRowMetadata
+        filesLiftAction = (defaults.object(forKey: Keys.filesLiftAction) as? String).flatMap(FilesLiftAction.init(rawValue:)) ?? Defaults.filesLiftAction
+        filesActionMenu = AppSettings.loadCodable(FilesActionMenu.self, defaults, Keys.filesActionMenu) ?? Defaults.filesActionMenu
+        filesToolsDisabled = defaults.object(forKey: Keys.filesToolsDisabled) as? [String] ?? Defaults.filesToolsDisabled
         keyboardLanguageEnabled = defaults.object(forKey: Keys.keyboardLanguageEnabled) as? Bool ?? Defaults.keyboardLanguageEnabled
         keyboardLanguageDefaultSourceID = defaults.object(forKey: Keys.keyboardLanguageDefaultSourceID) as? String ?? Defaults.keyboardLanguageDefaultSourceID
         keyboardLanguagePerSiteEnabled = defaults.object(forKey: Keys.keyboardLanguagePerSiteEnabled) as? Bool ?? Defaults.keyboardLanguagePerSiteEnabled
@@ -418,12 +465,13 @@ final class AppSettings: ObservableObject {
         axisLockRatio = Defaults.axisLockRatio
         stepDistance = Defaults.stepDistance
         wrapAtEnds = Defaults.wrapAtEnds
-        reverseDirection = Defaults.reverseDirection
         velocitySmoothing = Defaults.velocitySmoothing
         switcherWindowScale = Defaults.switcherWindowScale
         requireExactlyThree = Defaults.requireExactlyThree
         rowStepDistance = Defaults.rowStepDistance
-        reverseVerticalDirection = Defaults.reverseVerticalDirection
+        // Resolution-gesture bindings (incl. the folded reverse-direction switcher axes) reset to today's
+        // behavior — a single source of truth for the former `reverseDirection` / `reverseVerticalDirection`.
+        gestureBindings = Defaults.gestureBindings
         focusWatchdogEnabled = Defaults.focusWatchdogEnabled
         // Launcher tunables reset too; `enableLauncher` is a consent-gated opt-in (system side
         // effect) and is intentionally NOT reset, mirroring `manageVerticalGesture`.
@@ -452,6 +500,9 @@ final class AppSettings: ObservableObject {
         filesSortDirection = Defaults.filesSortDirection
         filesDefaultOpen = Defaults.filesDefaultOpen
         filesRowMetadata = Defaults.filesRowMetadata
+        filesLiftAction = Defaults.filesLiftAction   // back to deliver (the default contextual-delivery lift)
+        filesActionMenu = Defaults.filesActionMenu   // per-type menus back to the specified defaults
+        filesToolsDisabled = Defaults.filesToolsDisabled   // all detected terminals/editors enabled again
         filesRememberLocation = Defaults.filesRememberLocation   // a behavior tunable (back to default ON); the remembered map itself is preserved above
         // `aiCommandsEnabled` (a consent-gated opt-in that allows a multi-gigabyte download) and the
         // selected-model pin are a deliberate user choice, so they're intentionally NOT reset — mirrors
@@ -465,6 +516,36 @@ final class AppSettings: ObservableObject {
 
     private func persist(_ value: Double, _ key: String) { defaults.set(value, forKey: key) }
 
+    /// Persist any `Encodable` value as a JSON blob (the `gestureBindings` pattern, generalized for the
+    /// Files action-menu config). Encode failure is a no-op (the in-memory value still applies live).
+    private func persistCodable<T: Encodable>(_ value: T, _ key: String) {
+        guard let data = try? JSONEncoder().encode(value) else { return }
+        defaults.set(data, forKey: key)
+    }
+
+    /// Decode a persisted JSON blob, or nil on a missing/corrupt value (the caller supplies the default).
+    private static func loadCodable<T: Decodable>(_ type: T.Type, _ defaults: UserDefaults, _ key: String) -> T? {
+        guard let data = defaults.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(T.self, from: data)
+    }
+
+    /// Persist the gesture bindings as a JSON blob (`Data` is plist-native, mirroring `FavoritesStore`).
+    /// An encode failure is a no-op (the in-memory value still applies live), matching the store's
+    /// best-effort persistence.
+    private func persist(_ value: GestureBindings, _ key: String) {
+        guard let data = try? JSONEncoder().encode(value) else { return }
+        defaults.set(data, forKey: key)
+    }
+
+    /// Decode the persisted gesture bindings, falling back to the defaults on a missing/corrupt blob
+    /// (so older settings — which have no key — read back exactly today's behavior).
+    private static func loadGestureBindings(_ defaults: UserDefaults, _ key: String) -> GestureBindings {
+        guard let data = defaults.data(forKey: key),
+              let decoded = try? JSONDecoder().decode(GestureBindings.self, from: data)
+        else { return Defaults.gestureBindings }
+        return decoded
+    }
+
     // The gesture-feel numbers below are tuned from extended real daily use (the maintainer's
     // dialed-in values, adopted as the shipped defaults): a feather-light trigger, fine steps,
     // and a quick dwell — the feel the product is meant to have out of the box.
@@ -473,6 +554,10 @@ final class AppSettings: ObservableObject {
         static let axisLockRatio = 1.13          // slight horizontal dominance before scrubbing (in-hand tuned)
         static let stepDistance = 0.027          // one window per ~2.7% of trackpad width (in-hand tuned)
         static let wrapAtEnds = false
+        /// The resolution-gesture bindings default to exactly today's behavior (see `GestureBindings`).
+        static let gestureBindings = GestureBindings.default
+        /// Retained as the documented switcher-axis default (the `reverseDirection` boolean view of the
+        /// `gestureBindings.switcher.windowsAxis`). Kept so existing tests/Hub reads stay valid.
         static let reverseDirection = false
         static let velocitySmoothing = 0.35
         static let switcherWindowScale = 0.60    // 0.60× of SwitcherLayout.kMax
@@ -515,6 +600,9 @@ final class AppSettings: ObservableObject {
         static let filesSortDirection: FilesSortDirection = .ascending
         static let filesDefaultOpen: FilesDefaultOpen = .defaultApp
         static let filesRowMetadata: FilesRowMetadata = .date   // show the modified date beside the name
+        static let filesLiftAction: FilesLiftAction = .deliver  // lift delivers the entry to the front app by default
+        static let filesActionMenu = FilesActionMenu.default    // per-type menus exactly as specified
+        static let filesToolsDisabled: [String] = []            // all detected terminals/editors enabled
         static let keyboardLanguageEnabled = false // opt-in; gates per-app input-source learn/apply (no re-login)
         static let keyboardLanguageDefaultSourceID = ""  // "" = no global default (pure learn-as-you-go)
         // Per-host memory inside browsers rides along by default when the keyboard-language master
@@ -532,6 +620,10 @@ final class AppSettings: ObservableObject {
         static let axisLockRatio = "axisLockRatio"
         static let stepDistance = "stepDistance"
         static let wrapAtEnds = "wrapAtEnds"
+        /// The single JSON blob of all gesture bindings (the new single source of truth).
+        static let gestureBindings = "gestureBindings"
+        /// Legacy keys, read ONCE at init for the reverse-direction migration into the switcher axes; no
+        /// longer written (the switcher binding is now the single source of truth).
         static let reverseDirection = "reverseDirection"
         static let velocitySmoothing = "velocitySmoothing"
         static let switcherWindowScale = "switcherWindowScale"
@@ -574,6 +666,9 @@ final class AppSettings: ObservableObject {
         static let filesSortDirection = "filesSortDirection"
         static let filesDefaultOpen = "filesDefaultOpen"
         static let filesRowMetadata = "filesRowMetadata"
+        static let filesLiftAction = "filesLiftAction"
+        static let filesActionMenu = "filesActionMenu"
+        static let filesToolsDisabled = "filesToolsDisabled"
         static let keyboardLanguageEnabled = "keyboardLanguageEnabled"
         static let keyboardLanguageDefaultSourceID = "keyboardLanguageDefaultSourceID"
         static let keyboardLanguagePerSiteEnabled = "keyboardLanguagePerSiteEnabled"

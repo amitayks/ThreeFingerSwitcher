@@ -441,6 +441,9 @@ final class GestureRecognizer {
 
     private func emitStep(forward: Bool) {
         var dir = forward ? 1 : -1
+        // `reverseDirection` now resolves from `settings.gestureBindings.switcher.windowsAxis` — the
+        // configured switcher binding is the single source of truth for the windows-axis scrub direction
+        // (`add-gesture-previews-and-bindings` §9.4). No functional change; the read already consults it.
         if settings.reverseDirection { dir = -dir }
         delegate?.gestureDidStep(dir)
     }
@@ -448,6 +451,9 @@ final class GestureRecognizer {
     /// `up` = finger moved up (OMS y increases upward). Default: up = next Space-row.
     private func emitRowStep(up: Bool) {
         var dir = up ? 1 : -1
+        // `reverseVerticalDirection` now resolves from `settings.gestureBindings.switcher.spacesAxis` — the
+        // configured switcher binding is the single source of truth for the Spaces-axis scrub direction
+        // (`add-gesture-previews-and-bindings` §9.4). No functional change; the read already consults it.
         if settings.reverseVerticalDirection { dir = -dir }
         delegate?.gestureDidStepRow(dir)
     }
@@ -714,7 +720,9 @@ final class GestureRecognizer {
             let ratio = CGFloat(settings.axisLockRatio)
             if abs(dx) >= threshold && abs(dx) >= ratio * abs(dy) {
                 drillResolved = true
-                delegate?.filesDiscard()
+                // The physical four-finger horizontal swipe-away → its bound action
+                // (`add-gesture-previews-and-bindings` §9.4; default: discard).
+                resolveFilesDrillExcursion(.fourFingerHorizontal)
             }
             drillLast = c
             return
@@ -750,13 +758,31 @@ final class GestureRecognizer {
         // nothing); seeding requires a real ≥2-finger contact.
         if drillStarted {
             drillResolved = true
-            if pendingOpenWith {
-                delegate?.filesOpenWith()
-            } else {
-                delegate?.filesOpen()
-            }
+            // The physical lift → its bound action: a relative +1-finger lift is `.plusOneFingerLift`, a
+            // plain lift is `.lift` (`add-gesture-previews-and-bindings` §9.4; defaults: Open-With / open).
+            resolveFilesDrillExcursion(pendingOpenWith ? .plusOneFingerLift : .lift)
         }
         drillStarted = false
+    }
+
+    /// Map a DETECTED physical Files-drill excursion to its bound action via the user's configured
+    /// `filesDrill` binding (`add-gesture-previews-and-bindings` §9.4), then fire the matching delegate
+    /// intent. The recognizer detects only the *physical* move; which intent it carries is the binding's
+    /// job — defaults reproduce today's grammar (lift → open, +1-finger lift → Open-With, four-finger
+    /// horizontal → discard). All downstream guards (one-shot `drillResolved`, the defuse window, and
+    /// "discard never terminates a running app") live in the delegate/controller and are untouched.
+    private func resolveFilesDrillExcursion(_ excursion: GestureBindings.FilesExcursion) {
+        let binding = settings.gestureBindings.filesDrill
+        // Find which action is bound to the detected excursion (the binding is strictly one-to-one).
+        let action = GestureBindings.FilesAction.allCases.first {
+            binding.excursion(for: $0) == excursion
+        }
+        switch action {
+        case .open:     delegate?.filesOpen()
+        case .openWith: delegate?.filesOpenWith()
+        case .discard:  delegate?.filesDiscard()
+        case .none:     break   // unreachable: every excursion is bound to exactly one action
+        }
     }
 
     private func emitDrillDepth(forward: Bool) {

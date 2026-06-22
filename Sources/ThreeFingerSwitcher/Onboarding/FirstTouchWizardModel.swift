@@ -380,20 +380,15 @@ final class FirstTouchWizardModel: ObservableObject {
     }
 
     /// One full pad sweep ≈ 6.5 s at the 30 Hz tick — unhurried, self-evidently alive.
-    nonisolated static let attractPhaseStep = (2 * Double.pi) / (6.5 * 30)
+    /// Now sourced from the shared `GesturePose` driver (one cadence across every preview).
+    nonisolated static let attractPhaseStep = GesturePose.phaseStep
 
     /// One ghost-hand pose: a three-fingertip arc whose centroid ping-pongs across the trackpad
     /// (normalized 0..1 coordinates), each fingertip carrying a faint organic wobble so the hand
-    /// reads as a hand, not a cursor. Pure — unit-tested for bounds and shape.
+    /// reads as a hand, not a cursor. Thin wrapper over the shared pose driver — the 3-finger
+    /// horizontal case reproduces this loop's original output exactly, so onboarding is unchanged.
     nonisolated static func attractPose(phase: Double) -> (centroid: CGPoint, dots: [CGPoint]) {
-        let x = 0.5 + 0.40 * sin(phase)
-        let y = 0.42 + 0.05 * sin(phase * 0.63)
-        let offsets: [(CGFloat, CGFloat)] = [(-0.16, 0.10), (0, 0.17), (0.16, 0.10)]
-        let dots = offsets.enumerated().map { index, offset in
-            CGPoint(x: min(0.95, max(0.05, x + offset.0 + 0.012 * sin(phase * 1.7 + Double(index)))),
-                    y: min(0.95, max(0.05, y + offset.1 + 0.012 * cos(phase * 1.3 + Double(index)))))
-        }
-        return (CGPoint(x: x, y: y), dots)
+        GesturePose.pose(phase: phase, fingers: 3, axis: .horizontal)
     }
 
     private func handleTouch(_ frame: TouchFrame) {
