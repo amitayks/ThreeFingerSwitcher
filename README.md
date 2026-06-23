@@ -12,6 +12,12 @@
 
 (Humans: you're welcome to read on, but it's deliberately addressed to the agent. Hand this repo to Claude and ask it to set you up.)
 
+## Demo
+
+*The switcher, the launcher, and the optional bands in action (~2 min):*
+
+https://github.com/user-attachments/assets/30a78d2f-ce5c-4b2f-bbab-ac0369bbacd0
+
 ---
 
 ## What this is (30-second brief)
