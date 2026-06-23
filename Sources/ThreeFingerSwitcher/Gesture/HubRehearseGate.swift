@@ -24,23 +24,38 @@ import CoreGraphics
 /// Pure / value-typed, so the ≥2-finger gate and the ownership verdict are unit-testable without a real
 /// trackpad, the Hub, or the coordinator.
 enum HubRehearseGate {
-    /// The minimum fingers that engage the gate. One finger is never a gesture (no cursor-as-gesture);
-    /// two or more is the in-surface vocabulary the previews rehearse.
+    /// The minimum fingers that keep an ARMED rehearsal driving. One finger is never a gesture (no
+    /// cursor-as-gesture); two or more is the in-surface vocabulary the previews rehearse (the post-trigger
+    /// relax-to-two).
     static let minimumFingers = 2
 
-    /// True when the user's real fingers should drive the active preview this frame — i.e. a preview is
-    /// the active rehearse target AND at least `minimumFingers` are down. The coordinator feeds the
-    /// frame's contacts into the preview's `liveDots` seam exactly when this is true (and clears them
-    /// when it is false, so the ghost loop resumes).
-    static func shouldDriveDots(isActiveTarget: Bool, fingerCount: Int) -> Bool {
-        isActiveTarget && fingerCount >= minimumFingers
+    /// The finger count that ARMS a rehearsal. Every feature opens with a ≥3-finger contact (three opens
+    /// the switcher, four the launcher and its bands), so a gesture that never reaches three fingers is NOT
+    /// a feature trigger — it is an ordinary **two-finger scroll**, which must pass through untouched (so the
+    /// Hub page scrolls normally). The gate therefore arms only once a ≥3-finger trigger occurs, and only
+    /// THEN starts swallowing the relaxed two-finger movement.
+    static let armThreshold = 3
+
+    /// True when a frame should ARM the gate — a feature-opening contact count (≥`armThreshold`) is down.
+    /// The controller latches this for the rest of the touch sequence (until a full lift), mirroring the
+    /// recognizer's "three to trigger, relax to two" grammar.
+    static func shouldArm(fingerCount: Int) -> Bool {
+        fingerCount >= armThreshold
     }
 
-    /// True when real gesture handling must be suppressed for this frame — the Hub-preview analogue of
-    /// `wizardOwnsGestures`. Identical condition to `shouldDriveDots`: the Hub owns the gesture for
-    /// exactly the frames it is driving a rehearsed preview, so the recognizer is skipped only then and
-    /// resumes the instant the fingers drop below two or the preview is no longer the target.
-    static func ownsGestures(isActiveTarget: Bool, fingerCount: Int) -> Bool {
-        shouldDriveDots(isActiveTarget: isActiveTarget, fingerCount: fingerCount)
+    /// True when the user's real fingers should drive the active preview this frame — a preview is the
+    /// active rehearse target, the gate is **armed** (a ≥3-finger trigger happened this sequence), AND at
+    /// least `minimumFingers` remain down. Before arming, a one/two-finger move drives nothing (the ghost
+    /// loop keeps running and the scroll passes through).
+    static func shouldDriveDots(isActiveTarget: Bool, armed: Bool, fingerCount: Int) -> Bool {
+        isActiveTarget && armed && fingerCount >= minimumFingers
+    }
+
+    /// True when real gesture handling (and scroll) must be swallowed for this frame — the Hub-preview
+    /// analogue of `wizardOwnsGestures`. Identical condition to `shouldDriveDots`: the Hub owns the gesture
+    /// for exactly the frames it is driving an ARMED rehearsed preview, so the recognizer/scroll are skipped
+    /// only then and resume the instant the gate disarms (a full lift) or the preview loses focus.
+    static func ownsGestures(isActiveTarget: Bool, armed: Bool, fingerCount: Int) -> Bool {
+        shouldDriveDots(isActiveTarget: isActiveTarget, armed: armed, fingerCount: fingerCount)
     }
 }

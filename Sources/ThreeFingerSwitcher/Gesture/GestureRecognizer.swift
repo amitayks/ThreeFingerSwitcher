@@ -133,6 +133,23 @@ final class GestureRecognizer {
     private var canvasResStarted = false
     private var canvasResResolved = false
     private var canvasResStart: CGPoint = .zero
+    /// Running PEAK of `abs(centroidVelocity)` per axis across the in-contact frames of the current canvas
+    /// excursion (D4). A resolve fires only if the dominant axis's peak crossed `flickVelocityThreshold` —
+    /// a slow reading-scrub never reaches it. Reset on lift / fresh contact.
+    private var canvasResPeakVelX: CGFloat = 0
+    private var canvasResPeakVelY: CGFloat = 0
+    /// Timestamp of the most recent in-contact frame whose dominant-axis speed exceeded the flick velocity
+    /// threshold, and the most recent in-contact frame's timestamp. The lift is a FLICK only when it arrives
+    /// within `flickLiftWindow` of the last high-velocity frame (D4) — a pause before lifting means the
+    /// fingers decelerated to a hold/scroll. Reset on lift / fresh contact.
+    private var canvasResLastFastTime: CFTimeInterval = 0
+    private var canvasResLastContactTime: CFTimeInterval = 0
+    /// Whether any in-contact frame this excursion crossed the velocity threshold on the dominant axis.
+    private var canvasResSawFastFrame = false
+    /// Signed dominant-axis travel captured from the last in-contact frame, so the lift-frame (which is
+    /// empty / .zero centroid) can still classify the direction and travel floor of the flick.
+    private var canvasResLastDX: CGFloat = 0
+    private var canvasResLastDY: CGFloat = 0
 
     /// While true (the Files column navigator is open), every frame routes to `trackFilesDrill` and the
     /// normal finger-count latch is bypassed — a fresh contact during the drill never opens the switcher
@@ -212,6 +229,13 @@ final class GestureRecognizer {
     /// reading/scrolling the canvas is never mistaken for a commit/discard.
     private let canvasResolveThreshold: CGFloat = 0.12
 
+    /// Peak smoothed centroid speed (normalized/sec) the dominant axis must reach for a canvas excursion's
+    /// lift to count as a FLICK rather than a reading-scroll (D4). Sourced from `settings.flickVelocityThreshold`.
+    private var flickVelocityThreshold: CGFloat { CGFloat(settings.flickVelocityThreshold) }
+    /// Maximum gap (seconds) between the last high-velocity in-contact frame and the lift for that lift to
+    /// count as a flick (D4). Sourced from `settings.flickLiftWindow`.
+    private var flickLiftWindow: CFTimeInterval { CFTimeInterval(settings.flickLiftWindow) }
+
     init(settings: AppSettings) {
         self.settings = settings
     }
@@ -265,38 +289,99 @@ final class GestureRecognizer {
     }
 
     /// One-shot canvas-resolution tracking (see `launcherCanvasResolutionActive`). A fresh **two-finger**
-    /// swipe past `canvasResolveThreshold` reports a single `launcherCanvasResolve`: vertical-dominant →
-    /// `dy` (`+1` up, `-1` down; down applies, up is ignored upstream), else horizontal → `dx` (discard).
-    /// Two-finger resolution (change `positional-navigation`, D5) aligns the grammar — 4 fingers open /
-    /// dismiss the platform, 2 fingers act within it — and the threshold sits ABOVE incidental scrolling so
-    /// reading the canvas never resolves it. Runs INSTEAD of the normal state machine while the canvas is
-    /// open, so it never opens the launcher or switcher; it self-resets on lift.
+    /// FLICK-LIFT reports a single `launcherCanvasResolve`: vertical-dominant → `dy` (`+1` up, `-1` down;
+    /// down applies, up is ignored / parks upstream), else horizontal → `dx` (discard). Two-finger
+    /// resolution (change `positional-navigation`, D5) aligns the grammar — 4 fingers open / dismiss the
+    /// platform, 2 fingers act within it. Runs INSTEAD of the normal state machine while the canvas is open,
+    /// so it never opens the launcher or switcher; it self-resets on lift.
+    ///
+    /// D4 (scroll-vs-flick): the resolve does NOT fire the instant travel crosses `canvasResolveThreshold` —
+    /// that floor is a MINIMUM only. While fingers are down we accumulate the signed dominant-axis travel, a
+    /// running PEAK of `abs(centroidVelocity)` per axis, and the timing of the last high-velocity frame
+    /// (`frame.centroidVelocity`/`frame.time` from the engine — the lift frame is empty with `.zero`
+    /// velocity, so the flick speed must come from the LAST in-contact frame). On the lift frame we classify:
+    /// a FLICK (→ emit) requires (a) the travel floor was crossed, (b) the dominant axis's peak velocity
+    /// exceeded `flickVelocityThreshold`, AND (c) the lift arrived within `flickLiftWindow` of the last
+    /// high-velocity frame. A slow continuous scrub (sub-threshold peak, or held without a prompt lift) is
+    /// SCROLL and emits nothing.
     private func trackCanvasResolution(_ frame: TouchFrame) {
         let count = frame.fingerCount
-        if count == 0 {                       // lift → ready for the next resolution gesture
-            canvasResStarted = false
-            canvasResResolved = false
+        if count == 0 {                       // lift → classify the just-ended excursion, then re-arm
+            resolveCanvasFlickOnLift()
+            resetCanvasResolution()
             return
         }
         if !canvasResStarted {
             guard count >= 2 else { return }  // require a fresh (≥) two-finger contact to begin
+            resetCanvasResolution()
             canvasResStarted = true
-            canvasResResolved = false
             canvasResStart = frame.centroid
+            canvasResLastContactTime = frame.time
             return
         }
         guard !canvasResResolved, count >= 2 else { return }
         let dx = frame.centroid.x - canvasResStart.x
         let dy = frame.centroid.y - canvasResStart.y
-        let threshold = canvasResolveThreshold
-        guard abs(dx) >= threshold || abs(dy) >= threshold else { return }
-        canvasResResolved = true
         let ratio = CGFloat(settings.axisLockRatio)
-        if abs(dy) >= ratio * abs(dx) {
+        let verticalDominant = abs(dy) >= ratio * abs(dx)
+        // Accumulate the per-axis velocity peak + the dominant-axis travel from the last in-contact frame
+        // (the lift frame is empty, so the lift handler reads these). Treat `canvasResolveThreshold` as a
+        // travel FLOOR only — never fire here.
+        let vx = abs(frame.centroidVelocity.dx)
+        let vy = abs(frame.centroidVelocity.dy)
+        canvasResPeakVelX = max(canvasResPeakVelX, vx)
+        canvasResPeakVelY = max(canvasResPeakVelY, vy)
+        canvasResLastContactTime = frame.time
+        canvasResLastDX = dx
+        canvasResLastDY = dy
+        // Record the timing of any frame whose DOMINANT-axis speed crossed the flick threshold, so the lift
+        // window is measured from the last genuinely-fast frame on the relevant axis.
+        let dominantSpeed = verticalDominant ? vy : vx
+        if dominantSpeed >= flickVelocityThreshold {
+            canvasResSawFastFrame = true
+            canvasResLastFastTime = frame.time
+        }
+    }
+
+    /// Classify the just-ended canvas excursion on lift (`count == 0`). Emits at most one axis-locked
+    /// `launcherCanvasResolve` and only for a genuine FLICK-LIFT (D4). A one-shot guard (`canvasResResolved`)
+    /// keeps a stray re-lift a no-op; the firing lift already raised the fingers.
+    private func resolveCanvasFlickOnLift() {
+        guard canvasResStarted, !canvasResResolved else { return }
+        let dx = canvasResLastDX
+        let dy = canvasResLastDY
+        let ratio = CGFloat(settings.axisLockRatio)
+        let verticalDominant = abs(dy) >= ratio * abs(dx)
+        // (a) Travel floor: the dominant axis must have crossed `canvasResolveThreshold`.
+        let dominantTravel = verticalDominant ? abs(dy) : abs(dx)
+        guard dominantTravel >= canvasResolveThreshold else { return }
+        // (b) Peak velocity: the dominant axis must have flicked fast at some point.
+        let dominantPeak = verticalDominant ? canvasResPeakVelY : canvasResPeakVelX
+        guard dominantPeak >= flickVelocityThreshold else { return }   // slow scrub → SCROLL, no resolve
+        // (c) Prompt lift: the lift must have followed the last fast frame within the flick window (a pause
+        // before lifting means the fingers decelerated to a hold/scroll).
+        guard canvasResSawFastFrame,
+              canvasResLastContactTime - canvasResLastFastTime <= flickLiftWindow else { return }
+        canvasResResolved = true
+        if verticalDominant {
             delegate?.launcherCanvasResolve(dx: 0, dy: dy > 0 ? 1 : -1)   // dy>0 = up, dy<0 = down
         } else {
             delegate?.launcherCanvasResolve(dx: dx > 0 ? 1 : -1, dy: 0)
         }
+    }
+
+    /// Reset all per-excursion canvas-resolution state (on lift and on a fresh contact) so velocity peaks,
+    /// timing, and travel never leak across gestures.
+    private func resetCanvasResolution() {
+        canvasResStarted = false
+        canvasResResolved = false
+        canvasResPeakVelX = 0
+        canvasResPeakVelY = 0
+        canvasResLastFastTime = 0
+        canvasResLastContactTime = 0
+        canvasResSawFastFrame = false
+        canvasResLastDX = 0
+        canvasResLastDY = 0
     }
 
     // MARK: - Switcher (three-finger; relaxes to two after activation)

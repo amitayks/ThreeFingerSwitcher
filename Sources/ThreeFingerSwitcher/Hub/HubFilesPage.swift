@@ -40,11 +40,14 @@ struct FilesPage: View {
         _settings = ObservedObject(wrappedValue: context.settings)
         let holder = HubLauncherDemo()
         _demo = StateObject(wrappedValue: holder)
-        _driver = StateObject(wrappedValue: HubDemoDriver(
+        let driver = HubDemoDriver(
             gesture: Self.filesJourney,
-            onScrub: { [weak holder] centroid in holder?.scrub(centroid) },
-            onOpen: { [weak holder] in holder?.open() },
-            onDismiss: { [weak holder] in holder?.dismiss() }))
+            onScrub: { [weak holder] centroid in holder?.idleNavigate(centroid) },
+            onOpen: { [weak holder] in holder?.idleOpen() })
+        driver.onRehearse = { [weak holder] centroid, fingers in
+            if let centroid { holder?.rehearseFrame(centroid, fingerCount: fingers) } else { holder?.rehearseEnd() }
+        }
+        _driver = StateObject(wrappedValue: driver)
     }
 
     /// The preview's attract journey: open the four-finger launcher → traverse to the Files band → land
@@ -94,7 +97,11 @@ struct FilesPage: View {
         // Files band appended last, built from the configured roots (no live drill controller).
         let base = models.makeLauncherModel(clipboardOn: false, aiOn: false,
                                             dwell: settings.dwellToArmDuration)
-        demo.seed(from: appendingFilesBand(to: base), traverseToLastBand: true)
+        demo.seed(from: appendingFilesBand(to: base),
+                  mode: .bandJourney, dwell: settings.dwellToArmDuration,
+                  activation: CGFloat(settings.launcherActivationThreshold),
+                  itemStep: CGFloat(settings.launcherStepDistance),
+                  bandStep: CGFloat(settings.launcherContextStepDistance))
     }
 
     /// Build a fresh `LauncherModel` that is `base` plus a synthetic **Files band** appended as the last
@@ -163,6 +170,9 @@ struct FilesPage: View {
             appearanceSection
             behaviorSection
         }
+        // A real rehearsal morphs the preview into the actual launcher (showing the Files band) at real size,
+        // floating over the page, navigable — never fires.
+        .overlay { GrownLauncherOverlay(demo: demo) }
     }
 
     // MARK: - Action menu (the +1-finger menu — what it offers, per type)
@@ -608,22 +618,32 @@ struct FilesPage: View {
     }
 }
 
-// MARK: - §11.5 Files demo miniature (the real launcher, showing the Files band)
+// MARK: - §14 Files demo miniature (the real launcher, showing the Files band)
 
-/// The §11.5 Files-page miniature: the **real** `LauncherView` over the holder's seeded model (the user's
-/// bands + a synthetic Files band appended last), scaled to a tasteful Hub mini and launched in / receded
-/// with the holder's `launched` flag — a soft morph, exactly like the Launcher / Clipboard / AI demo
-/// miniatures (and the onboarding playground). It takes no hits (the preview disables hit-testing). The
-/// `HubDemoDriver` traverses the band selection to the Files band in sync with the demonstrated journey.
+/// The §14 Files-page miniature: the **real** `LauncherView` over the holder's seeded model (the user's bands
+/// + a synthetic Files band appended last), shown small (preview scale) — the preview "playing its part." It
+/// does NOT grow in place; while a real rehearsal is live it recedes so attention goes to the grown,
+/// actual-size launcher floating over the page (`GrownLauncherOverlay`, applied at the page body). No hits.
 private struct FilesDemoMiniature: View {
     @ObservedObject var demo: HubLauncherDemo
+    @ObservedObject var model: LauncherModel
+
+    init(demo: HubLauncherDemo) {
+        _demo = ObservedObject(wrappedValue: demo)
+        _model = ObservedObject(wrappedValue: demo.model)
+    }
+
+    private let scale: CGFloat = 0.46
 
     var body: some View {
-        LauncherView(model: demo.model, executor: nil, availability: nil)
-            .scaleEffect(0.5)
-            .frame(width: 360, height: 150)
-            .opacity(demo.launched ? 1 : 0.14)
-            .scaleEffect(demo.launched ? 1 : 0.95)
-            .animation(.easeInOut(duration: 0.3), value: demo.launched)
+        let n = launcherNaturalSize(model)
+        let h = min(n.height, 320)
+        LauncherView(model: model, executor: nil, availability: nil)
+            .frame(width: n.width, height: h)
+            .scaleEffect(scale)
+            .frame(width: n.width * scale, height: h * scale)
+            .allowsHitTesting(false)
+            .opacity(demo.playing ? 0.2 : 1)
+            .animation(.easeInOut(duration: 0.25), value: demo.playing)
     }
 }

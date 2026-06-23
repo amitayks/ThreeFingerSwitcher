@@ -60,8 +60,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// The configuration Hub is the single home for every setting (configuration-hub), so the status
     /// menu is trimmed to a minimal set of quick actions: open the Hub, toggle the switcher, add the
     /// front app to a band, and quit. Everything else (tunables, Open at Login, launcher status, setup
-    /// & permissions, gesture restores, diagnostics) lives in the Hub. Groups are joined by dividers,
-    /// and empty groups are dropped so there are never doubled or dangling separators.
+    /// & permissions, gesture restores) lives in the Hub. The one exception is the diagnostic actions
+    /// (write diagnostics, copy focus log), which appear here as their own group when the General
+    /// page's "Show diagnostic tools" preference is on. Groups are joined by dividers, and empty
+    /// groups are dropped so there are never doubled or dangling separators.
     private func rebuildMenu() {
         guard let menu = statusItem.menu else { return }
         menu.removeAllItems()
@@ -82,6 +84,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         toggle.state = coordinator.isEnabled ? .on : .off
         if !coordinator.isTrackpadAvailable { toggle.isEnabled = false }
         groups.append([toggle, quickAddMenuItem()])
+
+        // Diagnostics — surfaced here (their own group) only when the "Show diagnostic tools"
+        // preference is on; hidden everywhere otherwise. Read at rebuild time, so the menu always
+        // reflects the current preference the next time it opens.
+        if coordinator.showDiagnostics {
+            groups.append([item("Write Diagnostics → /tmp", #selector(writeDiagnostics)),
+                           item("Copy Focus Log", #selector(copyFocusLog))])
+        }
 
         groups.append([item("Quit", #selector(quit))])
 
@@ -129,5 +139,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         guard let id = sender.representedObject as? UUID else { return }
         coordinator.addFrontAppToBand(id)
     }
+    @objc private func writeDiagnostics() { coordinator.writeDiagnostics() }
+    @objc private func copyFocusLog() { coordinator.copyFocusLog() }
     @objc private func quit() { NSApp.terminate(nil) }
 }

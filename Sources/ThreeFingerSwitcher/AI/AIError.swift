@@ -60,6 +60,26 @@ public enum AIError {
             return AIPresentedError(headline: task.errorDescription ?? unknownHeadline,
                                     details: String(describing: task))
         }
+        if let skill = error as? SkillError {
+            return AIPresentedError(headline: skill.errorDescription ?? unknownHeadline,
+                                    details: String(describing: skill))
+        }
+        if let memory = error as? MemoryError {
+            return AIPresentedError(headline: memory.errorDescription ?? unknownHeadline,
+                                    details: details(for: memory))
+        }
+        if let park = error as? ParkError {
+            return AIPresentedError(headline: park.errorDescription ?? unknownHeadline,
+                                    details: park.rawDetail)
+        }
+        if let audit = error as? AuditError {
+            return AIPresentedError(headline: audit.errorDescription ?? unknownHeadline,
+                                    details: audit.rawDetail)
+        }
+        if let handoff = error as? HandoffError {
+            return AIPresentedError(headline: handoff.errorDescription ?? unknownHeadline,
+                                    details: handoff.copyableDetails)
+        }
 
         // 2) Cancellation is not a real failure — give a benign, clean headline if asked.
         if error is CancellationError {
@@ -133,6 +153,19 @@ public enum AIError {
             return detail
         case .offline, .serverUnavailable, .authOrAccessDenied, .modelMissing,
              .integrityFailed, .cancelled, .couldNotProduceValid, .unsupportedModality, .unavailable:
+            return nil
+        }
+    }
+
+    /// The copyable `details` for a `MemoryError`: the carried raw OS/parse text (kept OUT of the
+    /// headline). `nil` when the headline already says everything (no extra technical text).
+    private static func details(for memory: MemoryError) -> String? {
+        switch memory {
+        case let .unreadableCore(detail), let .writeFailed(detail):
+            return detail
+        case let .malformedSubfile(_, detail):
+            return detail
+        case .subfileNotFound, .capExceeded:
             return nil
         }
     }

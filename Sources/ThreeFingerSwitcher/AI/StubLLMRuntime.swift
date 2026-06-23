@@ -32,6 +32,23 @@ public final class StubLLMRuntime: LLMRuntime, @unchecked Sendable {
         case alwaysInvalid(json: String)
     }
 
+    // MARK: Multi-turn scripting
+
+    /// One turn's script for a multi-turn conversation (design D8). Each `generate(_:)` call (including
+    /// the one the default `chat(_:)` makes after flattening) dequeues the next `TurnScript` in order, so
+    /// `swift test` can drive a full deterministic conversation. `error`, when set, makes that turn fail
+    /// (after any `thinking`, before the response) so the per-turn `.failed` path is observable.
+    public struct TurnScript: Sendable {
+        public var tokens: [String]
+        public var thinking: [String]
+        public var error: RuntimeError?
+        public init(tokens: [String] = [], thinking: [String] = [], error: RuntimeError? = nil) {
+            self.tokens = tokens
+            self.thinking = thinking
+            self.error = error
+        }
+    }
+
     // MARK: Configuration
 
     /// Modalities this stub reports. Default = text + vision (mirrors the v1 flagship); a test can
@@ -46,6 +63,11 @@ public final class StubLLMRuntime: LLMRuntime, @unchecked Sendable {
     /// test can drive the canvas's "show the model's thinking" channel split). Default empty = today's
     /// behavior: a pure `.response` stream, byte-identical to before.
     var scriptedThinking: [String]
+
+    /// A FIFO queue of per-turn scripts for multi-turn conversations (design D8). Each `generate(_:)`
+    /// dequeues one; when exhausted, generation falls back to `scriptedTokens`/`scriptedThinking` so
+    /// existing single-generation tests stay byte-identical. Configure before driving a conversation.
+    var scriptedTurns: [TurnScript]
 
     /// Artificial delay between emitted tokens, in nanoseconds. Lets a test observe streaming order
     /// and cancel mid-stream. Default is a tiny delay so tests stay fast.
@@ -74,12 +96,14 @@ public final class StubLLMRuntime: LLMRuntime, @unchecked Sendable {
     public init(capabilities: Set<Modality> = [.text, .vision],
                 scriptedTokens: [String] = [],
                 scriptedThinking: [String] = [],
+                scriptedTurns: [TurnScript] = [],
                 interTokenDelayNanos: UInt64 = 1_000_000, // 1 ms
                 structuredScript: StructuredScript? = nil,
                 maxRepairAttempts: Int = 3) {
         self.capabilities = capabilities
         self.scriptedTokens = scriptedTokens
         self.scriptedThinking = scriptedThinking
+        self.scriptedTurns = scriptedTurns
         self.interTokenDelayNanos = interTokenDelayNanos
         self.structuredScript = structuredScript
         self.maxRepairAttempts = maxRepairAttempts
@@ -88,9 +112,24 @@ public final class StubLLMRuntime: LLMRuntime, @unchecked Sendable {
     // MARK: Streaming
 
     public func generate(_ request: LLMRequest) -> AsyncThrowingStream<Token, Error> {
+        // Multi-turn scripting: dequeue the next per-turn script (FIFO). When the queue is exhausted,
+        // fall back to the single-generation `scriptedTokens`/`scriptedThinking` so existing one-shot
+        // tests are byte-identical. The default `chat(_:)` (flatten → generate) consumes the queue
+        // through THIS method, so no `chat` override is needed in the stub.
+        let turn = nextTurnScript()
         // Capture the script up-front so the closure doesn't race on `self` mutation mid-stream.
-        let chunks = scriptedTokens.isEmpty ? [request.prompt] : scriptedTokens
-        let thinkingChunks = scriptedThinking
+        let chunks: [String]
+        let thinkingChunks: [String]
+        let turnError: RuntimeError?
+        if let turn {
+            chunks = turn.tokens.isEmpty ? [request.prompt] : turn.tokens
+            thinkingChunks = turn.thinking
+            turnError = turn.error
+        } else {
+            chunks = scriptedTokens.isEmpty ? [request.prompt] : scriptedTokens
+            thinkingChunks = scriptedThinking
+            turnError = nil
+        }
         let delay = interTokenDelayNanos
         let needsVision = request.requiresVision
         let caps = capabilities
@@ -111,6 +150,12 @@ public final class StubLLMRuntime: LLMRuntime, @unchecked Sendable {
                         if delay > 0 { try await Task.sleep(nanoseconds: delay) }
                         try Task.checkCancellation()
                         continuation.yield(Token(chunk, isFinal: false, channel: .thinking))
+                    }
+                    // A scripted per-turn error fails THIS turn (after any thinking, before the response)
+                    // so the executor's per-turn `.failed` path is observable.
+                    if let turnError {
+                        continuation.finish(throwing: turnError)
+                        return
                     }
                     for (i, chunk) in chunks.enumerated() {
                         // Honor cancellation BEFORE emitting so a discard stops work promptly.
@@ -241,5 +286,13 @@ public final class StubLLMRuntime: LLMRuntime, @unchecked Sendable {
     private func markCancelled() {
         lock.lock(); defer { lock.unlock() }
         didObserveCancellation = true
+    }
+
+    /// Dequeue the next per-turn script (FIFO) under the lock, or nil when the multi-turn queue is empty
+    /// (→ fall back to single-generation scripting). Called once at the start of each `generate(_:)`.
+    private func nextTurnScript() -> TurnScript? {
+        lock.lock(); defer { lock.unlock() }
+        guard !scriptedTurns.isEmpty else { return nil }
+        return scriptedTurns.removeFirst()
     }
 }

@@ -14,33 +14,38 @@ struct SwitcherPage: View {
     let context: HubContext
     @ObservedObject private var settings: AppSettings
 
-    /// §11.5 — the REAL mini switcher: a `SwitcherView` over the user's currently open windows (live
-    /// thumbnails when Screen Recording is granted, icons otherwise), seeded once on appear and driven
-    /// in sync with the ghost hand by `driver` (the `switcherDemo` directed strokes: 3-finger open →
-    /// 2-finger scrub). The driver's `onScrub` maps the navigate-stroke centroid to the highlighted
-    /// window (`centroid.x → setColumn`), exactly like `FirstTouchWizardModel.attractTick`.
-    @StateObject private var switcherModel = SwitcherModel()
+    /// §12 — the REAL mini switcher: a `SwitcherView` over the user's open windows grouped into Space-rows
+    /// (true proportions + live thumbnails; icon-only fallbacks), owned by a `HubSwitcherDemo` holder so the
+    /// driver's one-shot `onOpen` + per-frame `onScrub` closures (captured in `init`) drive the same model
+    /// the view observes. The demo teaches the full deterministic story — three-finger open → lift one →
+    /// up/down Spaces → sideways windows — with the highlight + Space reel moving in sync.
+    @StateObject private var demo: HubSwitcherDemo
     @StateObject private var driver: HubDemoDriver
     @State private var seeded = false
     /// The hover-demo override pushed into the preview's driver by the direction pickers: hovering the
-    /// windows-axis control demos a horizontal scrub, the Spaces-axis control a vertical one. `nil` ⇒
-    /// the attract loop (the base `switcherDemo`).
+    /// windows-axis control demos a sideways window scrub, the Spaces-axis control an up/down Space move.
+    /// `nil` ⇒ the base teaching demo.
     @State private var demoGesture: GesturePose.DemoGesture?
 
     init(context: HubContext) {
         self.context = context
         _settings = ObservedObject(wrappedValue: context.settings)
-        let model = SwitcherModel()
-        _switcherModel = StateObject(wrappedValue: model)
-        // `onScrub` maps the directed scrub's centroid.x → the highlighted window — the page's job
-        // (the driver only knows strokes). Hover-demo retargets `driver.gesture` (below).
-        _driver = StateObject(wrappedValue: HubDemoDriver(
-            gesture: GesturePose.switcherDemo(),
-            onScrub: { [weak model] centroid in
-                guard let model, model.windows.count > 1 else { return }
-                let col = min(model.windows.count - 1, max(0, Int(centroid.x * CGFloat(model.windows.count))))
-                if col != model.selectedIndex { model.setColumn(col) }
-            }))
+        let holder = HubSwitcherDemo()
+        _demo = StateObject(wrappedValue: holder)
+        // The driver plays the teaching gesture; its closures drive the holder's model in sync — `onOpen`
+        // resets to the home row each loop, `onScrub` maps the 2-finger centroid to (row, column). The open
+        // swipe length tracks the activation threshold so the demo reflects the real trigger distance.
+        let settingsRef = context.settings
+        let demoDriver = HubDemoDriver(
+            gesture: HubSwitcherDemo.teachingGesture(
+                openLength: HubSwitcherDemo.openLength(forActivation: settingsRef.activationThreshold)),
+            onScrub: { [weak holder] centroid in holder?.navigate(centroid) },
+            onOpen: { [weak holder] in holder?.reset() })
+        // A REAL swipe is NOT rehearsed in-section. While the user is on this page the genuine switcher
+        // overlay itself rises (the real recognizer drives it) and is neutralized so it never fires — see
+        // `AppCoordinator.switcherDemoActive`. So `onRehearse` is intentionally left unwired: the in-section
+        // miniature stays the idle teaching loop, and the "grow into the ACTUAL switcher" is the real overlay.
+        _driver = StateObject(wrappedValue: demoDriver)
     }
 
     /// Two-way bindings onto the switcher axis directions — the single source of truth (the former
@@ -54,18 +59,10 @@ struct SwitcherPage: View {
                 set: { settings.gestureBindings.switcher.spacesAxis = $0 })
     }
 
-    /// The Spaces-axis hover-demo: a three-finger open, then a decisive two-finger VERTICAL scrub
-    /// (down then back) — the up/down Space-row slide, mirroring `switcherDemo`'s horizontal scrub.
-    private static let spacesScrubDemo = GesturePose.DemoGesture(strokes: [
-        GesturePose.Stroke(fingers: 3, from: CGPoint(x: 0.5, y: 0.30), to: CGPoint(x: 0.5, y: 0.55)),
-        GesturePose.Stroke(fingers: 2, from: CGPoint(x: 0.5, y: 0.28), to: CGPoint(x: 0.5, y: 0.72))
-    ], liftGap: 0.5)
-
-    /// Seed the mini switcher once with the user's real windows + live thumbnails (degrades to sample
-    /// art / icons through `HubPreviewModels`). The holder builds a fully seeded model; its rows + any
-    /// synchronous frames are copied into the rendered `@StateObject`, then `seedThumbnails` is re-run
-    /// against the rendered model so the post-reveal retry sweeps land its live captures HERE. Sized to a
-    /// wide-but-short mini canvas so the scaled grid reads as the real switcher strip.
+    /// Seed the mini switcher once with the user's real windows grouped into Space-rows (true proportions +
+    /// live thumbnails, with the single-window / fabricated-second-Space fallbacks from `HubPreviewModels`),
+    /// sized to a wide-but-short mini canvas at the user's window-scale. Thumbnails are seeded against the
+    /// RENDERED model so the post-reveal live-capture retries land HERE.
     private func seedIfNeeded() {
         guard !seeded else { return }
         seeded = true
@@ -73,16 +70,11 @@ struct SwitcherPage: View {
         let models = HubPreviewModels(realWindowRows: context.realWindowRows,
                                       seedThumbnails: context.seedThumbnails,
                                       launcherBands: context.launcherBands)
-        let seededModel = models.makeSwitcherModel(canvas: canvas)
-        switcherModel.setCanvas(canvas)
-        switcherModel.setRows(seededModel.rows, labels: seededModel.rowLabels,
-                              startRow: 0, column: seededModel.selectedIndex)
-        // Carry over the holder's synchronous frames (sample art for the no-windows fallback, or any
-        // already-captured live thumbnails) — `setRows` cleared the rendered model's thumbnail map.
-        for (id, image) in seededModel.thumbnails { switcherModel.setThumbnail(image, for: id) }
-        // Re-run seeding against the RENDERED model (now populated with windows) so the live-capture
-        // retry sweeps target it, not the discarded holder model.
-        context.seedThumbnails(switcherModel)
+        let maxScale = SwitcherLayout.kMax * CGFloat(settings.switcherWindowScale)
+        let seededModel = models.makeSwitcherModel(canvas: canvas, maxScale: maxScale)
+        demo.seed(from: seededModel, canvas: canvas, maxScale: maxScale)
+        // Live-capture the REAL windows into the rendered model (icon-only mocks have no captures).
+        context.seedThumbnails(demo.model)
     }
 
     var body: some View {
@@ -91,9 +83,7 @@ struct SwitcherPage: View {
             HubSection {
                 HubFeatureHeader(
                     preview: HubGesturePreview(driver: driver) {
-                        SwitcherView(model: switcherModel)
-                            .scaleEffect(0.42)
-                            .frame(width: 360, height: 92)
+                        SwitcherDemoMiniature(demo: demo)
                     },
                     icon: HubDestination.switcher.systemImage,
                     title: HubDestination.switcher.title,
@@ -103,9 +93,21 @@ struct SwitcherPage: View {
                     rehearseController: context.rehearse
                 )
                 .onAppear { seedIfNeeded() }
-                // Hover the windows-axis control ⇒ demo the horizontal scrub; the Spaces-axis control ⇒
-                // a vertical scrub. The pickers below drive `demoGesture`; clearing it restores the base.
+                // Hover the windows-axis control ⇒ demo a sideways window scrub; the Spaces-axis control ⇒
+                // an up/down Space move. The pickers below drive `demoGesture`; clearing it restores the base.
                 .onChange(of: demoGesture) { _, new in driver.hoverGesture = new }
+                // Live window-size: dragging "Window size" grows/shrinks the preview cards in real time.
+                .onChange(of: settings.switcherWindowScale) { _, scale in
+                    demo.setMaxScale(SwitcherLayout.kMax * CGFloat(scale))
+                }
+                // The demo's opening swipe tracks the real activation distance as you tune it.
+                .onChange(of: settings.activationThreshold) { _, threshold in
+                    driver.gesture = HubSwitcherDemo.teachingGesture(
+                        openLength: HubSwitcherDemo.openLength(forActivation: threshold))
+                }
+            }
+            HubSection("How the gesture works") {
+                SwitcherActionMap()
             }
             HubSection("Appearance") {
                 LabeledSlider(title: "Window size", value: $settings.switcherWindowScale,
@@ -136,7 +138,7 @@ struct SwitcherPage: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .onHover { demoGesture = $0 ? GesturePose.switcherDemo() : nil }
+                .onHover { demoGesture = $0 ? HubSwitcherDemo.windowsHoverGesture() : nil }
                 Toggle("Require exactly three fingers", isOn: $settings.requireExactlyThree)
             }
             // Space-row switching — a sub-feature of the switcher: slide up/down while it is open to move
@@ -156,7 +158,7 @@ struct SwitcherPage: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .onHover { demoGesture = $0 ? Self.spacesScrubDemo : nil }
+                .onHover { demoGesture = $0 ? HubSwitcherDemo.spacesHoverGesture() : nil }
                 .disabled(!settings.manageVerticalGesture)
             }
             HubSection("Fixed order",
@@ -182,10 +184,11 @@ struct LauncherPage: View {
     let context: HubContext
     @ObservedObject private var settings: AppSettings
 
-    /// §11.5 — the REAL launcher demo, owned by a `HubLauncherDemo` holder so the driver's one-shot
-    /// open/dismiss + per-frame scrub closures (captured in `init`) can drive the same model + launch-in
-    /// flag the view observes. Driven by `launcherOpen()` (4-finger open → 2-finger navigate → 4-finger
-    /// dismiss) — exactly the onboarding playground's launch-in / dismiss.
+    /// §13 — the user's REAL launcher demo. The `HubLauncherDemo` holder owns the model + the grow flag; the
+    /// driver plays the deterministic teaching story (4-finger open → lift two → up/down bands → left/right
+    /// items) and, via `onRehearse`, hands the user's real fingers to the same settings-driven engine so a
+    /// real swipe GROWS the launcher and navigates it (never fires). The open swipe length tracks the
+    /// activation threshold; all tunables update the preview live (`.onChange`s below).
     @StateObject private var demo: HubLauncherDemo
     @StateObject private var driver: HubDemoDriver
     @State private var seeded = false
@@ -195,23 +198,32 @@ struct LauncherPage: View {
         _settings = ObservedObject(wrappedValue: context.settings)
         let holder = HubLauncherDemo()
         _demo = StateObject(wrappedValue: holder)
-        _driver = StateObject(wrappedValue: HubDemoDriver(
-            gesture: GesturePose.launcherOpen(),
-            onScrub: { [weak holder] centroid in holder?.scrub(centroid) },
-            onOpen: { [weak holder] in holder?.open() },
-            onDismiss: { [weak holder] in holder?.dismiss() }))
+        let driver = HubDemoDriver(
+            gesture: HubLauncherDemo.teachingGesture(
+                openLength: HubLauncherDemo.openLength(forActivation: context.settings.launcherActivationThreshold)),
+            onScrub: { [weak holder] centroid in holder?.idleNavigate(centroid) },
+            onOpen: { [weak holder] in holder?.idleOpen() })
+        // Real-finger rehearse: drive the engine (grow + navigate) from the user's live touch; the lift edge
+        // (`nil, 0`) recedes + disarms — never fires.
+        driver.onRehearse = { [weak holder] centroid, fingers in
+            if let centroid { holder?.rehearseFrame(centroid, fingerCount: fingers) } else { holder?.rehearseEnd() }
+        }
+        _driver = StateObject(wrappedValue: driver)
     }
 
-    /// Seed the launcher once with the user's real bands (favorites only — clipboard/AI off here). Lands
-    /// on the band list at the home band, exactly as the real launcher does.
+    /// Seed the launcher once with the user's real bands (favorites only — clipboard/AI off here) and load the
+    /// live tunables into the engine. Lands on the band list at the home band, exactly as the real launcher.
     private func seedIfNeeded() {
         guard !seeded else { return }
         seeded = true
         let models = HubPreviewModels(realWindowRows: context.realWindowRows,
                                       seedThumbnails: context.seedThumbnails,
                                       launcherBands: context.launcherBands)
-        demo.seed(from: models.makeLauncherModel(clipboardOn: false, aiOn: false,
-                                                 dwell: settings.dwellToArmDuration))
+        demo.seed(from: models.makeLauncherModel(clipboardOn: false, aiOn: false, dwell: settings.dwellToArmDuration),
+                  mode: .launcher, dwell: settings.dwellToArmDuration,
+                  activation: CGFloat(settings.launcherActivationThreshold),
+                  itemStep: CGFloat(settings.launcherStepDistance),
+                  bandStep: CGFloat(settings.launcherContextStepDistance))
     }
 
     var body: some View {
@@ -230,6 +242,28 @@ struct LauncherPage: View {
                     rehearseController: context.rehearse
                 )
                 .onAppear { seedIfNeeded() }
+                // The opening swipe tracks the real activation distance; every tunable reflects in the preview
+                // live (single source of truth — the engine reads the same settings the real launcher does).
+                .onChange(of: settings.launcherActivationThreshold) { _, t in
+                    driver.gesture = HubLauncherDemo.teachingGesture(openLength: HubLauncherDemo.openLength(forActivation: t))
+                    demo.updateDistances(activation: CGFloat(t),
+                                         itemStep: CGFloat(settings.launcherStepDistance),
+                                         bandStep: CGFloat(settings.launcherContextStepDistance))
+                }
+                .onChange(of: settings.launcherStepDistance) { _, s in
+                    demo.updateDistances(activation: CGFloat(settings.launcherActivationThreshold),
+                                         itemStep: CGFloat(s),
+                                         bandStep: CGFloat(settings.launcherContextStepDistance))
+                }
+                .onChange(of: settings.launcherContextStepDistance) { _, b in
+                    demo.updateDistances(activation: CGFloat(settings.launcherActivationThreshold),
+                                         itemStep: CGFloat(settings.launcherStepDistance),
+                                         bandStep: CGFloat(b))
+                }
+                .onChange(of: settings.dwellToArmDuration) { _, d in demo.setDwell(d) }
+            }
+            HubSection("How the gesture works") {
+                LauncherActionMap()
             }
             HubSection("Tuning") {
                 LabeledSlider(title: "Activation threshold", value: $settings.launcherActivationThreshold,
@@ -250,6 +284,9 @@ struct LauncherPage: View {
                     .disabled(!settings.enableLauncher)
             }
         }
+        // While a real rehearsal opens the launcher, it morphs into the user's ACTUAL launcher floating over
+        // the page at real size, navigable by their own fingers — never fires.
+        .overlay { GrownLauncherOverlay(demo: demo) }
     }
 }
 
@@ -262,10 +299,9 @@ struct ClipboardPage: View {
     let context: HubContext
     @ObservedObject private var settings: AppSettings
 
-    /// §11.5 — the REAL launcher showing its CLIPBOARD band: a `LauncherView` seeded with the clipboard
-    /// band on (it is the last band), driven by `bandJourney(bandFraction: 1.0, inSurface: .lift)` — the
-    /// full path: 4-finger open → 2-finger traverse to the Clipboard band → land/lift. The holder's
-    /// `scrub` traverses toward the target band in sync with the traverse stroke.
+    /// §13 — the REAL launcher showing its CLIPBOARD band: a `LauncherView` seeded with the clipboard band on
+    /// (it is the last band), playing the full path — 4-finger open → 2-finger traverse down to the Clipboard
+    /// band → land. A real four-finger rehearsal GROWS it under the hand (`onRehearse`), never firing.
     @StateObject private var demo: HubLauncherDemo
     @StateObject private var driver: HubDemoDriver
     @State private var seeded = false
@@ -275,11 +311,15 @@ struct ClipboardPage: View {
         _settings = ObservedObject(wrappedValue: context.settings)
         let holder = HubLauncherDemo()
         _demo = StateObject(wrappedValue: holder)
-        _driver = StateObject(wrappedValue: HubDemoDriver(
-            gesture: GesturePose.bandJourney(bandFraction: 1.0, inSurface: .lift),
-            onScrub: { [weak holder] centroid in holder?.scrub(centroid) },
-            onOpen: { [weak holder] in holder?.open() },
-            onDismiss: { [weak holder] in holder?.dismiss() }))
+        let driver = HubDemoDriver(
+            gesture: HubLauncherDemo.bandJourneyGesture(
+                openLength: HubLauncherDemo.openLength(forActivation: context.settings.launcherActivationThreshold)),
+            onScrub: { [weak holder] centroid in holder?.idleNavigate(centroid) },
+            onOpen: { [weak holder] in holder?.idleOpen() })
+        driver.onRehearse = { [weak holder] centroid, fingers in
+            if let centroid { holder?.rehearseFrame(centroid, fingerCount: fingers) } else { holder?.rehearseEnd() }
+        }
+        _driver = StateObject(wrappedValue: driver)
     }
 
     private var maxBytesMB: Binding<Double> {
@@ -287,17 +327,19 @@ struct ClipboardPage: View {
                 set: { settings.clipboardMaxBytes = Int($0 * 1024 * 1024) })
     }
 
-    /// Seed once with the clipboard band on, then point the holder's scrub at the Clipboard band (the last
-    /// band) so the traverse stroke lands on it.
+    /// Seed once with the clipboard band on, in band-journey mode (traverse to the last band) with the live
+    /// launcher tunables loaded.
     private func seedIfNeeded() {
         guard !seeded else { return }
         seeded = true
         let models = HubPreviewModels(realWindowRows: context.realWindowRows,
                                       seedThumbnails: context.seedThumbnails,
                                       launcherBands: context.launcherBands)
-        demo.seed(from: models.makeLauncherModel(clipboardOn: true, aiOn: false,
-                                                 dwell: settings.dwellToArmDuration),
-                  traverseToLastBand: true)
+        demo.seed(from: models.makeLauncherModel(clipboardOn: true, aiOn: false, dwell: settings.dwellToArmDuration),
+                  mode: .bandJourney, dwell: settings.dwellToArmDuration,
+                  activation: CGFloat(settings.launcherActivationThreshold),
+                  itemStep: CGFloat(settings.launcherStepDistance),
+                  bandStep: CGFloat(settings.launcherContextStepDistance))
     }
 
     var body: some View {
@@ -363,6 +405,9 @@ struct ClipboardPage: View {
                 .disabled(!settings.keepClipboardHistory)
             }
         }
+        // A real rehearsal morphs the preview into the actual launcher (showing the Clipboard band) at real
+        // size, floating over the page, navigable — never fires.
+        .overlay { GrownLauncherOverlay(demo: demo) }
     }
 }
 
@@ -398,11 +443,14 @@ struct AIPage: View {
         _models = ObservedObject(wrappedValue: context.models)
         let holder = HubLauncherDemo()
         _demo = StateObject(wrappedValue: holder)
-        _driver = StateObject(wrappedValue: HubDemoDriver(
+        let driver = HubDemoDriver(
             gesture: Self.aiJourney,
-            onScrub: { [weak holder] centroid in holder?.scrub(centroid) },
-            onOpen: { [weak holder] in holder?.open() },
-            onDismiss: { [weak holder] in holder?.dismiss() }))
+            onScrub: { [weak holder] centroid in holder?.idleNavigate(centroid) },
+            onOpen: { [weak holder] in holder?.idleOpen() })
+        driver.onRehearse = { [weak holder] centroid, fingers in
+            if let centroid { holder?.rehearseFrame(centroid, fingerCount: fingers) } else { holder?.rehearseEnd() }
+        }
+        _driver = StateObject(wrappedValue: driver)
     }
 
     /// The preview's attract journey: open the four-finger launcher → traverse to the AI band → a directed
@@ -437,9 +485,11 @@ struct AIPage: View {
         let previewModels = HubPreviewModels(realWindowRows: context.realWindowRows,
                                              seedThumbnails: context.seedThumbnails,
                                              launcherBands: context.launcherBands)
-        demo.seed(from: previewModels.makeLauncherModel(clipboardOn: false, aiOn: true,
-                                                        dwell: settings.dwellToArmDuration),
-                  traverseToLastBand: true)
+        demo.seed(from: previewModels.makeLauncherModel(clipboardOn: false, aiOn: true, dwell: settings.dwellToArmDuration),
+                  mode: .bandJourney, dwell: settings.dwellToArmDuration,
+                  activation: CGFloat(settings.launcherActivationThreshold),
+                  itemStep: CGFloat(settings.launcherStepDistance),
+                  bandStep: CGFloat(settings.launcherContextStepDistance))
     }
 
     /// Picker binding: maps `aiSelectedModelID` (nil = registry default) to the picker's optional-string.
@@ -453,6 +503,120 @@ struct AIPage: View {
         let registry = ModelRegistry.standard
         if let id = settings.aiSelectedModelID, let d = registry.descriptor(id: id) { return d }
         return registry.defaultDescriptor ?? registry.models[0]
+    }
+
+    // MARK: - Context tuning + cost surface (tasks 5.2 / 5.3 / 5.4, design D5)
+
+    /// The effective context-token budget for the chosen preset, clamped to the selected model's max.
+    /// `agentContextTokens` is the persisted resolution; for a non-custom preset it follows the preset.
+    private var effectiveContextTokens: Int {
+        let modelMax = selectedModelDescriptor.maxContextTokens
+        return settings.agentContextPreset.tokens(modelMax: modelMax, custom: settings.agentContextTokens)
+    }
+
+    /// The live cost surface (estimated RAM + concurrent-stream count + relative speed) for the chosen
+    /// context — derived from the SAME pure `ConcurrencyBudget` the batched conformer uses (never silent
+    /// OOM, house requirement). Recomputes whenever the preset / toggle / model changes.
+    private var cost: AgentContextCostModel {
+        AgentContextCostModel(contextTokens: effectiveContextTokens,
+                              compactKV: settings.agentCompactKV,
+                              weightBytes: selectedModelDescriptor.sizeBytes)
+    }
+
+    /// Picker binding: the preset segmented control writes the preset AND resolves `agentContextTokens` to
+    /// the preset's token value (clamped to the model max) so the persisted budget the runtime / compaction
+    /// reads always matches the chosen preset.
+    private var presetSelection: Binding<AgentContextPreset> {
+        Binding(get: { settings.agentContextPreset },
+                set: { preset in
+                    settings.agentContextPreset = preset
+                    settings.agentContextTokens = preset.tokens(modelMax: selectedModelDescriptor.maxContextTokens,
+                                                                custom: settings.agentContextTokens)
+                })
+    }
+
+    @ViewBuilder private var contextSection: some View {
+        HubSection("Context",
+                   footnote: "Longer context remembers more of a conversation, skills, and memory — but the KV cache grows per background session, so more context means fewer concurrent background sessions and slower per-token speed. The estimate below updates as you choose; the foreground session always fits.") {
+            // The Balanced / Long / Max preset (custom is implicit when a heavy skill raises it).
+            Picker("Context size", selection: presetSelection) {
+                ForEach([AgentContextPreset.balanced, .long, .max], id: \.self) { preset in
+                    Text(preset.title).tag(preset)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(!settings.aiCommandsEnabled)
+
+            // The single comprehensible KV-quant lever (8-bit) — a longer context fits the same RAM.
+            Toggle("Compact long contexts (8-bit KV)", isOn: $settings.agentCompactKV)
+                .disabled(!settings.aiCommandsEnabled)
+
+            // The cost surface (RAM · concurrent background sessions · relative speed) — live.
+            HStack(spacing: 6) {
+                Image(systemName: "memorychip")
+                    .foregroundStyle(.secondary)
+                Text("\(effectiveContextTokens.formatted()) tokens · \(cost.summary)")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+            }
+
+            // Per-skill override (read-only) — a heavy skill may raise the effective context (task 5.4).
+            // The override value rides on the skill file (`ai-skills-as-files`); this surface only displays
+            // that capability. With no skill source wired, the default resolves to no raise.
+            if let overrideNote = skillOverrideNote {
+                HStack(spacing: 6) {
+                    Image(systemName: "wand.and.stars")
+                        .foregroundStyle(.secondary)
+                    Text(overrideNote)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+    }
+
+    // MARK: - Parked sessions (design D1 — the auto-dismiss countdown)
+
+    /// The auto-dismiss countdown surfaced in MINUTES (design D1): a parked/idle (or task-completed)
+    /// session untouched this long is dismissed forever. `agentParkAutoDismissCountdown` is persisted in
+    /// SECONDS, so this binding divides on read / multiplies on write, keeping the Hub slider human (minutes,
+    /// default 5). Clamped to whole minutes so the readout is clean.
+    private var autoDismissMinutes: Binding<Double> {
+        Binding(get: { (settings.agentParkAutoDismissCountdown / 60).rounded() },
+                set: { settings.agentParkAutoDismissCountdown = max(1, $0.rounded()) * 60 })
+    }
+
+    @ViewBuilder private var parkedSessionsSection: some View {
+        HubSection("Parked sessions",
+                   footnote: "A conversation you park to the notch waits for you here. Untouched past this countdown — or once its task finishes — it's dismissed for good (only ongoing work and sessions that need you stay). Raise the cap to keep more parked at once.") {
+            LabeledSlider(title: "Auto-dismiss after (minutes)", value: autoDismissMinutes,
+                          range: 1...30, format: "%.0f",
+                          help: "How long a parked, idle session waits before it's dismissed forever. Default 5 minutes.")
+                .disabled(!settings.aiCommandsEnabled)
+
+            LabeledIntSlider(title: "Maximum parked sessions", value: $settings.agentMaxParkedSessions,
+                             range: 1...12,
+                             help: "Soft cap on parked sessions. When exceeded, the least-recently-used idle one is evicted (never an active or needs-you session).")
+                .disabled(!settings.aiCommandsEnabled)
+        }
+    }
+
+    /// The read-only per-skill-override note (task 5.4). Resolves the effective budget through the concrete
+    /// `AgentContextBudgetProvider` (∩ model max ∩ per-skill override) — when a heavy skill raises it above
+    /// the chosen preset, the note reports the raised number; otherwise it explains the capability.
+    private var skillOverrideNote: String? {
+        let provider = AgentContextBudgetProvider(userContextTokens: effectiveContextTokens,
+                                                  modelMaxContextTokens: selectedModelDescriptor.maxContextTokens)
+        let resolved = provider.maxContextTokens
+        if resolved > effectiveContextTokens {
+            return "A heavy skill raises the effective context to \(resolved.formatted()) tokens for that session."
+        }
+        return "A heavy skill may raise the effective context for its own session (read-only — authored on the skill)."
     }
 
     var body: some View {
@@ -518,6 +682,15 @@ struct AIPage: View {
                 Toggle("Reasoning", isOn: $settings.aiReasoningEnabled)
                     .disabled(!settings.aiCommandsEnabled)
             }
+            contextSection
+            parkedSessionsSection
+            // Background autonomy (`ai-background-autonomy`, §7): the user-editable trust boundary (the
+            // whitelist) + the append-only "what your agents did while you were away" ledger.
+            HubWhitelistEditor(trustedPaths: $settings.agentWhitelistPaths,
+                               trustedCommands: $settings.agentWhitelistCommands,
+                               isEnabled: settings.aiCommandsEnabled)
+            HubAuditLogViewer(records: context.recentAuditRecords,
+                              persistError: context.auditStorePersistError)
         }
         // Keep the status row tied to the SELECTED model: re-settle the manager's displayed state on
         // appear, when the picked model changes, and when AI is turned on — otherwise the single shared
@@ -527,6 +700,9 @@ struct AIPage: View {
         .onChange(of: settings.aiCommandsEnabled) {
             if settings.aiCommandsEnabled { models.showStatus(for: selectedModelDescriptor) }
         }
+        // A real rehearsal morphs the preview into the actual launcher (showing the AI band) at real size,
+        // floating over the page, navigable — never fires.
+        .overlay { GrownLauncherOverlay(demo: demo) }
     }
 }
 
@@ -638,25 +814,17 @@ struct GeneralPage: View {
 
     var body: some View {
         HubPage(HubDestination.general.title) {
-            HubSection("Reliability",
-                       footnote: "Verifies the switched-to window actually receives focus and recovers automatically, so you never need Mission Control to escape a stuck state.") {
-                Toggle("Self-heal focus after switching", isOn: $settings.focusWatchdogEnabled)
-            }
-            HubSection("Startup") {
-                Toggle("Open at Login", isOn: Binding(
+            HubSection("General") {
+                SwitchRow("Self-heal focus after switching", isOn: $settings.focusWatchdogEnabled,
+                          caption: "Verifies the switched-to window actually receives focus and recovers automatically, so you never need Mission Control to escape a stuck state.")
+                Divider()
+                SwitchRow("Open at Login", isOn: Binding(
                     get: { _ = refresh; return context.isOpenAtLogin() },
                     set: { _ in context.onToggleOpenAtLogin(); refresh.toggle() }
                 ))
-            }
-            HubSection("Diagnostics",
-                       footnote: "Adds “Write Diagnostics” and “Copy Focus Log” here — handy when reporting a bug. Off by default.") {
-                Toggle("Show diagnostic tools", isOn: $settings.showDiagnostics)
-                if settings.showDiagnostics {
-                    HStack {
-                        Button("Write Diagnostics → /tmp") { context.onWriteDiagnostics() }
-                        Button("Copy Focus Log") { context.onCopyFocusLog() }
-                    }
-                }
+                Divider()
+                SwitchRow("Show diagnostic tools", isOn: $settings.showDiagnostics,
+                          caption: "Adds “Write Diagnostics” and “Copy Focus Log” to the menu-bar menu — handy when reporting a bug. Off by default.")
             }
             HubSection {
                 HStack {
@@ -672,18 +840,18 @@ struct GeneralPage: View {
 
     private var dangerZone: some View {
         HubSection("Danger zone",
-                   footnote: "Each category is deleted only if its switch is on. Clearing app data or permissions relaunches the app; a data wipe restores any gesture relocations first (their backups live in the app data) and replays the welcome tour.") {
-            ToggleRow(title: "App data & settings", isOn: $wipeAppData,
-                      caption: "Preferences, bands, AI commands, keyboard-language memory, clipboard history, project outputs, first-run state.")
-            Divider()
-            ToggleRow(title: "Caches", isOn: $wipeCaches,
-                      caption: "The app's cache and HTTP storage directories.")
-            Divider()
-            ToggleRow(title: "AI models", isOn: $wipeAIModels,
-                      caption: "The downloaded on-device model weights (multi-GB, re-downloadable). Turns the AI opt-in off.")
-            Divider()
-            ToggleRow(title: "Permissions", isOn: $wipePermissions,
-                      caption: "Resets every permission the app can hold (Accessibility, Screen Recording, Input Monitoring, Automation, Calendar, Reminders, Contacts) — macOS will prompt again.")
+                   footnote: "Each category is deleted only if its card is selected. Clearing app data or permissions relaunches the app; a data wipe restores any gesture relocations first (their backups live in the app data) and replays the welcome tour.") {
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)],
+                      alignment: .leading, spacing: 12) {
+                ToggleCard("App data & settings", isOn: $wipeAppData,
+                           caption: "Preferences, bands, AI commands, keyboard-language memory, clipboard history, project outputs, first-run state.")
+                ToggleCard("Caches", isOn: $wipeCaches,
+                           caption: "The app's cache and HTTP storage directories.")
+                ToggleCard("AI models", isOn: $wipeAIModels,
+                           caption: "The downloaded on-device model weights (multi-GB, re-downloadable). Turns the AI opt-in off.")
+                ToggleCard("Permissions", isOn: $wipePermissions,
+                           caption: "Resets every permission the app can hold (Accessibility, Screen Recording, Input Monitoring, Automation, Calendar, Reminders, Contacts) — macOS will prompt again.")
+            }
             Divider()
             HStack {
                 Button("Restore native gestures…") { context.onRestoreAllGestures() }
@@ -711,120 +879,359 @@ struct GeneralPage: View {
     }
 }
 
-// MARK: - §11.5 Driven launcher demo (the real overlay, in sync with the ghost hand)
+// MARK: - §13 Driven launcher demo (the user's REAL launcher — real story, grow on rehearse, live tunables)
 
-/// The §11.5 holder behind the Launcher / Clipboard / AI previews: it owns the **real** `LauncherModel`
-/// (rendered by a real `LauncherView`) and the launch-in flag, and exposes the three driving entry
-/// points the `HubDemoDriver`'s stroke closures call so the launcher reacts in sync with the demonstrated
-/// gesture — `open()` launches it in on the 4-finger open stroke, `scrub(_:)` traverses / navigates on
-/// the 2-finger strokes, `dismiss()` recedes it on the 4-finger dismiss. It is an `ObservableObject` so
-/// the driver's closures (captured at the page's `init`, before any `@State` exists) can drive the same
-/// model + flag the view observes — the `@State`-binding-in-`init` problem the wizard's demo model also
-/// sidesteps by owning its model.
+/// The §13 holder behind the Launcher / Clipboard / Files / AI previews: it owns the **real** `LauncherModel`
+/// (rendered by a real `LauncherView`) and drives it IN SYNC with the demonstrated gesture, exactly the way
+/// `HubSwitcherDemo` does for the switcher. Two upgrades over the old §11.5 holder make this the user's
+/// *actual* launcher rather than a faithful mini:
+///   1. **Grow on rehearse.** A real four-finger swipe (the `HubDemoDriver`'s `onRehearse` seam, gated to
+///      ≥2 fingers) crosses the activation distance and MORPHS the launcher from idle preview scale to
+///      near-real size under the hand (`playing`), the onboarding `tourPlayActive` morph — then recedes on
+///      the lift. The grow is **rehearse-only**; the idle self-playing demo stays at preview scale.
+///   2. **Live tunables via `LauncherTourEngine`.** Both the idle ghost demo and a real rehearsal feed one
+///      settings-driven odometer (`engine`), so the activation distance, item/band stepping, and dwell-to-arm
+///      all reflect the user's tunables — and what is demonstrated is what the real launcher does. The tour
+///      **never fires an item**: a lift only recedes + disarms (the `launcherTourEnd` contract).
 ///
-/// Two modes, set at `seed`: a plain launcher (navigate items within the home band) and a **band
-/// journey** (`traverseToLastBand`) that steps the band selection across to the last band (the
-/// Clipboard / AI band, appended last by `WizardTourBands.compose`) as the traverse stroke crosses the
-/// pad — so the demo's "traverse to the band" reads on the real launcher.
+/// Two modes (set at `seed`): `.launcher` navigates items/bands with the engine (the hero); `.bandJourney`
+/// traverses the band selection toward the **last** band (the Clipboard / Files / AI band, appended last by
+/// `WizardTourBands.compose`) so the band pages' "open → traverse to the band" reads on the real launcher.
 @MainActor
 final class HubLauncherDemo: ObservableObject {
-    /// The real launcher model the preview renders + the strokes drive.
-    let model = LauncherModel()
-    /// The launch-in flag: `true` between an open stroke and the matching dismiss (the launcher is shown
-    /// morphed on); `false` at rest (it recedes). Animated by the view.
-    @Published private(set) var launched = false
+    enum Mode { case launcher, bandJourney }
 
-    /// When true (Clipboard / AI), `scrub` traverses the band selection toward the LAST band; when false
-    /// (Launcher), `scrub` navigates item selection within the current band.
-    private var traverseToLastBand = false
-    /// The last band index — the traverse target (the Clipboard / AI band is appended last).
+    /// The real launcher model the preview renders + the gesture drives.
+    let model = LauncherModel()
+    /// The GROW flag: `true` while a real rehearsing hand has opened the launcher (it is morphed up to
+    /// near-real size and the fingers drive it); `false` at rest and throughout the idle demo (preview scale).
+    @Published private(set) var playing = false
+
+    private var mode: Mode = .launcher
+    /// The band-journey target — the last band (Clipboard / Files / AI appended last).
     private var lastBandIndex = 0
 
-    /// Seed the model from a `HubPreviewModels`-built launcher (the user's real bands). `traverseToLastBand`
-    /// selects the band-journey mode. Lands on the band list at the home band, exactly as the real launcher.
-    func seed(from source: LauncherModel, traverseToLastBand: Bool = false) {
-        self.traverseToLastBand = traverseToLastBand
+    /// The settings-driven odometer. Both the idle ghost frames and the real rehearse frames feed it, so the
+    /// activation distance + item/band steps reflect the live tunables in both.
+    private var engine = LauncherTourEngine(activationThreshold: 0.05, itemStep: 0.04, bandStep: 0.09)
+    /// The dwell-to-arm driver (the controller's `manageDwell` semantics, verbatim): charge on a grid item,
+    /// disarm elsewhere; on arm the highlight ticks. The tour never *fires* on the lift.
+    private let dwellDriver = DwellArmDriver()
+    private var dwellDuration: Double = 0.5
+    /// True while a real rehearsal is in flight, so the first rehearse frame resets the engine (the idle and
+    /// real odometers never bleed) and the idle path stands down.
+    private var inRehearse = false
+
+    // MARK: - Seeding + live tunables
+
+    /// Seed the model from a `HubPreviewModels`-built launcher (the user's real bands), set the mode, and load
+    /// the live tunables into the engine + dwell. Lands on the band list at the home band, exactly as the real
+    /// launcher does.
+    func seed(from source: LauncherModel, mode: Mode, dwell: Double,
+              activation: CGFloat, itemStep: CGFloat, bandStep: CGFloat) {
+        self.mode = mode
         self.lastBandIndex = max(0, source.bandCount - 1)
+        self.dwellDuration = dwell
+        model.dwell = dwell
+        engine.updateDistances(activationThreshold: activation, itemStep: itemStep, bandStep: bandStep)
         model.setBands(source.bands, names: source.bandNames, colors: source.bandColors,
                        icons: source.bandIcons, startBand: 0, column: 0,
                        clipboardBandIndex: source.clipboardBandIndex)
     }
 
-    /// The open stroke landed: launch the launcher in and reset to a clean starting state (the home band
-    /// list for a journey; crossed one step into the grid for the plain launcher, so item scrub has room).
-    func open() {
-        // Reset selection to the home band before showing — re-running the loop starts clean.
+    /// Live: dragging a Tuning slider retargets the engine's distances without disturbing an in-flight tour.
+    func updateDistances(activation: CGFloat, itemStep: CGFloat, bandStep: CGFloat) {
+        engine.updateDistances(activationThreshold: activation, itemStep: itemStep, bandStep: bandStep)
+    }
+
+    /// Live: the dwell-to-arm slider changes how long a rehearsed item takes to arm.
+    func setDwell(_ dwell: Double) {
+        dwellDuration = dwell
+        model.dwell = dwell
+    }
+
+    // MARK: - Idle ghost demo (driven by the driver's onOpen / onScrub)
+
+    /// The ghost's open stroke landed (`onOpen`): snap to a clean home and arm the engine for the two-finger
+    /// navigate strokes that follow. The idle demo stays at preview scale — no grow.
+    func idleOpen() {
+        snapToHome()
+        engine.reset()
+        engine.beginNavigation()
+    }
+
+    /// A ghost two-finger navigate frame (`onScrub`): feed the engine (launcher) or step toward the band
+    /// target (journey), so the highlight / band advances in sync with the ghost hand — at the configured
+    /// step distances. Never grows (idle).
+    func idleNavigate(_ centroid: CGPoint) {
+        switch mode {
+        case .launcher:
+            if !engine.isActive { engine.beginNavigation() }   // self-heal if a loop resumed mid-stroke
+            for intent in engine.feed(fingerCount: 2, centroid: centroid, onBandList: model.focus == .bands) {
+                applyStep(intent)
+            }
+        case .bandJourney:
+            stepBand(toward: lastBandIndex)
+            manageDwell()
+        }
+    }
+
+    // MARK: - Rehearse (the user's REAL fingers — driven by the driver's onRehearse seam)
+
+    /// A real rehearse frame: the user's live centroid + finger count drive the SAME engine, so the launcher
+    /// GROWS on the four-finger activation and the two fingers then navigate it — all at the live tunables. The
+    /// first frame of a rehearsal resets the engine so it gates fresh (a clean four-finger open → grow).
+    func rehearseFrame(_ centroid: CGPoint, fingerCount: Int) {
+        if !inRehearse { inRehearse = true; engine.reset() }
+        let onBandList = model.focus == .bands
+        for intent in engine.feed(fingerCount: fingerCount, centroid: centroid, onBandList: onBandList) {
+            switch intent {
+            case .activate:
+                snapToHome()
+                withAnimation(.easeOut(duration: 0.32)) { playing = true }   // the grow morph
+            case .end:
+                recede()
+            case .stepHorizontal, .stepVertical:
+                if mode == .launcher { applyStep(intent) }
+            }
+        }
+        // Band journey: while the tour is live, traverse toward the target band each frame (the engine's
+        // item-steps don't apply to a vertical band traverse).
+        if mode == .bandJourney, engine.isActive {
+            stepBand(toward: lastBandIndex)
+            manageDwell()
+        }
+    }
+
+    /// The rehearsing fingers lifted (`onRehearse(nil, 0)`): recede the grow and disarm — NEVER fire the item.
+    func rehearseEnd() {
+        _ = engine.feed(fingerCount: 0, centroid: CGPoint(x: 0.5, y: 0.5), onBandList: model.focus == .bands)
+        inRehearse = false
+        recede()
+    }
+
+    // MARK: - Applying intents
+
+    /// Apply a navigation step intent to the model + (re)charge the dwell on the new selection.
+    private func applyStep(_ intent: LauncherTourEngine.Intent) {
+        switch intent {
+        case .stepHorizontal(let dir): model.stepHorizontal(dir)
+        case .stepVertical(let dir): model.stepVertical(dir)
+        case .activate, .end: break
+        }
+        manageDwell()
+    }
+
+    /// Recede the launcher to preview scale and disarm (the tour never fires). Idempotent.
+    private func recede() {
+        if playing { withAnimation(.easeIn(duration: 0.28)) { playing = false } }
+        dwellDriver.cancel()
+        model.disarm()
+    }
+
+    /// Reset selection to the home band so each demo loop / each fresh open starts clean.
+    private func snapToHome() {
         model.setBands(model.bands, names: model.bandNames, colors: model.bandColors,
                        icons: model.bandIcons, startBand: 0, column: 0,
                        clipboardBandIndex: model.clipboardBandIndex)
-        if !traverseToLastBand, model.bandCount > 0 {
-            model.stepHorizontal(1)   // cross into the grid so the navigate stroke moves items
-        }
-        withAnimation(.easeOut(duration: 0.32)) { launched = true }
     }
 
-    /// The dismiss stroke landed: recede the launcher.
-    func dismiss() {
-        withAnimation(.easeIn(duration: 0.28)) { launched = false }
-    }
-
-    /// A navigate-stroke frame: step the model toward the journey's target (the last band) or, for the
-    /// plain launcher, toward the item nearest the stroke's centroid.x — so the band selection / highlight
-    /// advances in sync with the ghost hand. Idempotent per target (only steps on a change). In journey
-    /// mode the target is ALWAYS the last band (the Clipboard / AI band): the `bandFraction` controls only
-    /// where the GHOST HAND lands on the pad, not which band is the destination, so a half-way ghost
-    /// landing (AI) must still traverse to the final band.
-    func scrub(_ centroid: CGPoint) {
-        if traverseToLastBand {
-            stepBand(toward: lastBandIndex)
+    /// The controller's `manageDwell`, verbatim semantics: charge the dwell on a grid item, disarm elsewhere.
+    /// On arm the highlight ticks — but the tour NEVER fires the item (no `onFire` is wired in a preview).
+    private func manageDwell() {
+        dwellDriver.cancel()
+        if model.focus == .grid, model.selectedItem != nil {
+            model.beginArming()
+            dwellDriver.charge(after: dwellDuration) { [weak self] in
+                guard let self, self.model.arming else { return }
+                self.model.setArmed()
+            }
         } else {
-            stepItem(toward: progressAcross(centroid.x))
+            model.disarm()
         }
     }
 
-    /// Normalize a pad x in `[lowerBound, upperBound]` to 0…1 travel.
-    private func progressAcross(_ x: CGFloat) -> CGFloat {
-        let lo = GesturePose.lowerBound, hi = GesturePose.upperBound
-        return min(1, max(0, (x - lo) / (hi - lo)))
-    }
-
-    /// Step the active band toward `target` (clamped). Band switching lives on the band list, so make sure
-    /// the focus is there first; `stepVertical(-1)` moves to the NEXT band (down the list), `+1` previous.
+    /// Step the active band one toward `target` (clamped). Band switching lives on the band list; ensure focus
+    /// is there first. `stepVertical(-1)` moves to the NEXT band (down the list), `+1` to the previous.
     private func stepBand(toward target: Int) {
         let clamped = min(lastBandIndex, max(0, target))
         guard clamped != model.currentBand else { return }
-        guard model.focus == .bands else {
-            // Crossed into the grid earlier (shouldn't happen in journey mode); cross back so the
-            // vertical band step applies.
-            model.stepHorizontal(-1)
-            return
-        }
-        let dir = clamped > model.currentBand ? -1 : 1   // down the list = next band = dir -1
-        // One step per frame toward the target — the eased stroke visits enough frames to arrive.
-        model.stepVertical(dir)
-    }
-
-    /// Step the grid selection toward the item nearest `progress` (0…1 across the current band's items).
-    private func stepItem(toward progress: CGFloat) {
-        guard model.focus == .grid, !model.items.isEmpty else { return }
-        let target = min(model.items.count - 1, max(0, Int((progress * CGFloat(model.items.count)).rounded(.down))))
-        guard target != model.selectedIndex else { return }
-        model.stepHorizontal(target > model.selectedIndex ? 1 : -1)
+        guard model.focus == .bands else { model.stepHorizontal(-1); return }   // cross back to the band list
+        model.stepVertical(clamped > model.currentBand ? -1 : 1)               // one step toward the target
     }
 }
 
-/// The §11.5 launcher-demo miniature: the **real** `LauncherView` over the holder's seeded model, scaled
-/// to a tasteful Hub mini and launched in / receded with the holder's `launched` flag (a soft morph, like
-/// the onboarding playground). Takes no hits (the preview disables hit-testing).
+// MARK: - §13 Launcher teaching gestures (real grammar via the connected-stroke seam)
+
+extension HubLauncherDemo {
+    /// The launcher's deterministic teaching gesture — the real usage story, mirroring
+    /// `HubSwitcherDemo.teachingGesture`. A **four-finger** open swipe whose length tracks the activation
+    /// distance, then — CONNECTED, no lift (`gapAfter: 0`, so two fingers lift while two stay down) — a
+    /// two-finger DOWN step to switch a band, then a two-finger RIGHT scrub into the grid and across the
+    /// items, then a lift and loop. The coordinates match the engine's centroid math so the highlight tracks
+    /// the hand.
+    static func teachingGesture(openLength: CGFloat) -> GesturePose.DemoGesture {
+        let openL = max(0.10, min(0.46, openLength))
+        let xL: CGFloat = 0.30, xR: CGFloat = 0.74, homeY: CGFloat = 0.50, downY: CGFloat = 0.66
+        // Four-finger open: a rightward swipe of `openL`, ending at `xL` so the two-finger nav has room to
+        // travel right. `gapAfter: 0` keeps the hand DOWN — the next stroke drops to two fingers.
+        let open = GesturePose.Stroke(fingers: 4,
+                                      from: CGPoint(x: max(GesturePose.lowerBound, xL - openL), y: homeY),
+                                      to: CGPoint(x: xL, y: homeY), gapAfter: 0)
+        // Two-finger DOWN one band on the list (down the pad = next band), connected.
+        let band = GesturePose.Stroke(fingers: 2, from: CGPoint(x: xL, y: homeY), to: CGPoint(x: xL, y: downY),
+                                      hold: 0.10, gapAfter: 0)
+        // Two-finger RIGHT into the grid and across the items, then a settle.
+        let items = GesturePose.Stroke(fingers: 2, from: CGPoint(x: xL, y: downY), to: CGPoint(x: xR, y: downY),
+                                       hold: 0.18)
+        return GesturePose.DemoGesture(strokes: [open, band, items], liftGap: 0.6)
+    }
+
+    /// The band-journey teaching gesture (Clipboard / Files / AI): a **four-finger** open, then — CONNECTED —
+    /// a long two-finger DOWN stroke that traverses the band list toward the last band, then a settle + lift.
+    /// The traverse is target-based in the holder, so the exact stroke extent need only read as "down the
+    /// bands"; the open length still tracks the activation distance.
+    static func bandJourneyGesture(openLength: CGFloat) -> GesturePose.DemoGesture {
+        let openL = max(0.10, min(0.46, openLength))
+        let xL: CGFloat = 0.34, topY: CGFloat = 0.34, botY: CGFloat = 0.80
+        let open = GesturePose.Stroke(fingers: 4,
+                                      from: CGPoint(x: max(GesturePose.lowerBound, xL - openL), y: topY),
+                                      to: CGPoint(x: xL, y: topY), gapAfter: 0)
+        let traverse = GesturePose.Stroke(fingers: 2, from: CGPoint(x: xL, y: topY), to: CGPoint(x: xL, y: botY),
+                                          hold: 0.22)
+        return GesturePose.DemoGesture(strokes: [open, traverse], liftGap: 0.6)
+    }
+
+    /// Map the configurable activation threshold (`0.01…0.15`, the real trigger distance) to the demo's
+    /// open-swipe length, so dragging "Activation threshold" visibly lengthens/shortens the ghost hand's
+    /// opening swipe (mirrors `HubSwitcherDemo.openLength`). Always longer than the threshold so the engine
+    /// activates partway through the visible swipe.
+    static func openLength(forActivation threshold: Double) -> CGFloat {
+        let clamped = min(0.15, max(0.01, threshold))
+        let f = (clamped - 0.01) / (0.15 - 0.01)
+        return CGFloat(0.18 + f * (0.44 - 0.18))
+    }
+}
+
+/// The ACTUAL (native, 1:1) size of the real launcher for `model` — the size the grown rehearse overlay
+/// presents at, and the natural size the small previews scale down from. This is the real launcher's own
+/// `LauncherGridLayout` geometry, so the grown overlay IS the launcher at real size.
+@MainActor
+func launcherNaturalSize(_ model: LauncherModel) -> CGSize {
+    let width = LauncherGridLayout.containerWidth
+        + (model.bandCount > 1 ? LauncherGridLayout.bandColumnWidth : 0)
+    let height = LauncherGridLayout.windowHeight(itemCount: model.items.count, bandCount: model.bandCount)
+    return CGSize(width: width, height: height)
+}
+
+/// The §14 launcher-demo miniature: the **real** `LauncherView` over the holder's seeded model, shown small
+/// (preview scale) — the preview "playing its part." It does NOT grow in place; while a real rehearsal is
+/// live (`demo.playing`) it recedes so the user's attention goes to the grown, actual-size launcher floating
+/// over the page (`GrownLauncherOverlay`). Takes no hits (the preview disables hit-testing).
 private struct LauncherDemoMiniature: View {
     @ObservedObject var demo: HubLauncherDemo
+    @ObservedObject var model: LauncherModel
+
+    init(demo: HubLauncherDemo) {
+        _demo = ObservedObject(wrappedValue: demo)
+        _model = ObservedObject(wrappedValue: demo.model)
+    }
+
+    private let scale: CGFloat = 0.46
 
     var body: some View {
-        LauncherView(model: demo.model, executor: nil, availability: nil)
-            .scaleEffect(0.5)
-            .frame(width: 360, height: 150)
-            .opacity(demo.launched ? 1 : 0.14)
-            .scaleEffect(demo.launched ? 1 : 0.95)
-            .animation(.easeInOut(duration: 0.3), value: demo.launched)
+        let n = launcherNaturalSize(model)
+        let h = min(n.height, 320)               // a compact preview slot; the grown overlay shows the full height
+        LauncherView(model: model, executor: nil, availability: nil)
+            .frame(width: n.width, height: h)
+            .scaleEffect(scale)
+            .frame(width: n.width * scale, height: h * scale)   // the slot is the SCALED size (no overflow)
+            .allowsHitTesting(false)
+            .opacity(demo.playing ? 0.2 : 1)     // recede behind the grown actual-size launcher
+            .animation(.easeInOut(duration: 0.25), value: demo.playing)
+    }
+}
+
+/// The §14 grow-on-rehearse presentation: while the user is really rehearsing (`demo.playing`), the small
+/// preview "morphs" into the user's **ACTUAL launcher** — the real `LauncherView` at its native 1:1 size,
+/// floating over the page on a dim backdrop, **navigable by the user's own fingers** (the model is driven by
+/// the `onRehearse` seam, so this teaches the real thing). It is scaled down ONLY if the Hub window can't fit
+/// the full launcher; otherwise it is exactly actual size. Presentation-only — the trackpad navigates it, not
+/// the mouse (`allowsHitTesting(false)`). Applied as a page-level `.overlay` so it floats above the scrolling
+/// section content (never clipped by it), and recedes on the lift (`playing == false`).
+struct GrownLauncherOverlay: View {
+    @ObservedObject var demo: HubLauncherDemo
+    @ObservedObject var model: LauncherModel
+
+    init(demo: HubLauncherDemo) {
+        _demo = ObservedObject(wrappedValue: demo)
+        _model = ObservedObject(wrappedValue: demo.model)
+    }
+
+    var body: some View {
+        ZStack {
+            if demo.playing {
+                Rectangle().fill(.black.opacity(0.32)).ignoresSafeArea()
+                GeometryReader { geo in
+                    let n = launcherNaturalSize(model)
+                    // Actual size whenever it fits the available area; scaled down (never clipped) if not.
+                    let fit = min(1.0, max(0.2, (geo.size.width - 32) / n.width),
+                                       max(0.2, (geo.size.height - 32) / n.height))
+                    ZStack {
+                        LauncherView(model: model, executor: nil, availability: nil)
+                            .frame(width: n.width, height: n.height)
+                            .scaleEffect(min(1.0, fit))
+                            .shadow(color: .black.opacity(0.35), radius: 30, y: 12)
+                    }
+                    .frame(width: geo.size.width, height: geo.size.height)   // center in the page
+                }
+                .transition(.opacity.combined(with: .scale(scale: 0.92)))
+            }
+        }
+        .allowsHitTesting(false)
+        .animation(.spring(response: 0.34, dampingFraction: 0.82), value: demo.playing)
+    }
+}
+
+// MARK: - §13 Launcher action map (a legend of the teaching story)
+
+/// A compact legend beneath the Launcher preview that spells out the gesture as a numbered story — the
+/// launcher counterpart to `SwitcherActionMap`.
+struct LauncherActionMap: View {
+    private struct Step: Identifiable {
+        let id = UUID()
+        let symbol: String
+        let title: String
+        let detail: String
+    }
+
+    private let steps: [Step] = [
+        Step(symbol: "hand.raised.fill", title: "Slide four fingers", detail: "Swipe sideways to open your launcher"),
+        Step(symbol: "hand.point.up.left.fill", title: "Lift two fingers", detail: "Keep two fingers resting to navigate"),
+        Step(symbol: "arrow.up.arrow.down", title: "Up / down", detail: "Move between bands"),
+        Step(symbol: "arrow.left.arrow.right", title: "Left / right", detail: "Move between items in the band"),
+        Step(symbol: "checkmark.circle.fill", title: "Hold, then lift", detail: "Dwell on an item until it ticks, then lift to fire")
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(steps.enumerated()), id: \.element.id) { index, step in
+                HStack(alignment: .center, spacing: 12) {
+                    ZStack {
+                        Circle().fill(Color.accentColor.opacity(0.16)).frame(width: 26, height: 26)
+                        Text("\(index + 1)").font(.system(size: 12, weight: .semibold)).foregroundStyle(.tint)
+                    }
+                    Image(systemName: step.symbol)
+                        .font(.system(size: 15))
+                        .foregroundStyle(.tint)
+                        .frame(width: 22)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(step.title).font(.callout).fontWeight(.medium)
+                        Text(step.detail).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+        }
     }
 }

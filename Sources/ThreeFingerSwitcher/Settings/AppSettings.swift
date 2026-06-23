@@ -232,6 +232,62 @@ final class AppSettings: ObservableObject {
     /// ON; gated behind the AI opt-in like the other AI prefs.
     @Published var aiReasoningEnabled: Bool { didSet { defaults.set(aiReasoningEnabled, forKey: Keys.aiReasoningEnabled) } }
 
+    /// The agent's context-size preset (`ai-batched-runtime-and-context`, design D5). Drives
+    /// `agentContextTokens`; longer context trades background concurrency + speed for recall (the Hub
+    /// surfaces the RAM/stream cost). Default Balanced.
+    @Published var agentContextPreset: AgentContextPreset { didSet { defaults.set(agentContextPreset.rawValue, forKey: Keys.agentContextPreset) } }
+    /// The resolved context-token budget (clamped to the model max). Feeds conversation-runtime
+    /// compaction through the injected `ContextBudgetProviding`, so growing it raises the compaction
+    /// trigger and the two never disagree about "the budget."
+    @Published var agentContextTokens: Int { didSet { defaults.set(agentContextTokens, forKey: Keys.agentContextTokens) } }
+    /// Compact long contexts with 8-bit KV cache — a longer context fits the same RAM at a small quality
+    /// cost (design D6). Default OFF.
+    @Published var agentCompactKV: Bool { didSet { defaults.set(agentCompactKV, forKey: Keys.agentCompactKV) } }
+
+    /// Soft target for the parked-session set (`ai-parked-sessions`, design §7). When exceeded, the
+    /// least-recently-updated IDLE session is evicted (never an active/needs-you/thinking one).
+    @Published var agentMaxParkedSessions: Int { didSet { defaults.set(agentMaxParkedSessions, forKey: Keys.agentMaxParkedSessions) } }
+    /// How long a parked session may stay idle before it summarizes-and-sleeps (drops its KV cache, keeps
+    /// a one-line resume). Seconds. RETIRED by design D1 (no live consumer) — kept only so an existing
+    /// stored value migrates cleanly; the live aging behavior is now `agentParkAutoDismissCountdown`.
+    @Published var agentParkIdleTimeout: TimeInterval { didSet { defaults.set(agentParkIdleTimeout, forKey: Keys.agentParkIdleTimeout) } }
+    /// The single user-configurable AUTO-DISMISS countdown (design D1): a parked/idle session untouched for
+    /// this long — and any session whose task COMPLETED — is dismissed FOREVER through the same
+    /// authoritative discard path as a manual dismiss (no summarize-and-sleep). Seconds; default 300 (5 min).
+    @Published var agentParkAutoDismissCountdown: TimeInterval { didSet { defaults.set(agentParkAutoDismissCountdown, forKey: Keys.agentParkAutoDismissCountdown) } }
+    /// The two-finger UP excursion (normalized) past the canvas bottom that parks the conversation. Sits
+    /// ABOVE the incidental scroll threshold (`canvasResolveThreshold`) so a normal scroll-to-bottom
+    /// never parks.
+    @Published var agentOverscrollParkThreshold: Double { didSet { defaults.set(agentOverscrollParkThreshold, forKey: Keys.agentOverscrollParkThreshold) } }
+    /// Peak smoothed centroid velocity (normalized units/sec) a canvas excursion must reach before its
+    /// lift counts as a FLICK (commit/park) rather than a slow reading-scroll (D4). A sub-threshold peak —
+    /// or fingers held down without a prompt lift — is SCROLL and never resolves the canvas. Run-verify
+    /// tuning (real trackpad EMA + frame cadence).
+    @Published var flickVelocityThreshold: Double { didSet { defaults.set(flickVelocityThreshold, forKey: Keys.flickVelocityThreshold) } }
+    /// Maximum delay (seconds) between the last high-velocity in-contact frame and the lift for that lift to
+    /// count as a flick. A longer pause before lifting means the fingers decelerated to a scroll/hold, so it
+    /// is NOT a flick (D4). Run-verify tuning.
+    @Published var flickLiftWindow: Double { didSet { defaults.set(flickLiftWindow, forKey: Keys.flickLiftWindow) } }
+
+    // MARK: - Background autonomy whitelist (ai-background-autonomy; default EMPTY)
+
+    /// The user's trusted folder path prefixes — a parked agent may auto-run a `confirm` write whose
+    /// target standardizes under one of these (component-boundary match). Default empty: a fresh install
+    /// trusts nothing arbitrary (the app's own memory/project stores are CONTAINED and auto WITHOUT a
+    /// whitelist row). A privacy/trust choice, so it is NOT cleared by `resetToDefaults` (mirrors the
+    /// AI/clipboard/files opt-in handling).
+    @Published var agentWhitelistPaths: [String] { didSet { defaults.set(agentWhitelistPaths, forKey: Keys.agentWhitelistPaths) } }
+
+    /// The user's trusted command patterns (anchored `*`/`?` globs against a tool/Shortcut name or a
+    /// shell `argv[0]`). Default empty; NOT cleared by `resetToDefaults` (same trust-choice rationale).
+    @Published var agentWhitelistCommands: [String] { didSet { defaults.set(agentWhitelistCommands, forKey: Keys.agentWhitelistCommands) } }
+
+    /// The pure `Whitelist` value the routing loop's `BackgroundPolicyResolver` consumes — assembled from
+    /// the two persisted lists. Read at resolution time so edits live-apply on the next step.
+    var agentWhitelist: Whitelist {
+        Whitelist(trustedPathPrefixes: agentWhitelistPaths, trustedCommandPatterns: agentWhitelistCommands)
+    }
+
     // MARK: - Files band (opt-in; default OFF)
 
     /// Opt-in to the launcher's Files band — a local-only Finder-mimic column navigator. Like the
@@ -438,6 +494,17 @@ final class AppSettings: ObservableObject {
         aiSelectedModelID = defaults.object(forKey: Keys.aiSelectedModelID) as? String ?? Defaults.aiSelectedModelID
         aiCommandLanguages = defaults.object(forKey: Keys.aiCommandLanguages) as? [String: String] ?? Defaults.aiCommandLanguages
         aiReasoningEnabled = defaults.object(forKey: Keys.aiReasoningEnabled) as? Bool ?? Defaults.aiReasoningEnabled
+        agentContextPreset = AgentContextPreset(rawValue: defaults.string(forKey: Keys.agentContextPreset) ?? "") ?? Defaults.agentContextPreset
+        agentContextTokens = defaults.object(forKey: Keys.agentContextTokens) as? Int ?? Defaults.agentContextTokens
+        agentCompactKV = defaults.object(forKey: Keys.agentCompactKV) as? Bool ?? Defaults.agentCompactKV
+        agentMaxParkedSessions = defaults.object(forKey: Keys.agentMaxParkedSessions) as? Int ?? Defaults.agentMaxParkedSessions
+        agentParkIdleTimeout = defaults.object(forKey: Keys.agentParkIdleTimeout) as? TimeInterval ?? Defaults.agentParkIdleTimeout
+        agentParkAutoDismissCountdown = defaults.object(forKey: Keys.agentParkAutoDismissCountdown) as? TimeInterval ?? Defaults.agentParkAutoDismissCountdown
+        agentOverscrollParkThreshold = defaults.object(forKey: Keys.agentOverscrollParkThreshold) as? Double ?? Defaults.agentOverscrollParkThreshold
+        flickVelocityThreshold = defaults.object(forKey: Keys.flickVelocityThreshold) as? Double ?? Defaults.flickVelocityThreshold
+        flickLiftWindow = defaults.object(forKey: Keys.flickLiftWindow) as? Double ?? Defaults.flickLiftWindow
+        agentWhitelistPaths = defaults.object(forKey: Keys.agentWhitelistPaths) as? [String] ?? Defaults.agentWhitelistPaths
+        agentWhitelistCommands = defaults.object(forKey: Keys.agentWhitelistCommands) as? [String] ?? Defaults.agentWhitelistCommands
         filesBandEnabled = defaults.object(forKey: Keys.filesBandEnabled) as? Bool ?? Defaults.filesBandEnabled
         filesRoots = defaults.object(forKey: Keys.filesRoots) as? [String] ?? Defaults.filesRoots
         filesRememberedLocations = defaults.object(forKey: Keys.filesRememberedLocations) as? [String: String] ?? Defaults.filesRememberedLocations
@@ -504,9 +571,23 @@ final class AppSettings: ObservableObject {
         filesActionMenu = Defaults.filesActionMenu   // per-type menus back to the specified defaults
         filesToolsDisabled = Defaults.filesToolsDisabled   // all detected terminals/editors enabled again
         filesRememberLocation = Defaults.filesRememberLocation   // a behavior tunable (back to default ON); the remembered map itself is preserved above
+        // Agent context tuning is a behavior tunable (like the clipboard/files appearance tunables), so it
+        // resets here back to Balanced / 8-bit-KV-off. The AI opt-in + model pin below are NOT reset.
+        agentContextPreset = Defaults.agentContextPreset
+        agentContextTokens = Defaults.agentContextTokens
+        agentCompactKV = Defaults.agentCompactKV
+        agentMaxParkedSessions = Defaults.agentMaxParkedSessions
+        agentParkIdleTimeout = Defaults.agentParkIdleTimeout
+        agentParkAutoDismissCountdown = Defaults.agentParkAutoDismissCountdown
+        agentOverscrollParkThreshold = Defaults.agentOverscrollParkThreshold
+        flickVelocityThreshold = Defaults.flickVelocityThreshold
+        flickLiftWindow = Defaults.flickLiftWindow
         // `aiCommandsEnabled` (a consent-gated opt-in that allows a multi-gigabyte download) and the
         // selected-model pin are a deliberate user choice, so they're intentionally NOT reset — mirrors
         // the launcher / clipboard opt-in handling.
+        // The background-autonomy whitelist (`agentWhitelistPaths`/`agentWhitelistCommands`) is the
+        // security boundary — a deliberate trust choice — so it is intentionally NOT reset here either
+        // (same handling as the other AI opt-ins; a reset never silently widens or narrows trust).
         // `keyboardLanguageEnabled` and the global-default source id are likewise an opt-in user choice
         // (the learned per-app map is a separate store), so they're intentionally NOT reset either.
         // The per-site sub-toggle and the Apple Events ("Allow browser control") opt-in are the same:
@@ -588,6 +669,17 @@ final class AppSettings: ObservableObject {
         static let aiSelectedModelID: String? = nil  // nil = registry default model
         static let aiCommandLanguages: [String: String] = [:]  // per-command remembered runtime language
         static let aiReasoningEnabled = true       // let the model think (filtered out of the result); gated by the AI opt-in
+        static let agentContextPreset: AgentContextPreset = .balanced   // comfortable mid context, the default
+        static let agentContextTokens = 8_192      // Balanced; clamped to the model max at use
+        static let agentCompactKV = false          // 8-bit KV off by default
+        static let agentMaxParkedSessions = 6      // soft cap; evicts the least-recently-updated idle one
+        static let agentParkIdleTimeout: TimeInterval = 30 * 60   // RETIRED (D1): legacy summarize-and-sleep
+        static let agentParkAutoDismissCountdown: TimeInterval = 300   // 5 min idle → auto-dismiss forever (D1)
+        static let agentOverscrollParkThreshold = 0.22            // above canvasResolveThreshold (0.12)
+        static let flickVelocityThreshold = 0.8                   // peak normalized vel/sec; below = reading-scroll (D4, run-verify)
+        static let flickLiftWindow = 0.12                         // seconds from last fast frame to lift (D4, run-verify)
+        static let agentWhitelistPaths: [String] = []             // trust nothing arbitrary on a fresh install
+        static let agentWhitelistCommands: [String] = []          // trust no command pattern on a fresh install
         static let filesBandEnabled = false        // opt-in; injects the local-only Files band (no re-login, no new permission)
         static let filesRoots: [String] = []       // configured local root folders (the Hub seeds a default set)
         static let filesRememberedLocations: [String: String] = [:]   // root path → last deepest path
@@ -654,6 +746,17 @@ final class AppSettings: ObservableObject {
         static let aiSelectedModelID = "aiSelectedModelID"
         static let aiCommandLanguages = "aiCommandLanguages"
         static let aiReasoningEnabled = "aiReasoningEnabled"
+        static let agentContextPreset = "agentContextPreset"
+        static let agentContextTokens = "agentContextTokens"
+        static let agentCompactKV = "agentCompactKV"
+        static let agentMaxParkedSessions = "agentMaxParkedSessions"
+        static let agentParkIdleTimeout = "agentParkIdleTimeout"
+        static let agentParkAutoDismissCountdown = "agentParkAutoDismissCountdown"
+        static let agentOverscrollParkThreshold = "agentOverscrollParkThreshold"
+        static let flickVelocityThreshold = "flickVelocityThreshold"
+        static let flickLiftWindow = "flickLiftWindow"
+        static let agentWhitelistPaths = "agentWhitelistPaths"
+        static let agentWhitelistCommands = "agentWhitelistCommands"
         static let filesBandEnabled = "filesBandEnabled"
         static let filesRoots = "filesRoots"
         static let filesRememberedLocations = "filesRememberedLocations"

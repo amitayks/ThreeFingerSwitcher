@@ -98,6 +98,16 @@ final class HubContext {
     // AI feature page.
     var onDownloadModel: () -> Void = {}
 
+    // AI feature page — Background autonomy (`ai-background-autonomy`, §7). The whitelist editor binds
+    // directly to `settings.agentWhitelistPaths` / `agentWhitelistCommands` (no provider needed). The
+    // audit viewer reads recent records synchronously through this seam (the Core `AuditLog`), and the
+    // store-persist failure surfaces as a bounded, non-blocking banner via the optional headline.
+    /// The most-recent audit records, reverse-chronological, capped at `limit`.
+    var recentAuditRecords: (_ limit: Int) -> [AuditRecord] = { _ in [] }
+    /// A clean, bounded headline if the durable audit store last failed to persist (else `nil`). Routed
+    /// through `AIError.message(for:)` so it never carries raw OS text.
+    var auditStorePersistError: () -> AIPresentedError? = { nil }
+
     // Keyboard Language feature page — the picker's source list (read fresh on each render). Provided by
     // the coordinator so the page never imports Carbon directly (the list comes from the service's
     // `InputSourceController`).

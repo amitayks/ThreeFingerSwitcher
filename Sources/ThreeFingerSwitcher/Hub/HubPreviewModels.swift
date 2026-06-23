@@ -26,43 +26,33 @@ struct HubPreviewModels {
         self.launcherBands = launcherBands
     }
 
-    /// Build a `SwitcherModel` for the mini switcher: the user's real windows (current Space) sized to
-    /// `canvas`, the selection on a middle column, with live thumbnails seeded. Falls back to stylized
-    /// sample windows (mirroring the wizard's `seedSampleDemo`) when there are no real rows — so the
-    /// preview is alive even with no windows or no Accessibility.
-    func makeSwitcherModel(canvas: CGSize) -> SwitcherModel {
+    /// Build the mini switcher's `SwitcherModel` for the Hub preview: the user's REAL windows grouped into
+    /// Space-rows (`realWindowRows` is already grouped by the coordinator), at their true proportions and at
+    /// the user's window-scale `maxScale`. Two fallbacks keep the preview alive and teachable:
+    ///   - **Single / no window:** if the user has at most one real window (only the Hub is open), mimic two
+    ///     icon-only windows so the row still reads as a real switcher.
+    ///   - **Fewer than two Spaces:** fabricate a sample second Space, so the teaching demo's "up to the
+    ///     second row, back down" move always has a row to reach.
+    /// Thumbnails are NOT seeded here — the page seeds them against the RENDERED model so the post-reveal
+    /// live-capture retries land there; the fabricated / icon-only windows simply stay icon-only.
+    func makeSwitcherModel(canvas: CGSize, maxScale: CGFloat) -> SwitcherModel {
         let model = SwitcherModel()
-        let realRow = realWindowRows().first ?? []
-        if realRow.isEmpty {
-            // Sample art — no real windows / no Accessibility. Mirrors the wizard's sample strip.
-            let cards: [(String, NSColor, NSColor)] = [
-                ("Canvas", NSColor(calibratedRed: 0.42, green: 0.36, blue: 0.91, alpha: 1),
-                           NSColor(calibratedRed: 0.20, green: 0.55, blue: 0.95, alpha: 1)),
-                ("Notes",  NSColor(calibratedRed: 0.95, green: 0.62, blue: 0.25, alpha: 1),
-                           NSColor(calibratedRed: 0.93, green: 0.35, blue: 0.42, alpha: 1)),
-                ("Music",  NSColor(calibratedRed: 0.22, green: 0.72, blue: 0.55, alpha: 1),
-                           NSColor(calibratedRed: 0.13, green: 0.45, blue: 0.60, alpha: 1)),
-                ("Mail",   NSColor(calibratedRed: 0.60, green: 0.40, blue: 0.86, alpha: 1),
-                           NSColor(calibratedRed: 0.90, green: 0.45, blue: 0.75, alpha: 1))
-            ]
-            let baseID: CGWindowID = 920_000
-            let windows = cards.enumerated().map { index, card in
-                WindowInfo(id: baseID + CGWindowID(index), pid: 0, appName: card.0, title: card.0,
-                           appIcon: nil, frame: .zero, axElement: nil,
-                           isOnCurrentSpace: true, spaceID: nil, spaceIndex: 0)
-            }
-            model.setCanvas(canvas)
-            model.setRows([windows], labels: ["1"], startRow: 0, column: middleColumn(of: windows.count))
-            for (index, card) in cards.enumerated() {
-                model.setThumbnail(Self.gradientArt(from: card.1, to: card.2), for: baseID + CGWindowID(index))
-            }
-            return model
-        }
-        // Real windows — cap to a clean single row for the mini, seed live thumbnails.
-        let row = Array(realRow.prefix(6))
         model.setCanvas(canvas)
-        model.setRows([row], labels: ["1"], startRow: 0, column: middleColumn(of: row.count))
-        seedThumbnails(model)
+        model.setMaxScale(maxScale)
+
+        var rows = realWindowRows().filter { !$0.isEmpty }.map { Array($0.prefix(6)) }
+        let totalWindows = rows.reduce(0) { $0 + $1.count }
+        if totalWindows <= 1 {
+            // At most one real window (just the Hub): mimic two icon-only windows.
+            rows = [Self.iconOnlyWindows(count: 2, baseID: 930_000)]
+        }
+        // Ensure at least two Space-rows so the up/down teaching move always lands on a real row (the
+        // requested "add a fake second Space" behavior).
+        while rows.count < 2 {
+            rows.append(Self.iconOnlyWindows(count: 3, baseID: CGWindowID(940_000 + rows.count * 100)))
+        }
+        let labels = rows.indices.map { String($0 + 1) }
+        model.setRows(rows, labels: labels, startRow: 0, column: 0)
         return model
     }
 
@@ -84,25 +74,41 @@ struct HubPreviewModels {
         return model
     }
 
-    /// A middle column so the demo opens with a centered selection (and has room to scrub either way).
-    private func middleColumn(of count: Int) -> Int {
-        guard count > 1 else { return 0 }
-        return count / 2
+    /// A short row of **icon-only** mock windows — used for the single-window and fabricated-second-Space
+    /// fallbacks. Each carries a real app icon (so it reads as a window) and a varied frame so the grid
+    /// solves to true, different proportions; no thumbnail, so the card renders the icon.
+    private static func iconOnlyWindows(count: Int, baseID: CGWindowID) -> [WindowInfo] {
+        let apps = resolvedSampleApps(count)
+        let aspects: [CGSize] = [CGSize(width: 1280, height: 800), CGSize(width: 1024, height: 768),
+                                 CGSize(width: 900, height: 1300), CGSize(width: 1440, height: 900)]
+        return (0..<count).map { i in
+            WindowInfo(id: baseID + CGWindowID(i), pid: 0,
+                       appName: apps[i].name, title: apps[i].name, appIcon: apps[i].icon,
+                       frame: CGRect(origin: .zero, size: aspects[i % aspects.count]),
+                       axElement: nil, isOnCurrentSpace: true, spaceID: nil, spaceIndex: 0)
+        }
     }
 
-    /// A soft diagonal gradient "window" — deliberately abstract (art, not a fake screenshot), mirroring
-    /// the wizard's sample art so the no-window fallback reads as one app with onboarding.
-    private static func gradientArt(from: NSColor, to: NSColor) -> NSImage {
-        let size = NSSize(width: 400, height: 300)
-        let image = NSImage(size: size)
-        image.lockFocus()
-        NSGradient(starting: from, ending: to)?
-            .draw(in: NSRect(origin: .zero, size: size), angle: -35)
-        NSColor.white.withAlphaComponent(0.18).setFill()
-        NSBezierPath(roundedRect: NSRect(x: 22, y: 230, width: 200, height: 26), xRadius: 13, yRadius: 13).fill()
-        NSColor.white.withAlphaComponent(0.10).setFill()
-        NSBezierPath(roundedRect: NSRect(x: 22, y: 40, width: 356, height: 170), xRadius: 10, yRadius: 10).fill()
-        image.unlockFocus()
-        return image
+    /// Resolve up to `n` real app icons + names for the mock windows (degrading to the generic app icon for
+    /// any that aren't installed), so the fallback looks like the user's own Mac rather than abstract art.
+    private static func resolvedSampleApps(_ n: Int) -> [(icon: NSImage, name: String)] {
+        let candidates: [(path: String, name: String)] = [
+            ("/System/Library/CoreServices/Finder.app", "Finder"),
+            ("/Applications/Safari.app", "Safari"),
+            ("/System/Applications/Notes.app", "Notes"),
+            ("/System/Applications/Music.app", "Music"),
+            ("/System/Applications/Mail.app", "Mail"),
+            ("/System/Applications/Calendar.app", "Calendar"),
+            ("/System/Applications/Maps.app", "Maps")
+        ]
+        let workspace = NSWorkspace.shared
+        var resolved: [(icon: NSImage, name: String)] = []
+        for app in candidates where FileManager.default.fileExists(atPath: app.path) {
+            resolved.append((workspace.icon(forFile: app.path), app.name))
+            if resolved.count >= n { break }
+        }
+        let generic = NSImage(named: NSImage.applicationIconName) ?? NSImage()
+        while resolved.count < n { resolved.append((generic, "Window \(resolved.count + 1)")) }
+        return resolved
     }
 }

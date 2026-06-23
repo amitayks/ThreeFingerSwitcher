@@ -36,29 +36,98 @@ public struct GenerationParameters: Equatable, Sendable {
     }
 }
 
-/// One unit of model work: a text prompt, optional image bytes for vision, and tuning.
-/// `image` carries encoded image data (e.g. PNG of a captured screen region); a `.text`-only
-/// runtime ignores it. Kept a value type so requests are cheap to build and pass around.
+/// One unit of model work: a text prompt, encoded image bytes for vision (a turn may carry MULTIPLE —
+/// design D2), and tuning. `images` carries encoded image data (e.g. PNGs of captured regions); a
+/// `.text`-only runtime ignores them. Kept a value type so requests are cheap to build and pass around.
 public struct LLMRequest: Sendable {
     /// The fully-resolved prompt text (templating happens upstream in the executor).
     public var prompt: String
-    /// Optional encoded image for `.vision` requests (nil for text-only).
-    public var image: Data?
+    /// Encoded images for a `.vision` request (empty for text-only). A SINGLE turn may carry MULTIPLE
+    /// images (design D2); the runtime feeds each to the model input.
+    public var images: [Data]
     public var parameters: GenerationParameters
     /// When true, the runtime should let the model think (reasoning) but stream/return only the final
     /// response — never the thinking.
     public var reasoning: Bool
 
-    public init(prompt: String, image: Data? = nil, parameters: GenerationParameters = .default,
+    /// The FIRST image, or nil — the single-image convenience (design D2: `images` is the source of truth).
+    public var image: Data? { images.first }
+
+    /// Designated init (multi-image). `images` defaults to `[]`.
+    public init(prompt: String, images: [Data] = [], parameters: GenerationParameters = .default,
                 reasoning: Bool = false) {
         self.prompt = prompt
-        self.image = image
+        self.images = images
         self.parameters = parameters
         self.reasoning = reasoning
     }
 
-    /// Whether this request needs a `.vision`-capable runtime.
-    public var requiresVision: Bool { image != nil }
+    /// Single-image convenience (design D2): folds one optional image into `images` so existing callers
+    /// (`LLMRequest(prompt:image:)`) keep compiling unchanged. A nil image yields `[]`.
+    public init(prompt: String, image: Data?, parameters: GenerationParameters = .default,
+                reasoning: Bool = false) {
+        self.init(prompt: prompt, images: image.map { [$0] } ?? [],
+                  parameters: parameters, reasoning: reasoning)
+    }
+
+    /// Whether this request needs a `.vision`-capable runtime (it carries at least one image).
+    public var requiresVision: Bool { !images.isEmpty }
+}
+
+/// A multi-turn conversation request: a role-tagged message list (already compacted upstream by the
+/// executor) plus the same tuning the single-prompt `LLMRequest` carries. Additive over `LLMRequest`
+/// (design D2 / blueprint §3.2) — served by `LLMRuntime.chat(_:)`, which is default-implemented in terms
+/// of `generate(_:)` so existing conformers work unchanged. `tools` is declared in its final shape for
+/// route-mode (owned by `ai-tool-routing`); this slice leaves it nil and ignores it.
+public struct LLMChatRequest: Sendable {
+    /// The role-tagged multi-turn context. The conversation's reasoning is NOT re-fed: the assembler
+    /// (`ChatTemplate.flatten`, or a conformer's chat template) reads each message's committed `text` only.
+    public var messages: [AgentMessage]
+    /// The turn's images (design D2 — ALL of the latest turn's images, not just one); a `.vision`-capable
+    /// runtime is required when non-empty. Empty = a text turn.
+    public var images: [Data]
+    public var parameters: GenerationParameters
+    /// When true, the runtime lets the model think but streams/returns only the final response.
+    public var reasoning: Bool
+    /// Advertised tools for route-mode (owned by `ai-tool-routing`); nil = plain chat (this slice).
+    public var tools: [ToolDescriptor]?
+
+    /// The FIRST request-level image, or nil — the single-image convenience (design D2).
+    public var image: Data? { images.first }
+
+    /// Designated init (multi-image). `images` defaults to `[]`.
+    public init(messages: [AgentMessage],
+                images: [Data] = [],
+                parameters: GenerationParameters = .default,
+                reasoning: Bool = false,
+                tools: [ToolDescriptor]? = nil) {
+        self.messages = messages
+        self.images = images
+        self.parameters = parameters
+        self.reasoning = reasoning
+        self.tools = tools
+    }
+
+    /// Single-image convenience (design D2): folds one optional image into `images` so existing callers
+    /// (`LLMChatRequest(messages:image:)`) keep compiling unchanged. A nil image yields `[]`.
+    public init(messages: [AgentMessage],
+                image: Data?,
+                parameters: GenerationParameters = .default,
+                reasoning: Bool = false,
+                tools: [ToolDescriptor]? = nil) {
+        self.init(messages: messages, images: image.map { [$0] } ?? [],
+                  parameters: parameters, reasoning: reasoning, tools: tools)
+    }
+
+    /// ALL of the effective turn's images (design D2): the request-level `images` if set, else the latest
+    /// message that carries images. Forwarded in full to the runtime so a multi-image turn reaches the model.
+    public var effectiveImages: [Data] {
+        if !images.isEmpty { return images }
+        return messages.last(where: { !$0.images.isEmpty })?.images ?? []
+    }
+
+    /// The latest effective image (first of `effectiveImages`), for single-image consumers/tests.
+    public var effectiveImage: Data? { effectiveImages.first }
 }
 
 // MARK: - Streaming token
@@ -100,7 +169,7 @@ public struct Token: Equatable, Sendable {
 /// A JSON-Schema wrapper handed to `structured(...)`. We carry the schema as a string (its JSON
 /// representation) rather than a parsed tree so it can be embedded in prompts, logged, and validated
 /// uniformly across conformers. `name` labels the target shape for the model's benefit.
-public struct StructuredSchema: Equatable, Sendable {
+public struct StructuredSchema: Codable, Equatable, Sendable {
     /// A short identifier for the target shape (e.g. "calendar_event").
     public var name: String
     /// The JSON Schema document, as a JSON string.
@@ -229,9 +298,30 @@ public protocol LLMRuntime: Sendable {
         schema: StructuredSchema,
         as type: T.Type
     ) async throws -> StructuredOutcome<T>
+
+    /// Stream a multi-turn conversation token-by-token. ADDITIVE (design D2): declared as a requirement
+    /// WITH a default implementation in the extension below, so (a) existing conformers
+    /// (`StubLLMRuntime`, `DevAIRuntime`, the Gemma conformer) keep compiling UNCHANGED — they inherit
+    /// the default — while (b) a conformer that overrides it (the batched MLX runtime, for true KV-reuse)
+    /// is dispatched correctly when called through the `LLMRuntime` existential. Declaring it only in the
+    /// extension would static-dispatch to the default and silently ignore the override.
+    func chat(_ request: LLMChatRequest) -> AsyncThrowingStream<Token, Error>
 }
 
 extension LLMRuntime {
+    /// DEFAULT multi-turn implementation (design D2 / blueprint §3.2): flatten the message list into one
+    /// prompt via the model-agnostic `ChatTemplate`, then serve it through `generate(_:)` — passing
+    /// `image`/`reasoning`/`parameters` straight through so the `.thinking`/`.response` channel split and
+    /// the vision path are inherited for free. Existing conformers get multi-turn with no change; the
+    /// batched MLX conformer OVERRIDES this for true key/value-cache reuse across turns.
+    public func chat(_ request: LLMChatRequest) -> AsyncThrowingStream<Token, Error> {
+        let prompt = ChatTemplate.flatten(request.messages)
+        return generate(LLMRequest(prompt: prompt,
+                                   images: request.effectiveImages,   // ALL of the turn's images (design D2)
+                                   parameters: request.parameters,
+                                   reasoning: request.reasoning))
+    }
+
     /// Convenience: collect a full generation into a single string (used by tests and non-streaming
     /// callers). Propagates cancellation and errors from the underlying stream.
     public func generateText(_ request: LLMRequest) async throws -> String {
@@ -241,4 +331,27 @@ extension LLMRuntime {
         }
         return out
     }
+}
+
+// MARK: - Batched (continuous-batching) runtime
+
+/// A runtime that multiplexes K conversation streams over ONE weight read per decode step (blueprint
+/// §3.6, `ai-batched-runtime-and-context`). Decode is memory-bandwidth-bound — K independent
+/// `generate()` calls would re-read the ~17 GB weights K times (K× bandwidth, no win); continuous
+/// batching reads the weights once and advances K streams together. `maxConcurrentStreams` is RAM-derived
+/// (see `ConcurrencyBudget`), not a constant, because the per-stream KV cache grows with context.
+///
+/// MLX-free Core declares the seam; the real conformer (`BatchedGemmaMLXRuntime`) lives in GemmaRuntime
+/// and is `xcodebuild` compile-verified only. It refines `LLMRuntime`, so the foreground `chat()` path is
+/// unchanged (a single-session `chat` is just a K=1 batch).
+public protocol BatchedLLMRuntime: LLMRuntime {
+    /// Advance K streams one batched step at a time, de-multiplexing each emitted token back to its
+    /// session. New requests may join mid-flight (continuous, not static, batching); a finished stream
+    /// frees its slot for the next runnable session with the weights still resident.
+    func batchStep(_ requests: [AgentSessionID: LLMChatRequest])
+        -> AsyncThrowingStream<(AgentSessionID, Token), Error>
+
+    /// K — how many streams fit RIGHT NOW, derived from free RAM at the current context length and
+    /// KV-quant bits (recomputed when the context setting changes or memory pressure is reported).
+    var maxConcurrentStreams: Int { get }
 }

@@ -323,7 +323,7 @@ final class DiskProjectStore: ProjectStore {
         directory.appendingPathComponent(Self.fileName(for: project))
     }
 
-    static func fileName(for project: String) -> String {
+    nonisolated static func fileName(for project: String) -> String {
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_ "))
         let cleaned = String(project.unicodeScalars.map { allowed.contains($0) ? Character($0) : "-" })
             .trimmingCharacters(in: .whitespaces)

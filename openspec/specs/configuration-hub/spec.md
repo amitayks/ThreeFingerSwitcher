@@ -96,10 +96,21 @@ The Hub SHALL adopt the same Liquid Glass / material visual language used by the
 - **WHEN** the Hub is shown on a system that does not support the glass material
 - **THEN** it renders with the same graceful fallback the overlays use, without error
 
+### Requirement: General page consolidated preference settings
+The Hub's **General** page SHALL present its preference settings — **Self-heal focus after switching**, **Open at Login**, and **Show diagnostic tools** — as a single consolidated section of switch-style rows (each a title with an optional explanatory caption and a right-aligned on/off switch), rather than as separate one-toggle sections. The **Show diagnostic tools** toggle SHALL control only the *visibility* of the diagnostic actions in the menu-bar status menu; the General page SHALL NOT host the **Write Diagnostics** or **Copy Focus Log** action buttons themselves.
+
+#### Scenario: Preferences shown as one switch section
+- **WHEN** the user opens the General page
+- **THEN** Self-heal focus after switching, Open at Login, and Show diagnostic tools appear together in one section as switch rows, and no Write Diagnostics / Copy Focus Log buttons appear on the page
+
+#### Scenario: Diagnostics toggle gates the menu, not the page
+- **WHEN** the user turns Show diagnostic tools on or off
+- **THEN** the persisted show-diagnostics preference flips, the diagnostic action buttons remain absent from the General page, and only the menu-bar status menu's diagnostic group appears (on) or disappears (off)
+
 ### Requirement: General page Danger zone
 The Hub's **General** page SHALL provide a "Danger zone" section with selective, explicit reset controls:
 
-- Four opt-in toggles, all default off, each gating one deletion category: **App data & settings** (the app's preferences domain, Application Support data excluding the AI model weights, and saved window state), **Caches**, **AI models** (the on-disk weights, with the AI opt-in turned off first), and **Permissions** (a TCC reset for every service the app can hold).
+- Four opt-in selectors, all default off, each gating one deletion category: **App data & settings** (the app's preferences domain, Application Support data excluding the AI model weights, and saved window state), **Caches**, **AI models** (the on-disk weights, with the AI opt-in turned off first), and **Permissions** (a TCC reset for every service the app can hold). The selectors SHALL be presented as a 2×2 grid of full-body toggle-cards: the whole card is the click target, and a selected card is visually highlighted (distinct from a plain on/off switch).
 - A destructive **Clear selected** action that SHALL be disabled while no category is selected and SHALL require an explicit confirmation enumerating exactly what will happen before anything is deleted.
 - WHEN App data & settings is selected and any native-gesture/Spaces backup exists, the relocations SHALL be restored FIRST (and the confirmation SHALL say so) — the wipe must never delete the backups while leaving the system relocated.
 - WHEN App data & settings or Permissions was cleared, the app SHALL relaunch itself so the fresh process reads the cleared state (a data wipe re-enters first-run onboarding); cache/model-only clears SHALL report a non-blocking summary and stay running.
@@ -124,6 +135,10 @@ The Hub's **General** page SHALL provide a "Danger zone" section with selective,
 #### Scenario: Restore-all gestures
 - **WHEN** the user invokes Restore native gestures with backups present
 - **THEN** the trackpad keys and Spaces setting return to their exact backed-up values (deleting previously-absent keys), the opt-ins turn off, and the user is told a re-login completes the trackpad changes
+
+#### Scenario: Selectors are a 2×2 toggle-card grid
+- **WHEN** the Danger zone is shown
+- **THEN** the four category selectors appear as a 2×2 grid of full-body toggle-cards where clicking anywhere on a card toggles its selection and the selected card is highlighted
 
 ### Requirement: Files page hosts roots, appearance, and behavior
 
@@ -174,4 +189,32 @@ Edits SHALL persist (see *tunable-settings*) and SHALL take effect on the next t
 
 - **WHEN** the user edits the folder menu
 - **THEN** the file menu editor and its result are unaffected
+
+### Requirement: The AI page hosts the Background autonomy whitelist and audit log
+The Hub's **AI** feature page SHALL provide a **Background autonomy** section with two surfaces:
+
+- a **whitelist editor** — add, remove, and review the trusted **folder path prefixes** (picked as **local folders only**) and the trusted **command patterns** that let a parked agent run a `confirm` write automatically. The editor SHALL default empty (a fresh install trusts nothing arbitrary), SHALL **persist** its values with the same keys/defaults/reset semantics as the other AI opt-ins, and SHALL state plainly that whitelisting a folder/command makes matching writes run in the background, and that dangerous operations (delete, overwrite-existing, arbitrary shell) are never made automatic by the whitelist.
+- an **audit log viewer** — a reverse-chronological "what your agents did while you were away" ledger of recent background and foreground tool steps, each showing the tool, a redacted arguments summary, the effective tier, the outcome (a failure shown as a clean headline with an opt-in details disclosure), and a timestamp, distinguishing background actions from foreground ones.
+
+Both surfaces SHALL use the shared Liquid Glass presentation consistent with the rest of the Hub. A failure to persist or load the audit log SHALL surface as a **bounded, non-blocking** banner (clean headline, opt-in details), **never** an app-modal alert.
+
+#### Scenario: The Background autonomy section is reachable on the AI page
+- **WHEN** the user opens the Hub and selects the AI feature page
+- **THEN** a Background autonomy section shows the whitelist editor (trusted folders + command patterns) and the audit log viewer
+
+#### Scenario: Editing the whitelist persists and live-applies
+- **WHEN** the user adds a trusted folder or command pattern and removes another
+- **THEN** the change persists across launches, is preserved by a reset-to-defaults like the other AI opt-ins, and the agent's effective-tier resolution reflects it on the next step
+
+#### Scenario: Only local folders can be added as trusted prefixes
+- **WHEN** the user adds a trusted folder
+- **THEN** only a local folder is accepted (network / iCloud-placeholder locations are rejected)
+
+#### Scenario: The audit viewer reads the ledger
+- **WHEN** the user opens the audit log viewer after the agent has worked
+- **THEN** the recent tool steps appear in reverse-chronological order with their tool, redacted args, effective tier, outcome, and timestamp, marking which ran in the background
+
+#### Scenario: An audit store failure is non-blocking
+- **WHEN** loading or persisting the audit log fails
+- **THEN** the viewer shows a bounded banner with a clean headline (details behind an opt-in disclosure) and the rest of the page stays usable, with no app-modal alert
 

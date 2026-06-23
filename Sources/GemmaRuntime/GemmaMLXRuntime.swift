@@ -188,17 +188,17 @@ public final class GemmaMLXRuntime: LLMRuntime, @unchecked Sendable {
         let reasoning = request.reasoning
         let pipeline = self.pipeline
 
-        let image = request.image
+        let images = request.images   // design D2: a turn may carry MULTIPLE images
 
         return AsyncThrowingStream { continuation in
             // Manual-loop path: any request that needs channel classification — EITHER vision (the text
             // pipeline's `chatStream` is text-only AND has no token-level entry point) OR reasoning ON
             // (channels are delimited by in-band control tokens only visible at the token level). Streams
             // channel-tagged tokens live; `enableThinking` is the request's `reasoning` flag (vision with
-            // reasoning off is response-only). The image's bytes, if any, are captured by value (PNG `Data`).
+            // reasoning off is response-only). All of the turn's image bytes are captured by value (PNG `Data`).
             if needsVision || reasoning {
                 let task = Task { @MainActor in
-                    await self.runManual(image: image, prompt: prompt, temperature: temperature,
+                    await self.runManual(images: images, prompt: prompt, temperature: temperature,
                                          maxTokens: maxTokens, enableThinking: reasoning,
                                          continuation: continuation)
                 }
@@ -317,14 +317,22 @@ public final class GemmaMLXRuntime: LLMRuntime, @unchecked Sendable {
 
     /// Number of soft tokens a single image expands to (the CLI's `numImageTokens`; `Gemma4ImageProcessor`
     /// also defaults to 280 via `maxSoftTokens`). Kept here so the placeholder expansion and the processor
-    /// agree on one constant.
-    private static let numImageTokens = 280
+    /// agree on one constant. `internal` so the batched runtime (same module) reuses the same value.
+    static let numImageTokens = 280
 
     /// Lazily build (and cache) the resident multimodal container from the SAME already-downloaded files
     /// that `prepare(...)` loaded. Mirrors the CLI's `loadLocalMultimodalModel(path:)`:
     /// `register(multimodal: true)` + `loadModelContainer(from:using:)` with the pipeline's own tokenizer
     /// loader. Throws `.modelMissing` if no model has been prepared yet. The container is multimodal-capable
     /// but also serves text-only manual generation (no image → no pixel injection → pure text decode).
+    /// Internal accessor so the batched conformer (`BatchedGemmaMLXRuntime`) can share this runtime's
+    /// SINGLE resident multimodal container as the one resident weight graph for its decode loop — the
+    /// weights load exactly once and every batched stream steps its own KV cache against them.
+    @MainActor
+    func ensureMultimodalContainerForBatching() async throws -> ModelContainer {
+        try await ensureMultimodalContainer()
+    }
+
     @MainActor
     private func ensureMultimodalContainer() async throws -> ModelContainer {
         if let multimodalContainer { return multimodalContainer }
@@ -355,7 +363,7 @@ public final class GemmaMLXRuntime: LLMRuntime, @unchecked Sendable {
     /// finish the stream; cancellation is NOT a failure (it finishes with `.cancelled`).
     @MainActor
     private func runManual(
-        image: Data?,
+        images: [Data],
         prompt: String,
         temperature: Float,
         maxTokens: Int,
@@ -364,7 +372,7 @@ public final class GemmaMLXRuntime: LLMRuntime, @unchecked Sendable {
     ) async {
         do {
             try await manualGenerate(
-                image: image, prompt: prompt, temperature: temperature, maxTokens: maxTokens,
+                images: images, prompt: prompt, temperature: temperature, maxTokens: maxTokens,
                 enableThinking: enableThinking, continuation: continuation)
             if Task.isCancelled {
                 continuation.finish(throwing: RuntimeError.cancelled)
@@ -393,7 +401,7 @@ public final class GemmaMLXRuntime: LLMRuntime, @unchecked Sendable {
     /// decode steps (throws `RuntimeError.cancelled`).
     @MainActor
     private func manualGenerate(
-        image: Data?,
+        images: [Data],
         prompt: String,
         temperature: Float,
         maxTokens: Int,
@@ -401,35 +409,47 @@ public final class GemmaMLXRuntime: LLMRuntime, @unchecked Sendable {
         continuation: AsyncThrowingStream<Token, Error>.Continuation
     ) async throws {
         if Task.isCancelled { throw RuntimeError.cancelled }
-        Self.log.notice("manual: begin (image \(image?.count ?? 0, privacy: .public) bytes, thinking=\(enableThinking, privacy: .public))")
+        Self.log.notice("manual: begin (\(images.count, privacy: .public) image(s), thinking=\(enableThinking, privacy: .public))")
 
         let container = try await ensureMultimodalContainer()
         if Task.isCancelled { throw RuntimeError.cancelled }
 
-        // 1) For a vision request, PNG `Data` → CGImage → pixelValues [1, C, H, W]. Map a decode failure to
-        //    a clean taxonomy case (never raw OS text in a headline — the detail rides as opt-in copyable).
+        // 1) For a vision request, each PNG `Data` → CGImage → pixelValues [1, C, H, W]. A turn may carry
+        //    MULTIPLE images (design D2): process each, then stack along the batch axis into [N, C, H, W] —
+        //    the multimodal model's forward pass already iterates `0..<numImages` and splices N×280 features
+        //    at the `<|image|>` token positions. Map a decode/preprocess failure to a clean taxonomy case
+        //    (never raw OS text in a headline — the detail rides as opt-in copyable).
         let numImageTokens = Self.numImageTokens
         var pixelValues: MLXArray? = nil
-        if let image {
-            guard let source = CGImageSourceCreateWithData(image as CFData, nil),
-                  let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-                Self.log.error("manual: could not decode image bytes")
-                throw RuntimeError.modelLoadFailed(detail: "Could not decode the captured image (PNG).")
+        if !images.isEmpty {
+            var perImage: [MLXArray] = []
+            perImage.reserveCapacity(images.count)
+            for image in images {
+                guard let source = CGImageSourceCreateWithData(image as CFData, nil),
+                      let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                    Self.log.error("manual: could not decode image bytes")
+                    throw RuntimeError.modelLoadFailed(detail: "Could not decode the captured image (PNG).")
+                }
+                do {
+                    perImage.append(try Gemma4ImageProcessor.processImage(cgImage, maxSoftTokens: numImageTokens))
+                } catch {
+                    Self.log.error("manual: image preprocessing FAILED: \(String(describing: error), privacy: .public)")
+                    throw RuntimeError.modelLoadFailed(detail: String(describing: error))
+                }
             }
-            do {
-                pixelValues = try Gemma4ImageProcessor.processImage(cgImage, maxSoftTokens: numImageTokens)
-            } catch {
-                Self.log.error("manual: image preprocessing FAILED: \(String(describing: error), privacy: .public)")
-                throw RuntimeError.modelLoadFailed(detail: String(describing: error))
-            }
-            Self.log.notice("manual: image preprocessed → \(pixelValues!.shape.description, privacy: .public)")
+            // [1,C,H,W] × N → [N,C,H,W] (a single image is the N==1 case, identical to before).
+            pixelValues = perImage.count == 1 ? perImage[0] : concatenated(perImage, axis: 0)
+            Self.log.notice("manual: \(images.count, privacy: .public) image(s) preprocessed → \(pixelValues!.shape.description, privacy: .public)")
         }
         if Task.isCancelled { throw RuntimeError.cancelled }
 
-        // 2) Build the chat-templated prompt. For vision, prepend one "<|image|>" placeholder. To enable
-        //    reasoning we pass `enable_thinking` through the template's additionalContext — Gemma 4's chat
-        //    template otherwise injects an empty closed thought channel that suppresses thinking (see type doc).
-        let content = image != nil ? "<|image|>\n" + prompt : prompt
+        // 2) Build the chat-templated prompt. For vision, prepend ONE "<|image|>" placeholder PER image. To
+        //    enable reasoning we pass `enable_thinking` through the template's additionalContext — Gemma 4's
+        //    chat template otherwise injects an empty closed thought channel that suppresses thinking (see type doc).
+        let imageCount = images.count
+        let content = imageCount > 0
+            ? String(repeating: "<|image|>\n", count: imageCount) + prompt
+            : prompt
         let messages: [[String: any Sendable]] = [["role": "user", "content": content]]
         let additionalContext: [String: any Sendable] = ["enable_thinking": enableThinking]
         let baseTokenIds: [Int] = try await container.perform { context in
@@ -437,13 +457,14 @@ public final class GemmaMLXRuntime: LLMRuntime, @unchecked Sendable {
                 messages: messages, tools: nil, additionalContext: additionalContext)
         }
 
-        // 3) For vision, expand the single image placeholder to boi + image_token×N + eoi (like the CLI).
+        // 3) For vision, expand EACH image placeholder to boi + image_token×N + eoi (like the CLI). With
+        //    multiple placeholders the model splices each image's features at its own run of image tokens.
         let imageTokenId = Int(Gemma4Processor.imageTokenId)
         let boiTokenId = Int(Gemma4Processor.boiTokenId)
         let eoiTokenId = Int(Gemma4Processor.eoiTokenId)
         var expanded: [Int] = []
-        if image != nil {
-            expanded.reserveCapacity(baseTokenIds.count + numImageTokens + 2)
+        if imageCount > 0 {
+            expanded.reserveCapacity(baseTokenIds.count + imageCount * (numImageTokens + 2))
             for tid in baseTokenIds {
                 if tid == imageTokenId {
                     expanded.append(boiTokenId)
@@ -574,7 +595,7 @@ public final class GemmaMLXRuntime: LLMRuntime, @unchecked Sendable {
             // braces that would otherwise mislead `extractJSONObject`).
             let genRequest = LLMRequest(
                 prompt: prompt,
-                image: request.image,
+                images: request.images,   // forward ALL of the request's images (design D2)
                 parameters: GenerationParameters(maxTokens: request.parameters.maxTokens, temperature: 0),
                 reasoning: request.reasoning
             )

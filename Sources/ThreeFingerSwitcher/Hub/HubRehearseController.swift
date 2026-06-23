@@ -30,6 +30,12 @@ final class HubRehearseController: ObservableObject {
     /// target changes so a stale count can never hold the gate open across a focus change.
     private var fingerCount = 0
 
+    /// Whether the current touch sequence has ARMED a rehearsal — latched true the moment a ≥3-finger
+    /// trigger is seen, cleared on a full lift (or a target change). Until armed, two-finger movement is NOT
+    /// swallowed, so an ordinary two-finger scroll of the Hub page passes through (the real switcher
+    /// grammar: three fingers trigger, then relax to two).
+    private var armed = false
+
     init() {}
 
     // MARK: - Registration (driven by the preview's appear/focus lifecycle)
@@ -41,6 +47,7 @@ final class HubRehearseController: ObservableObject {
         guard activeTarget != token else { return }
         activeTarget = token
         fingerCount = 0
+        armed = false
         liveDots = nil
     }
 
@@ -51,6 +58,7 @@ final class HubRehearseController: ObservableObject {
         guard activeTarget == token else { return }
         activeTarget = nil
         fingerCount = 0
+        armed = false
         liveDots = nil
     }
 
@@ -60,6 +68,7 @@ final class HubRehearseController: ObservableObject {
     func reset() {
         activeTarget = nil
         fingerCount = 0
+        armed = false
         liveDots = nil
     }
 
@@ -69,12 +78,17 @@ final class HubRehearseController: ObservableObject {
     /// from the `TouchFrame` (the coordinator does the `OMSTouchData` → point mapping at the boundary so
     /// this stays Core-pure). The ≥2-finger `HubRehearseGate` decides whether they become `liveDots`.
     func ingest(fingerCount: Int, contacts: [CGPoint]) {
+        // Latch ARMED on a ≥3-finger trigger; clear it on a full lift. Until armed, a two-finger move is an
+        // ordinary scroll and is left to pass through.
+        if HubRehearseGate.shouldArm(fingerCount: fingerCount) { armed = true }
+        if fingerCount == 0 { armed = false }
         self.fingerCount = fingerCount
         guard activeTarget != nil else { liveDots = nil; return }
-        if HubRehearseGate.shouldDriveDots(isActiveTarget: true, fingerCount: fingerCount) {
+        if HubRehearseGate.shouldDriveDots(isActiveTarget: true, armed: armed, fingerCount: fingerCount) {
             liveDots = contacts
         } else {
-            // <2 fingers (incl. a full lift): the ghost loop drives the pad; no rehearsal this frame.
+            // Not armed, or <2 fingers (incl. a full lift): the ghost loop drives the pad; the scroll passes
+            // through; no rehearsal this frame.
             liveDots = nil
         }
     }
@@ -85,7 +99,7 @@ final class HubRehearseController: ObservableObject {
     /// coordinator routes the frame to the preview and SKIPS `recognizer.feed(_:)` exactly when this is
     /// true (the `wizardOwnsGestures` mirror), so a rehearsal never fires the real feature.
     var ownsGestures: Bool {
-        HubRehearseGate.ownsGestures(isActiveTarget: activeTarget != nil, fingerCount: fingerCount)
+        HubRehearseGate.ownsGestures(isActiveTarget: activeTarget != nil, armed: armed, fingerCount: fingerCount)
     }
 }
 

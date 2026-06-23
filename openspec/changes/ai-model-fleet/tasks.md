@@ -1,0 +1,51 @@
+> Decomposed for a workflow fan-out: §1–§4 are the pure-Core substrate (do first, all `swift test`), §5 wires the manager around the existing provisioner, §6 is the cloud-escalation gating, §7 is the Hub roster UX (native — `xcodebuild` compile-verify only; user run-verify), §8 verifies. The Hub roster and any real residency behavior require the user's stable-signed build — the agent compile-verifies and unit-tests the math only.
+
+## 1. Fleet enums + extended `ModelDescriptor` (pure Core)
+
+- [ ] 1.1 Add `ModelRole` (`.chat`/`.ternaryChat`/`.image`/`.video`/`.cloudEscalation`) and `ModelProvider` (`.onDevice`/`.cloud`) enums to `AI/ModelRegistry.swift` (Core), verbatim per addendum §C1. *Verify: `swift test` — exhaustive cases; `swift build`.*
+- [ ] 1.2 Extend `ModelDescriptor` with `role: ModelRole`, `lane: ComputeLane?` (consume `ComputeLane` from `ai-compute-tiers` §A1 — do NOT redefine), `provider: ModelProvider`, `residencyBytes: UInt64`, `maxContextTokens: Int?`. Add **init defaults** (`role: .chat`, `lane: .gpu`, `provider: .onDevice`, `maxContextTokens: nil`, `residencyBytes` derived from existing size when unset) so every existing construction site keeps compiling (D1). *Verify: `swift build` — existing `.standard` entries + GemmaRuntime `pipelineModel(for:)` compile untouched; `swift test` — default-init descriptor equals today's shape and new fields set/read.*
+
+## 2. `ModelRegistry` protocol + `FleetRoster` (pure Core)
+
+- [ ] 2.1 Add the `ModelRegistry` protocol (`descriptors()`, `resident()`, `ensureResident(_:) throws`) to `AI/Fleet/` per §C1. *Verify: `swift build`.*
+- [ ] 2.2 Evolve `StandardModelRegistry` into `FleetRoster`: chat (`.chat`/`.gpu`/`.onDevice`), ternary (`.ternaryChat`/`.cpuTernary`/`.onDevice`, ~0.5 GB), image Q4 + image FP16 variants (`.image`/`.gpu`), and the two **cloud** members — Claude and GLM-5.2 (`.cloud`/`.cloudEscalation`, `residencyBytes: 0`, GLM-5.2's 753B/1M-ctx/MIT facts in `name`/`capabilities`). *Verify: `swift test` — `descriptors()` includes all incl. both cloud members; `resident()` excludes every `.cloud` member; capability-selection still finds the chat model.*
+- [ ] 2.3 Add a `StubModelRegistry` (Core, test-only) that scripts an arbitrary roster (incl. fleet-of-one). *Verify: `swift test` — fleet-of-one roster conforms; a scripted multi-member roster is queryable.*
+
+## 3. `ResidencyPlanner` — the pure residency/eviction math (pure Core)
+
+- [ ] 3.1 Add `ResidencyPlan { admit:[String]; evict:[String]; coResident:[String] }` and `ResidencyPlanner.plan(target:descriptors:budgetBytes:freeBytes:currentlyResident:)` (pure value function, injected free-memory probe — no Metal) in `AI/Fleet/ResidencyPlanner.swift` (D3). *Verify: `swift build`.*
+- [ ] 3.2 Implement co-residency: chat + ternary + Q4 image + a KV reserve admit together when their `residencyBytes` sum + reserve ≤ `budgetBytes`. *Verify: `swift test` — Q4 image co-resides with chat+ternary+KV under the 48 GB budget (no eviction).*
+- [ ] 3.3 Implement the eviction trigger: admitting a `.video` model, or a `.image` model above the FP16 threshold, evicts the GPU-lane chat (smallest-victim-first among GPU-lane occupants) until the target fits; the CPU-lane ternary is NOT evicted for a GPU gen (D3). *Verify: `swift test` — video evicts chat; FP16 image evicts chat; ternary survives; `coResident` reflects the post-eviction set.*
+- [ ] 3.4 Implement the cloud + infeasible cases: a `.cloud` target → empty admit/evict (residency no-op); a target that cannot fit even after evicting every evictable on-device model → infeasible flag. *Verify: `swift test` — cloud target plan is empty; an over-budget target reports infeasible.*
+
+## 4. `FleetError` taxonomy (pure Core)
+
+- [ ] 4.1 Add `FleetError: Error, Equatable, LocalizedError` with `.cannotAdmit(modelName:)` and `.cloudDisabled(modelName:)` — only the cases `RuntimeError` cannot carry (D7); clean per-case `errorDescription`. *Verify: `swift test` — each case has a non-empty clean description.*
+- [ ] 4.2 Route `FleetError` through `AIError.message(for:)` → `AIPresentedError` (the single translator; the eviction list goes in `details`, never the headline). *Verify: `swift test` — each case yields a clean bounded headline; no raw interpolation in the headline.*
+
+## 5. `ModelManager` consumes registry + planner around the EXISTING provisioner (Core)
+
+- [ ] 5.1 Give `ModelManager` a `ModelRegistry` + a `ResidencyPlanner`; implement `ensureResident(id)` = run the plan, evict each `plan.evict` via the **existing** evict path, load the target via the **existing** `ModelProvisioner` (real) / `runtimeFactory` (dev-stub). NO new provisioning seam (D4). *Verify: `swift test` (with `StubLLMRuntime`) — `ensureResident` evicts the planned ids then loads the target; a `cannotAdmit` plan throws `FleetError.cannotAdmit` and leaves state `.failed`, never a false `.loaded`.*
+- [ ] 5.2 Prove the **fleet-of-one** path: a roster with only the chat descriptor short-circuits to today's lazy-load-and-keep-resident behavior (no eviction, identical lifecycle/integrity-verify/per-model status). *Verify: `swift test` — fleet-of-one `ensureResident` matches the pre-fleet single-model load (snapshot of state transitions).*
+- [ ] 5.3 Cloud `ensureResident` is a residency no-op (never touches the provisioner / never loads weights). *Verify: `swift test` — `ensureResident(cloudID)` loads nothing and `resident()` is unchanged.*
+
+## 6. Cloud-escalation gating (Core read seam)
+
+- [ ] 6.1 Add a read seam for `fleetCloudEscalationEnabled` (the flag itself owned by `ai-full-potential-toggle` §D1 — consume, do NOT define it; default treated as false). *Verify: `swift build`.*
+- [ ] 6.2 Gate cloud members: when off, cloud descriptors are not offered for selection and selecting one yields `FleetError.cloudDisabled`; when on, a cloud-member selection routes the turn through the existing Claude-handoff escalation surface (`ai-claude-handoff` §3.8 — confirm-by-default, budget-capped, audited) — this slice routes, it does not reimplement the handoff (D5). *Verify: `swift test` — off → `cloudDisabled` + not selectable; on → routes to the handoff seam (asserted via a handoff spy).*
+
+## 7. Hub fleet-roster UX (native — `xcodebuild` compile-verify only; user run-verify)
+
+> Native SwiftUI in the app target. The agent NEVER builds/signs/installs the `.app` (ad-hoc signing breaks TCC). Real roster rendering, live per-model status, and the disclosure copy are verified only in the **user's stable-signed build** (§8.3).
+
+- [ ] 7.1 Evolve the Hub AI-page model picker into a **fleet roster**: each member shows role, lane (GPU / CPU / Cloud), provider, the existing per-model on-disk/resident status, and `residencyBytes` (GB) as its honest cost (D6). *Verify: `xcodebuild` compile; **user run-verify** the roster lists every member with correct lane/role/status.*
+- [ ] 7.2 Surface the **evict-chat** disclosure inline, computed from the `ResidencyPlanner` plan (not hard-coded): a member whose admission evicts chat shows "selecting ‹Role› pauses the chat model; it reloads when generation finishes." *Verify: `xcodebuild` compile; `swift test` the underlying plan→warning mapping; **user run-verify** the warning shows for Video/FP16-image and not for Q4-image.*
+- [ ] 7.3 Cloud members show a **Cloud** badge + escalation cost ($ / per-day cap) and are **disabled with an explanatory caption** until `fleetCloudEscalationEnabled`; a fleet-of-one renders as today's single picker. *Verify: `xcodebuild` compile; **user run-verify** cloud rows are gated/captioned off, enabled on; fleet-of-one is unchanged.*
+- [ ] 7.4 Any admission/escalation failure surfaces as a **bounded, non-blocking** row (clean headline via `AIError.message(for:)` + opt-in copyable details + Retry) — never an `NSAlert`, never raw error text in a headline (D7, blueprint invariant). *Verify: `xcodebuild` compile; **user run-verify** a forced `cannotAdmit` shows the bounded row, not a modal.*
+
+## 8. Provisioner wiring + verification
+
+- [ ] 8.1 Wire `FleetRoster` descriptors into GemmaRuntime's `pipelineModel(for:)` so the new descriptor fields compile in the MLX path; no `ModelManager`/`ModelProvisioner` API change. *Verify: `xcodebuild` compile-verify (the metallib `*.bundle` copy in `build-app.sh` must NOT regress).*
+- [ ] 8.2 Full Core suite green: enums, extended descriptor, registry, planner, error taxonomy, manager fleet-of-one + eviction + cloud no-op, gating. *Verify: `swift build` + `swift test` all pass.*
+- [ ] 8.3 **User stable-signed build** validates the live behavior the agent cannot: real Q4-image co-residency with chat+KV under 48 GB, a Video/FP16-image admission actually evicting chat and reloading it, the live free-memory probe, and the on-disk/resident status of real weights in the roster. *Verify: user's `INSTALL=1 ./scripts/build-app.sh` run — agent does not build/sign the `.app`.*
+- [ ] 8.4 `openspec validate ai-model-fleet --strict` passes. *Verify: command exits 0.*

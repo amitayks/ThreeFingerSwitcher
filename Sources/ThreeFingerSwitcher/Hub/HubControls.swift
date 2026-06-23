@@ -20,6 +20,82 @@ struct ToggleRow: View {
     }
 }
 
+/// A settings row with the title + optional caption on the left and a right-aligned `.switch` toggle —
+/// the "main toggle" look (matching the Overview `featureRow`'s switch) for immediate on/off preferences.
+struct SwitchRow: View {
+    let title: String
+    @Binding var isOn: Bool
+    var caption: String? = nil
+
+    init(_ title: String, isOn: Binding<Bool>, caption: String? = nil) {
+        self.title = title
+        self._isOn = isOn
+        self.caption = caption
+    }
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                if let caption {
+                    Text(caption)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 12)
+            Toggle("", isOn: $isOn).labelsHidden().toggleStyle(.switch)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// A full-body selectable card (title + optional caption). The whole card is the click target and a
+/// selected card is highlighted (tinted fill + stroke) — used for the General page's Danger-zone
+/// category selectors, where a multi-select reads better as deliberate tiles than as checkboxes.
+struct ToggleCard: View {
+    let title: String
+    @Binding var isOn: Bool
+    var caption: String? = nil
+
+    init(_ title: String, isOn: Binding<Bool>, caption: String? = nil) {
+        self.title = title
+        self._isOn = isOn
+        self.caption = caption
+    }
+
+    var body: some View {
+        Button { isOn.toggle() } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).fontWeight(.medium)
+                if let caption {
+                    Text(caption)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, minHeight: 56, alignment: .topLeading)
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(isOn ? Color.accentColor.opacity(0.18) : Color.primary.opacity(0.05))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(isOn ? Color.accentColor : Color.primary.opacity(0.12),
+                            lineWidth: isOn ? 1.5 : 1)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            // Fade the fill / stroke colour / line-width in and out on selection rather than snapping.
+            .animation(.easeInOut(duration: 0.18), value: isOn)
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(isOn ? [.isButton, .isSelected] : .isButton)
+    }
+}
+
 /// A labeled `Double` slider with a monospaced value readout and help text — the tuning row used
 /// across feature pages (ported from the former Settings window's `slider` helper).
 struct LabeledSlider: View {

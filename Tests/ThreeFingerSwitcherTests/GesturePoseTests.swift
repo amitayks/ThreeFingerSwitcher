@@ -307,6 +307,63 @@ final class GesturePoseTests: XCTestCase {
         }
     }
 
+    func testConnectedStrokesNeverLiftBetweenThem() {
+        // Two strokes joined by `gapAfter: 0` (the "lift one finger, keep going" seam): the hand goes from
+        // 3 fingers to 2 WITHOUT any lifted frame between them — the finger count changes mid-press.
+        let s0 = GesturePose.Stroke(fingers: 3, from: CGPoint(x: 0.6, y: 0.5), to: CGPoint(x: 0.3, y: 0.5), gapAfter: 0)
+        let s1 = GesturePose.Stroke(fingers: 2, from: CGPoint(x: 0.3, y: 0.5), to: CGPoint(x: 0.3, y: 0.3))
+        let g = GesturePose.DemoGesture(strokes: [s0, s1], liftGap: 0.6)
+
+        var liftedDuringStroke0 = false
+        var sawThree = false, sawTwo = false
+        sweepGesture(g) { frame in
+            if frame.strokeIndex == 0 { sawThree = sawThree || frame.fingerCount == 3
+                                        if frame.lifted { liftedDuringStroke0 = true } }
+            if frame.strokeIndex == 1 && !frame.lifted { sawTwo = sawTwo || frame.fingerCount == 2 }
+        }
+        XCTAssertFalse(liftedDuringStroke0, "a gapAfter:0 stroke is CONNECTED — no lift before the next")
+        XCTAssertTrue(sawThree, "the connected sequence presses three fingers first")
+        XCTAssertTrue(sawTwo, "…then drops to two without lifting (lift one finger, keep going)")
+    }
+
+    func testFourToTwoConnectedHandOffNeverLifts() {
+        // The launcher's real grammar (§13): open on FOUR fingers, then — CONNECTED (`gapAfter: 0`) — drop to
+        // TWO while two stay down ("lift two fingers, keep going"), then navigate. No lifted frame between the
+        // open and the navigate, and the finger count goes 4 → 2 mid-press.
+        let open = GesturePose.Stroke(fingers: 4, from: CGPoint(x: 0.20, y: 0.5), to: CGPoint(x: 0.46, y: 0.5), gapAfter: 0)
+        let band = GesturePose.Stroke(fingers: 2, from: CGPoint(x: 0.46, y: 0.5), to: CGPoint(x: 0.46, y: 0.66), gapAfter: 0)
+        let items = GesturePose.Stroke(fingers: 2, from: CGPoint(x: 0.46, y: 0.66), to: CGPoint(x: 0.74, y: 0.66))
+        let g = GesturePose.DemoGesture(strokes: [open, band, items], liftGap: 0.6)
+
+        var liftedDuringOpen = false, liftedBetweenBandAndItems = false
+        var sawFour = false, sawTwo = false
+        sweepGesture(g) { frame in
+            if frame.strokeIndex == 0 {
+                sawFour = sawFour || frame.fingerCount == 4
+                if frame.lifted { liftedDuringOpen = true }
+            }
+            if frame.strokeIndex == 1 && frame.lifted { liftedBetweenBandAndItems = true }
+            if frame.strokeIndex >= 1 && !frame.lifted { sawTwo = sawTwo || frame.fingerCount == 2 }
+        }
+        XCTAssertFalse(liftedDuringOpen, "the four-finger open is connected to the navigate — no lift after it")
+        XCTAssertFalse(liftedBetweenBandAndItems, "the connected two-finger strokes never lift between them")
+        XCTAssertTrue(sawFour, "the launcher journey presses four fingers to open")
+        XCTAssertTrue(sawTwo, "…then drops to two without lifting (lift two fingers, keep going)")
+    }
+
+    func testDefaultLiftGapStillLiftsBetweenStrokes() {
+        // Without `gapAfter`, strokes keep the normal full lift between them (regression guard for the
+        // variable-gap rewrite — uniform `liftGap` behaves exactly as before).
+        let s0 = GesturePose.Stroke(fingers: 2, from: CGPoint(x: 0.3, y: 0.5), to: CGPoint(x: 0.6, y: 0.5))
+        let s1 = GesturePose.Stroke(fingers: 2, from: CGPoint(x: 0.6, y: 0.5), to: CGPoint(x: 0.3, y: 0.5))
+        let g = GesturePose.DemoGesture(strokes: [s0, s1], liftGap: 0.6)
+        var sawLiftedAfterStroke0 = false
+        sweepGesture(g) { frame in
+            if frame.strokeIndex == 0 && frame.lifted { sawLiftedAfterStroke0 = true }
+        }
+        XCTAssertTrue(sawLiftedAfterStroke0, "a default-gap stroke still lifts before the next")
+    }
+
     func testEmptyGestureIsLifted() {
         let g = GesturePose.DemoGesture(strokes: [], liftGap: 0.5)
         let frame = GesturePose.pose(phase: 1.2, gesture: g)

@@ -1,0 +1,49 @@
+> Wave 4. Consumes committed types from `ai-conversation-runtime` (AgentConversation/AgentMessage/AgentSessionID + `.conversing`/`.awaitingTurn` + `runTurn`/`assembleRequest`), `ai-tool-routing` (AgentLoop state + `ApprovalGate`), and `ai-parked-sessions` (`OverscrollPark.shouldPark` + `canvasAtBottom` companion + restore entry). Bind to those types verbatim; do NOT redefine them. §1–§3 are pure Core (do first, `swift test`); §4–§6 are the overlay UX (`xcodebuild` compile + user run-verify); §7 verifies.
+
+## 1. Bare-seed defaults (pure Core)
+
+- [x] 1.1 Add `AI/Agent/BareSeedDefault.swift`: `enum SeedKind { case text, image }` + `static func question(for: SeedKind) -> String` — image → describe/what-is-this; text → summarize/explain. Pure, `nonisolated`, deterministic. *Verified: `swift test`.*
+- [x] 1.2 Map `AICommand.input` → `SeedKind` (`selection`/`clipboard` → `.text`; `clipboardImage`/`screenRegion` → `.image`). Pure helper. *Verified: `swift test`.*
+- [x] 1.3 Unit tests (`BareSeedDefaultTests`): a stable non-empty string per `SeedKind`; the `input → SeedKind` mapping for all five input sources. *Verified: `swift test`.*
+
+## 2. The seed/send/affirm/park machine (executor, Core)
+
+- [x] 2.1 Add the `.awaitingSeed` `State` case (+ hand-written `==` arm). Keep every existing one-shot case and `isCommittable` semantics (`.awaitingSeed` is NOT committable). Add render-only handling of `.awaitingApproval`/`.parked` only if the runtime slice did not already add them. *Verified: `swift test` (equality + `isCommittable`).*
+- [x] 2.2 Add `startConversation(seed:)`: acquire the seed via the EXISTING acquisition (`acquireInput` + `clipboardImage`/`screenRegion` paths, the same `.noInput`/permission/`.unavailable` mapping), build turn-1 user `AgentMessage`, open the `AgentConversation` (runtime slice type), land in `.awaitingSeed`. Do NOT invoke the model. *Verified: `swift test` (seed shown, no model call; `.noInput`/`.unavailable` preserved).*
+- [x] 2.3 Add `send(_ text:)`: append a user `AgentMessage(text:image:nil)` (one-source — follow-ups never attach), call the runtime slice's `runTurn()` (→ `.conversing` → stream → `.awaitingTurn`). An empty composer in `.awaitingSeed` sends `BareSeedDefault.question(for:)` folded with the seed (§1). *Verified: `swift test` (typed turn streams; bare-seed default fires on empty send; follow-up `AgentMessage.image == nil`).*
+- [x] 2.4 Preset unification: `startConversation(seed:)` for a preset pre-fills turn 1 (canned instruction folded with the seed, `{lang}` resolved as today) and **auto-sends** (one `send()`), reusing the conversational machine — NOT a parallel path. *Verified: `swift test` (Fix Grammar / Translate auto-stream as turn 1).*
+- [x] 2.5 Add `extractLatest()`: read the last assistant turn's `text`, route through the command's output target (`replaceSelection`/`pasteAtCursor`/`previewOnly`) via the existing `SelectionProviding`, honoring the honesty rule (failed write → `.failed`, never false Done) → `.committed`. *Verified: `swift test` (each output target; failed write → `.failed`).*
+- [x] 2.6 Add `var canvasAtBottom` (companion to `canvasAtTop`; not `@Published`; reset on each open) — the input the overscroll-park read needs. *Verified: `swift test` (default true; settable).*
+- [x] 2.7 Add `parkHandoff()`: transition `.parked`, hand the live `AgentConversation` to the parked-sessions store/scheduler (consumed seam), do NOT cancel an in-flight turn. *Verified: `swift test` (state → `.parked`; conversation handed off; turn not cancelled).*
+- [x] 2.8 Wire tool-step approval at the executor: DOWN-when-`.awaitingApproval` resolves `ApprovalGate.approve`; RIGHT resolves `.skip` (tool-routing seam). *Verified: `swift test` w/ scripted `ApprovalGate` (approve fires the step; skip declines).*
+
+## 3. The canvas-resolve + overscroll-park decision (pure, at the seam)
+
+- [x] 3.1 Extend `AppCoordinator.launcherCanvasResolve` `.commit` branch: if `.awaitingApproval` → approve; else keep the `canvasAtTop` guard → `extractLatest()`. *Verified: `xcodebuild` (wiring); `swift test` for the pure pieces.*
+- [x] 3.2 Extend the `.ignore` branch with the overscroll-park read: `if dy > 0 && OverscrollPark.shouldPark(dy: accumulatedUp, canvasAtBottom: executor.canvasAtBottom, overscrollThreshold: parkThreshold) { parkCanvas() }` — consume the parked-sessions helper verbatim; accumulate the UP excursion at the consumer. LEFT stays a genuine no-op (reserved). *Verified: `swift test` (a park-decision test: at-bottom+over-threshold → park; non-bottom / under-threshold → no-op).*
+- [x] 3.3 Confirm `canvasResolveDecision` (already tested) is unchanged; park rides whatever excursion resolves to `.ignore` in the UP direction even when the binding is remapped. *Verified: `swift test` (existing tests stay green; remapped-binding park case).*
+
+## 4. The thread renderer (overlay)
+
+- [x] 4.1 Add `ThreadView(conversation:)` to `AICommandCanvasView`: render `AgentConversation.messages` as user/assistant turn cards through `BidiText`; assistant turns reuse the existing collapsible **Thinking** section (per-message `thinking` for completed turns, live `executor.thinking` for the in-flight `.conversing` turn). Render the in-flight assistant turn live via the existing `resultScroll`. *Verified: `xcodebuild` compile; user run-verify.*
+- [x] 4.2 Render tool steps when the route loop is active: a compact list of `ToolStepResult.summary` + the existing `reviewFields(_:)` card on `.awaitingApproval` (tool-routing observable state). *Verified: `xcodebuild`; user run-verify.*
+- [x] 4.3 Add `CanvasAtBottomKey` reporter (mirror `atTopReporter`, measuring `maxY` vs. the viewport) → `executor.canvasAtBottom` via `onPreferenceChange`. Keep the existing `CanvasAtTopKey` → `canvasAtTop`. *Verified: `xcodebuild`; user run-verify (at-bottom reports true only when scrolled to the end).*
+- [x] 4.4 Render the new states: `.awaitingSeed` (seed card + placeholder), `.conversing` (growing assistant card), `.awaitingTurn` (idle thread + composer), `.awaitingApproval` (review card), `.parked` (receding/handed-off). *Verified: `xcodebuild`; user run-verify.*
+
+## 5. The composer + float-up (overlay)
+
+- [x] 5.1 Add `Composer` at the canvas bottom: a `TextField`/`TextEditor` with `@FocusState private var composerFocused` and `.onSubmit { executor.send(text) }` (Enter sends). *Verified: `xcodebuild`; user run-verify (Enter sends; field receives keystrokes).*
+- [x] 5.2 Add the float-up: an "Ask anything…" placeholder overlaid on the seed in `.awaitingSeed`; on first keystroke (text non-empty) OR focus, animate it up+out with the BubbleMorph-spirit spring (`scale→0.96`+`opacity→0`+upward offset, `.spring(response:0.34, dampingFraction:0.72)`). No new haptic. *Verified: `xcodebuild`; user run-verify (placeholder lifts the instant typing begins).*
+- [x] 5.3 Confirm the panel key/main path: `setCanvasInteractive(true)` on canvas open already makes the panel key-capable, so focusing the `TextField` flows keystrokes; verify the panel stays `.nonactivatingPanel` and the two-finger compass (off the multitouch device) still resolves while focused. Add a doc note; no new AppKit call for the common path. *Verified: `xcodebuild`; user run-verify (typing + a two-finger DOWN/RIGHT both work, captured app stays frontmost).*
+- [x] 5.4 Turn-aware `footerHint`: send/affirm/discard/park hints per state (Enter to send; swipe down to apply — at top; swipe aside to discard; overscroll up to park). *Verified: `xcodebuild`; user run-verify.*
+
+## 6. Controller wiring (overlay)
+
+- [x] 6.1 Route `resolveCanvasCommit()` → `executor.extractLatest()` / approve; add `parkCanvas()` → `executor.parkHandoff()` + a reverse-BubbleMorph recede toward the notch, then the EXISTING synchronous `orderOut`/`close` teardown (no deferred teardown — the ghost-on-Space-switch rule holds). *Verified: `xcodebuild`; user run-verify (park recedes + tears down cleanly across a Space switch).*
+- [x] 6.2 Wire the restore entry point the parked-sessions rail calls: re-open the canvas bound to a restored `AgentConversation` in `.awaitingTurn` (or `.awaitingApproval`). *Verified: `xcodebuild`; user run-verify (parked → restore re-renders the thread).*
+
+## 7. Verify
+
+- [x] 7.1 `swift build` + `swift test` green: the seed/send/affirm/park machine, `BareSeedDefault`, and the park decision are covered by scripted `StubLLMRuntime` conversations (seed-wait, typed turn, multi-turn, preset auto-send, extract-latest per target, bare-seed default, discard, park-decision, one-source follow-up). The full `ThreeFingerSwitcher` product compiles + links (Core + GemmaRuntime/MLX) via `xcodebuild` compile-verify. *Verified: `swift test` + `xcodebuild` compile-only.*
+- [x] 7.2 `openspec validate --strict` passes; the `ai-command-band` delta (ADDED/MODIFIED requirements + scenarios) matches the implementation. *Verified: `openspec validate --strict`.*
+- [ ] 7.3 **User run-verify** in a stable-signed build (`INSTALL=1 ./scripts/build-app.sh`): firing an AI item opens the canvas SHOWING the seed and WAITING (no auto-fire for the conversational command); typing floats the placeholder up; Enter sends; the assistant streams; a second turn works; a two-finger DOWN at top applies the latest answer to the output target; UP scrolls and an overscroll-past-bottom parks to the notch; RIGHT discards; a preset (Fix Grammar) still auto-streams turn 1 and DOWN replaces the selection; a bare seed (image) sends the default describe question; the captured app stays frontmost while a field is focused. *Verified: user run-verify (agent never builds/signs/installs).*

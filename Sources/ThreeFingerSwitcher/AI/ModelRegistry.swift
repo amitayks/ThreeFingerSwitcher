@@ -19,6 +19,11 @@ public struct ModelDescriptor: Equatable, Sendable, Identifiable {
     public var capabilities: Set<Modality>
     /// Quantization scheme of the published weights (informational + selection tie-breaks later).
     public var quantization: Quantization
+    /// The model's architectural maximum context length, in tokens (`ai-batched-runtime-and-context`,
+    /// design D5). This is the CLAMP CEILING for the user-adjustable `agentContextTokens`; the concrete
+    /// `ContextBudgetProviding` resolves the effective budget against it. Defaulted so existing
+    /// construction sites stay source-compatible (additive).
+    public var maxContextTokens: Int
 
     public enum Quantization: String, Codable, Sendable {
         case qat4bit   // QAT 4-bit (the shipped default for Apple Silicon)
@@ -32,7 +37,8 @@ public struct ModelDescriptor: Equatable, Sendable, Identifiable {
                 integritySHA: String,
                 downloadURL: URL,
                 capabilities: Set<Modality>,
-                quantization: Quantization) {
+                quantization: Quantization,
+                maxContextTokens: Int = 131_072) {
         self.id = id
         self.displayName = displayName
         self.sizeBytes = sizeBytes
@@ -40,6 +46,7 @@ public struct ModelDescriptor: Equatable, Sendable, Identifiable {
         self.downloadURL = downloadURL
         self.capabilities = capabilities
         self.quantization = quantization
+        self.maxContextTokens = maxContextTokens
     }
 }
 
@@ -87,7 +94,8 @@ public struct ModelRegistry: Sendable {
                 integritySHA: "hub-verified",
                 downloadURL: URL(string: "https://huggingface.co/mlx-community/gemma-4-31b-it-4bit")!,
                 capabilities: [.text, .vision],
-                quantization: .qat4bit
+                quantization: .qat4bit,
+                maxContextTokens: 131_072
             ),
             ModelDescriptor(
                 id: "gemma-4-26b-a4b",
@@ -96,7 +104,8 @@ public struct ModelRegistry: Sendable {
                 integritySHA: "hub-verified",
                 downloadURL: URL(string: "https://huggingface.co/mlx-community/gemma-4-26b-a4b-it-4bit")!,
                 capabilities: [.text, .vision],
-                quantization: .qat4bit
+                quantization: .qat4bit,
+                maxContextTokens: 131_072
             ),
             ModelDescriptor(
                 id: "gemma-4-12b",
@@ -105,7 +114,8 @@ public struct ModelRegistry: Sendable {
                 integritySHA: "hub-verified",
                 downloadURL: URL(string: "https://huggingface.co/mlx-community/gemma-4-e4b-it-4bit")!,
                 capabilities: [.text, .vision, .audio],
-                quantization: .qat4bit
+                quantization: .qat4bit,
+                maxContextTokens: 32_768
             )
         ],
         defaultModelID: "gemma-4-31b"

@@ -33,7 +33,12 @@ public enum GemmaRuntime {
             optedIn: optedIn,
             provisioner: { descriptor, progress in
                 let model = pipelineModel(for: descriptor)
-                let runtime = GemmaMLXRuntime()
+                // The batched conformer is now the resident runtime (design D9): it conforms to
+                // `LLMRuntime` AND `BatchedLLMRuntime`, subsuming the single-session paths and adding the
+                // multi-stream surface. `ModelManager` stores it as an `LLMRuntime` exactly as before —
+                // no API change; the scheduler-driven background advancer downcasts to `BatchedLLMRuntime`.
+                let runtime = BatchedGemmaMLXRuntime(weightBytes: descriptor.sizeBytes,
+                                                     maxContextTokens: descriptor.maxContextTokens)
                 try await runtime.prepare(model: model, progress: progress)
                 return runtime
             },

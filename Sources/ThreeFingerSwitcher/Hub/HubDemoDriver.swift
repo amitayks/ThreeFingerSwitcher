@@ -103,6 +103,15 @@ final class HubDemoDriver: ObservableObject {
     private let onOpen: () -> Void
     private let onDismiss: () -> Void
 
+    /// OPT-IN real-touch rehearse driving: when set, a rehearsed preview (real ≥2-finger touch) drives the
+    /// model through THIS closure — the user's live centroid + finger count sampled each tick — INSTEAD of
+    /// the autoplay script, so the miniature follows the user's real movement in steps. It is called with
+    /// `(nil, 0)` once when the fingers lift, so the page can recede / reset before the script resumes.
+    /// Pages that don't set it keep the legacy rehearse behavior (the script plays under the user's fingers).
+    var onRehearse: ((_ centroid: CGPoint?, _ fingerCount: Int) -> Void)?
+    /// Tracks whether the previous tick was a page-driven rehearse, so the lift edge fires `onRehearse(nil,0)`.
+    private var wasRehearsing = false
+
     /// The continuous phase advanced each tick; `GesturePose.pose(phase:gesture:)` turns it into a frame.
     private var phase: Double = 0
     private var timer: Timer?
@@ -191,10 +200,25 @@ final class HubDemoDriver: ObservableObject {
         let g = activeGesture
         let frame = GesturePose.pose(phase: phase, gesture: g)
 
+        // Page-driven rehearse: the user's REAL fingers drive the model in steps, not the autoplay script.
+        // The ghost loop keeps advancing `phase` underneath so it resumes the instant the fingers lift.
+        if isRehearsing, let onRehearse {
+            dots = []
+            let contacts = liveDots ?? []
+            fingerCount = contacts.count
+            wasRehearsing = true
+            onRehearse(Self.centroid(of: contacts), contacts.count)
+            return
+        }
+        if wasRehearsing {
+            wasRehearsing = false
+            onRehearse?(nil, 0)   // fingers lifted: let the page recede + reset before the script resumes
+        }
+
         fingerCount = frame.lifted ? 0 : frame.fingerCount
 
-        // Rehearse: the live hand owns the pad — suppress the ghost (the loop still drives the model below
-        // so the miniature keeps demonstrating under the user's contacts, the wizard's takeover behavior).
+        // Legacy rehearse (no `onRehearse`): the live hand owns the pad — suppress the ghost (the loop still
+        // drives the model below so the miniature keeps demonstrating under the user's contacts).
         if !isRehearsing {
             dots = frame.lifted ? [] : frame.dots
         }
@@ -215,5 +239,13 @@ final class HubDemoDriver: ObservableObject {
         if !frame.lifted && !isOpenStroke && !isDismissStroke && stroke.fingers <= 2 {
             onScrub(frame.centroid)
         }
+    }
+
+    /// The centroid (average) of the live contacts — the hand position the rehearse interpreter tracks. Pad
+    /// center when there are no contacts.
+    private static func centroid(of contacts: [CGPoint]) -> CGPoint {
+        guard !contacts.isEmpty else { return CGPoint(x: 0.5, y: 0.5) }
+        let sum = contacts.reduce(CGPoint.zero) { CGPoint(x: $0.x + $1.x, y: $0.y + $1.y) }
+        return CGPoint(x: sum.x / CGFloat(contacts.count), y: sum.y / CGFloat(contacts.count))
     }
 }

@@ -147,11 +147,19 @@ enum GesturePose {
         /// "land on the band" reads as a settle. `0` ⇒ stroke straight into the lift.
         var hold: Double
 
-        init(fingers: Int, from: CGPoint, to: CGPoint, hold: Double = 0) {
+        /// The lift gap AFTER this stroke, overriding the gesture's default `liftGap`. The load-bearing
+        /// case is **`0` = connected**: the hand does NOT lift before the next stroke, so a change in the
+        /// next stroke's finger count reads as *lifting one finger while the others stay down* (the real
+        /// switcher grammar: three fingers open, then lift one and navigate on two). `nil` ⇒ use the
+        /// gesture's `liftGap` (a normal full lift between separate swipes).
+        var gapAfter: Double?
+
+        init(fingers: Int, from: CGPoint, to: CGPoint, hold: Double = 0, gapAfter: Double? = nil) {
             self.fingers = fingers
             self.from = from
             self.to = to
             self.hold = hold
+            self.gapAfter = gapAfter
         }
     }
 
@@ -212,21 +220,31 @@ enum GesturePose {
             return (dots: [], fingerCount: 0, centroid: restingCentroid, strokeIndex: 0, progress: 0, lifted: true)
         }
 
-        // One loop = N strokes, each of unit duration, plus a `liftGap` after each. Map phase → [0, total).
-        let gap = max(0, gesture.liftGap)
-        let perStroke = 1.0 + gap
-        let total = perStroke * Double(gesture.strokes.count)
+        // One loop = N strokes; each occupies a SLOT of `1.0` (the stroke) + its trailing lift gap. The gap
+        // is the stroke's own `gapAfter` when set, else the gesture's `liftGap`. A `gapAfter` of 0 makes a
+        // stroke CONNECTED — no lift before the next, so a finger-count change across that boundary reads as
+        // lifting a finger mid-gesture (open on three → navigate on two). Map phase → [0, total) and walk
+        // the (variable-length) slots to the active stroke. With all gaps equal this is identical to the
+        // former uniform `perStroke` math, so existing demos are unchanged.
+        let slots: [Double] = gesture.strokes.map { 1.0 + max(0, $0.gapAfter ?? gesture.liftGap) }
+        let total = slots.reduce(0, +)
+        guard total > 0 else {
+            return (dots: [], fingerCount: 0, centroid: restingCentroid, strokeIndex: 0, progress: 0, lifted: true)
+        }
 
         let cycle = 2 * Double.pi
         var t = phase.truncatingRemainder(dividingBy: cycle) / cycle
         if t < 0 { t += 1 }
         var local = t * total                       // 0..total
 
-        let index = min(gesture.strokes.count - 1, Int(local / perStroke))
-        local -= Double(index) * perStroke          // 0..perStroke within this stroke
+        var index = 0
+        while index < slots.count - 1 && local >= slots[index] {
+            local -= slots[index]                   // advance past completed slots
+            index += 1
+        }
         let stroke = gesture.strokes[index]
 
-        // The stroke occupies [0, 1] (with a trailing `hold` dwell at `to`), the lift occupies [1, perStroke].
+        // The stroke occupies [0, 1] (with a trailing `hold` dwell at `to`); the rest of the slot is the lift.
         if local >= 1.0 {
             // Lifted gap between strokes: no dots, hand absent. Report progress at the stroke's end.
             return (dots: [], fingerCount: stroke.fingers, centroid: clampPoint(stroke.to),

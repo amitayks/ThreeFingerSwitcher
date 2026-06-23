@@ -1,0 +1,73 @@
+# Design — ai-compute-tiers
+
+## Context
+
+The batched GPU runtime (`ai-batched-runtime-and-context`, blueprint §3.6) is the v2 concurrency primitive: K conversation streams folded into ONE GPU forward pass per decode step so the weights are read once. It is correct and stays as-is — but it is single-lane. Every unit of agent work (foreground reply, router `structured()` turn, classify, memory retrieval, parked-subagent advance) competes for the same GPU decode loop and the same ~153 GB/s unified-memory bus.
+
+This slice introduces a **second compute lane** so the light, frequent, structured work can run **off** the GPU, **concurrently** with the heavy reply, on a small ternary/BitNet-class model whose weights are ~32× smaller and therefore barely touch the shared bus. It owns the addendum §A1 contracts (`ComputeLane`, `AgentWorkRole`, `LaneRouting`) and amends the implicit single-GPU assumption on `on-device-ai-runtime` — **via MODIFIED requirements only**, never by editing the batched or parked slice files. The CPU ternary model is **another `LLMRuntime` conformer** (reuse the seam, do not invent a protocol), selected by lane through the fleet registry (addendum §C1).
+
+### Measured M5 facts this slice rests on (cited honestly)
+
+- **Prefill ≈ ~4× on the GPU neural accelerators.** M5's matmul accelerators give up to ~4× prompt-processing/prefill over the prior generation → the GPU is where prefill-heavy heavy generation and media diffusion belong.
+- **Token-gen is bandwidth-bound at ~153 GB/s.** Decode reads the weight set per token; the bus, not the cores, is the ceiling. Two heavy generations on one lane contend for that one bus.
+- **Ternary weights ≈ ~32× smaller.** A ternary/BitNet-class model's weights read per token cost a fraction of the bandwidth → a CPU-lane ternary decode runs concurrently with a GPU generation with low bus contention.
+- **CPU per-token is slower (the honest limit).** A CPU ternary decode is slower per token than a GPU batched token, so the CPU lane is for short/frequent/structured bursts ONLY — never the long foreground reply.
+
+## Goals
+
+- Own `ComputeLane` / `AgentWorkRole` / `LaneRouting` (§A1) verbatim, and a pure role→lane policy that is `swift test`-verified.
+- Add a second `LLMRuntime` conformer (`TernaryCPURuntime`) on the CPU lane — a conformer, not a protocol — with a deterministic stub for tests.
+- Let the GPU lane and the CPU ternary lane run **concurrently** under a pure residency/co-residency budget, without the CPU lane starving the foreground GPU reply or borrowing GPU batch slots.
+- Make a `parkedSubagent` session advance on the CPU lane **at the same time** as a foreground GPU generation, via an **additive** lane-affinity hint consumed by `ParkScheduler` (§3.5) and the batched runtime (§3.6) through their pinned shapes.
+- AMEND the single-GPU assumption as MODIFIED requirements on `on-device-ai-runtime`.
+
+## Non-Goals
+
+- The GPU batched decode loop, KV-quant, prefix caching, context tuning — `ai-batched-runtime-and-context` (the GPU lane) owns these; this slice does not touch them.
+- The parked store, notch rail, park/sleep/discard lifecycle, the `ParkScheduler` policy itself — `ai-parked-sessions` owns these; this slice only attaches an additive hint to its runnable set.
+- The model registry, residency **eviction policy**, and cloud members — `ai-model-fleet` (§C1) owns these; this slice supplies the lane concept it consumes and the ternary co-residency MATH.
+- The master toggle UI / cost-disclosure Hub page — `ai-full-potential-toggle` (§D1) owns these; this slice only reads `cpuLaneEnabled`/`fullPotentialEnabled`.
+- Putting the long foreground reply on the CPU lane (it is slower per token — explicitly rejected).
+- Any low-end/degraded fallback — the CPU lane is a bandwidth optimization for capable hardware, NOT a weak-hardware path.
+
+## Decisions
+
+### D1. `ComputeLane` + `AgentWorkRole` + `LaneRouting` are Core, verbatim from §A1; this slice OWNS them.
+Define `ComputeLane { .gpu, .cpuTernary }`, `AgentWorkRole { foregroundGeneration, mediaDiffusion, toolRoute, classify, memoryRetrieval, parkedSubagent }`, and `protocol LaneRouting { func lane(for: AgentWorkRole) -> ComputeLane }` exactly as the addendum pins them. The concrete `DefaultLaneRouting` is a pure total function: `foregroundGeneration`/`mediaDiffusion` → `.gpu`; `toolRoute`/`classify`/`memoryRetrieval`/`parkedSubagent` → `.cpuTernary`. No state, time as no input needed — a switch. **Rationale:** a pure total map is trivially `swift test`-exhaustive (one assertion per case) and is the single source of truth every consumer (scheduler, batched runtime, executor) reads, so lane assignment can never drift between call sites. **Alternatives rejected:** (a) a `lane` field hand-set at each call site — drifts, untestable as a whole; (b) deriving the lane from the model descriptor alone — the SAME ternary model could in principle serve a GPU role, so role, not model, must drive the lane.
+
+### D2. The CPU ternary model is ANOTHER `LLMRuntime` conformer, never a new protocol.
+`TernaryCPURuntime` conforms to the existing `LLMRuntime` (`generate`, `structured`, `capabilities`, `chat()` default). It carries a SMALL ternary/BitNet-class model on the CPU lane. Feature code stays model-agnostic (the band, executor, router already depend only on `LLMRuntime`); selection is by **lane**, resolved through the fleet registry (§C1: `role: .ternaryChat`, `lane: .cpuTernary`). **Rationale:** blueprint house rule — reuse the model seam; a second protocol would fork the abstraction the whole feature depends on and force every consumer to branch on runtime type. **Alternatives rejected:** (a) a `CPURuntime`/`TernaryRuntime` protocol — forks `LLMRuntime`, violates §A1's explicit "NOT a new protocol"; (b) a mode flag on the GPU runtime — conflates two physically distinct lanes in one conformer and one residency footprint.
+
+### D3. A pure `LaneArbiter` over a `LaneResidencyBudget` decides cross-lane concurrency; the GPU reply is never blocked by CPU work.
+`LaneResidencyBudget` (pure, free-memory injected — no Metal) holds: chat weights (GPU, read once), KV per GPU stream, and the **ternary residency bytes** (a small constant — ~32× smaller weights). It answers "does the ternary model co-reside with the current GPU batch + KV under the 48 GB budget?" — and on this hardware it does, cheaply. `LaneArbiter` then admits CPU-lane work **concurrently** with GPU work, bounding CPU-lane concurrency on its OWN budget (a small fixed CPU-lane stream cap), and enforces two honest invariants: (1) a heavy GPU generation is NEVER made to wait on CPU-lane work; (2) CPU-lane bursts NEVER preempt or starve the foreground GPU reply (the CPU lane is bandwidth-frugal, so it doesn't need to). `now:` and free-memory are inputs (mirrors `DockHoverModel`/`ConcurrencyBudget`), so it is deterministically testable. **Rationale:** the two lanes are physically independent (GPU cores + accelerators vs CPU cores), and the ternary weights' tiny bandwidth footprint is exactly what makes true concurrency — not a second queue — correct; making the budget pure keeps the decision `swift test`-able without real Metal. **Alternatives rejected:** (a) let the CPU lane borrow GPU batch slots — defeats the purpose (it would re-serialize behind the GPU loop); (b) a global mutex across both lanes — re-serializes the very work we split out; (c) preempt the GPU reply for an urgent CPU burst — unnecessary (CPU work doesn't contend) and would stutter the visible answer.
+
+### D4. The lane-affinity hint is consumed ADDITIVELY by `ParkScheduler` (§3.5) and the batched runtime (§3.6); their pinned shapes are untouched.
+Add a Core `LaneAffinity` value (`{ sessionID: AgentSessionID, lane: ComputeLane }`, derived from the session's `AgentWorkRole` via `DefaultLaneRouting`). The parked scheduler attaches an affinity to each session it returns from `runnableSessions(now:maxSlots:)` **without changing that method's signature** (the hint is read alongside the returned IDs through an additive accessor, not by mutating the pinned method). The dispatcher (the batched runtime + the lane arbiter) reads the affinity and dispatches `cpuTernary`-affined sessions to `TernaryCPURuntime` while the GPU `batchStep(...)` keeps serving `.gpu`-affined and foreground sessions. Net effect: a `parkedSubagent` session advances on the CPU lane **concurrently** with the foreground GPU generation. **This is specified as MODIFIED requirements on `on-device-ai-runtime`; the `ai-parked-sessions` and `ai-batched-runtime-and-context` change files are NOT edited.** **Rationale:** the addendum mandates additive consumption ("`runnableSessions(now:maxSlots:)` signature unchanged"; "`batchStep` … additive"); an additive accessor + a value hint keeps both seams as pinned while delivering the concurrency win. **Alternatives rejected:** (a) add a `lane:` parameter to `runnableSessions`/`batchStep` — breaks the pinned signatures and forces sibling-slice edits; (b) split the scheduler into two schedulers — duplicates the FIFO/needs-you/`nextRunAt` policy `ai-parked-sessions` owns.
+
+### D5. Honest constraint: the CPU lane serves short/frequent/structured bursts ONLY — never the long reply.
+`DefaultLaneRouting` routes `foregroundGeneration` and `mediaDiffusion` to `.gpu` precisely because CPU per-token is slower. The router `structured()` turn, classify, memory retrieval, and parked-subagent advances are short and bounded, so even at a slower per-token rate they finish quickly and gain from running concurrently rather than queuing. The spec states this limit outright (a scenario asserts the long reply is GPU-only). **Rationale:** honesty about cost is a binding house rule; mis-routing the long reply to the CPU lane would be a regression, not a feature. **Alternatives rejected:** a "spill heavy work to CPU when GPU is busy" path — slower for the user and contradicts the bandwidth argument; the GPU's batched loop is already the heavy-work answer.
+
+### D6. Gated by `cpuLaneEnabled` under `fullPotentialEnabled`; OFF = today's one-lane behavior, no regression.
+The CPU lane checks `cpuLaneEnabled` (read from §D1, owned by `ai-full-potential-toggle`) before installing `TernaryCPURuntime`. When off, `LaneRouting` still answers, but the dispatcher coerces every lane to `.gpu` (a `LaneRouting` decorator), so all work routes to the GPU batched runtime exactly as before — a one-lane / fleet-of-one build stays valid. **Rationale:** addendum decision 6 (default OFF, ships calm; every sub-capability discloses its cost — here a small extra resident ternary model + CPU heat under sustained bursts). **Alternatives rejected:** always-on CPU lane — violates the default-OFF master-gate decision and spends RAM/heat the user didn't ask for.
+
+### D7. Errors stay in `RuntimeError`; a `ComputeError` only if lane dispatch genuinely needs its own case.
+A CPU-lane failure (ternary load/prepare/decode) maps at the `TernaryCPURuntime` boundary into `RuntimeError` (the existing taxonomy), surfaced via `AIError.message(for:)` as a clean headline — exactly like the GPU runtime. A `ComputeError` LocalizedError is added ONLY if a lane-dispatch case (e.g. "selected lane unavailable") cannot be carried by `RuntimeError`; prefer extending `RuntimeError`. A CPU-lane step that fails is an observable `.failed` for that turn (never a false "done"), never an `NSAlert`, never raw text in a headline. **Rationale:** one taxonomy + one translator is a binding invariant; a per-stream/per-turn failed state mirrors the batched slice's "one stream's failure does not abort the batch." **Alternatives rejected:** a standalone `ComputeError` for every case — proliferates error types against the house rule.
+
+## Target-split & verification (per component)
+
+| Component | Target | Verification |
+|---|---|---|
+| `ComputeLane`, `AgentWorkRole` (§A1) | MLX-free Core | `swift test` — enums construct, round-trip `Codable`; OWNED here verbatim |
+| `LaneRouting` protocol + `DefaultLaneRouting` policy (D1) | MLX-free Core | `swift test` — exhaustive role→lane assertion per case (heavy→`.gpu`, structured→`.cpuTernary`) |
+| `LaneAffinity` hint value (D4) | MLX-free Core | `swift test` — derived from role via `DefaultLaneRouting`; a `parkedSubagent` session yields `.cpuTernary` |
+| `LaneResidencyBudget` co-residency math (D3) | MLX-free Core | `swift test` — ternary (~32× smaller) co-resides with chat weights + GPU KV under an injected free-memory budget; fits where a second chat model would not |
+| `LaneArbiter` cross-lane concurrency (D3) | MLX-free Core | `swift test` (`now:`/free-mem injected) — GPU + CPU admit concurrently; a heavy GPU gen never waits on CPU work; CPU bursts never starve the foreground GPU reply; CPU-lane cap bounds CPU concurrency |
+| `LaneRouting` OFF-coercion decorator (D6) | MLX-free Core | `swift test` — with `cpuLaneEnabled == false` every role coerces to `.gpu` (one-lane build stays valid) |
+| `StubTernaryRuntime` (test-only `LLMRuntime` conformer) | MLX-free Core | `swift test` — scripts deterministic tokens/structured outcomes; de-mux to the right `AgentSessionID`; verifies the seam without real weights |
+| Error mapping → `RuntimeError` / `AIError.message(for:)` (D7) | MLX-free Core | `swift test` — a simulated CPU-lane failure maps to a `RuntimeError` case → a clean `AIPresentedError` headline; never raw text |
+| `TernaryCPURuntime` (real bitnet.cpp-class ternary `LLMRuntime` conformer on the CPU lane) | Native-linked (`GemmaRuntime`/sibling framework) | `xcodebuild` COMPILE-VERIFY ONLY; real per-token speed, true CPU/GPU concurrency, no cross-lane bleed, RAM/heat → **user's stable-signed build** (an agent never builds/signs the `.app`) |
+| Lane-keyed `ModelProvisioner`/`runtimeFactory` wiring (D2) | Native-linked (`GemmaRuntime`) | `xcodebuild` compile; **user run-verify** the ternary conformer is injected for `lane: .cpuTernary` with no `ModelManager` API change |
+| Additive lane-affinity dispatch into the batched loop (D4) | Native-linked (`GemmaRuntime`) | `xcodebuild` compile; **user run-verify** a parked subagent runs on CPU concurrently with a foreground GPU generation |
+| `cpuLaneEnabled`/`fullPotentialEnabled` gate read (D6) | MLX-free Core (read) + native install gate | `swift test` for the gate logic; **user run-verify** OFF installs no CPU lane and routes all work to the GPU |
+
+> The metallib `*.bundle` → `Contents/Resources/` copy in `build-app.sh` must not regress; the agent compile-verifies the native conformer only — live two-lane concurrency, CPU per-token speed, heat, and RAM headroom are validated solely by the user's stable-signed build.
