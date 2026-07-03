@@ -222,6 +222,90 @@ final class AppSettings: ObservableObject {
     /// so older settings (and a never-chosen default) read back identically.
     @Published var aiSelectedModelID: String? { didSet { defaults.set(aiSelectedModelID, forKey: Keys.aiSelectedModelID) } }
 
+    /// The fleet roster's pinned ACTIVE CHAT model id (the radio AMONG chat-role members), or nil for the
+    /// registry/fleet chat default. Distinct from the capability toggles below: a chat model is the single
+    /// resident conversational brain, so it is a radio choice. nil encodes as absent (legacy-safe).
+    @Published var aiSelectedChatModelID: String? {
+        didSet { defaults.set(aiSelectedChatModelID, forKey: Keys.aiSelectedChatModelID) }
+    }
+
+    /// The set of ENABLED capability-model ids (image / ternary / video) — INDEPENDENT toggles, NOT a
+    /// radio, because these co-reside with (or are evicted around) the chat model rather than replacing
+    /// it. Enabling one inserts its id here AND triggers its download if not already on disk. Persisted as
+    /// a string array; absent ⇒ empty (legacy-safe — pre-wave settings read back with nothing enabled).
+    @Published var aiEnabledCapabilityModelIDs: Set<String> {
+        didSet { defaults.set(Array(aiEnabledCapabilityModelIDs), forKey: Keys.aiEnabledCapabilityModelIDs) }
+    }
+
+    // MARK: - Release Full Potential (master gate + sub-flags; default OFF — addendum §D1)
+
+    /// The master **Release Full Potential** opt-in (`ai-full-potential-toggle`, addendum §D1). Default
+    /// OFF — V2.5 ships calm; this one deliberate, user-owned act lights up the heavy AI fleet. Like the
+    /// clipboard/device-link opt-ins it relocates NO native gesture, needs NO re-login, and requests NO
+    /// new permission; it takes effect immediately. Turning it OFF closes every sub-capability gate at
+    /// once (the calm panic-off) WITHOUT zeroing the sub-flags below — re-arming restores the prior
+    /// selection (the gate relocks by computation, never by mutating the stored flags). Older settings
+    /// have no key and decode with the master OFF. Preserved by `resetToDefaults` like the other AI opt-ins.
+    @Published var fullPotentialEnabled: Bool { didSet { defaults.set(fullPotentialEnabled, forKey: Keys.fullPotentialEnabled) } }
+
+    /// Sub-flag: the CPU ternary lane (`ai-compute-tiers`). Gated under the master. Cost: heat/battery —
+    /// a second (CPU) lane runs concurrently; short structured bursts only, CPU per-token is slower.
+    /// Default OFF; persisted; preserved by reset.
+    @Published var cpuLaneEnabled: Bool { didSet { defaults.set(cpuLaneEnabled, forKey: Keys.cpuLaneEnabled) } }
+
+    /// Sub-flag: the K-stream GPU batched runtime + growable context (`ai-batched-runtime-and-context`).
+    /// Gated under the master. Cost: RAM + latency — multiplexes K sessions over one weight read; larger
+    /// context = more resident KV; latency rises under load. Default OFF; persisted; preserved by reset.
+    @Published var batchedRuntimeEnabled: Bool { didSet { defaults.set(batchedRuntimeEnabled, forKey: Keys.batchedRuntimeEnabled) } }
+
+    /// Sub-flag: image/video generation tools (`ai-media-runtime` + backends). Gated under the master.
+    /// Cost: RAM (eviction) + latency + disk — a heavy gen EVICTS chat ("the assistant goes quiet while
+    /// it paints"); minutes per clip; tens of GB of weights. Default OFF; persisted; preserved by reset.
+    @Published var mediaGenEnabled: Bool { didSet { defaults.set(mediaGenEnabled, forKey: Keys.mediaGenEnabled) } }
+
+    /// Sub-flag: parked auto-vs-escalate + whitelist + audit (`ai-background-autonomy`). Gated under the
+    /// master. Cost: unattended action — the agent may act while you are away (whitelisted/contained
+    /// writes only; dangerous ones still escalate; all audited). Default OFF; persisted; preserved by reset.
+    @Published var backgroundAutonomyEnabled: Bool { didSet { defaults.set(backgroundAutonomyEnabled, forKey: Keys.backgroundAutonomyEnabled) } }
+
+    /// Sub-flag: cloud fleet members — Claude / GLM-5.2 (`ai-model-fleet` cloud members). Gated under the
+    /// master. Cost: $ + network + data off-device — sends prompts to a paid cloud model; budget-capped +
+    /// audited; off until armed. Default OFF; persisted; preserved by reset.
+    @Published var fleetCloudEscalationEnabled: Bool { didSet { defaults.set(fleetCloudEscalationEnabled, forKey: Keys.fleetCloudEscalationEnabled) } }
+
+    /// The pure `FullPotentialFlags` the gate consumes, assembled from the six persisted keys plus the
+    /// existing AI-commands opt-in (consumed verbatim — the AI-commands opt-in is owned by
+    /// `tunable-settings`, not redefined here). Read at consult time so a flag edit live-applies.
+    var fullPotentialFlags: FullPotentialFlags {
+        FullPotentialFlags(aiCommandsEnabled: aiCommandsEnabled,
+                           fullPotentialEnabled: fullPotentialEnabled,
+                           cpuLane: cpuLaneEnabled,
+                           batchedRuntime: batchedRuntimeEnabled,
+                           mediaGen: mediaGenEnabled,
+                           backgroundAutonomy: backgroundAutonomyEnabled,
+                           fleetCloud: fleetCloudEscalationEnabled)
+    }
+
+    /// The Full Potential gate every heavy slice consults via one `isUnlocked(_:)` check before
+    /// activating. A computed convenience over `fullPotentialFlags` — pure, total, never throws.
+    var fullPotentialGate: FullPotentialGate {
+        FullPotentialGate(flags: fullPotentialFlags)
+    }
+
+    /// The selected VIDEO backend behind the `MediaRuntime` seam (`ai-video-animation-generation`,
+    /// addendum §1). `.cloud` (the honest default — a hosted API, nothing downloaded) or `.localLTXV`
+    /// (the frontier — 35 GB+, gated by the master toggle). Persisted by `rawValue`; an unreadable /
+    /// absent value reads back as the calm `.cloud` default. The master-gate validity of `.localLTXV`
+    /// is enforced at selection by `VideoProvider.isSelectable(...)`, not here.
+    @Published var videoProvider: VideoProvider { didSet { defaults.set(videoProvider.rawValue, forKey: Keys.videoProvider) } }
+
+    /// The per-rolling-24h CLOUD-video budget cap (`ai-video-animation-generation`, addendum §1). Cloud
+    /// video spends real money + uploads bytes, so it is `.dangerous` AND rate-capped: the `VideoBudget`
+    /// admits at most this many cloud generations per rolling-24h window (NOT a calendar reset). A
+    /// conservative default so an autonomous loop physically cannot rack up spend before the user
+    /// deliberately raises it; 0 effectively disables cloud video.
+    @Published var mediaVideoBudgetPerDay: Int { didSet { defaults.set(mediaVideoBudgetPerDay, forKey: Keys.mediaVideoBudgetPerDay) } }
+
     /// Per-command remembered runtime-parameter language (spec: "Per-command runtime-parameter
     /// persistence"), keyed by the command's identifier string → the last chosen language. Out-of-band
     /// from the command itself, so seeds/catalog/band edits are unaffected; orphan keys (deleted
@@ -422,6 +506,13 @@ final class AppSettings: ObservableObject {
     /// down. Default OFF. Older settings have no key and decode with the opt-in OFF.
     @Published var showDockPreviews: Bool { didSet { defaults.set(showDockPreviews, forKey: Keys.showDockPreviews) } }
 
+    /// Opt-in: drive the window switcher from ⌘-Tab (intercept it, suppress the native application
+    /// switcher). Like `showDockPreviews` it needs NO re-login and requests NO new permission — it
+    /// reuses the already-granted Accessibility (active consuming event tap + raise) and the tracked
+    /// Input Monitoring. Because interception is a live event tap, flipping it ON installs the keyboard
+    /// tap and OFF removes it (native ⌘-Tab restored immediately). Default OFF; older settings decode OFF.
+    @Published var commandTabSwitcher: Bool { didSet { defaults.set(commandTabSwitcher, forKey: Keys.commandTabSwitcher) } }
+
     /// The language last chosen for `commandID`, or nil if none has been chosen yet (cold start).
     func rememberedLanguage(for commandID: UUID) -> String? { aiCommandLanguages[commandID.uuidString] }
 
@@ -492,6 +583,20 @@ final class AppSettings: ObservableObject {
         clipboardExcludedApps = defaults.object(forKey: Keys.clipboardExcludedApps) as? [String] ?? Defaults.clipboardExcludedApps
         aiCommandsEnabled = defaults.object(forKey: Keys.aiCommandsEnabled) as? Bool ?? Defaults.aiCommandsEnabled
         aiSelectedModelID = defaults.object(forKey: Keys.aiSelectedModelID) as? String ?? Defaults.aiSelectedModelID
+        aiSelectedChatModelID = defaults.object(forKey: Keys.aiSelectedChatModelID) as? String ?? Defaults.aiSelectedChatModelID
+        aiEnabledCapabilityModelIDs = Set(defaults.object(forKey: Keys.aiEnabledCapabilityModelIDs) as? [String]
+                                          ?? Defaults.aiEnabledCapabilityModelIDs)
+        // Full Potential master + sub-flags (addendum §D1): absent key ⇒ false (legacy-load), so settings
+        // written before this wave decode with the whole fleet OFF, leaving existing settings unchanged.
+        fullPotentialEnabled = defaults.object(forKey: Keys.fullPotentialEnabled) as? Bool ?? Defaults.fullPotentialEnabled
+        cpuLaneEnabled = defaults.object(forKey: Keys.cpuLaneEnabled) as? Bool ?? Defaults.cpuLaneEnabled
+        batchedRuntimeEnabled = defaults.object(forKey: Keys.batchedRuntimeEnabled) as? Bool ?? Defaults.batchedRuntimeEnabled
+        mediaGenEnabled = defaults.object(forKey: Keys.mediaGenEnabled) as? Bool ?? Defaults.mediaGenEnabled
+        backgroundAutonomyEnabled = defaults.object(forKey: Keys.backgroundAutonomyEnabled) as? Bool ?? Defaults.backgroundAutonomyEnabled
+        fleetCloudEscalationEnabled = defaults.object(forKey: Keys.fleetCloudEscalationEnabled) as? Bool ?? Defaults.fleetCloudEscalationEnabled
+        videoProvider = (defaults.object(forKey: Keys.videoProvider) as? String)
+            .flatMap(VideoProvider.init(rawValue:)) ?? Defaults.videoProvider
+        mediaVideoBudgetPerDay = defaults.object(forKey: Keys.mediaVideoBudgetPerDay) as? Int ?? Defaults.mediaVideoBudgetPerDay
         aiCommandLanguages = defaults.object(forKey: Keys.aiCommandLanguages) as? [String: String] ?? Defaults.aiCommandLanguages
         aiReasoningEnabled = defaults.object(forKey: Keys.aiReasoningEnabled) as? Bool ?? Defaults.aiReasoningEnabled
         agentContextPreset = AgentContextPreset(rawValue: defaults.string(forKey: Keys.agentContextPreset) ?? "") ?? Defaults.agentContextPreset
@@ -525,6 +630,7 @@ final class AppSettings: ObservableObject {
         keyboardLanguagePerSiteEnabled = defaults.object(forKey: Keys.keyboardLanguagePerSiteEnabled) as? Bool ?? Defaults.keyboardLanguagePerSiteEnabled
         keyboardLanguageAllowBrowserControl = defaults.object(forKey: Keys.keyboardLanguageAllowBrowserControl) as? Bool ?? Defaults.keyboardLanguageAllowBrowserControl
         showDockPreviews = defaults.object(forKey: Keys.showDockPreviews) as? Bool ?? Defaults.showDockPreviews
+        commandTabSwitcher = defaults.object(forKey: Keys.commandTabSwitcher) as? Bool ?? Defaults.commandTabSwitcher
     }
 
     func resetToDefaults() {
@@ -593,6 +699,11 @@ final class AppSettings: ObservableObject {
         // The per-site sub-toggle and the Apple Events ("Allow browser control") opt-in are the same:
         // consent-gated user choices (the latter governs a per-browser permission), NOT reset here.
         // `showDockPreviews` is likewise an opt-in user choice (no tunables of its own), NOT reset here.
+        // The Release Full Potential master + five sub-flags (`fullPotentialEnabled`, `cpuLaneEnabled`,
+        // `batchedRuntimeEnabled`, `mediaGenEnabled`, `backgroundAutonomyEnabled`,
+        // `fleetCloudEscalationEnabled`) are consent-gated opt-ins (some allow a multi-GB media download or
+        // real cloud spend), so they JOIN the AI opt-in preserve-set — intentionally NOT reset here. A
+        // tunables reset must never silently re-arm or disarm a fleet the user deliberately configured.
     }
 
     private func persist(_ value: Double, _ key: String) { defaults.set(value, forKey: key) }
@@ -667,6 +778,16 @@ final class AppSettings: ObservableObject {
         static let clipboardExcludedApps: [String] = []
         static let aiCommandsEnabled = false       // opt-in; gates the AI band + model download/residency
         static let aiSelectedModelID: String? = nil  // nil = registry default model
+        static let aiSelectedChatModelID: String? = nil  // nil = fleet/registry chat default
+        static let aiEnabledCapabilityModelIDs: [String] = []  // no capability models enabled by default
+        static let fullPotentialEnabled = false      // master gate; OFF → V2.5 ships calm (addendum §D1)
+        static let cpuLaneEnabled = false            // sub-flag; OFF (heat/battery)
+        static let batchedRuntimeEnabled = false     // sub-flag; OFF (RAM + latency)
+        static let mediaGenEnabled = false           // sub-flag; OFF (evicts chat; minutes/clip; GB of weights)
+        static let backgroundAutonomyEnabled = false // sub-flag; OFF (unattended action, audited)
+        static let fleetCloudEscalationEnabled = false   // sub-flag; OFF ($ + network + data off-device)
+        static let videoProvider: VideoProvider = .cloud   // honest default: hosted API, nothing downloaded
+        static let mediaVideoBudgetPerDay = 3        // conservative cloud-video cap (rolling 24h); 0 disables
         static let aiCommandLanguages: [String: String] = [:]  // per-command remembered runtime language
         static let aiReasoningEnabled = true       // let the model think (filtered out of the result); gated by the AI opt-in
         static let agentContextPreset: AgentContextPreset = .balanced   // comfortable mid context, the default
@@ -704,6 +825,7 @@ final class AppSettings: ObservableObject {
         static let keyboardLanguagePerSiteEnabled = true
         static let keyboardLanguageAllowBrowserControl = false   // opt-in; Apple Events host reader (per-browser permission)
         static let showDockPreviews = false        // opt-in; Dock-hover window previews (no re-login, no new permission)
+        static let commandTabSwitcher = false      // opt-in; drive the switcher from ⌘-Tab (no re-login, no new permission)
     }
 
     private enum Keys {
@@ -744,6 +866,16 @@ final class AppSettings: ObservableObject {
         static let clipboardExcludedApps = "clipboardExcludedApps"
         static let aiCommandsEnabled = "aiCommandsEnabled"
         static let aiSelectedModelID = "aiSelectedModelID"
+        static let aiSelectedChatModelID = "aiSelectedChatModelID"
+        static let aiEnabledCapabilityModelIDs = "aiEnabledCapabilityModelIDs"
+        static let fullPotentialEnabled = "fullPotentialEnabled"
+        static let cpuLaneEnabled = "cpuLaneEnabled"
+        static let batchedRuntimeEnabled = "batchedRuntimeEnabled"
+        static let mediaGenEnabled = "mediaGenEnabled"
+        static let backgroundAutonomyEnabled = "backgroundAutonomyEnabled"
+        static let fleetCloudEscalationEnabled = "fleetCloudEscalationEnabled"
+        static let videoProvider = "videoProvider"
+        static let mediaVideoBudgetPerDay = "mediaVideoBudgetPerDay"
         static let aiCommandLanguages = "aiCommandLanguages"
         static let aiReasoningEnabled = "aiReasoningEnabled"
         static let agentContextPreset = "agentContextPreset"
@@ -777,5 +909,6 @@ final class AppSettings: ObservableObject {
         static let keyboardLanguagePerSiteEnabled = "keyboardLanguagePerSiteEnabled"
         static let keyboardLanguageAllowBrowserControl = "keyboardLanguageAllowBrowserControl"
         static let showDockPreviews = "showDockPreviews"
+        static let commandTabSwitcher = "commandTabSwitcher"
     }
 }

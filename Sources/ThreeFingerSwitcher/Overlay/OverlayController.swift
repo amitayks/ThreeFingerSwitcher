@@ -125,6 +125,30 @@ final class OverlayController {
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.slideDuration, execute: work)
     }
 
+    /// Step the selection forward/back along the flat reel order (the ⌘-Tab driver). Animates the
+    /// Space-row slide ONLY when the step crosses into another Space; a within-Space step just moves the
+    /// highlight (as `moveHorizontal` does). Returns whether the Space-row changed, so the caller can
+    /// refresh that row's previews (mirroring `switchSpace`).
+    @discardableResult
+    func selectLinear(delta: Int, wrap: Bool) -> Bool {
+        guard let t = model.linearTarget(delta: delta, wrap: wrap) else { return false }
+        return applyLinear(row: t.row, index: t.index)
+    }
+
+    /// Apply a linear target. A row change slides the reel inside one explicit `withAnimation` (as
+    /// `updateRow` does, so it animates instead of snapping); a same-row change just moves the highlight.
+    private func applyLinear(row: Int, index: Int) -> Bool {
+        let rowChanged = row != model.currentRow
+        if rowChanged {
+            withAnimation(.easeInOut(duration: Self.slideDuration)) {
+                model.setRowAndColumn(row, column: index)
+            }
+        } else {
+            model.setColumn(index)
+        }
+        return rowChanged
+    }
+
     var currentRow: Int { model.currentRow }
     var rowCount: Int { model.rowCount }
     var selectedColumn: Int { model.selectedIndex }

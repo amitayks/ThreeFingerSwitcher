@@ -361,8 +361,15 @@ final class WindowService {
         logEntry(.commit, window: window, passed: nil, state: state, note: "")
 
         scheduleWatchdog(window, token: token, attempt: 0)
-        if !window.isOnCurrentSpace && StageManager.isEnabled {
-            scheduleNextHoldTick(window, token: token, tick: 0, refronts: 0)
+        // EVERY off-Space raise needs the polling hold-guard, not just under Stage Manager: a plain Space
+        // switch also restores the destination's last-focused window ~300–500ms later and steals frontmost
+        // (the "selected then deselected" race), and the single +180ms watchdog retires on its first
+        // passing probe — BEFORE that steal — so nothing else recovers it. Stage Manager's WindowManager
+        // re-steals repeatedly (full ~2.4s window); a plain switch steals once (shorter ~1.2s window, so we
+        // don't fight a deliberate user switch-away for as long).
+        if !window.isOnCurrentSpace {
+            let maxTicks = StageManager.isEnabled ? offSpaceHoldTicks : offSpaceHoldShortTicks
+            scheduleNextHoldTick(window, token: token, tick: 0, refronts: 0, maxTicks: maxTicks)
         }
     }
 
@@ -497,29 +504,34 @@ final class WindowService {
         )
     }
 
-    /// Off-Space focus-hold guard tuning. Under Stage Manager, WindowManager grabs frontmost ~300–500ms
-    /// after an off-Space raise — a key-less vacuum the +180ms watchdog is too early to see (verified by
-    /// trace). Rather than re-front at a fixed delay (a visible ~200ms flash), poll frequently and
-    /// re-front the INSTANT the steal is detected (≈ one poll of flash), then keep watching for the
-    /// occasional late re-steal. Bounded so a daemon that fights back can't make us thrash or loop.
+    /// Off-Space focus-hold guard tuning. After ANY off-Space raise the destination Space restores its
+    /// own last-focused window ~300–500ms later and steals frontmost from the just-raised target (the
+    /// "selected then deselected" race) — a key-less vacuum the +180ms watchdog is too early to see and
+    /// never rechecks once a probe passes. So this polling guard is the real defense: rather than
+    /// re-front at a fixed delay (a visible ~200ms flash), poll frequently and re-front the INSTANT the
+    /// steal is detected (≈ one poll of flash). Under Stage Manager, WindowManager re-steals REPEATEDLY,
+    /// so keep watching the full window; a plain Space switch steals ONCE, so a shorter window defeats it
+    /// without fighting a deliberate user switch-away for as long. Bounded so a daemon that fights back
+    /// can't make us thrash or loop.
     private let offSpaceHoldInterval: TimeInterval = 0.06   // detect the steal within ~one frame
-    private let offSpaceHoldTicks = 40                      // ~2.4s guard window (covers late re-steals)
+    private let offSpaceHoldTicks = 40                      // Stage Manager: ~2.4s (repeated re-steals)
+    private let offSpaceHoldShortTicks = 20                 // plain Space switch: ~1.2s (one-time steal)
     private let offSpaceHoldMaxRefronts = 6
 
-    private func scheduleNextHoldTick(_ window: WindowInfo, token: UInt64, tick: Int, refronts: Int) {
-        guard tick < offSpaceHoldTicks else { return }
+    private func scheduleNextHoldTick(_ window: WindowInfo, token: UInt64, tick: Int, refronts: Int, maxTicks: Int) {
+        guard tick < maxTicks else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + offSpaceHoldInterval) { [weak self] in
             MainActor.assumeIsolated {
-                self?.offSpaceHoldTick(window, token: token, tick: tick, refronts: refronts)
+                self?.offSpaceHoldTick(window, token: token, tick: tick, refronts: refronts, maxTicks: maxTicks)
             }
         }
     }
 
-    private func offSpaceHoldTick(_ window: WindowInfo, token: UInt64, tick: Int, refronts: Int) {
+    private func offSpaceHoldTick(_ window: WindowInfo, token: UInt64, tick: Int, refronts: Int, maxTicks: Int) {
         guard token == commitSeq else { return }            // superseded by a newer commit
         let state = FocusLog.probe(targetPID: window.pid)
         if state.frontmostMatchesTarget && state.frontmostHasKeyWindow {
-            scheduleNextHoldTick(window, token: token, tick: tick + 1, refronts: refronts)
+            scheduleNextHoldTick(window, token: token, tick: tick + 1, refronts: refronts, maxTicks: maxTicks)
             return
         }
         // Secure input held by another app: re-fronting can't help and may thrash — log and stop.
@@ -534,7 +546,7 @@ final class WindowService {
         }
         focusSequence(window, offSpaceHandshake: true)
         logEntry(.trace, window: window, passed: false, state: state, note: "hold-refront #\(refronts + 1) @tick\(tick)")
-        scheduleNextHoldTick(window, token: token, tick: tick + 1, refronts: refronts + 1)
+        scheduleNextHoldTick(window, token: token, tick: tick + 1, refronts: refronts + 1, maxTicks: maxTicks)
     }
 
     /// Run one focus sequence for `window`. With `offSpaceHandshake` the SkyLight setFront +

@@ -147,6 +147,55 @@ final class SwitcherModel: ObservableObject {
         return .moved
     }
 
+    // MARK: - Linear traversal (⌘-Tab keyboard driver)
+
+    /// Total windows across every Space-row — the length of the flat reel order.
+    var flatCount: Int { rows.reduce(0) { $0 + $1.count } }
+
+    /// Flat index of (row, index) in the reel order: rows concatenated in Mission-Control order, each
+    /// row's windows in snapshot order.
+    private func flatIndex(row: Int, index: Int) -> Int {
+        rows.prefix(row).reduce(0) { $0 + $1.count } + index
+    }
+
+    /// Map a flat reel index back to (row, indexInRow), clamped into range.
+    private func rowAndIndex(forFlat flat: Int) -> (row: Int, index: Int) {
+        guard flatCount > 0 else { return (0, 0) }
+        var remaining = clamp(flat, 0, flatCount - 1)
+        for (r, spaceWindows) in rows.enumerated() {
+            if remaining < spaceWindows.count { return (r, remaining) }
+            remaining -= spaceWindows.count
+        }
+        let lastRow = max(rows.count - 1, 0)                 // defensive (clamped above)
+        return (lastRow, max((rows.last?.count ?? 1) - 1, 0))
+    }
+
+    /// Pure: the (row, index) that stepping the selection by `delta` along the flat reel order lands on,
+    /// wrapping or clamping at the ends per `wrap`. Crossing a Space edge forward lands on the next
+    /// Space's first window; a backward wrap lands on the previous row's last window. `nil` when empty.
+    func linearTarget(delta: Int, wrap: Bool) -> (row: Int, index: Int)? {
+        guard flatCount > 0 else { return nil }
+        let cur = flatIndex(row: currentRow, index: selectedIndex)
+        var next = cur + delta
+        if wrap {
+            next = ((next % flatCount) + flatCount) % flatCount
+        } else {
+            next = clamp(next, 0, flatCount - 1)
+        }
+        return rowAndIndex(forFlat: next)
+    }
+
+    /// Move the selection to a specific Space-row AND column together (unlike `setRow`, which resets the
+    /// column to 0). The caller wraps this in `withAnimation` to slide the reel when the row changes; a
+    /// bare call lands instantly (matching a (re)show).
+    func setRowAndColumn(_ row: Int, column: Int) {
+        guard !rows.isEmpty else { return }
+        let target = clamp(row, 0, rows.count - 1)
+        if target != currentRow { lastRowDirection = target > currentRow ? 1 : -1 }
+        currentRow = target
+        applyCurrentRow(column: column)
+    }
+
     /// While a Space-switch slide animates, thumbnail updates are BUFFERED rather than published: a
     /// mid-slide `@Published` mutation re-renders the view, re-applies the reel `.offset` non-animated,
     /// and snaps the slide (preview-bearing cards jumping instead of sliding on a Space's first visit).

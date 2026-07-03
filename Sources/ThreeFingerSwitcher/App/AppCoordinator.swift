@@ -7,7 +7,7 @@ import DeviceLinkProtocol
 /// Owns and wires the whole pipeline: touch → recognizer → overlay highlight → commit raise.
 /// Also drives onboarding, settings, and the native-gesture consent flow.
 @MainActor
-final class AppCoordinator: GestureRecognizerDelegate {
+final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate {
     let settings = AppSettings.shared
     let permissions = PermissionsService()
     let trackpadConfig = TrackpadGestureConfig()
@@ -33,6 +33,13 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// feature set (resolving the shared four-finger keys) and snapshots pristine backups first.
     private let relocationApplier = RelocationApplier()
     private let scrollTap = ScrollEventTap()
+    /// The ⌘-Tab keyboard driver (opt-in `commandTabSwitcher`): the tap intercepts ⌘-Tab and feeds the
+    /// pure state machine, which emits open/step/first/commit/cancel intents into this coordinator.
+    private let keyboardSwitcherTap = KeyboardSwitcherTap()
+    private let keyboardSwitcher = KeyboardSwitcher()
+    /// Which driver currently owns the switcher overlay — enforces one session at a time (design D7).
+    private enum SwitcherOwner { case none, trackpad, keyboard }
+    private var switcherOwner: SwitcherOwner = .none
     private var cancellables: Set<AnyCancellable> = []
 
     // Dock-hover window previews (opt-in; the switcher "from another angle"). Reuses windowService for
@@ -178,9 +185,17 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// fabricated dev payload, so download/verify/load succeed WITHOUT a real multi-gigabyte fetch and
     /// the streaming canvas is fully usable in a signed build today. Swapping in the real runtime is a
     /// one-line `runtimeFactory` change (design D1/D7) — feature code never sees a concrete model.
-    private lazy var modelManager: ModelManager =
-        AIRuntimeInjection.modelManagerFactory?(settings.aiCommandsEnabled)
-        ?? DevAIRuntime.makeModelManager(optedIn: settings.aiCommandsEnabled)
+    private lazy var modelManager: ModelManager = {
+        // Resolve the two heavy GPU/CPU gates through the SINGLE resolver (`FullPotentialGate.isUnlocked`):
+        // a master-OFF or ai-commands-OFF locks BOTH at once (the calm panic-off), and each sub-flag gates
+        // only its own capability. The factory then constructs the CPU ternary lane / multi-stream batched
+        // runtime only when unlocked; OFF → today's single-GPU-lane, single-session build.
+        let gate = settings.fullPotentialGate
+        return AIRuntimeInjection.modelManagerFactory?(settings.aiCommandsEnabled,
+                                                       gate.isUnlocked(.cpuLane),
+                                                       gate.isUnlocked(.batchedRuntime))
+            ?? DevAIRuntime.makeModelManager(optedIn: settings.aiCommandsEnabled)
+    }()
     /// The agentic task layer (calendar / save-to-project / open-tool / send-to), driven by the model's
     /// structured output. Calendar permission is requested lazily at first calendar-task use.
     private lazy var taskDispatcher = TaskDispatcher(
@@ -195,6 +210,149 @@ final class AppCoordinator: GestureRecognizerDelegate {
     /// wired) records every tool step here, and the Hub AI page's audit viewer reads `recent(limit:)`
     /// synchronously + surfaces `lastPersistError` as a bounded, non-blocking banner. MLX-free Core.
     private lazy var auditLog = DiskAuditLog()
+    /// The live tool registry the AI route loop advertises + dispatches through (`wire-tool-routing`).
+    /// v1 contributes the parameterless side-effecting `TaskKind`s (EventKit calendar/reminder, Contacts)
+    /// as routable tools, bridged back into the UNCHANGED `taskDispatcher`. This is the EXTENSION POINT:
+    /// later waves ADD contributors to this array (`MemoryToolContributor`, `SkillToolProvider`,
+    /// `MediaToolContributor`, `ClaudeHandoffContributor`) — no loop change, just more descriptors.
+    // Generative media (`wire-media-tool`): the `generate_image` tool routes to the app's image
+    // `MediaRuntime` and FAILS HONESTLY until Wave 2 builds the diffusion pipeline (a clean bounded
+    // `MediaError`, never the model's raw tool-call text, never a blank/false-Done). The runtime is
+    // injected at the same seam as Gemma (`AIRuntimeInjection.imageRuntimeFactory`, set in `main.swift`);
+    // Core/test builds leave it nil so the tool simply isn't advertised (MLX-free).
+    /// The persisted image-model selection (Q4 default / FP16 opt-in). No Hub picker is wired yet, so this
+    /// resolves to `nil` → the Q4 default (`ImageModelCatalog.selected`); when an `imageModelID` setting
+    /// lands it threads through here unchanged.
+    private var aiImageModelID: String? { nil }
+    /// The image backend for the selected `imageModelID`, or nil in a Core/test build. Resolved once from
+    /// the injected factory.
+    private lazy var aiImageRuntime: MediaRuntime? =
+        AIRuntimeInjection.imageRuntimeFactory?(aiImageModelID)
+    /// Output #1 — the generated-media gallery (a Files-band `.fileEntry` source). Local-only.
+    private let aiMediaGallery = MediaGallery()
+    /// The thread-safe live mirror of the AI route loop's `AppSettings`-derived gating inputs (Full
+    /// Potential master / media / cloud gates + the cloud-video budget). The route loop's contributors run
+    /// OFF the main actor (`AgentLoop` is a non-isolated `Sendable` struct), so their `@Sendable` gating
+    /// closures MUST read these values from any thread WITHOUT `MainActor.assumeIsolated` (which traps off
+    /// main — the first-routed-tool crash). The main actor refreshes it on every relevant settings change
+    /// (`refreshAIGatingSnapshot()`), so gating stays LIVE, not a stale build-time snapshot.
+    private let aiGatingSnapshot = AIGatingSnapshot()
+    /// The cloud-video per-day budget cap (consumed by the contributor + sink). Video has no provider
+    /// wired yet, so this is effectively dormant; the cap reads the live snapshot (refreshed on every
+    /// settings change) — thread-safe off the main actor, where the route loop's sink runs.
+    private lazy var aiMediaVideoBudget = PerDayVideoBudget(
+        cap: { [aiGatingSnapshot] in aiGatingSnapshot.mediaVideoBudgetPerDay })
+    /// The route-loop executor for a routed media call — drives the runtime, threads progress, writes the
+    /// gallery asset, and returns a clean `.done`/`.declined`/`.failed` step. Video runtime is nil (its
+    /// own wave); image is the injected `aiImageRuntime`.
+    private lazy var aiMediaGenSink = MediaGenSink(
+        imageRuntime: aiImageRuntime,
+        videoRuntime: nil,
+        gallery: aiMediaGallery,
+        budget: aiMediaVideoBudget,
+        audit: auditLog,
+        imageModelID: aiImageModelID)
+    /// The media-tool availability gate (master ∧ media floor; cloud-video extras). Reads the live
+    /// `fullPotentialEnabled`/`mediaGenEnabled` flags; no video provider is wired, so `generate_video`
+    /// stays dark until that wave.
+    private lazy var aiMediaAvailability = MediaToolAvailability(
+        // These `@Sendable` predicates are invoked by `MediaToolContributor.descriptors()`/`videoAvailable`,
+        // which the route loop reaches OFF the main actor (`AgentLoop` is a non-isolated `Sendable` struct).
+        // So they MUST read the gating flags thread-safely, NOT via `MainActor.assumeIsolated` (which TRAPS
+        // off main — the first-routed-tool crash). They read the live `aiGatingSnapshot`, which the main
+        // actor refreshes on every relevant settings change, so gating stays LIVE (never a stale snapshot).
+        // Each gate already routed through the SINGLE resolver (`FullPotentialGate.isUnlocked`) at refresh
+        // time — so `mediaGen` / `fleetCloud` are honestly locked whenever the master or ai-commands opt-in
+        // is off (the calm panic-off), never just their own sub-flag. `isFullPotentialEnabled` stays the raw
+        // master read (the contributor ANDs it with `isMediaGenEnabled`, which is already the full gate).
+        isFullPotentialEnabled: { [aiGatingSnapshot] in aiGatingSnapshot.isFullPotentialEnabled },
+        isMediaGenEnabled: { [aiGatingSnapshot] in aiGatingSnapshot.isMediaGenUnlocked },
+        isCloudEscalationEnabled: { [aiGatingSnapshot] in aiGatingSnapshot.isFleetCloudUnlocked },
+        hasVideoProvider: { false })
+
+    // MARK: - Memory + Skills (`wire-memory-skills`)
+    //
+    // The agent's long-term memory store: `core.md` facts + `subfiles/` notes under Application Support
+    // (`…/ThreeFingerSwitcher/memory`, created on first write). MLX-free Core; the `MemoryToolProvider`
+    // projects it into the `memory.read` (.auto) / `memory.write`/`update`/`forget`/`promote` (.confirm)
+    // routable tools the registry advertises. The default-directory init points at the live folder.
+    private let aiMemoryStore = MemoryStore()
+    private lazy var aiMemoryToolProvider = MemoryToolProvider(store: aiMemoryStore)
+
+    // The skills store: built-in skills are projected in-memory from `AICommandCatalog` (the catalog stays
+    // the source of truth) ∪ user `.skill.md` files dropped into `…/ThreeFingerSwitcher/Skills/`. The
+    // folder watcher coalesces edits into an off-main reload that republishes the snapshot (no rebuild).
+    // The migration is a no-op by design (built-ins are projected, never written to disk) and idempotent.
+    private let aiSkillStore = SkillStore(userFolder: AppCoordinator.skillsUserFolder())
+    // A lazily-resolving runtime: skills generate their text result through the resident model, loaded
+    // lazily by `ModelManager`. The forwarder resolves it at call time (cheap — kept resident) so the
+    // registry can be built before any model is loaded; a no-model state surfaces as a clean `.failed`.
+    private lazy var aiSkillRuntime = ForwardingLLMRuntime(
+        resolve: { [modelManager] caps in try await modelManager.runtime(requiring: caps) })
+    private lazy var aiSkillToolProvider = SkillToolProvider(
+        manifests: SkillStore.builtInManifests(),
+        runtime: aiSkillRuntime,
+        dispatcher: taskDispatcher,
+        globalReasoning: settings.aiReasoningEnabled)
+
+    /// Watches the user `Skills/` folder and coalesces edits into an off-main `store.loadAll()` that
+    /// republishes the snapshot — a dropped/edited `.skill.md` appears with NO rebuild. Built-ins are
+    /// projected in-memory (loaded once, never watched). Started in `start()`; nil until then.
+    private var aiSkillWatcher: SkillFolderWatcher?
+
+    /// The live Skills user folder (`…/Application Support/ThreeFingerSwitcher/Skills`, created on first
+    /// run by the store's load). Parallels `MemoryStore.defaultDirectory()`.
+    private static func skillsUserFolder() -> URL {
+        let base = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                                 appropriateFor: nil, create: true))
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        return base.appendingPathComponent("ThreeFingerSwitcher/Skills", isDirectory: true)
+    }
+
+    private lazy var aiToolRegistry = ToolRegistry([
+        TaskKindToolContributor(
+            dispatcher: taskDispatcher,
+            kinds: [.addToCalendar, .addToReminder, .newContact]),
+        // Generative media (`wire-media-tool`): advertises `generate_image` (and later `generate_video`)
+        // when the master ∧ media flags are on AND a capable runtime is wired; dispatches to the sink.
+        MediaToolContributor(
+            availability: aiMediaAvailability,
+            imageRuntime: aiImageRuntime,
+            videoRuntime: nil,
+            budget: aiMediaVideoBudget,
+            sink: aiMediaGenSink),
+        // Long-term memory (`wire-memory-skills`): `memory.read`/`write`/`update`/`forget`/`promote`.
+        aiMemoryToolProvider,
+        // Skills as tools (`wire-memory-skills`): each built-in/user skill projected as a routable tool.
+        aiSkillToolProvider
+        // + future contributors here.
+    ])
+    /// The v1 candidate retriever: cheap keyword ranking over the registry's descriptors, offering ~5
+    /// tools per turn (the loop also offers `widen_candidates` so the model can ask for more).
+    private lazy var aiToolCandidateSource =
+        KeywordToolCandidateSource(all: { [aiToolRegistry] in aiToolRegistry.allDescriptors() })
+
+    /// Background autonomy (`ai-background-autonomy`): the per-step auto-vs-escalate runner. Built ONLY
+    /// when `FullPotentialGate.isUnlocked(.backgroundAutonomy)` (master ∧ sub-flag ∧ ai-commands) — when
+    /// LOCKED this is `nil`, so the `AICommandExecutor`/`AgentLoop` take the plain foreground path: a
+    /// parked session's step simply doesn't auto-run/escalate (calmly inert, no error, never a false
+    /// "Done"). Reads the live whitelist (the trust boundary) and routes escalation + park-state through
+    /// the live `ParkController`; every step is audited to the shared `auditLog`.
+    private lazy var aiBackgroundRunner: BackgroundToolRunner? = {
+        guard settings.fullPotentialGate.isUnlocked(.backgroundAutonomy) else { return nil }
+        // The route loop drives `BackgroundToolRunner.run` (and thus `parkStateOf`) OFF the main actor, so
+        // this `@Sendable` closure MUST read park state thread-safely, NOT via `MainActor.assumeIsolated`
+        // (which TRAPS off main). `ParkScheduler.parkState(of:)` is the lock-guarded, any-thread read (the
+        // same live state `ParkController.parkState(of:)` exposes) — no main-actor hop, fully live (an
+        // unknown id → `.active`, the foreground path).
+        let scheduler = parkController.parkScheduler
+        return BackgroundToolRunner(
+            resolver: BackgroundPolicyResolver(whitelist: settings.agentWhitelist),
+            audit: auditLog,
+            scheduler: scheduler,
+            parkStateOf: { id in scheduler.parkState(of: id) })
+    }()
+
     private lazy var aiCommandExecutor = AICommandExecutor(
         modelManager: modelManager,
         selection: selectionService,
@@ -204,7 +362,18 @@ final class AppCoordinator: GestureRecognizerDelegate {
         },
         loadLanguage: { [weak self] id in self?.settings.rememberedLanguage(for: id) },
         saveLanguage: { [weak self] id, lang in self?.settings.rememberLanguage(lang, for: id) },
-        reasoning: { [weak self] in self?.settings.aiReasoningEnabled ?? false }
+        reasoning: { [weak self] in self?.settings.aiReasoningEnabled ?? false },
+        registry: aiToolRegistry,
+        candidateSource: aiToolCandidateSource,
+        // Active-skill allow-list (`wire-memory-skills`): the bound skill's `toolNames` are always offered
+        // as candidates while it drives the conversation. Resolves through the live store (user skills,
+        // post-reload) with a synchronous built-in projection fallback (so it works before the async load).
+        skillTools: { [aiSkillStore] id in
+            (aiSkillStore.manifest(id: id)
+                ?? SkillStore.builtInManifests().first { $0.id == id })?.toolNames ?? []
+        },
+        // Background autonomy: nil when `.backgroundAutonomy` is locked (the plain foreground path).
+        backgroundRunner: aiBackgroundRunner
     )
 
     // Per-app keyboard language (opt-in; remembers and re-selects the input source per app/site). Gated
@@ -363,6 +532,8 @@ final class AppCoordinator: GestureRecognizerDelegate {
 
     init() {
         recognizer.delegate = self
+        keyboardSwitcher.delegate = self
+        keyboardSwitcherTap.input = keyboardSwitcher
         touchEngine.onFrame = { [weak self] frame in
             guard let self else { return }
             self.currentFingerCount = frame.fingerCount
@@ -521,6 +692,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         observeEnabledToggle()
         observeSpacesRearrangeToggle()
         observeVerticalGestureToggle()
+        observeCommandTabToggle()
         observeLauncherToggle()
         observeClipboardToggle()
         observeDeviceLinkToggle()
@@ -531,6 +703,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         observeKeyboardLanguageBrowserControlToggle()
         observeDockPreviewsToggle()
         observeParkToggle()
+        observeAIGatingSnapshot()
         reconcileAIModelAtLaunch()
     }
 
@@ -608,11 +781,30 @@ final class AppCoordinator: GestureRecognizerDelegate {
         // captures don't stall the reel slide mid-animation (SCK stays warm process-wide thereafter —
         // the reason only the first run stutters). No-op without Screen Recording permission.
         Task { await thumbnails.warmUp() }
+        // Skills-as-files (`wire-memory-skills`): load the built-in ∪ user skill corpus off-main once (this
+        // IS the idempotent catalog→skill-files migration — built-ins are projected in-memory, so there's
+        // nothing on disk to rewrite), then start the folder watcher so a dropped/edited user `.skill.md`
+        // re-indexes with no rebuild. The store's `loaded` snapshot backs `manifest(id:)` (the active-skill
+        // allow-list resolver) and `index()`. AI feature-gated, like the park rail.
+        if settings.aiCommandsEnabled { startSkillsLoadAndWatch() }
         // The First Touch wizard IS the first-run flow: it replaced the four one-shot consent
         // alerts (didPrompt* — set on the wizard's completion so they can never fire) and the
         // open-Hub-on-Setup fallback. Resume-aware: any interruption (relaunch, re-login, plain
         // quit) reopens at the right act.
         maybeShowFirstTouchWizard()
+    }
+
+    /// Load the skill corpus once + start the user-folder watcher (`wire-memory-skills`). Idempotent: a
+    /// re-call no-ops the watcher (it's started once) and re-loads the snapshot. The built-in projection is
+    /// already available synchronously to the provider/resolver; this populates the store's `loaded` so
+    /// user-folder skills (shadowing/extra) participate in `manifest(id:)`/`index()`.
+    private func startSkillsLoadAndWatch() {
+        guard aiSkillWatcher == nil else { return }
+        let store = aiSkillStore
+        Task { _ = await store.loadAll() }   // initial off-main load (the idempotent migration is a no-op)
+        let watcher = SkillFolderWatcher(store: store, onReload: { _ in })   // store.loadAll() updates `loaded`
+        aiSkillWatcher = watcher
+        watcher.start()
     }
 
     // MARK: - Enable / disable
@@ -635,6 +827,8 @@ final class AppCoordinator: GestureRecognizerDelegate {
         recognizer.reset()
         touchEngine.stop()
         scrollTap.stop()
+        keyboardSwitcherTap.stop()
+        keyboardSwitcher.forceCancel()   // tear down any open ⌘-Tab session before hiding the overlay
         mru.stop()
         focus.stop()
         overlay.hide()
@@ -710,6 +904,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         // Drop any in-flight gesture/overlay so we don't wake into a half-committed state.
         guard isEnabled else { return }
         recognizer.reset()
+        keyboardSwitcher.forceCancel()   // don't wake into a half-open ⌘-Tab session
         overlay.hide()
         stopPreviewRefresh()
         launcherOverlay.cancel()
@@ -790,9 +985,21 @@ final class AppCoordinator: GestureRecognizerDelegate {
         // that responds (the live-hand act mirrors the same frames), so the real overlay would
         // double the scene. Commits stay inert via the first-run Accessibility gate.
         guard !wizardOwnsGestures else { return }
+        // A ⌘-Tab session owns the overlay: the trackpad gesture defers rather than clobber it (D7).
+        guard switcherOwner != .keyboard else { return }
         // Decide ONCE whether this gesture is a Hub teaching run (rehearsing on the Switcher section): if so
         // the genuine overlay still rises to teach, but its commit/Mission-Control are neutralized below.
         switcherDemoGestureInFlight = switcherDemoActive
+        _ = openSwitcher(owner: .trackpad)
+    }
+
+    /// Open the switcher overlay from either driver (the trackpad gesture or ⌘-Tab). Input-agnostic:
+    /// snapshot windows (+ the synthetic Hub card when open), group into Space-rows, show, seed every
+    /// Space's cached previews, capture the visible row, and start the periodic refresh. Records the
+    /// owning driver so only one session runs at a time. Returns whether it actually opened (false when
+    /// there are no windows to show).
+    @discardableResult
+    private func openSwitcher(owner: SwitcherOwner) -> Bool {
         var windows = windowService.snapshot()
         // Inject the configuration Hub as a synthetic switcher entry whenever it is open. The snapshot
         // filters out our own PID (so the overlay panels never leak); the Hub is the one window we add
@@ -800,7 +1007,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         if let hub = hubSwitcherEntry(snapshot: windows) {
             windows.append(hub)
         }
-        guard !windows.isEmpty else { return }
+        guard !windows.isEmpty else { return false }
         let grid = SpaceGrouping.group(windows)
         // When the app has Mission Control open, float the overlay above it (otherwise it renders
         // behind the MC windows). The elevated config is scoped to this case in `OverlayController`.
@@ -810,9 +1017,11 @@ final class AppCoordinator: GestureRecognizerDelegate {
                      // dim with a pending glyph so the gated vertical axis explains itself.
                      rowSwitchingPending: settings.manageVerticalGesture && !isSpaceRowSwitchingEffective,
                      windowScale: CGFloat(settings.switcherWindowScale))
+        switcherOwner = owner
         seedAllRows()         // every Space's cached previews present up front (no first-visit rebuild)
         prefetchCurrentRow()  // immediate capture of the whole visible row (no highlight needed)
         startPreviewRefresh()
+        return true
     }
 
     /// Build the synthetic Hub switcher entry from live state, or `nil` when the Hub isn't open. Reads
@@ -942,6 +1151,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
     }
 
     func gestureDidCommit() {
+        switcherOwner = .none   // the session is ending regardless of which branch below runs
         // A Hub teaching run: the genuine overlay was shown only to demonstrate — dismiss it and raise
         // NOTHING (no window, no Space change). This is what keeps the Switcher section from ever firing the
         // real switcher even though the real overlay is what the user sees.
@@ -999,9 +1209,96 @@ final class AppCoordinator: GestureRecognizerDelegate {
     }
 
     func gestureDidCancel() {
+        switcherOwner = .none
         switcherDemoGestureInFlight = false
         overlay.hide()
         stopPreviewRefresh()
+    }
+
+    // MARK: - KeyboardSwitcherDelegate (⌘-Tab driver)
+    //
+    // These run INSIDE the keyboard event-tap callback, which the WindowServer blocks on until it
+    // returns — so the callback must stay cheap. All heavy work (window snapshot, overlay show,
+    // thumbnail prefetch, the cross-Space raise) is dispatched to the next main-runloop tick; only cheap
+    // ownership bookkeeping stays synchronous. The blocks queue in event order (FIFO), so open runs
+    // before its steps and commit runs last. (The trackpad path calls the SAME shared methods
+    // synchronously from the touch-frame handler, which does not block the WindowServer, so it is
+    // unaffected.) Doing this work synchronously in the tap callback stalled the whole input pipeline —
+    // including trackpad frames + highlight rendering on the same main thread — behind each keypress.
+
+    /// First Tab: claim ownership synchronously (so following steps see it) and open on the next tick.
+    /// Refuses (returns false, leaving the session armed to retry) while onboarding owns the stage or a
+    /// trackpad gesture already owns the overlay (D7).
+    func keyboardSwitcherOpen() -> Bool {
+        guard !wizardOwnsGestures, !switcherDemoActive else { return false }
+        guard switcherOwner != .trackpad else { return false }
+        switcherOwner = .keyboard
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.switcherOwner == .keyboard else { return }
+            if !self.openSwitcher(owner: .keyboard) { self.switcherOwner = .none }   // no windows → release
+        }
+        return true
+    }
+
+    /// Tab (forward) / Shift+Tab (backward): step the selection one window along the flat reel order,
+    /// flowing across Spaces in that direction. A cross-Space step refreshes the newly visible row's
+    /// previews (as `switchSpace` does for the trackpad).
+    func keyboardSwitcherStep(forward: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.switcherOwner == .keyboard, self.overlay.isVisible else { return }
+            if self.overlay.selectLinear(delta: forward ? 1 : -1, wrap: self.settings.wrapAtEnds) {
+                self.afterKeyboardRowChange()
+            }
+        }
+    }
+
+    /// Up/Down arrow: jump directly to the adjacent Space (its first window), reusing the trackpad's
+    /// `switchSpace`. The direction mirrors the trackpad's vertical scrub exactly — `up ? +1 : -1`,
+    /// flipped by `reverseVerticalDirection` (same computation as `GestureRecognizer.emitRowStep`) — so
+    /// the Up arrow and an up-scrub move the reel the same way.
+    func keyboardSwitcherStepSpace(up: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.switcherOwner == .keyboard, self.overlay.isVisible else { return }
+            var delta = up ? 1 : -1
+            if self.settings.reverseVerticalDirection { delta = -delta }
+            self.switchSpace(by: delta)
+        }
+    }
+
+    /// ⌘ released: commit through the shared raise path (cross-Space raise, Hub card, and
+    /// Mission-Control-open handling all live in `gestureDidCommit` — reuse, don't duplicate).
+    ///
+    /// DEFERS like open/step (and cancel), so the whole sequence drains in FIFO order — open → step →
+    /// commit — keeping the invariant that commit runs AFTER the open that shows the overlay and the step
+    /// that advances it. A SYNCHRONOUS commit broke that order on a fast ⌘-Tab press-release: the tap can
+    /// process the entire ⌘-down / Tab / ⌘-up burst before the run loop drains the deferred open/step, so
+    /// a synchronous commit ran FIRST — it saw `overlay.isVisible == false` (open hadn't run), dismissed
+    /// nothing, and the open/step then drained and stranded a now-commitless overlay on screen (§9.7).
+    /// Focus no longer needs the raise to be synchronous: `WindowService.raise` arms the polling
+    /// hold-guard for EVERY off-Space raise (§9.5), which re-fronts the target for ~1.2s and defeats the
+    /// "selected then deselected" steal regardless of WHEN the raise fires. Deferring by one run-loop
+    /// tick is imperceptible and is a ONE-TIME end-of-gesture raise (not per-keystroke browsing work), so
+    /// it reintroduces neither the focus-steal nor the browsing lag.
+    func keyboardSwitcherCommit() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.switcherOwner == .keyboard else { return }
+            self.gestureDidCommit()
+        }
+    }
+
+    /// Esc, or an external teardown: dismiss without raising, through the shared cancel path.
+    func keyboardSwitcherCancel() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.switcherOwner == .keyboard else { return }
+            self.gestureDidCancel()
+        }
+    }
+
+    /// The tail of a ⌘-Tab Space crossing: seed + capture the new row and freeze late captures for the
+    /// slide, exactly as `switchSpace` does for a trackpad grid-edge crossing.
+    private func afterKeyboardRowChange() {
+        prefetchCurrentRow()
+        overlay.beginSlideFreeze()
     }
 
     // MARK: - GestureRecognizerDelegate (four-finger launcher)
@@ -1710,6 +2007,33 @@ final class AppCoordinator: GestureRecognizerDelegate {
             .store(in: &cancellables)
     }
 
+    /// Keep the off-main `aiGatingSnapshot` in step with the live Full Potential gating flags + cloud-video
+    /// budget, so the route loop's `@Sendable` gating closures read CURRENT values (not a stale build-time
+    /// snapshot) WITHOUT trapping off the main actor. Seeds once now, then refreshes on every relevant
+    /// `@Published` change (`@Published` fires in `willSet`, so we re-read the assembled gate AFTER the
+    /// change lands by hopping onto the main run loop's next tick via `receive(on:)`). The flags feeding the
+    /// gate: the ai-commands opt-in + the master + the media/cloud sub-flags + the cloud-video budget.
+    private func observeAIGatingSnapshot() {
+        aiGatingSnapshot.refresh(from: settings)   // seed before the first AI command can route a tool
+        // Each `@Published` emits its current value on subscribe; those initial emissions are harmless
+        // (they re-seed the same values just set above — `refresh` is idempotent). Every later emission is a
+        // real flag edit; `receive(on:)` defers the re-read to the next main-run-loop tick so the new value
+        // (set in `willSet`) has landed before we re-assemble the gate.
+        Publishers.MergeMany(
+            settings.$aiCommandsEnabled.map { _ in () }.eraseToAnyPublisher(),
+            settings.$fullPotentialEnabled.map { _ in () }.eraseToAnyPublisher(),
+            settings.$mediaGenEnabled.map { _ in () }.eraseToAnyPublisher(),
+            settings.$fleetCloudEscalationEnabled.map { _ in () }.eraseToAnyPublisher(),
+            settings.$mediaVideoBudgetPerDay.map { _ in () }.eraseToAnyPublisher()
+        )
+        .receive(on: RunLoop.main)
+        .sink { [weak self] in
+            guard let self else { return }
+            self.aiGatingSnapshot.refresh(from: self.settings)
+        }
+        .store(in: &cancellables)
+    }
+
     /// Install / tear down the coarse auto-dismiss timer alongside the park rail (design D1). Each tick runs
     /// the authoritative auto-dismiss pass; idempotent (invalidates any prior timer first) and safe to call
     /// with `false` repeatedly.
@@ -1959,6 +2283,28 @@ final class AppCoordinator: GestureRecognizerDelegate {
                 // The manager already reflects `.failed` (clean headline + details) in its observable
                 // state, which the Settings row renders with a Retry action. Just log for diagnostics.
                 NSLog("[ThreeFingerSwitcher] AI model download failed: \(AIError.message(for: error).details ?? AIError.message(for: error).headline)")
+            }
+        }
+    }
+
+    /// Download a SPECIFIC capability fleet model (image / ternary / video) the user just enabled in the
+    /// roster. Reuses the EXISTING `ModelManager.downloadAndVerify` path (the same provisioner / byte-SHA
+    /// pipeline `downloadAIModel` drives) — no new provisioning seam. The PRIMARY error surface is the
+    /// roster row's per-model `.failed` status + Retry; the manager's observable state already carries the
+    /// clean headline + copyable details. No app-modal `NSAlert` here (it would freeze the Settings window).
+    private func downloadCapabilityModel(_ descriptor: ModelDescriptor) {
+        modelManager.setOptedIn(settings.aiCommandsEnabled)
+        Task { @MainActor in
+            do {
+                try await modelManager.downloadAndVerify(descriptor)
+            } catch is CancellationError {
+                // User cancelled — not a failure; the manager already reset its state.
+            } catch RuntimeError.cancelled {
+                // Same: a cancelled provision is not a failure surface.
+            } catch {
+                // The manager already reflects `.failed` (clean headline + details) in its observable
+                // state, which the roster row renders. Just log for diagnostics.
+                NSLog("[ThreeFingerSwitcher] AI capability model download failed: \(AIError.message(for: error).details ?? AIError.message(for: error).headline)")
             }
         }
     }
@@ -2255,6 +2601,20 @@ final class AppCoordinator: GestureRecognizerDelegate {
         } else {
             scrollTap.stop()
         }
+        refreshCommandTabGate()
+    }
+
+    /// Install the ⌘-Tab keyboard tap only while the switcher is enabled AND the opt-in is on; otherwise
+    /// remove it (native ⌘-Tab restored immediately, no re-login) and tear down any open session. Folded
+    /// into `refreshRowSwitchingGate` so every lifecycle point (launch, enable, setting changes, wake)
+    /// keeps it in sync; `observeCommandTabToggle` also calls it when only the opt-in flips.
+    private func refreshCommandTabGate() {
+        if isEnabled && settings.commandTabSwitcher {
+            _ = keyboardSwitcherTap.start()
+        } else {
+            keyboardSwitcherTap.stop()
+            keyboardSwitcher.forceCancel()
+        }
     }
 
     /// React to the Settings toggle: enabling relocates the native vertical gesture, disabling
@@ -2268,6 +2628,18 @@ final class AppCoordinator: GestureRecognizerDelegate {
                 // relocation rewrite (and a modal alert on failure) is blocking and otherwise stalled the
                 // SwiftUI render until the page was rebuilt. See observeSpacesRearrangeToggle.
                 DispatchQueue.main.async { self?.handleVerticalGestureToggle(enabled) }
+            }
+            .store(in: &cancellables)
+    }
+
+    /// React to the ⌘-Tab opt-in toggle: install/remove the keyboard tap live (no re-login). The
+    /// persisted initial value is skipped (`dropFirst`); launch-apply runs via `refreshRowSwitchingGate`
+    /// in `start()`.
+    private func observeCommandTabToggle() {
+        settings.$commandTabSwitcher
+            .dropFirst()
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { self?.refreshCommandTabGate() }
             }
             .store(in: &cancellables)
     }
@@ -2932,6 +3304,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
         ctx.onClearClipboard = { [weak self] includingPinned in self?.clipboardStore.clear(includingPinned: includingPinned) }
         // AI.
         ctx.onDownloadModel = { [weak self] in self?.downloadAIModel() }
+        ctx.onDownloadCapabilityModel = { [weak self] descriptor in self?.downloadCapabilityModel(descriptor) }
         // AI — Background autonomy audit viewer (`ai-background-autonomy`, §7). The viewer reads the
         // durable ledger synchronously; a store-persist failure is surfaced as a bounded, non-blocking
         // banner (headline routed through the single `AIError.message(for:)` translator — never raw OS text).
@@ -3009,6 +3382,7 @@ final class AppCoordinator: GestureRecognizerDelegate {
 
     /// Order the overlay out (idempotent) — used on resign-active to avoid a leaked panel.
     func hideOverlay() {
+        keyboardSwitcher.forceCancel()   // never leave a ⌘-Tab session open behind the hidden overlay
         overlay.hide()
         stopPreviewRefresh()
     }

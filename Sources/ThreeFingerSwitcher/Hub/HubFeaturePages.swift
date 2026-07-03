@@ -105,6 +105,11 @@ struct SwitcherPage: View {
                     driver.gesture = HubSwitcherDemo.teachingGesture(
                         openLength: HubSwitcherDemo.openLength(forActivation: threshold))
                 }
+                // Drive this same window switcher from ⌘-Tab (instead of the native app switcher). Sits
+                // right under the master enable and needs it on (⌘-Tab reuses the switcher's engine).
+                SwitchRow("Use ⌘-Tab for the window switcher", isOn: $settings.commandTabSwitcher,
+                          caption: "Replaces the macOS ⌘-Tab app switcher: hold ⌘, Tab steps forward across Spaces, ⇧Tab back, release ⌘ to switch, Esc cancels. No new permission or logout — turn off to restore the native ⌘-Tab.")
+                    .disabled(!settings.enabled)
             }
             HubSection("How the gesture works") {
                 SwitcherActionMap()
@@ -498,9 +503,21 @@ struct AIPage: View {
                 set: { settings.aiSelectedModelID = $0 })
     }
 
+    /// The fleet roster's ACTIVE CHAT radio binding (`aiSelectedChatModelID`; nil = chat default).
+    private var chatModelSelection: Binding<String?> {
+        Binding(get: { settings.aiSelectedChatModelID },
+                set: { settings.aiSelectedChatModelID = $0 })
+    }
+
+    /// The fleet roster's ENABLED CAPABILITY toggles binding (`aiEnabledCapabilityModelIDs`).
+    private var capabilityModelSelection: Binding<Set<String>> {
+        Binding(get: { settings.aiEnabledCapabilityModelIDs },
+                set: { settings.aiEnabledCapabilityModelIDs = $0 })
+    }
+
     /// The model the management surface shows: the user's pinned selection if it resolves, else default.
     private var selectedModelDescriptor: ModelDescriptor {
-        let registry = ModelRegistry.standard
+        let registry = ModelCatalog.standard
         if let id = settings.aiSelectedModelID, let d = registry.descriptor(id: id) { return d }
         return registry.defaultDescriptor ?? registry.models[0]
     }
@@ -619,6 +636,75 @@ struct AIPage: View {
         return "A heavy skill may raise the effective context for its own session (read-only — authored on the skill)."
     }
 
+    // MARK: - Release Full Potential (ai-full-potential-toggle, addendum §D1)
+
+    /// Per-capability binding into `AppSettings` for the five sub-flags. The gate reads these at consult
+    /// time; the Hub writes them directly (turning the master off NEVER zeroes them — see `panic-off`).
+    private func subFlagBinding(_ capability: FullPotentialCapability) -> Binding<Bool> {
+        switch capability {
+        case .cpuLane:            return $settings.cpuLaneEnabled
+        case .batchedRuntime:     return $settings.batchedRuntimeEnabled
+        case .mediaGen:           return $settings.mediaGenEnabled
+        case .backgroundAutonomy: return $settings.backgroundAutonomyEnabled
+        case .fleetCloud:         return $settings.fleetCloudEscalationEnabled
+        }
+    }
+
+    /// The sub-toggle's human title.
+    private func subFlagTitle(_ capability: FullPotentialCapability) -> String {
+        switch capability {
+        case .cpuLane:            return "CPU lane"
+        case .batchedRuntime:     return "Batched runtime"
+        case .mediaGen:           return "Media generation"
+        case .backgroundAutonomy: return "Background autonomy"
+        case .fleetCloud:         return "Cloud escalation"
+        }
+    }
+
+    /// The persistent, ALWAYS-VISIBLE cost line (RAM / heat / latency / $) — rendered inline as the row's
+    /// caption, never behind a tooltip (design Decision 4; the honest-surface ethos). The media + cloud
+    /// rows state the hard truths plainly: media evicts chat; cloud spends real money + sends data
+    /// off-device.
+    private func subFlagCost(_ capability: FullPotentialCapability) -> String {
+        switch capability {
+        case .cpuLane:
+            return "Heat / battery — a second (CPU) lane runs concurrently for fast small jobs. Short structured bursts only; CPU per-token is slower."
+        case .batchedRuntime:
+            return "RAM + latency — multiplexes several background sessions over one weight read. Larger context means more resident KV cache, and latency rises under load."
+        case .mediaGen:
+            return "RAM (eviction) + latency + disk — a heavy generation evicts chat: the assistant goes quiet while it paints. Minutes per clip; tens of gigabytes of weights."
+        case .backgroundAutonomy:
+            return "Unattended action — the agent may act while you're away. Only whitelisted, contained writes auto-run; dangerous ones still ask, and everything is audited."
+        case .fleetCloud:
+            return "$ + network — spends real money and sends data off-device to a paid cloud model (Claude / GLM-5.2). Budget-capped + audited; off until you arm it."
+        }
+    }
+
+    /// The Full Potential section: the master toggle FIRST, then the five sub-toggles (disabled while the
+    /// master is off — visibly relocked — but their persisted values RETAINED). Each sub-row carries its
+    /// cost inline. Shared Liquid Glass presentation (`HubSection` card). The whole section is itself gated
+    /// behind the AI-commands opt-in (the fleet is a strict subset of the AI feature).
+    @ViewBuilder private var fullPotentialSection: some View {
+        HubSection("Release Full Potential",
+                   footnote: "The agent ships calm: every heavy capability below is off until you release it here, and each states its own cost in the same breath it offers itself. Turning the master off relocks them all at once (your choices are kept, just inert) — a single calm panic-off. Cloud escalation stays off until you arm it: no surprise spend, no data leaving the device.") {
+            // The master toggle FIRST. No cost line of its own — it just lights up the section.
+            SwitchRow("Release Full Potential", isOn: $settings.fullPotentialEnabled,
+                      caption: "Lights up the agent fleet. Each capability below states its own cost.")
+                .disabled(!settings.aiCommandsEnabled)
+
+            Divider()
+
+            // The five sub-toggles, rendered by iterating the capability enum. Disabled (visibly relocked)
+            // while the master is off; flipping the master off retains these stored values (no zeroing).
+            ForEach(FullPotentialCapability.allCases, id: \.self) { capability in
+                SwitchRow(subFlagTitle(capability),
+                          isOn: subFlagBinding(capability),
+                          caption: subFlagCost(capability))
+                    .disabled(!settings.aiCommandsEnabled || !settings.fullPotentialEnabled)
+            }
+        }
+    }
+
     var body: some View {
         HubPage(HubDestination.ai.title,
                 subtitle: "Run on-device AI commands. Author the commands themselves on the Bands page.") {
@@ -662,21 +748,29 @@ struct AIPage: View {
                 )
                 .disabled(!settings.aiCommandsEnabled)
             }
-            HubSection("Model") {
-                let registry = ModelRegistry.standard
-                Picker("Model", selection: modelSelection) {
-                    Text("Default (\(registry.defaultDescriptor?.displayName ?? "registry"))").tag(String?.none)
-                    ForEach(registry.models, id: \.id) { model in
-                        Text(model.displayName).tag(String?.some(model.id))
-                    }
-                }
-                .disabled(!settings.aiCommandsEnabled)
+            HubSection("Model",
+                       footnote: "The fleet: a chat model + a small CPU model co-reside; an image or video model evicts chat while it generates (the assistant goes quiet, then reloads). Cloud models never run on-device and are off until you enable cloud escalation.") {
+                // The §C1 fleet roster (`ai-model-fleet`, D6): role / lane / provider / per-model status /
+                // honest residency cost, with the plan-driven evict-chat disclosure and the gated cloud
+                // rows. `fleetCloudEscalationEnabled` is owned by `ai-full-potential-toggle` — consumed
+                // here (default false) until that flag lands. Fleet-of-one renders as the single picker.
+                HubFleetRosterView(cloudEscalationEnabled: { settings.fullPotentialGate.isUnlocked(.fleetCloud) },
+                                   activeChatID: chatModelSelection,
+                                   enabledCapabilityModelIDs: capabilityModelSelection,
+                                   onDownloadCapabilityModel: context.onDownloadCapabilityModel,
+                                   manager: models,
+                                   aiEnabled: settings.aiCommandsEnabled)
 
+                // The existing per-model lifecycle surface (download / status / evict / delete) for the
+                // SELECTED model — preserved unchanged so the per-model status rule still holds.
                 ModelManagementView(manager: models,
                                     descriptor: selectedModelDescriptor,
                                     onDownload: context.onDownloadModel)
                     .disabled(!settings.aiCommandsEnabled)
             }
+            // Release Full Potential: the master gate + five cost-disclosing sub-toggles for the heavy
+            // fleet capabilities (`ai-full-potential-toggle`, addendum §D1).
+            fullPotentialSection
             HubSection("Reasoning",
                        footnote: "Let the model think before answering for higher-quality results (a bit slower). Thinking is never shown or pasted — only the final result.") {
                 Toggle("Reasoning", isOn: $settings.aiReasoningEnabled)

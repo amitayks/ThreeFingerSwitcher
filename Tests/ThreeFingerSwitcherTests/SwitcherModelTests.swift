@@ -681,4 +681,75 @@ final class SwitcherModelTests: XCTestCase {
         XCTAssertEqual(model.col, 0)
         XCTAssertEqual(model.windows.map(\.id).first, 200)
     }
+
+    // MARK: - Linear traversal (⌘-Tab keyboard driver)
+
+    func testFlatCountSumsEverySpace() {
+        let model = SwitcherModel()
+        model.setRows(threeRowGrid(), labels: ["1", "2", "3"], startRow: 0, column: 0)
+        XCTAssertEqual(model.flatCount, 6)   // [10,11] + [20,21,22] + [30]
+    }
+
+    func testLinearTargetAdvancesWithinSpace() {
+        let model = SwitcherModel()
+        model.setRows(threeRowGrid(), labels: ["1", "2", "3"], startRow: 0, column: 0)
+        let t = model.linearTarget(delta: 1, wrap: false)   // (0,0) id 10 → (0,1) id 11, same Space
+        XCTAssertEqual(t?.row, 0)
+        XCTAssertEqual(t?.index, 1)
+    }
+
+    func testLinearTargetFlowsForwardAcrossSpaceEdge() {
+        let model = SwitcherModel()
+        model.setRows(threeRowGrid(), labels: ["1", "2", "3"], startRow: 0, column: 0)
+        model.setColumn(1)                                  // (0,1) = last window of Space 0
+        let t = model.linearTarget(delta: 1, wrap: false)   // +1 flows into Space 1's first window
+        XCTAssertEqual(t?.row, 1)
+        XCTAssertEqual(t?.index, 0)
+    }
+
+    func testLinearTargetWrapsAndClampsAtReelEnd() {
+        let model = SwitcherModel()
+        model.setRows(threeRowGrid(), labels: ["1", "2", "3"], startRow: 2, column: 0)  // last window (id 30)
+        let wrapped = model.linearTarget(delta: 1, wrap: true)    // wrap: back to the first window
+        XCTAssertEqual(wrapped?.row, 0)
+        XCTAssertEqual(wrapped?.index, 0)
+        let clamped = model.linearTarget(delta: 1, wrap: false)   // clamp: stay on the last window
+        XCTAssertEqual(clamped?.row, 2)
+        XCTAssertEqual(clamped?.index, 0)
+    }
+
+    func testLinearTargetBackwardWrapLandsPreviousSpaceLastWindow() {
+        let model = SwitcherModel()
+        model.setRows(threeRowGrid(), labels: ["1", "2", "3"], startRow: 1, column: 0)  // (1,0) id 20
+        let t = model.linearTarget(delta: -1, wrap: true)   // -1 crosses back into Space 0's LAST window
+        XCTAssertEqual(t?.row, 0)
+        XCTAssertEqual(t?.index, 1)                         // id 11
+    }
+
+    func testLinearTargetBackwardClampsAndWrapsAtReelStart() {
+        let model = SwitcherModel()
+        model.setRows(threeRowGrid(), labels: ["1", "2", "3"], startRow: 0, column: 0)  // first window (id 10)
+        let clamped = model.linearTarget(delta: -1, wrap: false)   // clamp: stay on the first window
+        XCTAssertEqual(clamped?.row, 0)
+        XCTAssertEqual(clamped?.index, 0)
+        let wrapped = model.linearTarget(delta: -1, wrap: true)    // wrap: to the very last window
+        XCTAssertEqual(wrapped?.row, 2)
+        XCTAssertEqual(wrapped?.index, 0)
+    }
+
+    func testSetRowAndColumnSetsBothTogether() {
+        let model = SwitcherModel()
+        model.setRows(threeRowGrid(), labels: ["1", "2", "3"], startRow: 0, column: 0)
+        model.setRowAndColumn(1, column: 2)                 // Space 1, third window (id 22)
+        XCTAssertEqual(model.currentRow, 1)
+        XCTAssertEqual(model.selectedIndex, 2)
+        XCTAssertEqual(model.selectedWindow?.id, 22)
+        XCTAssertEqual(model.lastRowDirection, 1)           // moved to a later Space
+    }
+
+    func testLinearTraversalIsNilWhenEmpty() {
+        let model = SwitcherModel()
+        XCTAssertNil(model.linearTarget(delta: 1, wrap: true))
+        XCTAssertNil(model.linearTarget(delta: -1, wrap: true))
+    }
 }
