@@ -48,7 +48,7 @@ final class NotchHomeZoneController {
         } else {
             cursor.stop()
             cursor.onMove = nil
-            dismiss()
+            dismiss(animated: false)             // immediate teardown when the feature is switched off
             tearDownGlow()
         }
     }
@@ -73,16 +73,15 @@ final class NotchHomeZoneController {
     // MARK: - Cursor handling (edge-gated, mirrors DockPreviewController)
 
     private func handleCursor(_ point: CGPoint) {
-        guard enabled else { return }
+        guard enabled, let m = metrics(for: point) else { return }
+        let zone = zoneRectFor(m)
         // Edge-gate: only compute when something is shown or the cursor is near the top-center zone.
-        guard overlay.isVisible || nearTopZone(point) else { return }
+        guard overlay.isVisible || nearTopZone(point, zone: zone, metrics: m) else { return }
 
-        let zone = zoneRect(for: point)
         let railFrame = overlay.isVisible ? overlay.frame : nil
         // The ONE contiguous live region (zone + connecting band + container, extended up into the notch
         // pixels) — so moving the cursor UP into the notch keeps the rail .shown (docks), never dismisses.
-        let liveZone = NotchHomeZoneAnchor.liveZoneRect(
-            zone: zone, rail: railFrame, visibleFrame: visibleFrame(for: point))
+        let liveZone = liveZoneFor(m, zone: zone, rail: railFrame)
         let decision = reveal.feed(cursor: point, zoneRect: zone, railFrame: railFrame,
                                    liveZone: liveZone, now: now())
 
@@ -93,12 +92,11 @@ final class NotchHomeZoneController {
             dismiss()
         case .reveal:
             overlay.model.sessions = sessionsProvider()
-            let rail = railRect(zone: zone)
-            if overlay.isVisible {
-                overlay.move(to: rail)          // reposition only — never re-front (glow stays put)
-            } else {
-                overlay.show(at: rail)
-            }
+            // Set the attachment BEFORE showing so the view carves the notch / insets content correctly on
+            // the very first frame (no flash of an un-carved rounded rect).
+            overlay.model.attachment = attachmentFor(m)
+            let rail = railRectFor(m, zone: zone)
+            overlay.reveal(at: rail)            // spreads out of the notch on first show; repositions after
         }
         manageRefreshTimer()
     }
@@ -109,22 +107,28 @@ final class NotchHomeZoneController {
         // `onRestore?` would order this app's panel out right after the restored canvas made itself key,
         // stealing first-responder back so Enter never reaches `executor.send`. Dismissing first leaves the
         // restored canvas the key window once `onRestore?` makes it key + orders it front.
-        dismiss()
+        dismiss(animated: false)                 // immediate: the restored canvas must take focus cleanly
         onRestore?(id)
         refresh()                                // restoring may clear the last needs-you → clear glow
     }
 
-    private func dismiss() {
-        overlay.hide()                           // synchronous orderOut — ghost-on-Space-switch landmine
+    /// Dismiss the rail. `animated` (the default, used for the cursor-left grace-dismiss) recedes it back
+    /// into the notch on the ease-in-out spread; `animated == false` (restore / feature-off) tears it down
+    /// synchronously so focus/teardown are immediate (the ghost-on-Space-switch landmine path).
+    private func dismiss(animated: Bool = true) {
+        overlay.hide(animated: animated)
         manageRefreshTimer()
     }
 
     private func manageRefreshTimer() {
-        if overlay.isVisible, refreshTimer == nil {
+        // Pause the re-feed while an animated recede is in flight (isReceding) — otherwise each tick would
+        // re-issue the dismiss and the recede would never complete.
+        let wantTimer = overlay.isVisible && !overlay.isReceding
+        if wantTimer, refreshTimer == nil {
             refreshTimer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.tick() }
             }
-        } else if !overlay.isVisible, let t = refreshTimer {
+        } else if !wantTimer, let t = refreshTimer {
             t.invalidate()
             refreshTimer = nil
         }
@@ -136,48 +140,78 @@ final class NotchHomeZoneController {
         handleCursor(point)
     }
 
-    // MARK: - Geometry (top-center zone on the active screen)
+    // MARK: - Geometry (top-center zone on the active screen; notch-attached OR tab-degraded)
+
+    /// The active screen's metrics + the resolved physical notch box (nil ⇒ notchless/external → tab mode).
+    /// The one place `NSScreen`'s notch geometry (`safeAreaInsets` + the aux menu-bar areas) is read; the
+    /// pure `NotchHomeZoneAnchor` does the rest.
+    private struct ScreenMetrics {
+        let screen: NSScreen
+        let notch: CGRect?
+        var screenFrame: CGRect { screen.frame }
+        var visibleFrame: CGRect { screen.visibleFrame }
+        var safeAreaTop: CGFloat { screen.safeAreaInsets.top }
+    }
 
     private func activeScreen(for point: CGPoint) -> NSScreen? {
         NSScreen.screens.first { NSMouseInRect(point, $0.frame, false) } ?? NSScreen.main
     }
 
-    private func safeAreaTop(_ screen: NSScreen) -> CGFloat {
-        screen.safeAreaInsets.top
+    private func metrics(for point: CGPoint) -> ScreenMetrics? {
+        guard let screen = activeScreen(for: point) else { return nil }
+        let notch = NotchHomeZoneAnchor.notchRect(
+            screenFrame: screen.frame,
+            safeAreaTop: screen.safeAreaInsets.top,
+            auxLeft: screen.auxiliaryTopLeftArea,
+            auxRight: screen.auxiliaryTopRightArea)
+        return ScreenMetrics(screen: screen, notch: notch)
     }
 
-    private func visibleFrame(for point: CGPoint) -> CGRect {
-        activeScreen(for: point)?.visibleFrame ?? .zero
+    private var zoneSize: CGSize {
+        CGSize(width: NotchHomeZoneLayout.zoneWidth, height: NotchHomeZoneLayout.zoneHeight)
     }
 
-    private func zoneRect(for point: CGPoint) -> CGRect {
-        guard let screen = activeScreen(for: point) else { return .zero }
-        return NotchHomeZoneAnchor.zoneRect(
-            size: CGSize(width: NotchHomeZoneLayout.zoneWidth, height: NotchHomeZoneLayout.zoneHeight),
-            visibleFrame: screen.visibleFrame,
-            safeAreaTop: safeAreaTop(screen))
+    /// The reveal target: in attached mode a thin nub hugging the notch's bottom edge; else the honest
+    /// top-center tab a margin below the menu bar.
+    private func zoneRectFor(_ m: ScreenMetrics) -> CGRect {
+        if let notch = m.notch {
+            return NotchHomeZoneAnchor.attachedNubRect(size: zoneSize, notch: notch, screenFrame: m.screenFrame)
+        }
+        return NotchHomeZoneAnchor.zoneRect(size: zoneSize, visibleFrame: m.visibleFrame, safeAreaTop: m.safeAreaTop)
     }
 
-    private func railRect(zone: CGRect) -> CGRect {
-        let screen = NSScreen.screens.first { NSMouseInRect(zone.origin, $0.frame, false) } ?? NSScreen.main
-        let visible = screen?.visibleFrame ?? zone
-        // Content-fit solve: the rail hugs its actual sessions in width AND height (clamped to a screen
-        // fraction → scroll), mirroring SwitcherLayout.solveGrid + OverlayController.layout. No hardcoded
-        // width; emerges flush from the notch edge (railRect now anchors the TOP at zone.maxY).
-        let count = overlay.model.sessions.count
-        let solved = NotchHomeZoneLayout.solve(count: count, visibleFrame: visible)
-        return NotchHomeZoneAnchor.railRect(zone: zone, size: solved.contentSize, visibleFrame: visible)
+    /// The revealed panel: in attached mode it merges into the notch (top at the physical top, content band
+    /// below); else it hangs flush below the tab. Both hug their sessions via the shared content-fit solve.
+    private func railRectFor(_ m: ScreenMetrics, zone: CGRect) -> CGRect {
+        let solved = NotchHomeZoneLayout.solve(count: overlay.model.sessions.count, visibleFrame: m.visibleFrame)
+        if let notch = m.notch {
+            return NotchHomeZoneAnchor.attachedPanelRect(
+                contentSize: solved.contentSize, notch: notch, screenFrame: m.screenFrame)
+        }
+        return NotchHomeZoneAnchor.railRect(zone: zone, size: solved.contentSize, visibleFrame: m.visibleFrame)
+    }
+
+    private func liveZoneFor(_ m: ScreenMetrics, zone: CGRect, rail: CGRect?) -> CGRect {
+        if let notch = m.notch {
+            return NotchHomeZoneAnchor.attachedLiveZone(nub: zone, panel: rail, notch: notch)
+        }
+        return NotchHomeZoneAnchor.liveZoneRect(zone: zone, rail: rail, visibleFrame: m.visibleFrame)
+    }
+
+    private func attachmentFor(_ m: ScreenMetrics) -> NotchAttachment {
+        if let notch = m.notch {
+            return .notch(cutout: CGSize(width: notch.width, height: notch.height))
+        }
+        return .tab
     }
 
     /// Edge-gate: the cursor is near the top-center resting zone OR anywhere in the contiguous live region
     /// (cheap idle, like `nearDockEdge`). Widened to cover the connecting band + the notch pixels above
     /// the zone so the cursor isn't dropped on the way UP into the notch (the dismiss-on-move-into-notch bug).
-    private func nearTopZone(_ point: CGPoint) -> Bool {
-        let zone = zoneRect(for: point)
+    private func nearTopZone(_ point: CGPoint, zone: CGRect, metrics m: ScreenMetrics) -> Bool {
         guard zone != .zero else { return false }
         let railFrame = overlay.isVisible ? overlay.frame : nil
-        let live = NotchHomeZoneAnchor.liveZoneRect(
-            zone: zone, rail: railFrame, visibleFrame: visibleFrame(for: point))
+        let live = liveZoneFor(m, zone: zone, rail: railFrame)
         // A small slack ring around the contiguous live region (the `nearDockEdge` slop) for reveal trigger.
         return live.insetBy(dx: -40, dy: -8).contains(point)
     }
@@ -204,7 +238,7 @@ final class NotchHomeZoneController {
         }
         // Anchor on the active screen's top-center zone; never re-fronts the rail (separate panel).
         let point = NSEvent.mouseLocation
-        let zone = zoneRect(for: point)
+        let zone = metrics(for: point).map { zoneRectFor($0) } ?? .zero
         if zone != .zero, let panel = glowPanel {
             var frame = panel.frame
             frame.origin = CGPoint(x: zone.midX - frame.width / 2, y: zone.minY)

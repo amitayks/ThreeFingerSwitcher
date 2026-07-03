@@ -53,6 +53,66 @@ enum NotchHomeZoneAnchor {
         return CGRect(x: minX, y: bottom, width: maxX - minX, height: max(topCapped - bottom, 0))
     }
 
+    // MARK: - Attached (notch-merged) mode — the NotchNook look
+
+    /// The physical notch cutout box in Cocoa global coords (bottom-left), or `nil` when the display has no
+    /// notch (notchless built-in OR external → the honest top-center tab). Derived from the two menu-bar
+    /// strips flanking the camera housing (`NSScreen.auxiliaryTopLeftArea` / `auxiliaryTopRightArea`): the
+    /// cutout is the gap BETWEEN them, its height `safeAreaTop`, its top edge the physical top
+    /// (`screenFrame.maxY`). The y is taken from `screenFrame` (robust) — only the aux X extents are trusted.
+    static func notchRect(screenFrame: CGRect, safeAreaTop: CGFloat,
+                          auxLeft: CGRect?, auxRight: CGRect?) -> CGRect? {
+        guard safeAreaTop > 0, let l = auxLeft, let r = auxRight, r.minX > l.maxX else { return nil }
+        return CGRect(x: l.maxX, y: screenFrame.maxY - safeAreaTop,
+                      width: r.minX - l.maxX, height: safeAreaTop)
+    }
+
+    /// The smallest horizontal flank kept on each side of the notch inside the merged panel, so the notch
+    /// tongue always fits with its concave fillets even when the content (few cards) is narrower than the
+    /// notch. The merged panel width is `max(contentWidth, notchWidth + 2 * minNotchFlank)`.
+    static let minNotchFlank: CGFloat = 26
+
+    /// The resting nub in attached mode: a thin lip hugging the notch — centered on the cutout, its TOP
+    /// edge FLUSH at the notch's bottom (`notch.minY`, zero gap), growing downward. Clamped horizontally
+    /// within `screenFrame` (the top is never clamped — it must stay welded to the notch).
+    static func attachedNubRect(size: CGSize, notch: CGRect, screenFrame: CGRect) -> CGRect {
+        let origin = CGPoint(x: notch.midX - size.width / 2, y: notch.minY - size.height)
+        return clampHorizontally(CGRect(origin: origin, size: size), within: screenFrame)
+    }
+
+    /// The expanded/merged panel: centered on the notch, its TOP reaching the PHYSICAL top (`notch.maxY`)
+    /// so the panel's black spans the notch band and reads as one shape. `contentSize.height` is the height
+    /// BELOW the notch (the rail); total panel height = `notch.height + contentSize.height`. The width hugs
+    /// the content but never narrower than the notch + flanks. Clamped horizontally within `screenFrame`;
+    /// the top stays welded to the physical top (never clamped down).
+    static func attachedPanelRect(contentSize: CGSize, notch: CGRect, screenFrame: CGRect) -> CGRect {
+        let width = max(contentSize.width, notch.width + 2 * minNotchFlank)
+        let totalH = contentSize.height + notch.height
+        let origin = CGPoint(x: notch.midX - width / 2, y: notch.maxY - totalH)
+        return clampHorizontally(CGRect(origin: origin, size: CGSize(width: width, height: totalH)),
+                                 within: screenFrame)
+    }
+
+    /// The one contiguous live/hit region for attached mode: the union of the resting nub, the merged panel
+    /// (when shown), and the notch cutout itself — so the cursor moving UP into the notch (the docking
+    /// target) stays inside the live zone and never grace-dismisses. Mirrors `liveZoneRect`'s contract.
+    static func attachedLiveZone(nub: CGRect, panel: CGRect?, notch: CGRect) -> CGRect {
+        var union = nub.union(notch)
+        if let panel { union = union.union(panel) }
+        return union
+    }
+
+    /// Horizontal-only clamp: shift the origin so `rect` stays within `bounds` inset by `screenInset` on the
+    /// LEFT/RIGHT only, leaving the vertical position (welded to the notch/physical top) untouched.
+    static func clampHorizontally(_ rect: CGRect, within bounds: CGRect) -> CGRect {
+        guard !bounds.isNull, bounds.width > 0 else { return rect }
+        let minX = bounds.minX + screenInset
+        let maxX = bounds.maxX - screenInset
+        var origin = rect.origin
+        origin.x = min(max(origin.x, minX), max(minX, maxX - rect.width))
+        return CGRect(origin: origin, size: rect.size)
+    }
+
     /// Keep `rect` inside `bounds` (inset by `screenInset`) without resizing — shift origin only
     /// (verbatim the `DockHoverModel.clamp` idiom).
     static func clamp(_ rect: CGRect, within bounds: CGRect) -> CGRect {

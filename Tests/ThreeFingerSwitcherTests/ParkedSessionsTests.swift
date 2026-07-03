@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 @testable import ThreeFingerSwitcherCore
 
 /// Tests for the `ai-parked-sessions` slice (tasks §1–§5): the park types (§1), the `ParkScheduler`
@@ -459,6 +460,88 @@ final class ParkedSessionsTests: XCTestCase {
         _ = model.feed(cursor: outside, zoneRect: zone, railFrame: rail, liveZone: live, now: 5.1)
         XCTAssertEqual(model.feed(cursor: outside, zoneRect: zone, railFrame: rail,
                                   liveZone: live, now: 6.0), .dismiss)
+    }
+
+    // MARK: - Attached (notch-merged) mode — change `notch-attached-park-dock`
+
+    /// The notch box is the gap BETWEEN the two aux menu-bar strips, its height `safeAreaTop`, its top edge
+    /// the physical top (`screenFrame.maxY`). Nil on a notchless/external display (no aux areas / no safe
+    /// area) so the controller degrades to the honest top-center tab.
+    func testNotchRectDerivationAndTabDegradation() throws {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let auxL = CGRect(x: 0, y: 862, width: 620, height: 38)
+        let auxR = CGRect(x: 820, y: 862, width: 620, height: 38)
+        let notch = try XCTUnwrap(NotchHomeZoneAnchor.notchRect(
+            screenFrame: screen, safeAreaTop: 38, auxLeft: auxL, auxRight: auxR))
+        XCTAssertEqual(notch, CGRect(x: 620, y: 862, width: 200, height: 38))
+        XCTAssertEqual(notch.maxY, screen.maxY)                      // top edge is the physical top
+        XCTAssertEqual(notch.midX, screen.midX, accuracy: 0.5)      // notch is screen-centered
+
+        // Degradation: no safe area, or missing aux areas, or degenerate overlap → nil (tab mode).
+        XCTAssertNil(NotchHomeZoneAnchor.notchRect(screenFrame: screen, safeAreaTop: 0, auxLeft: auxL, auxRight: auxR))
+        XCTAssertNil(NotchHomeZoneAnchor.notchRect(screenFrame: screen, safeAreaTop: 38, auxLeft: nil, auxRight: auxR))
+        XCTAssertNil(NotchHomeZoneAnchor.notchRect(screenFrame: screen, safeAreaTop: 38,
+                                                   auxLeft: CGRect(x: 0, y: 862, width: 900, height: 38),
+                                                   auxRight: CGRect(x: 800, y: 862, width: 640, height: 38)))
+    }
+
+    /// The resting nub hugs the notch: centered on the cutout, its TOP edge FLUSH at the notch's bottom
+    /// (zero gap), growing downward — the "attached" fix for the old free-floating rect.
+    func testAttachedNubHugsNotchFlush() {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let notch = CGRect(x: 620, y: 862, width: 200, height: 38)
+        let nub = NotchHomeZoneAnchor.attachedNubRect(size: CGSize(width: 120, height: 10),
+                                                      notch: notch, screenFrame: screen)
+        XCTAssertEqual(nub.maxY, notch.minY, accuracy: 0.001)        // top flush at the notch bottom
+        XCTAssertEqual(nub.midX, notch.midX, accuracy: 0.5)          // centered on the notch
+        XCTAssertLessThan(nub.minY, notch.minY)                      // grows downward
+    }
+
+    /// The merged panel reaches the PHYSICAL top (its black spans the notch band), is centered on the notch,
+    /// floors its width at the notch + flanks, and stacks the notch band ON TOP of the content height.
+    func testAttachedPanelMergesIntoNotch() {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let notch = CGRect(x: 620, y: 862, width: 200, height: 38)
+
+        // Narrow content (one-card floor) → width floored at notch + 2 flanks; panel top at the physical top.
+        let narrow = NotchHomeZoneAnchor.attachedPanelRect(
+            contentSize: CGSize(width: NotchHomeZoneLayout.oneCardWidth, height: NotchHomeZoneLayout.railHeight),
+            notch: notch, screenFrame: screen)
+        XCTAssertEqual(narrow.maxY, notch.maxY, accuracy: 0.001)                     // reaches the physical top
+        XCTAssertEqual(narrow.midX, notch.midX, accuracy: 0.5)                       // centered on the notch
+        XCTAssertEqual(narrow.width, notch.width + 2 * NotchHomeZoneAnchor.minNotchFlank, accuracy: 0.001)
+        XCTAssertEqual(narrow.height, NotchHomeZoneLayout.railHeight + notch.height, accuracy: 0.001)
+
+        // Wide content → the panel hugs the content width (above the notch floor).
+        let wide = NotchHomeZoneAnchor.attachedPanelRect(
+            contentSize: CGSize(width: 900, height: NotchHomeZoneLayout.railHeight),
+            notch: notch, screenFrame: screen)
+        XCTAssertEqual(wide.width, 900, accuracy: 0.001)
+        XCTAssertEqual(wide.maxY, notch.maxY, accuracy: 0.001)
+    }
+
+    /// The attached live zone is one contiguous region spanning the panel, the nub, AND the notch band, so a
+    /// cursor moving UP into the notch docks (never grace-dismisses) — the attached analogue of `liveZoneRect`.
+    func testAttachedLiveZoneUnionsNotchAndDocks() {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let notch = CGRect(x: 620, y: 862, width: 200, height: 38)
+        let nub = NotchHomeZoneAnchor.attachedNubRect(size: CGSize(width: 120, height: 10),
+                                                      notch: notch, screenFrame: screen)
+        let panel = NotchHomeZoneAnchor.attachedPanelRect(
+            contentSize: CGSize(width: 600, height: NotchHomeZoneLayout.railHeight),
+            notch: notch, screenFrame: screen)
+        let live = NotchHomeZoneAnchor.attachedLiveZone(nub: nub, panel: panel, notch: notch)
+
+        XCTAssertGreaterThanOrEqual(live.maxY, notch.maxY - 0.001)          // extends up to the physical top
+        XCTAssertTrue(live.contains(CGPoint(x: notch.midX, y: notch.midY))) // the notch band is inside
+        XCTAssertTrue(live.contains(CGPoint(x: panel.midX, y: panel.midY))) // the panel is inside
+
+        // The reveal model keeps the panel open for a cursor anywhere in the notch band, past grace.
+        let model = NotchRevealModel(graceInterval: 0.25)
+        XCTAssertEqual(model.feed(cursor: CGPoint(x: nub.midX, y: nub.midY),
+                                  zoneRect: nub, railFrame: panel, liveZone: live, now: 0), .reveal)
+        XCTAssertEqual(model.feed(cursor: CGPoint(x: notch.midX, y: notch.midY),
+                                  zoneRect: nub, railFrame: panel, liveZone: live, now: 5.0), .reveal)
     }
 
     // MARK: - 5.4 AppSettings keys

@@ -220,4 +220,12 @@ final class SwitcherPanel: NSPanel {
     var keyInteractive = false
     override var canBecomeKey: Bool { keyInteractive }
     override var canBecomeMain: Bool { false }
+
+    /// When true, `setFrame` is trusted verbatim — AppKit's menu-bar constraint is skipped so the panel can
+    /// reach the PHYSICAL top of the display and merge with the notch (the `notch-attached-park-dock` look).
+    /// Default off, so every other overlay keeps the standard constrain-below-the-menu-bar behavior.
+    var reachesPhysicalTop = false
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        reachesPhysicalTop ? frameRect : super.constrainFrameRect(frameRect, to: screen)
+    }
 }

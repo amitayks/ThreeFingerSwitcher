@@ -75,11 +75,27 @@ enum NotchHomeZoneLayout {
     }
 }
 
+/// How the panel attaches to the display top: `.notch` merges into a physical notch (the NotchNook look —
+/// the opaque-black panel top reaches the physical top and spans behind the black notch, no carving), `.tab`
+/// is the honest top-center rounded pill on a notchless/external display. Carries the notch cutout size
+/// (panel-local points); its height is the notch-band headroom the view keeps the centered content clear of.
+enum NotchAttachment: Equatable {
+    case notch(cutout: CGSize)
+    case tab
+}
+
 /// The observable rail state (the AppKit/SwiftUI seam). The pure scheduler/store own the data; this is
 /// the view-model the overlay renders. `@MainActor` — UI state.
 @MainActor
 final class NotchHomeZoneViewModel: ObservableObject {
     @Published var sessions: [ParkedSession] = []
+    /// The current attachment mode + notch cutout (set by the controller before each reveal/reposition).
+    /// Defaults to `.tab` so the view is well-defined before the first geometry solve.
+    @Published var attachment: NotchAttachment = .tab
+    /// Drives the smooth ease-in-out **spread**: `false` collapses the panel toward the notch (a tiny seed
+    /// at the top-center), `true` spreads it out to full size. The controller flips it inside `withAnimation`
+    /// on reveal (→ true) and animated hide (→ false), so the panel grows out of / recedes into the notch.
+    @Published var isExpanded: Bool = false
     /// True iff at least one parked session is in `.needsYou` — drives the ambient glow.
     var hasNeedsYou: Bool { sessions.contains { $0.state == .needsYou } }
 }
@@ -122,6 +138,9 @@ final class NotchHomeZoneOverlayController {
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
         panel.level = .popUpMenu
+        // Attached mode positions the panel's TOP at the physical top of the display (over the menu bar) so
+        // its black merges with the notch — skip AppKit's constrain-below-the-menu-bar so the frame sticks.
+        panel.reachesPhysicalTop = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         panel.contentView = NSHostingView(rootView: NotchHomeZoneRailView(
             model: model,
@@ -134,55 +153,156 @@ final class NotchHomeZoneOverlayController {
     var isVisible: Bool { panel?.isVisible ?? false }
     var frame: CGRect { panel?.frame ?? .zero }
 
-    /// Reveal the rail at `rect` and order it to the front (reveal only).
-    func show(at rect: CGRect) {
+    /// The ease-in-out spread duration (reveal grow / animated-hide recede), shared by both directions.
+    static let spreadDuration: TimeInterval = 0.3
+    /// A scheduled animated-hide teardown, cancelled if a fresh reveal arrives mid-recede.
+    private var pendingHide: DispatchWorkItem?
+    /// True while an animated recede is in flight (its `orderOut` is scheduled but not yet run) — the
+    /// controller reads this to pause its re-feed timer so it doesn't re-trigger the recede every tick.
+    var isReceding: Bool { pendingHide != nil }
+
+    /// Reveal or reposition the rail at `rect` and spread it OUT of the notch (ease-in-out). Handles the
+    /// first show (orders front) and per-tick reanchor (repositions only — never re-fronts a visible panel,
+    /// so a layer above like a menu is never stomped, matching the Dock-preview `move(to:)` discipline). A
+    /// reveal arriving during an animated recede cancels the pending teardown and re-spreads.
+    func reveal(at rect: CGRect) {
+        pendingHide?.cancel(); pendingHide = nil
         let panel = self.panel ?? makePanel()
         self.panel = panel
+        // The window (the "outer container") casts NO shadow in attached mode — a window drop-shadow at the
+        // top would read as a border where the panel merges into the notch/menu bar. Tab mode keeps it.
+        let attached: Bool = { if case .notch = model.attachment { return true }; return false }()
+        if panel.hasShadow != !attached {
+            panel.hasShadow = !attached
+            panel.invalidateShadow()
+        }
+        let wasVisible = panel.isVisible
         panel.setFrame(rect, display: true)
-        panel.orderFrontRegardless()
+        if !wasVisible { panel.orderFrontRegardless() }
+        if !model.isExpanded {
+            withAnimation(.easeInOut(duration: Self.spreadDuration)) { model.isExpanded = true }
+        }
     }
 
-    /// Reposition the already-visible rail WITHOUT re-ordering it to the front (per-tick reanchor) — so a
-    /// layer above (e.g. a menu) is never stomped, matching the Dock-preview `move(to:)` discipline.
-    func move(to rect: CGRect) {
-        panel?.setFrame(rect, display: true)
-    }
-
-    /// Synchronous teardown (no deferred close — Space-switch ghost landmine).
-    func hide() {
-        panel?.orderOut(nil)
+    /// Tear down the rail. `animated` recedes it back INTO the notch (ease-in-out) then orders out on
+    /// completion — used for the gentle grace-dismiss. `animated == false` is the **synchronous** `orderOut`
+    /// (the ghost-on-Space-switch landmine) — used for restore/disable where the teardown must be immediate.
+    func hide(animated: Bool) {
+        guard let panel else { return }
+        guard animated else {
+            pendingHide?.cancel(); pendingHide = nil
+            model.isExpanded = false
+            panel.orderOut(nil)                    // synchronous — ghost-on-Space-switch landmine
+            return
+        }
+        if pendingHide != nil { return }           // already receding — don't restart the animation
+        withAnimation(.easeInOut(duration: Self.spreadDuration)) { model.isExpanded = false }
+        let work = DispatchWorkItem { [weak self] in
+            self?.panel?.orderOut(nil)
+            self?.pendingHide = nil
+        }
+        pendingHide = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.spreadDuration, execute: work)
     }
 }
 
-/// The rail: a horizontally-scrollable row of parked cards EMERGING FROM the notch (design D5). The whole
-/// bordered container spreads down out of the notch edge — a container-level `bubbleMorph(anchor: .top)`
-/// scale/clip-reveal anchored at the TOP edge on the `BubbleMorph` spring, so it reads as water spreading
-/// down into the container rather than a card-by-card pop. Each card still buds in (anchored `.top` too,
-/// so per-card growth also flows downward from the notch). A bounded `failed` badge carries the clean
-/// headline ONLY (raw text lives behind an opt-in disclosure on the restored canvas, never here).
+/// The rail: a horizontally-scrollable row of parked cards. In attached mode it's a **plain black rounded
+/// rectangle** whose top edge reaches the physical top so its black simply spans up **behind** the (also
+/// black) notch — no cutout is carved, because both are black and read as one shape. The whole container
+/// spreads out of / recedes into the notch on the controller's ease-in-out `isExpanded` transition. The
+/// cards are **centered** (both axes) in the panel — horizontally so a few sessions don't hug the left, and
+/// vertically so they sit clear of the notch. A bounded `failed` badge carries the clean headline ONLY (raw
+/// text lives behind an opt-in disclosure on the restored canvas, never here).
 struct NotchHomeZoneRailView: View {
     @ObservedObject var model: NotchHomeZoneViewModel
     let onRestore: (AgentSessionID) -> Void
     let onDiscard: (AgentSessionID) -> Void
 
+    private var isAttached: Bool {
+        if case .notch = model.attachment { return true }
+        return false
+    }
+
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: NotchHomeZoneLayout.cardSpacing) {
-                ForEach(model.sessions) { session in
-                    NotchParkedCard(session: session,
-                                    onRestore: { onRestore(session.id) },
-                                    onDiscard: { onDiscard(session.id) })
-                        .bubbleMorph(anchor: .top)   // each card grows downward, out of the notch edge
+        GeometryReader { geo in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: NotchHomeZoneLayout.cardSpacing) {
+                    ForEach(model.sessions) { session in
+                        NotchParkedCard(session: session,
+                                        onRestore: { onRestore(session.id) },
+                                        onDiscard: { onDiscard(session.id) })
+                    }
                 }
+                .padding(.horizontal, NotchHomeZoneLayout.padding)
+                // Center the cards across the whole panel (both axes): `minWidth` centers a few sessions
+                // instead of left-hugging them yet still allows horizontal scroll when they overflow;
+                // `minHeight` centers the row vertically so it sits clear of the notch that overlaps the top.
+                .frame(minWidth: geo.size.width, minHeight: geo.size.height, alignment: .center)
             }
-            .padding(NotchHomeZoneLayout.padding)
         }
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(.white.opacity(0.08)))
-        .clipShape(RoundedRectangle(cornerRadius: 18))   // clip-reveal so the spread is bounded by the chrome
-        // Container-level spread: the bordered container scales up FROM ITS TOP EDGE (flush at the notch)
-        // on the same droplet spring, so the whole rail unfurls downward out of the notch.
-        .bubbleMorph(anchor: .top)
+        .background(chromeFill)
+        .overlay(chromeStroke)
+        .clipShape(chromeShape)
+        // The smooth ease-in-out SPREAD: the whole panel grows out of / recedes into the notch, anchored at
+        // its TOP edge, so it unfurls downward AND out to both sides. The controller flips `isExpanded`
+        // inside `withAnimation(.easeInOut)`, which drives this transition.
+        .scaleEffect(model.isExpanded ? 1 : Self.seedScale, anchor: .top)
+        .opacity(model.isExpanded ? 1 : 0)
+    }
+
+    /// The collapsed seed scale — small enough to read as emerging from the notch, non-zero so the anchor
+    /// stays well-defined during the spread (a literal `0` collapses the frame and the anchor with it).
+    private static let seedScale: CGFloat = 0.06
+
+    /// The chrome silhouette. Attached mode is a plain rounded rectangle with a **flat top** (square top
+    /// corners so it grows cleanly from the physical top / behind the notch) and rounded bottom corners; the
+    /// tab-degradation path is a fully-rounded pill. No notch is carved — the black spans behind the notch.
+    private var chromeShape: AnyShape {
+        if isAttached {
+            return AnyShape(UnevenRoundedRectangle(
+                topLeadingRadius: 0, bottomLeadingRadius: 20,
+                bottomTrailingRadius: 20, topTrailingRadius: 0))
+        }
+        return AnyShape(RoundedRectangle(cornerRadius: 18))
+    }
+
+    /// In attached mode the fill is opaque black so it reads as one shape with the hardware notch's black
+    /// pixels (a translucent material would reveal a seam); in tab mode it stays the app's `.regularMaterial`.
+    @ViewBuilder private var chromeFill: some View {
+        if isAttached {
+            chromeShape.fill(Color.black)
+        } else {
+            chromeShape.fill(.regularMaterial)
+        }
+    }
+
+    /// The hairline border. In attached mode it traces only the **sides and bottom** — never the top edge —
+    /// so there is no line where the panel merges into the notch / menu bar at the physical top; the tab
+    /// path keeps a full rounded-rect border.
+    @ViewBuilder private var chromeStroke: some View {
+        if isAttached {
+            NotchPanelBorderShape().stroke(.white.opacity(0.08), lineWidth: 1)
+        } else {
+            chromeShape.stroke(.white.opacity(0.08), lineWidth: 1)
+        }
+    }
+}
+
+/// An OPEN border tracing the attached panel's left side, rounded bottom, and right side — but NOT the top
+/// edge — so the merged panel shows no hairline at the physical top where it meets the notch/menu bar.
+private struct NotchPanelBorderShape: Shape {
+    var bottomRadius: CGFloat = 20
+    func path(in rect: CGRect) -> Path {
+        let W = rect.width, H = rect.height
+        let r = min(bottomRadius, min(W, H) / 2)
+        var p = Path()
+        p.move(to: CGPoint(x: 0, y: 0))                                  // top-left (top edge NOT drawn)
+        p.addLine(to: CGPoint(x: 0, y: H - r))
+        p.addQuadCurve(to: CGPoint(x: r, y: H), control: CGPoint(x: 0, y: H))
+        p.addLine(to: CGPoint(x: W - r, y: H))
+        p.addQuadCurve(to: CGPoint(x: W, y: H - r), control: CGPoint(x: W, y: H))
+        p.addLine(to: CGPoint(x: W, y: 0))                              // up to top-right, then stop
+        return p
     }
 }
 

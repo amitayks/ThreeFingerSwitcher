@@ -15,16 +15,16 @@ The system SHALL let the user **park** the active AI conversation by overscrolli
 - **WHEN** the park trigger is added
 - **THEN** the gesture recognizer still emits only its raw direction and the park interpretation lives entirely at the consumer seam
 
-### Requirement: The notch home zone degrades gracefully and never depends on a physical notch
-The system SHALL provide a **notch home zone** — an interactive, **non-activating** overlay panel anchored **top-center** — as the resting place for parked sessions. The panel SHALL reuse the mouse-interactive, non-activating popup species (the Dock-preview overlay pattern): it SHALL accept hover and click, SHALL NOT become the app's key/main window, SHALL NOT steal focus from the foreground app, and SHALL tear down **synchronously** (ordered out, no deferred close that could ghost on a Space switch). The zone SHALL anchor with notch awareness: on a display that reports a notch it SHALL tuck just below the notch/menu bar; on a notchless built-in display or an **external display** it SHALL degrade to a **top-center menu-bar tab** at a fixed margin. The home zone SHALL **never** hard-depend on a physical notch.
+### Requirement: The notch home zone attaches to the notch and degrades gracefully
+The system SHALL provide a **notch home zone** — an interactive, **non-activating** overlay panel anchored **top-center** — as the resting place for parked sessions. The panel SHALL reuse the mouse-interactive, non-activating popup species (the Dock-preview overlay pattern): it SHALL accept hover and click, SHALL NOT become the app's key/main window, SHALL NOT steal focus from the foreground app, and SHALL tear down **synchronously** (ordered out, no deferred close that could ghost on a Space switch). The zone SHALL anchor with notch awareness, and on a notched display it SHALL read as a **downward extension of the notch itself**, not a panel floating below it. On a display that **reports a physical notch**, the zone and its revealed panel SHALL **attach to the notch**: the panel SHALL be a **plain rounded rectangle** whose top edge reaches the **physical top** of the display (drawing over the menu-bar strip beneath it), **horizontally centered on the cutout** and at least as wide as it. The notch SHALL NOT be carved out of the panel — because the panel fill is **opaque black** and the notch is black, the panel's black simply spans up **behind** the notch and the two read as **one continuous shape** (no cutout, no seam). The parked content SHALL be **centered** within the panel (both axes) so it sits clear of the notch that overlaps the top-center; it SHALL NEVER be rendered behind the notch. On a **notchless built-in display or an external display** it SHALL degrade to a **top-center menu-bar tab** hanging **below** the menu bar at a fixed margin, with all other parked-session behavior identical. The home zone SHALL **never** hard-depend on a physical notch: the notch box (position, width, height) SHALL be **detected at runtime** from the display's safe-area inset and the menu-bar areas flanking the camera housing, and its absence SHALL cleanly select the tab path.
 
-#### Scenario: Notched display tucks the zone under the notch
-- **WHEN** the active display reports a notch (a non-zero top safe-area inset)
-- **THEN** the home zone anchors just below the notch, top-center
+#### Scenario: Notched display attaches the zone as an extension of the notch
+- **WHEN** the active display reports a physical notch (a non-zero top safe-area inset with resolvable flanking menu-bar areas)
+- **THEN** the home zone attaches flush to the notch as a plain black rounded rectangle whose black spans up behind the (also black) notch so they read as one continuous shape (no carved cutout), and the parked content is centered in the panel, clear of the notch
 
 #### Scenario: Notchless or external display degrades to a top-center tab
 - **WHEN** the active display reports no notch (a built-in notchless display or an external monitor)
-- **THEN** the home zone degrades to a top-center menu-bar tab and all parked-session behavior is otherwise identical
+- **THEN** the home zone degrades to a top-center menu-bar tab hanging below the menu bar and all parked-session behavior is otherwise identical
 
 #### Scenario: The panel never steals focus and tears down synchronously
 - **WHEN** the home zone is shown and later dismissed
@@ -61,18 +61,26 @@ When a parked session escalates to **needs-you** (a dangerous write or required 
 - **THEN** the notch home zone shows no glow
 
 ### Requirement: Cursor-to-notch reveals a scrollable rail of parked sessions
-Moving the cursor to the notch home zone SHALL reveal a **rail** of parked-session cards hanging below the zone. The rail SHALL be **horizontally scrollable** when it overflows. The reveal SHALL reuse the edge-gated cursor-reveal pattern (a passive global cursor monitor needing **no new permission**; geometry read only when the cursor is near the zone while hidden; a unified zone+rail live area with a grace-period dismiss; a coarse re-feed while shown). Teardown SHALL be **synchronous**. The cards SHALL bud in with the app's first-spring morph.
+Moving the cursor to the notch home zone SHALL reveal a **rail** of parked-session cards. On a notched display the rail SHALL **emerge from the notch as a downward extension** — its top spanning up behind the notch (reaching the physical top), the cards spreading **downward** below the notch; on a notchless/external display the rail SHALL **hang below** the top-center tab. The rail SHALL be **horizontally scrollable** when it overflows. The reveal SHALL reuse the edge-gated cursor-reveal pattern (a passive global cursor monitor needing **no new permission**; geometry read only when the cursor is near the zone while hidden; a unified live area — the zone, the rail, **and the notch band** — with a grace-period dismiss, so moving the cursor **up into the notch docks** rather than dismisses; a coarse re-feed while shown). The panel SHALL **spread** open and closed with a smooth **ease-in-out** animation anchored at its top edge — growing out of the notch on reveal and receding back into it on the grace-dismiss. Teardown for the grace-dismiss MAY defer the order-out until the recede completes, but restore and feature-off teardown SHALL remain **synchronous** (the ghost-on-Space-switch path).
 
 #### Scenario: Cursor near the notch reveals the rail
 - **WHEN** the cursor moves to the notch home zone
-- **THEN** the rail of parked-session cards is revealed below the zone
+- **THEN** the rail of parked-session cards is revealed — emerging downward from the notch on a notched display, or hanging below the tab on a notchless/external display
+
+#### Scenario: The panel spreads open and closed with ease-in-out
+- **WHEN** the rail is revealed and later grace-dismissed
+- **THEN** it spreads open out of the notch and recedes back into it on a smooth ease-in-out animation anchored at the top edge, and a reveal arriving mid-recede cancels the recede and re-spreads
 
 #### Scenario: The rail scrolls when it overflows
 - **WHEN** there are more parked sessions than fit across the rail
 - **THEN** the rail scrolls horizontally to reach the rest
 
+#### Scenario: Moving up into the notch docks rather than dismisses
+- **WHEN** the rail is shown and the cursor moves up into the notch band above the resting zone
+- **THEN** the rail stays shown (the notch band is inside the contiguous live area), and it does not grace-dismiss
+
 #### Scenario: Leaving the zone and rail dismisses after a grace period
-- **WHEN** the cursor leaves both the zone and the rail for longer than the grace period
+- **WHEN** the cursor leaves the zone, the rail, and the notch band for longer than the grace period
 - **THEN** the rail dismisses, ordered out synchronously
 
 #### Scenario: The reveal needs no new permission

@@ -81,18 +81,30 @@ enum OverscrollPark {
 - This mirrors the existing `canvasAtTop` commit guard exactly (down-at-top = commit; up-past-bottom = park) — the spatial mnemonic TOP=act / BOTTOM=stash. The recognizer keeps emitting raw `±1`; this slice adds **no** recognizer state.
 - *Rejected:* a dedicated recognizer "overscroll" gesture. It would fork `GestureRecognizer` and violate the "interpretation lives at the consumer seam" decision; the consumer already has `canvasAtTop`, so adding `canvasAtBottom` + a threshold is the minimal, in-pattern change.
 
-### 5. The notch home zone — a `DockPreviewOverlay`-species panel, notch-OR-tab, never notch-dependent
-A `NotchHomeZoneOverlayController` built on the same panel recipe as `DockPreviewOverlayController` (non-activating, mouse-interactive, never key/main, `level = .popUpMenu`, `.canJoinAllSpaces`, synchronous `orderOut`). Anchoring is **top-center** via a pure `NotchHomeZoneAnchor` mirroring `DockHoverModel.anchorRect`/`clamp` (pure, unit-tested, `now:`-free here — it's pure geometry):
+### 5. The notch home zone — a `DockPreviewOverlay`-species panel, notch-ATTACHED-or-tab, never notch-dependent
+A `NotchHomeZoneOverlayController` built on the same panel recipe as `DockPreviewOverlayController` (non-activating, mouse-interactive, never key/main, `level = .popUpMenu`, `.canJoinAllSpaces`, synchronous `orderOut`). Anchoring is **top-center** via a pure `NotchHomeZoneAnchor` mirroring `DockHoverModel.anchorRect`/`clamp` (pure, unit-tested, `now:`-free — pure geometry). There are **two anchor modes** behind one controller, selected by whether a physical notch resolves at runtime:
 ```swift
 enum NotchHomeZoneAnchor {
-    // Top-center on the active screen; tucked under the notch when one exists, else under the menu bar.
+    // Runtime detection: the cutout box (Cocoa global) from the safe-area inset + the menu-bar areas
+    // flanking the camera housing; nil ⇒ notchless/external ⇒ the tab path.
+    static func notchRect(screenFrame: CGRect, safeAreaTop: CGFloat, auxLeft: CGRect?, auxRight: CGRect?) -> CGRect?
+
+    // TAB mode (notchless/external) — top-center, hangs below the menu bar (unchanged).
     static func zoneRect(size: CGSize, visibleFrame: CGRect, safeAreaTop: CGFloat) -> CGRect
-    static func railRect(zone: CGRect, size: CGSize, visibleFrame: CGRect) -> CGRect  // hangs below the zone, clamped
+    static func railRect(zone: CGRect, size: CGSize, visibleFrame: CGRect) -> CGRect
+
+    // ATTACHED mode (physical notch) — the NotchNook look: the nub hugs the notch's bottom edge; the panel
+    // reaches the PHYSICAL top (notch.maxY) so its black merges with the notch; content sits BELOW the band.
+    static func attachedNubRect(size: CGSize, notch: CGRect, screenFrame: CGRect) -> CGRect
+    static func attachedPanelRect(contentSize: CGSize, notch: CGRect, screenFrame: CGRect) -> CGRect
+    static func attachedLiveZone(nub: CGRect, panel: CGRect?, notch: CGRect) -> CGRect
 }
 ```
-- **Degradation (MUST, not optional):** `safeAreaTop > 0` ⇒ physical notch — the resting glyph/zone tucks `safeAreaTop + margin` below the menu bar, hugging the notch; `safeAreaTop == 0` (notchless built-in or **external display**) ⇒ a **top-center menu-bar tab** at a fixed margin (the `ReceiveHUD` `12pt` precedent). The same controller drives both; only the anchor differs. The home zone is **never** a hard dependency on a physical notch.
-- The rail hangs **below** the zone (Cocoa: smaller y), clamped on-screen by the same shift-only `clamp` idiom as `DockHoverModel`.
-- *Rejected:* projecting the panel *into* the notch's black pixels (a "live notch widget"). Fragile, display-specific, and pointless on external/notchless displays — the tab degradation is the honest cross-display model.
+- **Attached mode (physical notch):** the zone is a thin nub whose TOP is flush at the notch's bottom edge; the revealed panel's TOP reaches the **physical top** (`notch.maxY`, i.e. it draws **over** the menu-bar strip — `SwitcherPanel.reachesPhysicalTop` skips AppKit's constrain-below-the-menu-bar), is **centered on the cutout**, and its width is floored at `notch.width + 2·minNotchFlank` so the panel is never narrower than the notch. The chrome is a **plain rounded rectangle** filled **opaque black** — the notch is **not carved**: because the panel is black and the notch is black, the panel's black simply spans up **behind** the notch and the two read as one shape (no cutout, no seam to align, robust to any notch corner radius). Top corners are square (`UnevenRoundedRectangle`, flat top) so it grows cleanly from the physical top; bottom corners rounded. The hairline border traces only the **sides and bottom** (an open `NotchPanelBorderShape`), never the top edge, and the **window itself casts no shadow** in attached mode (`hasShadow = false`) — a window drop-shadow at the top would read as a border where the panel meets the notch/menu bar — so nothing draws a line across the merge. The cards are **centered in the panel on both axes** (a `GeometryReader` + `frame(minWidth:minHeight:alignment:.center)` — horizontal centering so a few sessions don't hug the left yet still scroll on overflow; vertical centering so the row sits clear of the notch). The panel height carries an extra notch-band of headroom (`contentSize.height + notch.height`) so the centered row clears the notch. Covering the focused app's menu titles while expanded is **intended** (the NotchNook trade), matched only in attached mode.
+- **Spread animation (ease-in-out):** the panel does not bud on the first spring here — it **spreads**. A `@Published isExpanded` on the view-model drives a `scaleEffect(anchor: .top)` + opacity from a small seed to full; the controller flips it inside `withAnimation(.easeInOut)` on reveal (grow out of the notch) and on the grace-dismiss (recede back in). The grace-dismiss defers its `orderOut` until the recede finishes (a cancellable work item, cancelled if a reveal re-arrives mid-recede); **restore and feature-off stay synchronous** `orderOut` (the ghost-on-Space-switch landmine). The re-feed timer pauses while receding (`isReceding`) so a tick never re-issues the dismiss.
+- **Degradation (MUST, not optional):** `notchRect == nil` (notchless built-in or **external display**) ⇒ a **top-center menu-bar tab** at a fixed margin (the `ReceiveHUD` `12pt` precedent), a plain `RoundedRectangle` on `.regularMaterial`, hanging **below** the menu bar. The same controller drives both; only the anchor + chrome differ. The home zone is **never** a hard dependency on a physical notch.
+- **Black-on-black, not carved:** the merge needs no shape trickery — an opaque-black panel drawn up behind a black notch is seamless, so there is no cutout to align and nothing depends on the notch's (unpublished) corner radius. This is more robust than carving a matching notch silhouette.
+- *Refined (supersedes the original "never touch the notch pixels" rejection, alt #3):* on a physical notch the panel now **attaches to and visually merges with** the notch (reaching the physical top; its black spans behind the notch), because "floating a little below the notch" read as detached. This is **not** a live widget rendered *inside* the black cutout — content is **centered clear** of the notch; the merge is a placement + fill decision, and the **tab degradation is preserved** so external/notchless displays stay honest (the reason alt #3 was cautious). The reversal mirrors `dock-window-previews` reversing its own D2.
 
 ### 6. State badges + the ambient needs-you notch glow (the make-or-break UX)
 Each rail card renders a badge off `ParkedSession.state` + `badgeCount`:
@@ -144,7 +156,7 @@ struct ParkLifecycle {
 | `ParkedSessionStore` (protocol + impl) | Core (IO bridged off-main) | `swift test` (in-memory impl: upsert/remove/resume; `ParkError` mapping at boundary) |
 | `ParkLifecycle` (eviction + sleepable) | Core | `swift test` (eviction victim selection; idle-timeout sleepable; active/needsYou never chosen; injected `now:`) |
 | `OverscrollPark.shouldPark` | Core | `swift test` (at-bottom + over-threshold parks; below-threshold scrolls; not-at-bottom never parks) |
-| `NotchHomeZoneAnchor` / `NotchRevealModel` | Core (pure geometry + lifecycle) | `swift test` (notch vs tab anchor; rail clamps on-screen; reveal/keep/grace-dismiss with injected `now:`) |
+| `NotchHomeZoneAnchor` / `NotchRevealModel` | Core (pure geometry + lifecycle) | `swift test` (tab anchor + clamp; **attached mode**: notch-box detection + degradation, nub flush at notch bottom, panel reaches physical top + width floor, live-zone unions the notch band; reveal/keep/grace-dismiss with injected `now:`) |
 | `ParkError` + `AIError.message(for:)` routing | Core | `swift test` (each case → clean headline; no raw OS text) |
 | `NotchHomeZoneOverlayController` (panel) | App / GemmaRuntime | `xcodebuild` compile-verify; **user run-verifies** the panel, glow, notch/tab |
 | `NotchHomeZoneController` (cursor wiring, restore, glow) | App | `xcodebuild` compile-verify; **user run-verifies** reveal/teardown/restore |
@@ -169,7 +181,7 @@ Per the house rule, an agent **never** builds/signs/installs the `.app` (ad-hoc 
 
 1. **Recognizer-level overscroll gesture** — forks `GestureRecognizer`; rejected in favor of the consumer-seam `canvasAtBottom` + threshold (mirrors `canvasAtTop`).
 2. **`nextRunnable() -> AgentSessionID?` scheduler** — bakes one-active-now into the protocol; rejected for `runnableSessions(now:maxSlots:)` so batching is a drop-in.
-3. **A live "notch widget" rendered into the notch pixels** — display-fragile, meaningless on external/notchless displays; rejected for the notch-OR-tab top-center panel.
+3. **A live "notch widget" rendered *inside* the notch's black cutout** — still rejected: no parked content is ever drawn inside the cutout. *Refined by §5, though:* on a physical notch the panel now **attaches to and merges with** the notch (top edge at the physical top; an opaque-black panel drawn behind the black notch reads as one shape) so it becomes a downward extension of the notch, while the **tab degradation is preserved** for notchless/external displays (the honest cross-display model this alternative was protecting).
 4. **Dock badge / Notification Center alert for needs-you** — intrusive, out of the overlay model, needs entitlements; rejected for the peripheral ambient glow + on-card count.
 5. **A second conversation store** — rejected; this slice owns the durable store, the runtime slice owns the types (blueprint 3.1).
 6. **App-modal alert on a park/restore/persist failure** — freezes Settings; rejected for the bounded `failed` badge + Retry through `AIError.message(for:)`.
