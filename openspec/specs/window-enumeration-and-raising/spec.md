@@ -19,6 +19,29 @@ The system SHALL enumerate normal application windows across all Spaces, excludi
 - **WHEN** a gesture begins
 - **THEN** the ordered window list is captured once and not re-ordered while scrubbing
 
+### Requirement: Switchable-window gate with optional non-standard inclusion
+The system SHALL treat a window as switchable only when it is a window-role Accessibility element on the normal window layer, is not minimized, and — by default — reports the standard-window subrole (a window that exposes no subrole at all is treated as standard). The system SHALL provide a user-configurable setting to relax the subrole requirement: when enabled, any window-role element on the normal window layer is switchable regardless of its subrole, surfacing real windows that report a non-standard or absent subrole (e.g. windows from foreign UI toolkits such as the Android emulator, and setup/welcome windows such as Xcode's start window). The relaxation SHALL apply consistently to both current-Space enumeration and off-Space enumeration (the off-Space element acquisition SHALL widen its own subrole filter to match, so a qualifying non-standard window is acquirable and raisable off-Space). The normal-window-layer gate and the minimized exclusion SHALL continue to apply in both modes, so floating HUD/utility panels (windows above the normal window layer) and minimized windows remain excluded. In relaxed mode the system SHALL additionally exclude windows below a minimum size, measured by the window's real (Accessibility) size so a window shown as a small Stage-Manager strip proxy is measured by its true size and not mis-filtered; this drops the tiny helper/shadow/toolbar surfaces that foreign toolkits expose as extra windows of the same process (which would otherwise appear as a spurious second entry that merely re-fronts the app's real window). The setting SHALL default to the strict (standard-only) behavior and SHALL take effect on the next gesture without a restart.
+
+#### Scenario: Strict mode lists only standard windows
+- **WHEN** the setting is off and a process exposes a non-standard-subrole window (e.g. a dialog, panel, or foreign-toolkit window) alongside its standard document windows
+- **THEN** the non-standard window is not included in the switcher list while the standard windows are
+
+#### Scenario: Relaxed mode includes non-standard windows
+- **WHEN** the setting is on and a process exposes a window-role window with a non-standard or absent subrole on the normal window layer
+- **THEN** that window is included in the switcher list
+
+#### Scenario: Relaxation applies across Spaces
+- **WHEN** the setting is on and a qualifying non-standard window is on another Space
+- **THEN** it is enumerated and can be raised, the same as an off-Space standard window
+
+#### Scenario: Minimized and floating panels still excluded when relaxed
+- **WHEN** the setting is on
+- **THEN** minimized windows and windows above the normal window layer (floating HUD/utility panels) are still excluded
+
+#### Scenario: Tiny helper windows excluded when relaxed
+- **WHEN** the setting is on and a process (e.g. a foreign-toolkit app) exposes both a real window and a tiny helper/toolbar window on the normal window layer
+- **THEN** the real window is included but the tiny helper window (below the minimum size, by its real size) is excluded, so the app appears once rather than as a spurious small second entry
+
 ### Requirement: MRU ordering with z-order fallback
 The system SHALL order the window list by **per-window** most-recently-focused recency, fully interleaved across applications, so a short flick lands on the previously focused window regardless of which app owns it. Windows of the same application SHALL NOT be clustered ahead of a more-recently-focused window of another application. The currently focused (frontmost) window SHALL be ordered first and the previously focused window second. Windows with no recorded focus history (never focused since launch) SHALL fall back to the existing ordering — current-Space windows first, then Mission Control Space order, then on-screen z-order. Recency SHALL be tracked per `CGWindowID` and held in memory only (it resets on relaunch); recency ordering applies *within* a Space-row and SHALL NOT reorder the Space-rows themselves.
 

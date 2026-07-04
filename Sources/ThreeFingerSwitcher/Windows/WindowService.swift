@@ -144,7 +144,7 @@ final class WindowService {
                 currentByPid[m.pid] = Set(currentSpaceElements(pid: m.pid).keys)
             }
             if !onCurrent, bruteByPid[m.pid] == nil {
-                bruteByPid[m.pid] = Set(bruteForceWindows(pid: m.pid).map(\.0))
+                bruteByPid[m.pid] = Set(bruteForceWindows(pid: m.pid, includeNonStandard: settings.includeNonStandardWindows).map(\.0))
             }
             let live = onCurrent ? (currentByPid[m.pid]?.contains(wid) ?? false)
                                  : (bruteByPid[m.pid]?.contains(wid) ?? false)
@@ -230,7 +230,7 @@ final class WindowService {
                 element = axCurrentByPid[m.pid]?[wid]
             } else {
                 if axBruteByPid[m.pid] == nil {
-                    axBruteByPid[m.pid] = Dictionary(bruteForceWindows(pid: m.pid), uniquingKeysWith: { a, _ in a })
+                    axBruteByPid[m.pid] = Dictionary(bruteForceWindows(pid: m.pid, includeNonStandard: settings.includeNonStandardWindows), uniquingKeysWith: { a, _ in a })
                 }
                 element = axBruteByPid[m.pid]?[wid]
             }
@@ -699,7 +699,7 @@ final class WindowService {
         if window.isOnCurrentSpace {
             if let el = currentSpaceElements(pid: window.pid)[window.id] { return el }
         } else {
-            if let el = bruteForceWindows(pid: window.pid).first(where: { $0.0 == window.id })?.1 { return el }
+            if let el = bruteForceWindows(pid: window.pid, includeNonStandard: settings.includeNonStandardWindows).first(where: { $0.0 == window.id })?.1 { return el }
         }
         // Fall back to an element cached while the window was reachable (off-Space Chromium raise).
         if let cached = elementCache[window.id], axCopy(cached, kAXRoleAttribute as String) != nil {
@@ -773,10 +773,34 @@ final class WindowService {
         return map
     }
 
+    /// Minimum window dimension — the SHORTER side must clear this — admitted by the RELAXED gate. A
+    /// standard document window clears it easily; the thin helper/shadow/toolbar surfaces a foreign
+    /// toolkit exposes as extra windows do not — so the relaxation surfaces the real window without its
+    /// junk companions. Only consulted in relaxed mode; strict mode never admitted these.
+    ///
+    /// Calibrated from the live case that motivated it: the Android emulator (`qemu-system-aarch64`)
+    /// exposes its real device window (short side 372) AND a borderless side-toolbar (61×515, empty
+    /// title, same process — raising it just re-fronts the emulator). 100 sits in the wide gap between
+    /// the toolbar's 61 and the next-narrowest real window (138 in the observed set), so it drops the
+    /// toolbar with margin while keeping every genuine window (a small square/watch emulator, ~320, is
+    /// well clear).
+    private let minRelaxedWindowDimension: CGFloat = 100
+
     private func isSwitchable(_ axWin: AXUIElement) -> Bool {
         if axBool(axWin, kAXMinimizedAttribute as String) { return false }
         let role = axString(axWin, kAXRoleAttribute as String)
         guard role == (kAXWindowRole as String) else { return false }
+        // Relaxed gate (`includeNonStandardWindows`): any window-role element is switchable regardless
+        // of subrole — surfacing real windows that report a non-standard/unknown subrole (foreign
+        // toolkits like the Android emulator's Qt window; setup/welcome surfaces like Xcode's start
+        // window). The layer-0 gate in `snapshot()` still filters true floating HUD/utility panels; a
+        // minimum-size gate here filters the tiny helper windows those toolkits also expose. Size is the
+        // AX (real) size, so a Stage-Manager strip proxy — small in CGWindowList bounds but really
+        // large — is measured by its true size and not mistaken for a helper window.
+        if settings.includeNonStandardWindows {
+            let size = axFrame(axWin).size
+            return size.width >= minRelaxedWindowDimension && size.height >= minRelaxedWindowDimension
+        }
         if let subrole = axString(axWin, kAXSubroleAttribute as String) {
             return subrole == (kAXStandardWindowSubrole as String)
         }

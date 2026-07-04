@@ -110,6 +110,17 @@ final class AppSettings: ObservableObject {
     /// Require exactly three fingers (true) vs. three-or-more (false).
     @Published var requireExactlyThree: Bool { didSet { defaults.set(requireExactlyThree, forKey: Keys.requireExactlyThree) } }
 
+    /// Relax the switcher's window gate to include windows that don't report the standard
+    /// `AXStandardWindow` subrole. The strict default lists only standard document windows (plus
+    /// windows that expose no subrole at all), which drops real windows from foreign UI toolkits and
+    /// setup/welcome surfaces — e.g. the Android emulator (a Qt window whose subrole isn't standard)
+    /// and Xcode's start/welcome window (a panel/dialog subrole). When ON, any window-role element on
+    /// the normal window layer is switchable regardless of subrole; the layer-0 gate still filters true
+    /// floating HUD/utility panels, and minimized windows stay excluded. A pure behavior tunable — no
+    /// system side effect, no new permission — so it live-applies on the next gesture. Default OFF
+    /// (preserve today's strict behavior); older settings have no key and decode with it OFF.
+    @Published var includeNonStandardWindows: Bool { didSet { defaults.set(includeNonStandardWindows, forKey: Keys.includeNonStandardWindows) } }
+
     /// Normalized vertical centroid travel that switches one Space-row. Larger than stepDistance
     /// so horizontal scrubbing jitter doesn't flip rows.
     @Published var rowStepDistance: Double { didSet { persist(rowStepDistance, Keys.rowStepDistance) } }
@@ -560,6 +571,7 @@ final class AppSettings: ObservableObject {
         velocitySmoothing = defaults.object(forKey: Keys.velocitySmoothing) as? Double ?? Defaults.velocitySmoothing
         switcherWindowScale = defaults.object(forKey: Keys.switcherWindowScale) as? Double ?? Defaults.switcherWindowScale
         requireExactlyThree = defaults.object(forKey: Keys.requireExactlyThree) as? Bool ?? Defaults.requireExactlyThree
+        includeNonStandardWindows = defaults.object(forKey: Keys.includeNonStandardWindows) as? Bool ?? Defaults.includeNonStandardWindows
         rowStepDistance = defaults.object(forKey: Keys.rowStepDistance) as? Double ?? Defaults.rowStepDistance
         focusWatchdogEnabled = defaults.object(forKey: Keys.focusWatchdogEnabled) as? Bool ?? Defaults.focusWatchdogEnabled
         manageSpacesRearrange = defaults.object(forKey: Keys.manageSpacesRearrange) as? Bool ?? Defaults.manageSpacesRearrange
@@ -641,6 +653,9 @@ final class AppSettings: ObservableObject {
         velocitySmoothing = Defaults.velocitySmoothing
         switcherWindowScale = Defaults.switcherWindowScale
         requireExactlyThree = Defaults.requireExactlyThree
+        // A pure behavior tunable (no system side effect / permission / download), so — like `wrapAtEnds`
+        // and `requireExactlyThree` — it resets back to its strict default.
+        includeNonStandardWindows = Defaults.includeNonStandardWindows
         rowStepDistance = Defaults.rowStepDistance
         // Resolution-gesture bindings (incl. the folded reverse-direction switcher axes) reset to today's
         // behavior — a single source of truth for the former `reverseDirection` / `reverseVerticalDirection`.
@@ -754,6 +769,7 @@ final class AppSettings: ObservableObject {
         static let velocitySmoothing = 0.35
         static let switcherWindowScale = 0.60    // 0.60× of SwitcherLayout.kMax
         static let requireExactlyThree = true
+        static let includeNonStandardWindows = false   // strict: only AXStandardWindow (opt-in to widen)
         static let rowStepDistance = 0.06       // 2× the horizontal step; deliberate up/down
         static let reverseVerticalDirection = false
         static let focusWatchdogEnabled = true
@@ -842,6 +858,7 @@ final class AppSettings: ObservableObject {
         static let velocitySmoothing = "velocitySmoothing"
         static let switcherWindowScale = "switcherWindowScale"
         static let requireExactlyThree = "requireExactlyThree"
+        static let includeNonStandardWindows = "includeNonStandardWindows"
         static let rowStepDistance = "rowStepDistance"
         static let reverseVerticalDirection = "reverseVerticalDirection"
         static let focusWatchdogEnabled = "focusWatchdogEnabled"

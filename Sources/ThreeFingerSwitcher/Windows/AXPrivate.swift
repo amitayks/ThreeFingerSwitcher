@@ -39,7 +39,14 @@ private func remoteToken(pid: pid_t, id: UInt) -> Data {
 /// way to obtain a VALID AXUIElement for a window on another Space (kAXWindowsAttribute can't
 /// see off-Space windows). Also reaches windows created before this process launched.
 /// Returns (CGWindowID, element) pairs for standard windows / dialogs. Budgeted to avoid stalls.
-func bruteForceWindows(pid: pid_t, budgetMs: Double = 100) -> [(CGWindowID, AXUIElement)] {
+///
+/// The subrole pre-filter mirrors the switcher's `isSwitchable` gate so an off-Space window that
+/// WOULD be listed is also acquirable here (and one that wouldn't isn't wasted on): strict mode keeps
+/// only `AXStandardWindow` / `AXDialog`; when `includeNonStandard` is set, ANY window-role element
+/// counts, so a Qt/panel window with a non-standard or unknown subrole (the Android emulator, Xcode's
+/// welcome window) resolves off-Space too. Role (not subrole) is the window discriminator in the
+/// relaxed path, so non-window elements the remote-token sweep also resolves are still dropped.
+func bruteForceWindows(pid: pid_t, includeNonStandard: Bool = false, budgetMs: Double = 100) -> [(CGWindowID, AXUIElement)] {
     guard let create = cgs.createWithRemoteToken else { return [] }
     var results: [(CGWindowID, AXUIElement)] = []
     let deadline = DispatchTime.now() + .milliseconds(Int(budgetMs))
@@ -47,8 +54,12 @@ func bruteForceWindows(pid: pid_t, budgetMs: Double = 100) -> [(CGWindowID, AXUI
         if DispatchTime.now() >= deadline { break }
         let token = remoteToken(pid: pid, id: UInt(axId))
         guard let element = create(token as CFData)?.takeRetainedValue() else { continue }
-        let subrole = axString(element, kAXSubroleAttribute as String)
-        guard subrole == (kAXStandardWindowSubrole as String) || subrole == (kAXDialogSubrole as String) else { continue }
+        if includeNonStandard {
+            guard axString(element, kAXRoleAttribute as String) == (kAXWindowRole as String) else { continue }
+        } else {
+            let subrole = axString(element, kAXSubroleAttribute as String)
+            guard subrole == (kAXStandardWindowSubrole as String) || subrole == (kAXDialogSubrole as String) else { continue }
+        }
         if let wid = axWindowID(element) {
             results.append((wid, element))
         }

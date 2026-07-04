@@ -5,11 +5,15 @@
 Define the settings model, persistence, defaults, and Settings UI for the switcher's sensitivity, stepping, and behavior tunables.
 ## Requirements
 ### Requirement: Tunable gesture parameters
-The system SHALL expose tunable parameters with sensible defaults: activation threshold, axis-lock ratio, step distance ("one window per N"), wrap-vs-clamp at list ends, direction (natural/reverse), velocity smoothing factor, and exact-three-fingers requirement.
+The system SHALL expose tunable parameters with sensible defaults: activation threshold, axis-lock ratio, step distance ("one window per N"), wrap-vs-clamp at list ends, direction (natural/reverse), velocity smoothing factor, exact-three-fingers requirement, and inclusion of non-standard windows in the switcher list (default off — the strict standard-window gate).
 
 #### Scenario: Defaults applied on first run
 - **WHEN** the app runs for the first time
 - **THEN** all tunables have sensible default values and the switcher is usable without configuration
+
+#### Scenario: Non-standard window inclusion is a pure behavior tunable
+- **WHEN** the user turns on "include non-standard windows"
+- **THEN** the switcher lists windows that don't report the standard-window subrole (per the window-enumeration-and-raising gate), the change takes effect on the next gesture without a restart, and "reset to defaults" restores it to off (it has no system side effect, permission, or download to preserve)
 
 #### Scenario: Changing step distance changes stepping
 - **WHEN** the user increases the step distance

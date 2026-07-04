@@ -337,6 +337,53 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertEqual(settings.axisLockRatio, AppSettings.Defaults.axisLockRatio, accuracy: eps)
     }
 
+    // MARK: - Include non-standard windows (switcher gate relaxation)
+
+    /// The gate-relaxation toggle defaults OFF (strict `AXStandardWindow`-only listing) and matches the
+    /// `Defaults` enum, so out of the box the switcher behaves exactly as before.
+    func testIncludeNonStandardWindowsDefaultsOff() {
+        let settings = makeSettings()
+        XCTAssertFalse(settings.includeNonStandardWindows, "must default OFF (preserve strict behavior)")
+        XCTAssertEqual(settings.includeNonStandardWindows, AppSettings.Defaults.includeNonStandardWindows)
+        XCTAssertFalse(AppSettings.Defaults.includeNonStandardWindows, "the Defaults literal is false")
+    }
+
+    /// The toggle round-trips through the documented raw key and persists across instances both ways.
+    func testIncludeNonStandardWindowsPersistsAcrossInstances() {
+        let writer = makeSettings()
+        writer.includeNonStandardWindows = true
+        XCTAssertEqual(defaults.object(forKey: "includeNonStandardWindows") as? Bool, true, "writes the documented key")
+
+        let reader = AppSettings(defaults: defaults)
+        XCTAssertTrue(reader.includeNonStandardWindows, "persists across instances")
+
+        reader.includeNonStandardWindows = false
+        XCTAssertFalse(AppSettings(defaults: defaults).includeNonStandardWindows, "the off state persists too")
+    }
+
+    /// Older settings (no key present) decode with the toggle OFF while pre-existing settings are
+    /// untouched — the addition is purely additive.
+    func testOlderSettingsDecodeWithIncludeNonStandardWindowsOff() {
+        defaults.set(0.0777, forKey: "stepDistance")
+        XCTAssertNil(defaults.object(forKey: "includeNonStandardWindows"), "precondition: no key on disk")
+
+        let settings = AppSettings(defaults: defaults)
+        XCTAssertFalse(settings.includeNonStandardWindows, "absent key falls back to the OFF default")
+        XCTAssertEqual(settings.stepDistance, 0.0777, accuracy: eps, "pre-existing settings untouched")
+    }
+
+    /// Unlike the consent-gated opt-ins, this is a pure behavior tunable (no system side effect /
+    /// permission / download), so `resetToDefaults()` DOES restore it to the strict default — mirroring
+    /// `wrapAtEnds` / `requireExactlyThree`.
+    func testResetToDefaultsRestoresIncludeNonStandardWindows() {
+        let settings = makeSettings()
+        settings.includeNonStandardWindows = true
+
+        settings.resetToDefaults()
+
+        XCTAssertFalse(settings.includeNonStandardWindows, "reset restores the strict default (OFF)")
+    }
+
     // MARK: - AI commands opt-in
 
     /// The AI-commands opt-in is off on first run (it gates a multi-gigabyte model download), and the

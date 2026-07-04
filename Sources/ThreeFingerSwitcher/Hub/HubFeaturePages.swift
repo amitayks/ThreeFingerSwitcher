@@ -145,6 +145,9 @@ struct SwitcherPage: View {
                 .pickerStyle(.segmented)
                 .onHover { demoGesture = $0 ? HubSwitcherDemo.windowsHoverGesture() : nil }
                 Toggle("Require exactly three fingers", isOn: $settings.requireExactlyThree)
+                ToggleRow(title: "Include non-standard windows",
+                          isOn: $settings.includeNonStandardWindows,
+                          caption: "Also switch to windows that don't report as standard document windows — like the Android emulator, simulators and tools from other UI toolkits, and setup/welcome screens (e.g. Xcode's start window). May also surface some dialog and panel windows.")
             }
             // Space-row switching — a sub-feature of the switcher: slide up/down while it is open to move
             // between Spaces. Re-homed here from the former standalone Spaces page.
