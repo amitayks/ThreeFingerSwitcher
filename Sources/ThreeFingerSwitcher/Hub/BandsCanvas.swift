@@ -438,7 +438,8 @@ private struct AICommandSource: View {
                 LazyVGrid(columns: sourceGridColumns, spacing: 12) {
                     Button {
                         let cmd = AICommand(name: "New Command", icon: .sfSymbol("wand.and.stars"),
-                                            input: .selection, promptTemplate: "{input}", output: .previewOnly)
+                                            inputs: AICommand.defaultInputs, promptTemplate: "{input}",
+                                            outputs: AICommand.defaultOutputs)
                         onPick(AIBand.item(for: cmd))
                     } label: {
                         GridTile(title: "Custom command", subtitle: "AI Command") { SourceSymbol(name: "wand.and.stars") }
@@ -1429,7 +1430,8 @@ private struct ItemInspector: View {
     /// only appears when `liveAICommand != nil`).
     private var ai: AICommand {
         liveAICommand ?? AICommand(name: "", icon: .sfSymbol("wand.and.stars"),
-                                   input: .selection, promptTemplate: "", output: .previewOnly)
+                                   inputs: AICommand.defaultInputs, promptTemplate: "",
+                                   outputs: AICommand.defaultOutputs)
     }
 
     /// Apply an edit to the embedded command and persist it, mirroring name/icon/tint onto the
@@ -1480,17 +1482,14 @@ private struct ItemInspector: View {
                             .onChange(of: title) { updateCommand { $0.name = title } }
                     }
 
-                    // Input source + Output target on one tight row; the output's conditional
-                    // task/destination sub-editors flow below it.
+                    // Sources + Result are CAPABILITY sets (change `ai-action-context-resolution`): the
+                    // action senses the live environment at fire and resolves BOTH the input channel and
+                    // the commit from what's enabled here — all-on is the smart default. Toggles narrow it.
+                    aiField("Sources") { aiInputToggles }
+                    Text("The action reads the first available source: your selection, then clipboard text, then a clipboard image. A selection commits as a replace; the clipboard commits as a paste at the cursor.")
+                        .font(.caption).foregroundStyle(.secondary)
                     HStack(spacing: 18) {
-                        aiField("Input source") {
-                            Picker("Input source", selection: Binding(
-                                get: { ai.input }, set: { src in updateCommand { $0.input = src } })) {
-                                ForEach(InputSource.allCases, id: \.self) { Text(aiInputLabel($0)).tag($0) }
-                            }
-                            .labelsHidden()
-                        }
-                        aiField("Output target") { aiOutputPicker.labelsHidden() }
+                        aiField("Result") { aiOutputKindPicker.labelsHidden() }
                         Spacer(minLength: 0)
                     }
                     aiOutputDetail
@@ -1523,20 +1522,76 @@ private struct ItemInspector: View {
         .frame(height: 380)
     }
 
-    private var aiOutputPicker: some View {
-        Picker("Output target", selection: Binding(
-            get: { outputChoice(ai.output) }, set: { setOutputChoice($0) })) {
-            ForEach(OutputChoice.allCases) { Text($0.label).tag($0) }
+    // MARK: - Input capability toggles (design D1/D4)
+
+    /// The input capability toggles: the ambient cascade (selection ▸ clipboard ▸ clipboard image) plus a
+    /// mutually-exclusive "screen region" (region-first, vision). Enabling screen region clears the ambient
+    /// set; while it is on, the ambient toggles are disabled.
+    private var aiInputToggles: some View {
+        let regionMode = ai.inputs.contains(.screenRegion)
+        return VStack(alignment: .leading, spacing: 4) {
+            Toggle(aiInputLabel(.selection), isOn: inputBinding(.selection)).disabled(regionMode)
+            Toggle(aiInputLabel(.clipboard), isOn: inputBinding(.clipboard)).disabled(regionMode)
+            Toggle(aiInputLabel(.clipboardImage), isOn: inputBinding(.clipboardImage)).disabled(regionMode)
+            Toggle(aiInputLabel(.screenRegion), isOn: inputBinding(.screenRegion))
+                .help("Captures a screen region instead — exclusive of the other sources.")
+        }
+        .toggleStyle(.checkbox)
+    }
+
+    private func inputBinding(_ s: InputSource) -> Binding<Bool> {
+        Binding(get: { ai.inputs.contains(s) },
+                set: { on in updateCommand { cmd in Self.setInput(&cmd, s, on) } })
+    }
+
+    /// Toggle one input capability, enforcing the screen-region exclusivity (design D4).
+    static func setInput(_ cmd: inout AICommand, _ s: InputSource, _ on: Bool) {
+        if on {
+            if s == .screenRegion { cmd.inputs = [.screenRegion] }         // region-first: exclusive
+            else { cmd.inputs.remove(.screenRegion); cmd.inputs.insert(s) }
+        } else {
+            cmd.inputs.remove(s)
         }
     }
 
-    /// The output's conditional task/destination sub-editors — shown below the paired input/output
-    /// row (only when the chosen output target needs further configuration).
+    // MARK: - Output capability (kind + in-place toggles)
+
+    /// The result KIND: an in-place command (the replace/paste/preview toggles below), or a side-effecting
+    /// task / send-to (its own sub-editor). Derived from whether the outputs carry a side-effecting member.
+    private var aiOutputKindPicker: some View {
+        Picker("Result", selection: Binding(get: { outputKind(ai) }, set: { setOutputKind($0) })) {
+            ForEach(AIOutputKind.allCases) { Text($0.label).tag($0) }
+        }
+    }
+
+    /// The in-place output capability toggles: which commit behaviors the action may use (resolved from the
+    /// input channel at fire — selection→replace, clipboard→paste, else preview).
+    private var aiInPlaceOutputToggles: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle("Replace selection", isOn: inPlaceOutputBinding(.replaceSelection))
+            Toggle("Paste at cursor", isOn: inPlaceOutputBinding(.pasteAtCursor))
+            Toggle("Preview only", isOn: inPlaceOutputBinding(.previewOnly))
+        }
+        .toggleStyle(.checkbox)
+    }
+
+    private func inPlaceOutputBinding(_ o: OutputTarget) -> Binding<Bool> {
+        Binding(get: { ai.outputs.contains(o) },
+                set: { on in updateCommand { cmd in
+                    if on { cmd.outputs.insert(o) } else { cmd.outputs.remove(o) }
+                } })
+    }
+
+    /// The output's conditional sub-editors: the in-place toggles, or the task/destination editor when the
+    /// result is a side-effecting task / send-to.
     @ViewBuilder
     private var aiOutputDetail: some View {
-        if case let .runTask(kind) = ai.output { aiTaskKindEditor(kind) }
-        if case let .sendTo(dest) = ai.output {
-            aiDestinationEditor(dest) { newDest in updateCommand { $0.output = .sendTo(newDest) } }
+        switch ai.sideEffect {
+        case let .runTask(kind): aiTaskKindEditor(kind)
+        case let .sendTo(dest):
+            aiDestinationEditor(dest) { newDest in updateCommand { $0.outputs = [.sendTo(newDest)] } }
+        default:
+            aiInPlaceOutputToggles
         }
     }
 
@@ -1557,12 +1612,12 @@ private struct ItemInspector: View {
                 .font(.caption).foregroundStyle(.secondary)
         case let .saveToProject(project):
             TextField("Project", text: Binding(
-                get: { project }, set: { p in updateCommand { $0.output = .runTask(.saveToProject(project: p)) } }))
+                get: { project }, set: { p in updateCommand { $0.outputs = [.runTask(.saveToProject(project: p))] } }))
         case let .openToolWithPayload(tool):
             ToolTargetPicker(tool: Binding(
-                get: { tool }, set: { t in updateCommand { $0.output = .runTask(.openToolWithPayload(tool: t)) } }))
+                get: { tool }, set: { t in updateCommand { $0.outputs = [.runTask(.openToolWithPayload(tool: t))] } }))
         case let .sendTo(dest):
-            aiDestinationEditor(dest) { newDest in updateCommand { $0.output = .runTask(.sendTo(newDest)) } }
+            aiDestinationEditor(dest) { newDest in updateCommand { $0.outputs = [.runTask(.sendTo(newDest))] } }
         }
     }
 
@@ -1583,7 +1638,7 @@ private struct ItemInspector: View {
     }
 
     private var aiModelPicker: some View {
-        let registry = ModelRegistry.standard
+        let registry = ModelCatalog.standard
         return Picker("Model", selection: Binding(
             get: { selectedModelID(ai.model) }, set: { id in updateCommand { $0.model = .onDevice(modelID: id) } })) {
             Text("Registry default").tag(String?.none)
@@ -1600,29 +1655,28 @@ private struct ItemInspector: View {
         }
     }
 
-    private func outputChoice(_ o: OutputTarget) -> OutputChoice {
-        switch o {
-        case .replaceSelection: return .replaceSelection
-        case .pasteAtCursor: return .pasteAtCursor
-        case .previewOnly: return .previewOnly
+    private func outputKind(_ c: AICommand) -> AIOutputKind {
+        switch c.sideEffect {
         case .runTask: return .runTask
-        case .sendTo: return .sendTo
+        case .sendTo:  return .sendTo
+        default:       return .inPlace
         }
     }
 
-    private func setOutputChoice(_ choice: OutputChoice) {
-        let newOutput: OutputTarget
-        switch choice {
-        case .replaceSelection: newOutput = .replaceSelection
-        case .pasteAtCursor: newOutput = .pasteAtCursor
-        case .previewOnly: newOutput = .previewOnly
-        case .runTask: newOutput = .runTask(.addToCalendar)
-        case .sendTo: newOutput = .sendTo(.shortcut(name: ""))
-        }
-        let crossedBoundary = ai.output.isSideEffecting != newOutput.isSideEffecting
-        updateCommand {
-            $0.output = newOutput
-            if crossedBoundary { $0.confirmBeforeRun = AICommand.defaultConfirmBeforeRun(for: newOutput) }
+    /// Switch the result kind. Moving to in-place restores the all-on in-place toggles; moving to a task /
+    /// send-to seeds a default payload. Crossing the in-place ⇄ side-effect boundary re-derives
+    /// `confirmBeforeRun` (matching the prior single-picker behavior).
+    private func setOutputKind(_ kind: AIOutputKind) {
+        let wasSideEffecting = ai.isSideEffecting
+        updateCommand { cmd in
+            switch kind {
+            case .inPlace: cmd.outputs = AICommand.defaultOutputs
+            case .runTask: cmd.outputs = [.runTask(.addToCalendar)]
+            case .sendTo:  cmd.outputs = [.sendTo(.shortcut(name: ""))]
+            }
+            if wasSideEffecting != cmd.isSideEffecting {
+                cmd.confirmBeforeRun = AICommand.defaultConfirmBeforeRun(for: cmd.outputs)
+            }
         }
     }
 
@@ -1647,7 +1701,7 @@ private struct ItemInspector: View {
         case .openToolWithPayload: kind = .openToolWithPayload(tool: "")
         case .sendTo: kind = .sendTo(.shortcut(name: ""))
         }
-        updateCommand { $0.output = .runTask(kind) }
+        updateCommand { $0.outputs = [.runTask(kind)] }
     }
 
     private func destinationChoice(_ d: Destination) -> DestinationChoice {
@@ -2158,14 +2212,14 @@ private struct AITokenBar: View {
     }
 }
 
-private enum OutputChoice: String, CaseIterable, Identifiable {
-    case replaceSelection, pasteAtCursor, previewOnly, runTask, sendTo
+/// The result KIND of an AI command: an in-place command (whose replace/paste/preview behaviors are
+/// capability toggles resolved from the input at fire) vs a side-effecting task / send-to.
+private enum AIOutputKind: String, CaseIterable, Identifiable {
+    case inPlace, runTask, sendTo
     var id: String { rawValue }
     var label: String {
         switch self {
-        case .replaceSelection: return "Replace selection"
-        case .pasteAtCursor: return "Paste at cursor"
-        case .previewOnly: return "Preview only"
+        case .inPlace: return "In-place (replace / paste / preview)"
         case .runTask: return "Run a task"
         case .sendTo: return "Send to…"
         }

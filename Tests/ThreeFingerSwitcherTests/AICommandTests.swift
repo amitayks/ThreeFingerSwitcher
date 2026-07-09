@@ -41,7 +41,9 @@ final class AICommandTests: XCTestCase {
                                     promptTemplate: "{date}", output: output)
             let data = try JSONEncoder().encode(command)
             let decoded = try JSONDecoder().decode(AICommand.self, from: data)
-            XCTAssertEqual(decoded.output, output, "output \(output) round-trips")
+            XCTAssertEqual(decoded, command, "output \(output) (as a set) round-trips")
+            XCTAssertEqual(decoded.outputs, AICommand.migrate(output: output),
+                           "output \(output) migrates to its capability set")
         }
     }
 
@@ -128,11 +130,92 @@ final class AICommandTests: XCTestCase {
     }
 
     func testDefaultConfirmHelperMatchesSideEffectClassification() {
-        XCTAssertTrue(AICommand.defaultConfirmBeforeRun(for: .runTask(.addToCalendar)))
-        XCTAssertTrue(AICommand.defaultConfirmBeforeRun(for: .sendTo(.shortcut(name: "X"))))
-        XCTAssertFalse(AICommand.defaultConfirmBeforeRun(for: .replaceSelection))
-        XCTAssertFalse(AICommand.defaultConfirmBeforeRun(for: .pasteAtCursor))
-        XCTAssertFalse(AICommand.defaultConfirmBeforeRun(for: .previewOnly))
+        XCTAssertTrue(AICommand.defaultConfirmBeforeRun(for: [.runTask(.addToCalendar)]))
+        XCTAssertTrue(AICommand.defaultConfirmBeforeRun(for: [.sendTo(.shortcut(name: "X"))]))
+        // A set containing ANY side-effecting member confirms; a purely in-place set does not.
+        XCTAssertTrue(AICommand.defaultConfirmBeforeRun(for: [.previewOnly, .runTask(.newContact)]))
+        XCTAssertFalse(AICommand.defaultConfirmBeforeRun(for: [.replaceSelection, .pasteAtCursor, .previewOnly]))
+        XCTAssertFalse(AICommand.defaultConfirmBeforeRun(for: [.pasteAtCursor]))
+    }
+
+    // MARK: - Capability sets: defaults, migration, resolution (change `ai-action-context-resolution`)
+
+    func testDefaultCapabilitySetsAreAllOn() {
+        XCTAssertEqual(AICommand.defaultInputs, [.selection, .clipboard, .clipboardImage],
+                       "a new command's inputs default to the ambient cascade")
+        XCTAssertEqual(AICommand.defaultOutputs, [.replaceSelection, .pasteAtCursor, .previewOnly],
+                       "a new command's in-place outputs default all-on")
+    }
+
+    func testLegacyScalarMigrationMapping() {
+        // The pure migration table (design D5): behavior-preserving, with the selection→clipboard fallback
+        // made explicit and replaceSelection gaining pasteAtCursor.
+        XCTAssertEqual(AICommand.migrate(input: .selection), [.selection, .clipboard])
+        XCTAssertEqual(AICommand.migrate(input: .clipboard), [.clipboard])
+        XCTAssertEqual(AICommand.migrate(input: .clipboardImage), [.clipboardImage])
+        XCTAssertEqual(AICommand.migrate(input: .screenRegion), [.screenRegion])
+        XCTAssertEqual(AICommand.migrate(input: .none), [])
+        XCTAssertEqual(AICommand.migrate(output: .replaceSelection), [.replaceSelection, .pasteAtCursor])
+        XCTAssertEqual(AICommand.migrate(output: .pasteAtCursor), [.pasteAtCursor])
+        XCTAssertEqual(AICommand.migrate(output: .previewOnly), [.previewOnly])
+        XCTAssertEqual(AICommand.migrate(output: .runTask(.addToCalendar)), [.runTask(.addToCalendar)])
+    }
+
+    func testLegacyScalarInputOutputMigrateOnDecode() throws {
+        // A command persisted with the OLD single `input`/`output` scalar keys must decode into the sets.
+        // Rewrite a modern command's JSON to that legacy shape, then decode.
+        let modern = AICommand(name: "Fix", icon: .sfSymbol("checkmark"),
+                               inputs: [.selection], promptTemplate: "{input}", outputs: [.previewOnly])
+        var dict = try JSONSerialization.jsonObject(with: JSONEncoder().encode(modern)) as! [String: Any]
+        dict.removeValue(forKey: "inputs")
+        dict.removeValue(forKey: "outputs")
+        dict["input"] = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(InputSource.selection), options: [.fragmentsAllowed])
+        dict["output"] = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(OutputTarget.replaceSelection))
+        let data = try JSONSerialization.data(withJSONObject: dict)
+        let decoded = try JSONDecoder().decode(AICommand.self, from: data)
+        XCTAssertEqual(decoded.inputs, [.selection, .clipboard], "legacy .selection → {selection, clipboard}")
+        XCTAssertEqual(decoded.outputs, [.replaceSelection, .pasteAtCursor],
+                       "legacy .replaceSelection → {replaceSelection, pasteAtCursor}")
+    }
+
+    func testInPlaceCommitPlanResolvesFromChannelAndOutputs() {
+        let all = AICommand.defaultOutputs   // {replace, paste, preview}
+        // A selection source replaces; a clipboard source pastes (the core "it knows what to do").
+        XCTAssertEqual(AICommand.inPlaceCommitPlan(resolvedWasSelection: true, outputs: all), .replaceSelection)
+        XCTAssertEqual(AICommand.inPlaceCommitPlan(resolvedWasSelection: false, outputs: all), .pasteAtCursor)
+        // Replace disabled → a selection still pastes.
+        XCTAssertEqual(AICommand.inPlaceCommitPlan(resolvedWasSelection: true,
+                                                   outputs: [.pasteAtCursor, .previewOnly]), .pasteAtCursor)
+        // Preview-only (read-only understanding command) writes nothing even with a selection.
+        XCTAssertEqual(AICommand.inPlaceCommitPlan(resolvedWasSelection: true, outputs: [.previewOnly]), .preview)
+        // Only replace enabled, no selection → still replace (SelectionService pastes when not settable).
+        XCTAssertEqual(AICommand.inPlaceCommitPlan(resolvedWasSelection: false, outputs: [.replaceSelection]),
+                       .replaceSelection)
+        // Nothing enabled → preview (safe default).
+        XCTAssertEqual(AICommand.inPlaceCommitPlan(resolvedWasSelection: true, outputs: []), .preview)
+    }
+
+    func testRequiredCapabilitiesIsUnionOverInputs() {
+        let mixed = AICommand(name: "M", icon: .emoji("🖼"), inputs: [.selection, .clipboardImage],
+                              promptTemplate: "{input}", outputs: [.previewOnly])
+        XCTAssertEqual(mixed.requiredCapabilities, [.text, .vision],
+                       "a command mixing text + image inputs unions both capabilities")
+        let standalone = AICommand(name: "S", icon: .emoji("✨"), inputs: [],
+                                   promptTemplate: "{date}", outputs: [.previewOnly])
+        XCTAssertEqual(standalone.requiredCapabilities, [.text], "an empty input set needs only text")
+    }
+
+    func testSideEffectAccessor() {
+        let task = AICommand(name: "Cal", icon: .emoji("📅"), inputs: [.selection],
+                             promptTemplate: "{input}", outputs: [.runTask(.addToCalendar)])
+        XCTAssertEqual(task.sideEffect, .runTask(.addToCalendar))
+        XCTAssertTrue(task.isSideEffecting)
+        let inPlace = AICommand(name: "Fix", icon: .emoji("✍️"), inputs: [.selection],
+                                promptTemplate: "{input}", outputs: [.replaceSelection, .pasteAtCursor])
+        XCTAssertNil(inPlace.sideEffect)
+        XCTAssertFalse(inPlace.isSideEffecting)
     }
 
     // MARK: - requiredCapabilities

@@ -77,7 +77,7 @@ final class AICommandExecutorTests: XCTestCase {
     private func loadedManager(runtime: StubLLMRuntime,
                               capabilities: Set<Modality> = [.text, .vision]) async throws -> ModelManager {
         let payload = Data("weights".utf8)
-        let registry = ModelRegistry(
+        let registry = ModelCatalog(
             models: [ModelDescriptor(
                 id: "test-model",
                 displayName: "Test Model",
@@ -137,7 +137,7 @@ final class AICommandExecutorTests: XCTestCase {
     /// `loadedManager(runtime:)` that accepts any `LLMRuntime` (used by the reasoning-propagation test).
     private func loadedManager(anyRuntime runtime: LLMRuntime) async throws -> ModelManager {
         let payload = Data("weights".utf8)
-        let registry = ModelRegistry(
+        let registry = ModelCatalog(
             models: [ModelDescriptor(
                 id: "test-model",
                 displayName: "Test Model",
@@ -307,6 +307,107 @@ final class AICommandExecutorTests: XCTestCase {
         // The stub echoes its prompt, which is the resolved template = the acquired input.
         XCTAssertEqual(executor.state, .ready(result: "from clipboard"),
                        "an empty selection falls back to the clipboard text")
+    }
+
+    // MARK: - Contextual commit (change `ai-action-context-resolution`)
+
+    /// The core behavior: a default all-on command REPLACES when there is a live selection and PASTES when
+    /// there is not — one command, resolved from the environment (the user's "it knows what to do").
+    func testDefaultCommandReplacesWhenSelectingAndPastesOtherwise() async throws {
+        // (a) With a live selection → commit is a replace.
+        do {
+            let stub = StubLLMRuntime(scriptedTokens: ["done"], interTokenDelayNanos: 0)
+            let manager = try await loadedManager(runtime: stub)
+            let selection = FakeSelectionProvider(selectedText: "sel", clipboardText: "clip")
+            let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                             dispatcher: FakeTaskDispatcher())
+            let command = AICommand(name: "Smart", icon: .emoji("✨"),
+                                    inputs: AICommand.defaultInputs, promptTemplate: "{input}",
+                                    outputs: AICommand.defaultOutputs)
+            executor.fire(command)
+            await waitUntil { if case .ready = executor.state { return true }; return false }
+            try await executor.commit()
+            XCTAssertEqual(selection.replacedWith, ["done"], "a live selection commits as a replace")
+            XCTAssertTrue(selection.pastedAtCursor.isEmpty, "it does not also paste")
+        }
+        // (b) With no selection (clipboard only) → commit is a paste at the cursor.
+        do {
+            let stub = StubLLMRuntime(scriptedTokens: ["done"], interTokenDelayNanos: 0)
+            let manager = try await loadedManager(runtime: stub)
+            let selection = FakeSelectionProvider(selectedText: nil, clipboardText: "clip")
+            let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                             dispatcher: FakeTaskDispatcher())
+            let command = AICommand(name: "Smart", icon: .emoji("✨"),
+                                    inputs: AICommand.defaultInputs, promptTemplate: "{input}",
+                                    outputs: AICommand.defaultOutputs)
+            executor.fire(command)
+            await waitUntil { if case .ready = executor.state { return true }; return false }
+            try await executor.commit()
+            XCTAssertEqual(selection.pastedAtCursor, ["done"], "no selection commits as a paste at the cursor")
+            XCTAssertTrue(selection.replacedWith.isEmpty, "it does not replace the (absent) selection")
+        }
+    }
+
+    /// A command that disables the selection channel uses the clipboard even when a selection exists.
+    func testDisabledSelectionChannelIsSkippedForClipboard() async throws {
+        let stub = StubLLMRuntime(scriptedTokens: [], interTokenDelayNanos: 0)   // echoes the prompt
+        let manager = try await loadedManager(runtime: stub)
+        let selection = FakeSelectionProvider(selectedText: "ignored selection", clipboardText: "from clipboard")
+        let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                         dispatcher: FakeTaskDispatcher())
+        let command = AICommand(name: "ClipOnly", icon: .emoji("📋"),
+                                inputs: [.clipboard], promptTemplate: "{input}", outputs: [.pasteAtCursor])
+        executor.fire(command)
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+        XCTAssertEqual(executor.state, .ready(result: "from clipboard"),
+                       "a disabled selection channel is skipped even when a selection exists")
+        try await executor.commit()
+        XCTAssertEqual(selection.pastedAtCursor, ["from clipboard"], "the clipboard input commits as a paste")
+        XCTAssertTrue(selection.replacedWith.isEmpty)
+    }
+
+    // MARK: - Selection read ordering + reuse (change: read before the canvas takes key focus)
+
+    /// The interaction hook fires once, AFTER the executor has acquired its input — so the controller only
+    /// makes the canvas key-interactive after the selection has been read (never stealing the read).
+    func testOnReadyForInteractionFiresAfterInputAcquired() async throws {
+        let stub = StubLLMRuntime(scriptedTokens: ["x"], interTokenDelayNanos: 0)
+        let manager = try await loadedManager(runtime: stub)
+        let selection = FakeSelectionProvider(selectedText: "hi")
+        let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                         dispatcher: FakeTaskDispatcher())
+        var readyCalls = 0
+        executor.onReadyForInteraction = { readyCalls += 1 }
+        let command = AICommand(name: "C", icon: .emoji("✨"), inputs: [.selection],
+                                promptTemplate: "{input}", outputs: [.previewOnly])
+        executor.fire(command)
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+        XCTAssertEqual(readyCalls, 1, "the interaction hook fires exactly once, after input acquisition")
+    }
+
+    /// A language re-run REUSES the originally-acquired source instead of re-reading the selection (which
+    /// would fail once the canvas panel has taken key focus) — the retained-input half of the fix.
+    func testSetLanguageReusesRetainedInputNotAFreshRead() async throws {
+        let stub = StubLLMRuntime(scriptedTokens: [], interTokenDelayNanos: 0)   // echoes the prompt
+        let manager = try await loadedManager(runtime: stub)
+        let selection = FakeSelectionProvider(selectedText: "original")
+        var saved: [UUID: String] = [:]
+        let executor = AICommandExecutor(modelManager: manager, selection: selection,
+                                         dispatcher: FakeTaskDispatcher(),
+                                         loadLanguage: { saved[$0] }, saveLanguage: { saved[$0] = $1 })
+        let command = AICommand(name: "Translate", icon: .emoji("🌐"), inputs: [.selection],
+                                promptTemplate: "{input}", outputs: [.previewOnly],
+                                runtimeParameter: .language(default: "English"))
+        executor.fire(command)
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+        XCTAssertEqual(executor.state, .ready(result: "original"))
+        // The selection CHANGES after the first fire (focus moved / the panel took key). A re-translate
+        // must reuse the retained source, not re-read the now-different selection.
+        selection.selectedText = "CHANGED"
+        executor.setLanguage("Hebrew")
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+        XCTAssertEqual(executor.state, .ready(result: "original"),
+                       "a language re-run reuses the originally-acquired input, not a fresh (changed) selection")
     }
 
     // MARK: - No input

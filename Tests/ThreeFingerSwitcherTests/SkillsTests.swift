@@ -68,6 +68,50 @@ final class SkillsTests: XCTestCase {
         XCTAssertEqual(serialized, SkillFile.serialize(second))
     }
 
+    /// A `.skill.md` saved with the OLD single `input:`/`output:` lines still parses, migrated into the
+    /// capability sets (change `ai-action-context-resolution`).
+    func testLegacySkillInputOutputMigrateToSets() {
+        let legacy = """
+        ---
+        id: legacy
+        title: Legacy
+        summary: A skill saved with the old single input/output fields.
+        icon: sparkles
+        input: selection
+        output: replaceSelection
+        ---
+        {input}
+        """
+        guard case let .success(m) = SkillFile.parse(legacy) else { return XCTFail("legacy skill should parse") }
+        XCTAssertEqual(m.command.inputs, [.selection, .clipboard],
+                       "legacy input: selection migrates to the ambient text set")
+        XCTAssertEqual(m.command.outputs, [.replaceSelection, .pasteAtCursor],
+                       "legacy output: replaceSelection migrates to the write-back pair")
+    }
+
+    /// A `.skill.md` using the new comma-joined `inputs:`/`outputs:` sets parses exactly and round-trips.
+    func testNewSkillInputsOutputsSetsParseAndRoundTrip() {
+        let modern = """
+        ---
+        id: modern
+        title: Modern
+        summary: A skill using capability sets.
+        icon: sparkles
+        inputs: selection, clipboard, clipboardImage
+        outputs: pasteAtCursor, previewOnly
+        ---
+        {input}
+        """
+        guard case let .success(m) = SkillFile.parse(modern) else { return XCTFail("modern skill should parse") }
+        XCTAssertEqual(m.command.inputs, [.selection, .clipboard, .clipboardImage])
+        XCTAssertEqual(m.command.outputs, [.pasteAtCursor, .previewOnly])
+        guard case let .success(reparsed) = SkillFile.parse(SkillFile.serialize(m)) else {
+            return XCTFail("the serialized set form should re-parse")
+        }
+        XCTAssertEqual(reparsed.command.inputs, m.command.inputs, "inputs set round-trips")
+        XCTAssertEqual(reparsed.command.outputs, m.command.outputs, "outputs set round-trips")
+    }
+
     /// Every `OutputTarget` case round-trips through the flat colon encoding.
     func testEveryOutputTargetRoundTripsThroughTheColonEncoding() {
         let cases: [OutputTarget] = [

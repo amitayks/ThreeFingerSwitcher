@@ -36,7 +36,7 @@ struct SkillToolProvider: ToolContributor {
         let reasoning = m.command.resolvedReasoning(globalDefault: globalReasoning)
 
         // In-place skill: generate the text result; that text IS the step's outcome.
-        if let kind = Self.taskKind(for: m.command.output) {
+        if let kind = Self.taskKind(for: m.command) {
             return await runSideEffecting(kind, m: m, prompt: prompt, reasoning: reasoning,
                                           descriptor: call.descriptor, gate: gate)
         }
@@ -93,7 +93,7 @@ struct SkillToolProvider: ToolContributor {
         ToolDescriptor(
             name: m.id,
             summary: m.summary,
-            argsSchema: schema(for: m.command.output),
+            argsSchema: schema(for: m.command),
             writePolicy: m.command.confirmBeforeRun ? .confirm : .auto,
             keywords: m.keywords)
     }
@@ -101,25 +101,27 @@ struct SkillToolProvider: ToolContributor {
     /// The args schema the router targets: the bound `ParsedActions` schema for a side-effecting sink (so
     /// the model emits the same validated/declinable shape the dispatcher consumes); a minimal text schema
     /// for an in-place sink (the model just produces text).
-    static func schema(for output: OutputTarget) -> StructuredSchema {
-        switch output {
+    static func schema(for command: AICommand) -> StructuredSchema {
+        switch command.sideEffect {
         case .runTask(.addToCalendar): return ParsedCalendarEvent.schema
         case .runTask(.addToReminder): return ParsedReminder.schema
         case .runTask(.newContact): return ParsedContact.schema
         case .runTask(.saveToProject): return ParsedSaveToProject.schema
         case .runTask(.openToolWithPayload): return ParsedOpenTool.schema
         case .runTask(.sendTo), .sendTo: return ParsedSendTo.schema
-        case .replaceSelection, .pasteAtCursor, .previewOnly:
+        default:   // in-place (no side-effecting output): the model just produces text
             return StructuredSchema(name: "text_result",
                                     json: "{\"type\":\"object\",\"required\":[\"result\"],\"properties\":{\"result\":{\"type\":\"string\"}}}")
         }
     }
 
-    private static func taskKind(for output: OutputTarget) -> TaskKind? {
-        switch output {
+    /// The `TaskKind` this command's side-effecting output routes to (reads `command.sideEffect`), or nil
+    /// for an in-place skill.
+    private static func taskKind(for command: AICommand) -> TaskKind? {
+        switch command.sideEffect {
         case let .runTask(kind): return kind
         case let .sendTo(destination): return .sendTo(destination)
-        case .replaceSelection, .pasteAtCursor, .previewOnly: return nil
+        default: return nil
         }
     }
 }

@@ -46,8 +46,8 @@ final class AICommandCatalogTests: XCTestCase {
         for copy in [first, second] {
             XCTAssertEqual(copy.name, original.name, "copy preserves the name")
             XCTAssertEqual(copy.promptTemplate, original.promptTemplate, "copy preserves the template")
-            XCTAssertEqual(copy.input, original.input, "copy preserves the input source")
-            XCTAssertEqual(copy.output, original.output, "copy preserves the output target")
+            XCTAssertEqual(copy.inputs, original.inputs, "copy preserves the input capability set")
+            XCTAssertEqual(copy.outputs, original.outputs, "copy preserves the output capability set")
         }
     }
 
@@ -57,24 +57,24 @@ final class AICommandCatalogTests: XCTestCase {
         let vision = AICommandCatalog.commands(in: .vision)
         XCTAssertFalse(vision.isEmpty, "the vision category ships presets")
         for command in vision {
-            XCTAssertTrue([.screenRegion, .clipboardImage].contains(command.input),
+            XCTAssertTrue(command.inputs.contains(.screenRegion) || command.inputs.contains(.clipboardImage),
                           "vision preset \(command.name) reads an image source (screen region or clipboard image)")
             XCTAssertEqual(command.requiredCapabilities, [.vision],
                            "vision preset \(command.name) requires a vision-capable model")
-            XCTAssertEqual(command.output, .previewOnly,
+            XCTAssertEqual(command.outputs, [.previewOnly],
                            "vision preset \(command.name) is preview-only")
         }
     }
 
     func testVisionCategoryShipsAClipboardImagePreset() {
         let vision = AICommandCatalog.commands(in: .vision)
-        let clipboardImage = vision.filter { $0.input == .clipboardImage }
+        let clipboardImage = vision.filter { $0.inputs.contains(.clipboardImage) }
         XCTAssertFalse(clipboardImage.isEmpty,
                        "the Vision category ships at least one clipboard-image preset (analyze a copied image)")
         for command in clipboardImage {
             XCTAssertFalse(command.name.isEmpty, "preset has a name")
             XCTAssertFalse(command.promptTemplate.isEmpty, "preset \(command.name) has a prompt template")
-            XCTAssertEqual(command.output, .previewOnly, "clipboard-image preset \(command.name) is preview-only")
+            XCTAssertEqual(command.outputs, [.previewOnly], "clipboard-image preset \(command.name) is preview-only")
         }
     }
 
@@ -95,7 +95,7 @@ final class AICommandCatalogTests: XCTestCase {
         let understand = AICommandCatalog.commands(in: .understand)
         XCTAssertFalse(understand.isEmpty, "the understand category ships presets")
         for command in understand {
-            XCTAssertEqual(command.output, .previewOnly,
+            XCTAssertEqual(command.outputs, [.previewOnly],
                            "understand preset \(command.name) is preview-only")
         }
     }

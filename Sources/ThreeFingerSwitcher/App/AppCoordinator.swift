@@ -523,6 +523,11 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         }
         // AI preview canvas: the executor it observes, and the two-stage commit / discard gestures.
         launcherOverlay.executor = aiCommandExecutor
+        // The canvas panel becomes key-interactive only AFTER the executor has read its input — otherwise
+        // a `.nonactivatingPanel` taking key focus first steals the front app's key focus and the selection
+        // read comes back empty (falling through to the clipboard). The executor calls this back once the
+        // input is acquired (or it resolves `.unavailable`, whose Enable/Download controls need the mouse).
+        aiCommandExecutor.onReadyForInteraction = { [weak self] in self?.launcherOverlay.makeCanvasInteractive() }
         // Enable/download wiring for the canvas's `.unavailable` state (fired an AI item while AI is
         // off or the model isn't downloaded → the canvas offers Enable/Download + a model picker).
         launcherOverlay.aiAvailability = AICanvasAvailability(

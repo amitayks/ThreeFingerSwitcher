@@ -19,11 +19,6 @@ final class LauncherOverlayController {
     /// Called when the AI preview canvas is discarded (a horizontal swipe / cancel gesture). Wired to
     /// `AICommandExecutor.cancel()` so any in-flight generation stops and nothing is written.
     var onDiscardCanvas: (() -> Void)?
-    /// Called when the AI preview canvas is PARKED (an overscroll-past-bottom UP excursion — `ai-parked-
-    /// sessions`). Unlike discard, parking does NOT cancel the in-flight turn: the conversation is handed
-    /// off to the park scheduler (via `AICommandExecutor.parkHandoff()`) and keeps advancing in the
-    /// background, then the overlay recedes. Only invoked while the canvas is active.
-    var onParkCanvas: (() -> Void)?
     /// Called when the canvas opens (`true`) / closes (`false`). The coordinator uses it to put the
     /// gesture recognizer into canvas-resolution mode, so a fresh four-finger swipe resolves the canvas
     /// (horizontal = discard, down = apply) instead of opening the launcher again.
@@ -46,13 +41,6 @@ final class LauncherOverlayController {
     /// Enable/download wiring for the canvas's `.unavailable` state (configuration-hub). Set by the
     /// coordinator before `show`; picked up when the panel's `LauncherView` is (re)built on each open.
     var aiAvailability: AICanvasAvailability?
-    /// Begin the canvas composer's "attach screenshot" region capture (Bug 6). Set by the coordinator; runs
-    /// the SAME region-picker flow as `onScreenRegionCommand` but stages the captured bytes via
-    /// `AICommandExecutor.attachScreenshot(_:)` instead of firing a one-shot command. Forwarded into the
-    /// panel's `LauncherView` → canvas when (re)built on each open. Screen capture stays off the executor
-    /// seam (per `SelectionProviding`), so the coordinator owns the capture and only hands back the bytes.
-    var onAttachCanvasScreenshot: (() -> Void)?
-
     private var panel: SwitcherPanel?
     private var bands: [ContextBand] = []
     private var dwell: Double = 0.5
@@ -124,33 +112,8 @@ final class LauncherOverlayController {
         onCanvasStateChanged?(true)        // → recognizer enters canvas-resolution mode (swipe to resolve)
         layout(panel, animated: false)     // canvas metrics
         panel.orderFrontRegardless()
-        setCanvasInteractive(true)         // canvas is interactive for its whole life (scroll / pills)
-    }
-
-    /// Re-open the canvas for a PARKED conversation pulled back from the notch rail (design D7 / task 6.2).
-    /// The executor was already re-bound to the restored thread (`restoreConversation`); this presents the
-    /// canvas over a fresh panel in canvas-resolution mode, exactly like `showCanvas`, titled by a synthetic
-    /// placeholder command (a restored ad-hoc conversation has no live `AICommand`). The thread renders from
-    /// the persisted messages; a typed follow-up resumes it.
-    func restoreCanvas(title: String) {
-        endEdgeAutoScroll()
-        canvasDiscardAccum = 0
-        let placeholder = AICommand(name: title.isEmpty ? "Conversation" : title,
-                                    icon: .sfSymbol("text.bubble"), input: .none,
-                                    promptTemplate: "", output: .previewOnly)
-        let panel = self.panel ?? makePanel()
-        self.panel = panel
-        model.enterCanvas(placeholder)
-        onCanvasStateChanged?(true)
-        layout(panel, animated: false)
-        panel.orderFrontRegardless()
-        // Bug 4 (restore focus, the AppKit half): make the panel KEY *after* `enterCanvas` +
-        // `orderFrontRegardless` (matching `showCanvas`), so the restored canvas's composer can be first
-        // responder and Enter reaches `executor.send`. `setCanvasInteractive(true)` makes the
-        // `.nonactivatingPanel` key-capable + `makeKeyAndOrderFront` WITHOUT activating this app (the
-        // captured front app stays the active app); the SwiftUI half (`AICommandCanvasView`) then auto-
-        // focuses the composer on appear for the restored `.awaitingTurn` thread.
-        setCanvasInteractive(true)
+        // The panel stays PASS-THROUGH (not key) until the executor has read the input — becoming key first
+        // would steal the selection read (see `makeCanvasInteractive` / `AICommandExecutor.onReadyForInteraction`).
     }
 
     /// Re-publish whether the Files directory **drill** is engaged so the coordinator can flip the
@@ -324,7 +287,7 @@ final class LauncherOverlayController {
             // picker orchestration. That captures the designated region and re-opens the canvas via
             // `showCanvas(for:)`; a cancelled pick opens no canvas. `onFire` is NOT called here — the
             // coordinator fires the executor with the captured image.
-            if command.input == .screenRegion {
+            if command.inputs.contains(.screenRegion) {
                 hide()                          // synchronous dismiss → reveal the desktop (ghost-safe)
                 onScreenRegionCommand?(command)
                 return true
@@ -333,17 +296,14 @@ final class LauncherOverlayController {
             onCanvasStateChanged?(true)   // → recognizer enters canvas-resolution mode (swipe to resolve)
             if let panel { layout(panel, animated: true) }   // grow to the canvas metrics
             onFire?(item, band)   // fires the executor synchronously → sets its state (.unavailable / .loadingModel)
-            // The canvas is interactive for its WHOLE life (every AI command, every state), so the user
-            // can SCROLL the streamed thinking / response and TAP the language pill or the "Thinking"
-            // disclosure. The front app gets no scroll/click while the canvas is open.
-            //
-            // This is SAFE: the panel is a `.nonactivatingPanel`, so becoming key here never activates
-            // *this* app (the captured front app stays the active app); the four-finger swipe-to-resolve
-            // is recognized off the MULTITOUCH device (touch frames → `trackCanvasResolution`), NOT from
-            // window mouse/scroll events, so commit (down) / discard (horizontal) keep working while the
-            // panel is interactive; and write-back re-activates the captured app on commit. Reset is
-            // implicit on `hide()` (the panel is destroyed + recreated pass-through per open).
-            setCanvasInteractive(true)
+            // The canvas becomes key-interactive (scroll / language pill / Thinking disclosure / the
+            // unavailable Enable+Download controls) only AFTER the executor has read its input — the panel
+            // stays PASS-THROUGH until `AICommandExecutor.onReadyForInteraction` calls back
+            // `makeCanvasInteractive()`. Becoming key at fire (a `.nonactivatingPanel` makeKey) would steal
+            // the front app's key focus BEFORE the async selection read runs, so the read comes back empty
+            // and the input wrongly falls through to the clipboard — the exact bug this defers past.
+            // The four-finger swipe-to-resolve rides the MULTITOUCH device (not window events), so commit
+            // (down) / discard (horizontal) keep working while the panel is still pass-through.
             return true
         }
 
@@ -371,26 +331,12 @@ final class LauncherOverlayController {
     /// canvas isn't open.
     func resolveCanvasCommit() {
         guard model.canvasActive else { return }
-        // A one-shot fire commits only from a committable state (`.ready`/`.reviewingAction`); a down swipe
-        // while still loading/streaming is ignored. A CONVERSATIONAL session instead commits by EXTRACTING
-        // the latest assistant turn (design D5/task 6.1) — committable iff a thread is open with at least one
-        // assistant turn (so a down swipe before the first answer waits, never inserts an empty result).
+        // A one-shot fire commits only from a committable state (`.ready`/`.reviewingAction`); a down
+        // swipe while still loading/streaming is ignored (the user waits; a horizontal swipe discards).
         if let executor {
-            let canExtract = executor.conversation?.messages.contains { $0.role == .assistant } ?? false
-            guard executor.state.isCommittable || canExtract else { return }
+            guard executor.state.isCommittable else { return }
         }
         onCommitCanvas?()
-        hide()
-    }
-
-    /// Park the open AI preview canvas (an overscroll-past-bottom UP excursion — `ai-parked-sessions` §7.3):
-    /// hand the conversation off to the park scheduler (which keeps advancing it in the background — NOT a
-    /// cancel), then recede the overlay. The canvas flies up into the notch home zone; the in-flight turn is
-    /// untouched. No-op when the canvas isn't open. The fly-up morph is the BubbleMorph recede side, played
-    /// by the receding panel teardown (synchronous, per the ghost-on-Space-switch invariant in `hide()`).
-    func parkCanvas() {
-        guard model.canvasActive else { return }
-        onParkCanvas?()
         hide()
     }
 
@@ -611,6 +557,14 @@ final class LauncherOverlayController {
         if on { panel.makeKeyAndOrderFront(nil) }
     }
 
+    /// Make the canvas key-interactive — called by the coordinator from `AICommandExecutor.onReadyForInteraction`,
+    /// i.e. AFTER the executor has read the fire's input, so taking key focus no longer steals the selection
+    /// read. Guarded on the canvas actually being open (the hook may arrive a beat after a fast discard).
+    func makeCanvasInteractive() {
+        guard model.canvasActive else { return }
+        setCanvasInteractive(true)
+    }
+
     private func makePanel() -> SwitcherPanel {
         let panel = SwitcherPanel(
             contentRect: NSRect(x: 0, y: 0, width: 800, height: SwitcherLayout.panelHeight),
@@ -632,8 +586,7 @@ final class LauncherOverlayController {
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
         panel.contentView = NSHostingView(rootView: LauncherView(model: model, executor: executor,
-                                                                 availability: aiAvailability,
-                                                                 onAttachScreenshot: onAttachCanvasScreenshot))
+                                                                 availability: aiAvailability))
         return panel
     }
 

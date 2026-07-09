@@ -2,6 +2,14 @@ import AppKit
 import ApplicationServices
 import CoreGraphics
 import ScreenCaptureKit
+import Carbon.HIToolbox   // IsSecureEventInputEnabled()
+import os
+
+/// Diagnostic log for the selection read/write path. Filter in Console.app by
+/// `subsystem:ThreeFingerSwitcher category:Selection` to see, per fire, which app was targeted, whether
+/// Accessibility exposed a selection, and whether the ⌘C fallback landed — the trail for "it didn't
+/// recognize my selection and used the clipboard."
+private let selectionLog = Logger(subsystem: "ThreeFingerSwitcher", category: "Selection")
 
 /// The concrete `SelectionProviding` (design D3, spec `selection-io`): the AX / clipboard / screen
 /// input-output primitive the `AICommandExecutor` drives. It reads the front app's selection via
@@ -48,7 +56,7 @@ final class SelectionService: SelectionProviding {
         self.copyTimeout = copyTimeout
         self.pasteKeystroke = pasteKeystroke ?? { app in
             app.activate(options: [])
-            Self.synthesizeKey(0x09, flags: .maskCommand, toPid: app.processIdentifier)   // ⌘V
+            Self.synthesizeCommandKeystroke(0x09)   // ⌘V via the session tap → the frontmost (activated) app
         }
     }
 
@@ -59,13 +67,20 @@ final class SelectionService: SelectionProviding {
     /// fall back to a ⌘C-with-restore capture. Returns nil (never "") when no selection can be read by
     /// either path, so the executor's "no input" handling fires rather than running the model on empty.
     func readSelectedText() async -> String? {
-        guard let app = frontApp() else { return nil }
-
+        guard let app = frontApp() else {
+            selectionLog.error("readSelectedText: no captured front app (resolves to self/nil) → nil (would fall back to clipboard)")
+            return nil
+        }
+        let name = app.localizedName ?? "?"
         if let ax = Self.normalized(axSelectedText(pid: app.processIdentifier)) {
+            selectionLog.notice("readSelectedText[\(name, privacy: .public)]: AX exposed a selection (\(ax.count) chars)")
             return ax   // AX exposed a real selection — return it without touching the clipboard.
         }
         // AX didn't expose the selection (many apps don't): synthesize ⌘C, read, then restore.
-        return await copyWithRestore(pid: app.processIdentifier)
+        selectionLog.notice("readSelectedText[\(name, privacy: .public)]: AX exposed nothing → trying the ⌘C fallback")
+        let copied = await copyWithRestore(app: app)
+        selectionLog.notice("readSelectedText[\(name, privacy: .public)]: ⌘C fallback captured \(copied?.count ?? -1) chars (-1 = nothing → clipboard fallback)")
+        return copied
     }
 
     /// The CURRENT clipboard string (no synthesis). This is the executor's higher-level "empty
@@ -282,17 +297,32 @@ final class SelectionService: SelectionProviding {
 
     // MARK: - Clipboard fallback / paste (effectful; verified on-device)
 
-    /// ⌘C-with-restore capture of the selection: save the pasteboard, advance past the current change
-    /// count, synthesize ⌘C to `pid`, poll `changeCount` until it advances (bounded by `copyTimeout`),
-    /// read the resulting string, then RESTORE the saved contents so the user's clipboard is untouched
-    /// (spec: "Fallback reads via copy and restores the clipboard"). nil when nothing was captured.
-    private func copyWithRestore(pid: pid_t) async -> String? {
+    /// ⌘C-with-restore capture of the selection: save the pasteboard, **re-assert the captured app as
+    /// frontmost** (a synthesized ⌘C posted to an app that isn't active doesn't land — e.g. Terminal — so
+    /// we `activate` + settle first, mirroring the working ⌘V paste path), synthesize ⌘C, poll
+    /// `changeCount` until it advances (bounded by `copyTimeout`), read the result, then RESTORE the saved
+    /// clipboard so the user's contents are untouched (spec: "Fallback reads via copy and restores the
+    /// clipboard"). nil when nothing was captured. If **Secure Keyboard Entry** is on (Terminal ▸ Secure
+    /// Keyboard Entry, or any app that enabled it) synthesized keys are blocked system-wide and this can't
+    /// succeed — that case is logged so it is diagnosable rather than a silent clipboard fall-through.
+    private func copyWithRestore(app: NSRunningApplication) async -> String? {
+        if IsSecureEventInputEnabled() {
+            selectionLog.error("copyWithRestore: Secure Keyboard Entry is ON — synthesized ⌘C is blocked system-wide (e.g. Terminal ▸ Secure Keyboard Entry). Turn it off to read a selection by copy.")
+        }
         let saved = pasteboard.snapshot()
         let before = pasteboard.changeCount
-        Self.synthesizeKey(0x08, flags: .maskCommand, toPid: pid)   // ⌘C (C = 0x08)
+        // Re-assert the captured app as frontmost so the ⌘C is delivered to it, then let activation settle
+        // (matches the paste path's activate + 40ms). Posting ⌘C without this didn't land for Terminal.
+        app.activate(options: [])
+        try? await Task.sleep(nanoseconds: 60_000_000)   // let activation settle before the HID keystroke
+        // Confirm the target is actually frontmost at post time (the HID ⌘C goes to whoever is frontmost).
+        let front = NSWorkspace.shared.frontmostApplication
+        selectionLog.notice("copyWithRestore[\(app.localizedName ?? "?", privacy: .public)]: pre-⌘C frontmost=\(front?.localizedName ?? "nil", privacy: .public) isTarget=\(front?.processIdentifier == app.processIdentifier)")
+        Self.synthesizeCommandKeystroke(0x08)   // ⌘C (C = 0x08) via the HID tap → the frontmost (activated) app
 
         let captured = await pollForChange(after: before)
         let result = captured ? Self.normalized(pasteboard.string()) : nil
+        selectionLog.notice("copyWithRestore[\(app.localizedName ?? "?", privacy: .public)]: activated + ⌘C; changeCount advanced=\(captured) (before=\(before)) → \(result?.count ?? -1) chars")
 
         pasteboard.restore(saved)   // ALWAYS restore — even on a missed copy — so we never clobber.
         return result
@@ -344,6 +374,28 @@ final class SelectionService: SelectionProviding {
               let up = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false) else { return }
         down.flags = flags; up.flags = flags
         down.postToPid(pid); up.postToPid(pid)
+    }
+
+    /// Synthesize a ⌘-modified keystroke into the **HID event tap** (`.cghidEventTap`) — the lowest-level,
+    /// most "real" input path, where a target app's **menu key-equivalent** (e.g. Terminal's Copy/Paste)
+    /// reliably matches. Uses a clean `.hidSystemState` source and stamps `.maskCommand` on the key events
+    /// themselves, with **NO** separate ⌘-key (0x37) events — that, plus `.combinedSessionState`, desyncs
+    /// the modifier bookkeeping and the shortcut never matches (the bug this replaces). This mirrors the
+    /// app's proven working chord synthesis, `AppCoordinator.sendLogOutKeystroke` (a ⇧⌘Q that logs out).
+    /// The caller `activate`s the target first so the HID event reaches it.
+    ///
+    /// Ruled out on-device before landing here: `postToPid` ⌘C (a PID-delivered event isn't matched as a
+    /// menu shortcut, even with the app activated), and a `.cgSessionEventTap` post with hand-injected
+    /// ⌘-key events (malformed modifier state). The `.cghidEventTap` + flags-only recipe is the one the
+    /// codebase already relies on for a real system-level keystroke.
+    nonisolated static func synthesizeCommandKeystroke(_ keyCode: CGKeyCode) {
+        let src = CGEventSource(stateID: .hidSystemState)
+        guard let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false) else { return }
+        down.flags = .maskCommand
+        up.flags = .maskCommand
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
     }
 }
 

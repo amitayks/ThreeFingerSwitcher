@@ -88,12 +88,14 @@ struct BidiText: NSViewRepresentable {
     ///
     /// We do NOT use `.natural`: on `NSTextView` a `.natural` writing direction resolves to the
     /// USER-INTERFACE / system locale direction (LTR on an English-localized Mac) — NOT the Unicode
-    /// first-strong rule — so Hebrew rendered left-aligned. Instead we detect each paragraph's first
-    /// strong directional character ourselves (`firstStrongDirection`) and PIN `baseWritingDirection`
-    /// + `alignment` explicitly: a Hebrew/Arabic paragraph → `.rightToLeft` + `.right`, otherwise
-    /// `.leftToRight` + `.left`. Mixed runs within a paragraph still resolve via the system Bidi
-    /// algorithm; this only fixes the paragraph's base side. Re-run on every stream update so the side
-    /// recomputes as tokens arrive.
+    /// first-strong rule — so Hebrew rendered left-aligned. Instead we choose each paragraph's base from
+    /// its **first strong directional character** (`firstStrongDirection`) — the first word/char of the
+    /// line decides its side — and PIN `baseWritingDirection` + `alignment` explicitly: a paragraph whose
+    /// first strong char is Hebrew/Arabic (or any RTL script) → `.rightToLeft` + `.right`, otherwise
+    /// `.leftToRight` + `.left`. Once that first strong char is present the side is STABLE (later
+    /// characters never change it); mixed runs within the paragraph still resolve via the system Bidi
+    /// algorithm. Re-run on every stream update only so a paragraph that begins with neutrals adopts its
+    /// side once the first strong char streams in — never to re-decide from later content.
     private func apply(to textView: NSTextView) {
         let font = NSFont.systemFont(ofSize: fontSize)
         textView.font = font
@@ -143,49 +145,49 @@ private final class FittingTextView: NSTextView {
     }
 }
 
-/// The base writing direction of a string by the Unicode **first-strong** rule, as a SwiftUI
-/// `LayoutDirection`: the first strong Hebrew/Arabic character ⇒ `.rightToLeft`, the first strong Latin
-/// character ⇒ `.leftToRight`, and an empty/neutral-only string ⇒ `.leftToRight` (the canvas default).
-///
-/// Used for the SHORT SwiftUI `Text` surfaces (review-field values) that don't warrant a full
-/// `NSTextView` — pair it with `.multilineTextAlignment` + `.environment(\.layoutDirection, …)` so a
-/// Hebrew/Arabic value starts on the right while a Latin value starts on the left.
+/// The base writing direction of a paragraph by the Unicode **first-strong** rule, as a SwiftUI
+/// `LayoutDirection`: the first strong RTL character (Hebrew/Arabic/… ) ⇒ `.rightToLeft`, the first strong
+/// Latin/Greek/Cyrillic/… character ⇒ `.leftToRight`, and an empty/neutral-only string ⇒ `.leftToRight`
+/// (the canvas default). The FIRST word/char of a line decides its side; leading neutrals (digits,
+/// punctuation, whitespace, a URL) are skipped until the first strong char, and once that char is present
+/// the side is STABLE — later characters never change it (that is the intended behavior: a line's
+/// alignment is fixed by how it starts, not re-decided as more content streams in).
 func firstStrongDirection(_ text: String) -> LayoutDirection {
     for scalar in text.unicodeScalars {
-        let value = scalar.value
-        // Right-to-left strong ranges: Hebrew + Arabic blocks (incl. presentation forms / supplements).
-        let isRTL = (0x0590...0x05FF).contains(value)   // Hebrew
-            || (0x0600...0x06FF).contains(value)        // Arabic
-            || (0x0700...0x074F).contains(value)        // Syriac
-            || (0x0750...0x077F).contains(value)        // Arabic Supplement
-            || (0x08A0...0x08FF).contains(value)        // Arabic Extended-A
-            || (0xFB1D...0xFB4F).contains(value)        // Hebrew presentation forms
-            || (0xFB50...0xFDFF).contains(value)        // Arabic presentation forms-A
-            || (0xFE70...0xFEFF).contains(value)        // Arabic presentation forms-B
-        if isRTL { return .rightToLeft }
+        if isStrongRTL(scalar.value) { return .rightToLeft }
         // First strong character is NOT in an RTL block ⇒ treat it as left-to-right. We detect only the
         // RTL ranges explicitly and default everything else to LTR, so a strong-LTR character outside the
         // common Latin range (e.g. IPA Extensions 0x0250–0x02AF, Greek, Cyrillic) still resolves LTR
         // rather than being mistaken for a neutral and scanned past.
-        if isStrongLTR(value) { return .leftToRight }
+        if isStrongLTR(scalar.value) { return .leftToRight }
         // Neutral (digits, punctuation, whitespace, symbols) ⇒ keep scanning for the first strong char.
     }
     return .leftToRight
 }
 
+/// Whether a scalar is a strong RIGHT-TO-LEFT character. Covers **all** RTL scripts, not just Hebrew and
+/// Arabic: the contiguous RTL block `U+0590–U+08FF` (Hebrew, Arabic, Syriac, Thaana, N'Ko, Samaritan,
+/// Mandaic, Arabic Extended-A/B) plus the Hebrew/Arabic presentation-form blocks.
+func isStrongRTL(_ value: UInt32) -> Bool {
+    (0x0590...0x08FF).contains(value)          // Hebrew, Arabic, Syriac, Thaana, NKo, Samaritan, Mandaic, Arabic Ext
+        || (0xFB1D...0xFB4F).contains(value)   // Hebrew presentation forms
+        || (0xFB50...0xFDFF).contains(value)   // Arabic presentation forms-A
+        || (0xFE70...0xFEFF).contains(value)   // Arabic presentation forms-B
+}
+
 /// Whether a scalar is a strong LEFT-TO-RIGHT character: any letter that is not in an RTL block. We
 /// approximate "letter" as "not a neutral" — digits, punctuation, whitespace, and symbols are neutral
-/// and skipped — so a strong-LTR letter outside the Latin range still ends the scan as LTR.
-private func isStrongLTR(_ value: UInt32) -> Bool {
-    guard let scalar = Unicode.Scalar(value) else { return false }
+/// and skipped — so a strong-LTR letter outside the Latin range still counts as LTR.
+func isStrongLTR(_ value: UInt32) -> Bool {
+    guard let scalar = Unicode.Scalar(value), !isStrongRTL(value) else { return false }
     let p = scalar.properties
     return p.isAlphabetic || p.generalCategory == .modifierLetter || p.generalCategory == .otherLetter
 }
 
 extension View {
-    /// Align a short SwiftUI `Text` by its content's natural base direction (first-strong): a
-    /// Hebrew/Arabic value reads right-aligned, a Latin value left-aligned. Sets both the multiline
-    /// alignment and the layout direction so the leading edge matches the text's script.
+    /// Align a short SwiftUI `Text` by its content's first-strong base direction: a value that STARTS with
+    /// Hebrew/Arabic reads right-aligned, one that starts with Latin left-aligned. Sets both the multiline
+    /// alignment and the layout direction so the leading edge matches the text's opening script.
     func naturalTextDirection(for text: String) -> some View {
         let direction = firstStrongDirection(text)
         return self

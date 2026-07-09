@@ -19,13 +19,18 @@ enum SkillFile {
         guard let id = fields["id"], !id.isEmpty else { return .failure(.missingRequiredField(name: "id")) }
         guard let title = fields["title"], !title.isEmpty else { return .failure(.missingRequiredField(name: "title")) }
         guard let summary = fields["summary"], !summary.isEmpty else { return .failure(.missingRequiredField(name: "summary")) }
-        guard let inputRaw = fields["input"] else { return .failure(.missingRequiredField(name: "input")) }
-        guard let input = InputSource(rawValue: inputRaw) else {
-            return .failure(.unknownEnumValue(field: "input", value: inputRaw))
+        // Inputs / outputs are capability SETS (change `ai-action-context-resolution`): the new
+        // comma-joined `inputs:`/`outputs:` fields, falling back to a legacy single `input:`/`output:`
+        // line (migrated into the set), so pre-existing `.skill.md` files still parse.
+        let inputs: Set<InputSource>
+        switch parseInputSet(new: fields["inputs"], legacy: fields["input"]) {
+        case let .success(set): inputs = set
+        case let .failure(err): return .failure(err)
         }
-        guard let outputRaw = fields["output"] else { return .failure(.missingRequiredField(name: "output")) }
-        guard let output = parseOutput(outputRaw) else {
-            return .failure(.unknownEnumValue(field: "output", value: outputRaw))
+        let outputs: Set<OutputTarget>
+        switch parseOutputSet(new: fields["outputs"], legacy: fields["output"]) {
+        case let .success(set): outputs = set
+        case let .failure(err): return .failure(err)
         }
 
         let confirm = fields["confirmBeforeRun"].flatMap { Bool($0) }
@@ -42,9 +47,9 @@ enum SkillFile {
             name: title,
             icon: parseIcon(fields["icon"]),
             tint: parseTint(fields["tint"]),
-            input: input,
+            inputs: inputs,
             promptTemplate: body,
-            output: output,
+            outputs: outputs,
             confirmBeforeRun: confirm,
             runtimeParameter: runtimeParameter,
             reasoning: reasoning)
@@ -70,8 +75,8 @@ enum SkillFile {
         if let category = m.category { lines.append("category: \(category)") }
         lines.append("icon: \(serializeIcon(m.command.icon))")
         if let tint = m.command.tint { lines.append("tint: \(serializeTint(tint))") }
-        lines.append("input: \(m.command.input.rawValue)")
-        lines.append("output: \(serializeOutput(m.command.output))")
+        lines.append("inputs: \(serializeInputs(m.command.inputs))")
+        lines.append("outputs: \(serializeOutputs(m.command.outputs))")
         lines.append("confirmBeforeRun: \(m.command.confirmBeforeRun)")
         if let rp = serializeRuntimeParameter(m.command.runtimeParameter) { lines.append("runtimeParameter: \(rp)") }
         if let r = m.command.reasoning { lines.append("reasoning: \(r.rawValue)") }
@@ -171,6 +176,72 @@ enum SkillFile {
         case let .urlScheme(scheme): return "urlScheme:\(scheme)"
         case let .shell(command): return "shell:\(command)"
         }
+    }
+
+    // MARK: - Capability-set encodings (change `ai-action-context-resolution`)
+
+    /// Parse the input capability set: the new comma-joined `inputs:` (raw `InputSource` values), else a
+    /// legacy single `input:` line migrated into its set. An empty `inputs:` value is a valid empty
+    /// (standalone) set; neither field present is a missing-field error.
+    static func parseInputSet(new: String?, legacy: String?) -> Result<Set<InputSource>, SkillError> {
+        if let new {
+            var set: Set<InputSource> = []
+            for raw in tokens(new) {
+                guard let s = InputSource(rawValue: raw) else {
+                    return .failure(.unknownEnumValue(field: "inputs", value: raw))
+                }
+                set.insert(s)
+            }
+            return .success(set)
+        }
+        if let legacy {
+            guard let s = InputSource(rawValue: legacy) else {
+                return .failure(.unknownEnumValue(field: "input", value: legacy))
+            }
+            return .success(AICommand.migrate(input: s))
+        }
+        return .failure(.missingRequiredField(name: "inputs"))
+    }
+
+    /// Parse the output capability set: the new `outputs:` value — tried FIRST as a single output (a
+    /// side-effecting encoding carries internal `:`/`,`), else a comma list of simple in-place tokens —
+    /// else a legacy single `output:` line migrated into its set. Must resolve to a non-empty set.
+    static func parseOutputSet(new: String?, legacy: String?) -> Result<Set<OutputTarget>, SkillError> {
+        if let new {
+            if let single = parseOutput(new) { return .success([single]) }   // side-effecting / lone token
+            var set: Set<OutputTarget> = []
+            for tok in tokens(new) {
+                guard let o = parseOutput(tok) else {
+                    return .failure(.unknownEnumValue(field: "outputs", value: tok))
+                }
+                set.insert(o)
+            }
+            guard !set.isEmpty else { return .failure(.missingRequiredField(name: "outputs")) }
+            return .success(set)
+        }
+        if let legacy {
+            guard let o = parseOutput(legacy) else {
+                return .failure(.unknownEnumValue(field: "output", value: legacy))
+            }
+            return .success(AICommand.migrate(output: o))
+        }
+        return .failure(.missingRequiredField(name: "outputs"))
+    }
+
+    /// Serialize the input set as a deterministic comma-joined list of raw values (empty set ⇒ "").
+    static func serializeInputs(_ inputs: Set<InputSource>) -> String {
+        inputs.map(\.rawValue).sorted().joined(separator: ", ")
+    }
+
+    /// Serialize the output set as a deterministic comma-joined list of `serializeOutput` tokens (a lone
+    /// side-effecting output serializes to just itself, so `parseOutputSet`'s single-value path round-trips).
+    static func serializeOutputs(_ outputs: Set<OutputTarget>) -> String {
+        outputs.map(serializeOutput).sorted().joined(separator: ", ")
+    }
+
+    /// Split a comma-separated field value into trimmed, non-empty tokens.
+    private static func tokens(_ value: String) -> [String] {
+        value.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     }
 
     private static func parseIcon(_ value: String?) -> ItemIcon {
