@@ -325,11 +325,13 @@ For an AI command that declares a runtime parameter (v1: a target language), the
 - **THEN** the canvas shows no language dropdown
 
 ### Requirement: Collapsible live Thinking section and scrollable, input-capturing canvas
-When a **reasoning** command streams, the preview canvas SHALL present the model's **thinking** in a **collapsible** section that is **collapsed by default** — showing a live activity indicator (a pulse + elapsed time) so the user can see the model is actively working (not stuck or silently slow) without it sprawling across the screen — **expandable on tap** to watch the thinking stream live, and **scrollable** when long. The committed/inserted result SHALL remain the **response** only (thinking is never committed). The canvas's thinking and response panes SHALL be **scrollable**, and while the canvas is open it SHALL **capture 1–2-finger scroll** (routing it to the canvas content, not the front app) until the canvas is dismissed; the four-finger commit/discard swipe SHALL continue to resolve the canvas.
+When a **reasoning** command streams, the preview canvas SHALL present the model's **thinking** in a **collapsible** section that is **collapsed by default** — showing a live activity indicator (an **elapsed-time** readout) so the user can see the model is actively working (not stuck or silently slow) without it sprawling across the screen — **expandable on tap** to watch the thinking stream live, and **scrollable** when long. The committed/inserted result SHALL remain the **response** only (thinking is never committed). The canvas's thinking and response panes SHALL be **scrollable**, and while the canvas is open it SHALL **capture 1–2-finger scroll** (routing it to the canvas content, not the front app) until the canvas is dismissed; the four-finger commit/discard swipe SHALL continue to resolve the canvas.
+
+> Note: the earlier animated "breathing" **pulse** on this indicator was **removed** — its `TimelineView` kept ticking after reasoning finished and while the canvas was hidden, pinning the main thread (see `docs/postmortem-idle-cpu-spin.md`). The elapsed timer (which freezes when reasoning ends) stays; any reintroduced pulse MUST pause when the canvas is not visible.
 
 #### Scenario: Thinking shows collapsed by default, expandable
 - **WHEN** a reasoning command is generating
-- **THEN** the canvas shows a collapsed Thinking section with a live pulse + elapsed timer; tapping it expands a scrollable live view of the thinking, and tapping again collapses it
+- **THEN** the canvas shows a collapsed Thinking section with a live elapsed timer; tapping it expands a scrollable live view of the thinking, and tapping again collapses it
 
 #### Scenario: Only the response is committed
 - **WHEN** the user commits a reasoning command's result

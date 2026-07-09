@@ -6,9 +6,9 @@ import SwiftUI
 /// read only when the cursor is near the top-center zone (the `nearDockEdge` analogue — cheap idle); a
 /// pure `NotchRevealModel` decides reveal/keep/dismiss (`now:` injected); a coarse re-feed timer advances
 /// grace/relayout only while shown; teardown is **synchronous**. Gated by the agent-feature opt-in (when
-/// off, the monitor isn't installed). The ambient needs-you glow rides its own slim non-activating glow
-/// panel on the resting zone, present iff any session is `.needsYou`, cleared only when every needs-you
-/// is addressed.
+/// off, the monitor isn't installed). A `hasNeedsYou` flag tracks whether any session is `.needsYou`
+/// (the rail badges those rows on reveal); the earlier always-on animated glow panel was removed — it
+/// pinned the main thread while idle (see docs/postmortem-idle-cpu-spin.md).
 @MainActor
 final class NotchHomeZoneController {
     private let overlay = NotchHomeZoneOverlayController()
@@ -18,24 +18,38 @@ final class NotchHomeZoneController {
 
     /// The data source: the parked rows + their stored conversations (the scheduler/store seam).
     var sessionsProvider: () -> [ParkedSession] = { [] }
-    /// Restore a session as the active canvas (handed to `ai-conversational-canvas`).
-    var onRestore: ((AgentSessionID) -> Void)?
-    /// Discard a parked session (cancel pending + remove).
+    /// Expand a session's card IN PLACE into its conversation view (`notch-native-conversations`).
+    var onExpand: ((AgentSessionID) -> Void)?
+    /// The "+ New chat" card was activated — create a session (durable at birth) and expand it.
+    var onNewSession: (() -> Void)?
+    /// The expanded conversation asked to collapse (chevron / Esc / notch-nub click).
+    var onCollapse: (() -> Void)?
+    /// Discard a parked session (deletion — cancel pending + remove).
     var onDiscard: ((AgentSessionID) -> Void)?
+    /// Resolve the engine driving a session's expanded conversation (owned by `ParkController`).
+    var engineProvider: (AgentSessionID) -> NotchSessionEngine? = { _ in nil }
 
     private var enabled = false
     private var refreshTimer: Timer?
     private let refreshInterval: TimeInterval = 0.12
+    /// True while a conversation is expanded in place — pins the panel open (cursor departure and the
+    /// grace-dismiss apply to RAIL mode only; an open conversation never tears down under the reader).
+    private var isConversationExpanded: Bool {
+        if case .expanded = overlay.model.mode { return true }
+        return false
+    }
 
-    /// The ambient-glow panel — a slim, non-activating, click-through panel on the resting zone.
-    private var glowPanel: NSPanel?
-    private let glowState = GlowState()
+    /// Whether any parked session currently needs the user. Tracked for the rail badge + tests; the
+    /// earlier always-on animated glow panel was removed (see docs/postmortem-idle-cpu-spin.md).
+    private var hasNeedsYou = false
 
     init(cursor: CursorMonitor? = nil,
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.cursor = cursor ?? GlobalCursorMonitor()
         self.now = now
-        overlay.onRestore = { [weak self] id in self?.handleRestore(id) }
+        overlay.onExpand = { [weak self] id in self?.onExpand?(id) }
+        overlay.onNewSession = { [weak self] in self?.onNewSession?() }
+        overlay.onCollapse = { [weak self] in self?.onCollapse?() }
         overlay.onDiscard = { [weak self] id in self?.onDiscard?(id) }
     }
 
@@ -49,31 +63,73 @@ final class NotchHomeZoneController {
             cursor.stop()
             cursor.onMove = nil
             dismiss(animated: false)             // immediate teardown when the feature is switched off
-            tearDownGlow()
         }
     }
 
-    /// Refresh the rail rows + the ambient glow from the current parked set (call after a scheduler
-    /// advance / escalate). Updates the glow presence iff any session is `.needsYou`.
+    /// Refresh the rail rows + the needs-you flag from the current parked set (call after a scheduler
+    /// advance / escalate). `hasNeedsYou` is true iff any session is `.needsYou`.
     func refresh() {
         let sessions = sessionsProvider()
         overlay.model.sessions = sessions
-        let needsYou = sessions.contains { $0.state == .needsYou }
-        glowState.isActive = needsYou
-        if needsYou { ensureGlow() } else { tearDownGlow() }
+        hasNeedsYou = sessions.contains { $0.state == .needsYou }
     }
 
-    // MARK: - Test seams (the rail view-model the overlay renders + the glow predicate)
+    // MARK: - Test seams (the rail view-model the overlay renders + the needs-you predicate)
 
     /// The rail rows the overlay currently renders (after the last `refresh`/reveal). Test-only read.
     var overlayModelSessionsForTest: [ParkedSession] { overlay.model.sessions }
-    /// Whether the ambient needs-you glow is currently lit. Test-only read.
-    var hasNeedsYouForTest: Bool { glowState.isActive }
+    /// Whether any parked session currently needs the user. Test-only read.
+    var hasNeedsYouForTest: Bool { hasNeedsYou }
+
+    // MARK: - Expand / collapse in place (`notch-native-conversations` D4)
+
+    /// Switch the panel into the in-place EXPANDED conversation for `id`: bind the session's engine to
+    /// the view-model, flip the mode, and resize the same panel to the expanded content solve. The rail's
+    /// reveal machinery is then PINNED (see `handleCursor`) so cursor departure never tears it down.
+    func expandSession(_ id: AgentSessionID) {
+        let point = NSEvent.mouseLocation
+        guard let m = metrics(for: point) ?? NSScreen.main.flatMap(metricsFor) else { return }
+        overlay.model.engine = engineProvider(id)
+        overlay.model.mode = .expanded(id)
+        overlay.model.attachment = attachmentFor(m)
+        let size = NotchHomeZoneLayout.solveExpanded(visibleFrame: m.visibleFrame)
+        let rect: CGRect
+        if let notch = m.notch {
+            rect = NotchHomeZoneAnchor.attachedPanelRect(contentSize: size, notch: notch,
+                                                         screenFrame: m.screenFrame)
+        } else {
+            rect = NotchHomeZoneAnchor.railRect(zone: zoneRectFor(m), size: size,
+                                                visibleFrame: m.visibleFrame)
+        }
+        overlay.reveal(at: rect)
+        manageRefreshTimer()
+    }
+
+    /// Return the panel to RAIL mode (the expanded conversation collapsed): drop key FIRST (the D5
+    /// ordering — never tear down/resize while holding key), unbind the engine, resize back to the rail
+    /// solve, and let the normal rail grace behavior resume.
+    func collapseToRail() {
+        overlay.setKeyCapable(false)
+        overlay.model.engine = nil
+        overlay.model.mode = .rail
+        guard overlay.isVisible else { return }
+        let point = NSEvent.mouseLocation
+        guard let m = metrics(for: point) ?? NSScreen.main.flatMap(metricsFor) else { return }
+        overlay.model.sessions = sessionsProvider()
+        overlay.model.attachment = attachmentFor(m)
+        overlay.reveal(at: railRectFor(m, zone: zoneRectFor(m)))
+        manageRefreshTimer()
+    }
 
     // MARK: - Cursor handling (edge-gated, mirrors DockPreviewController)
 
     private func handleCursor(_ point: CGPoint) {
         guard enabled, let m = metrics(for: point) else { return }
+        // The expanded-conversation PIN (`notch-native-conversations` D4): while a conversation is open
+        // in place, the reveal model is not fed at all — cursor departure and the grace-dismiss apply to
+        // rail mode only (the `menuSuppressedPID` consumer-side suppression precedent). The panel closes
+        // only via explicit collapse, feature-off, or the synchronous teardown paths.
+        if isConversationExpanded { return }
         let zone = zoneRectFor(m)
         // Edge-gate: only compute when something is shown or the cursor is near the top-center zone.
         guard overlay.isVisible || nearTopZone(point, zone: zone, metrics: m) else { return }
@@ -99,17 +155,6 @@ final class NotchHomeZoneController {
             overlay.reveal(at: rail)            // spreads out of the notch on first show; repositions after
         }
         manageRefreshTimer()
-    }
-
-    private func handleRestore(_ id: AgentSessionID) {
-        // Bug 4 (restore focus): dismiss the rail FIRST, then re-open the canvas. The rail's teardown is a
-        // synchronous `orderOut` (ghost-on-Space-switch landmine — kept synchronous); doing it AFTER
-        // `onRestore?` would order this app's panel out right after the restored canvas made itself key,
-        // stealing first-responder back so Enter never reaches `executor.send`. Dismissing first leaves the
-        // restored canvas the key window once `onRestore?` makes it key + orders it front.
-        dismiss(animated: false)                 // immediate: the restored canvas must take focus cleanly
-        onRestore?(id)
-        refresh()                                // restoring may clear the last needs-you → clear glow
     }
 
     /// Dismiss the rail. `animated` (the default, used for the cursor-left grace-dismiss) recedes it back
@@ -159,6 +204,10 @@ final class NotchHomeZoneController {
 
     private func metrics(for point: CGPoint) -> ScreenMetrics? {
         guard let screen = activeScreen(for: point) else { return nil }
+        return metricsFor(screen)
+    }
+
+    private func metricsFor(_ screen: NSScreen) -> ScreenMetrics {
         let notch = NotchHomeZoneAnchor.notchRect(
             screenFrame: screen.frame,
             safeAreaTop: screen.safeAreaInsets.top,
@@ -216,43 +265,4 @@ final class NotchHomeZoneController {
         return live.insetBy(dx: -40, dy: -8).contains(point)
     }
 
-    // MARK: - Ambient glow panel (its own slim non-activating click-through panel on the zone)
-
-    private final class GlowState: ObservableObject { @Published var isActive = false }
-
-    private func ensureGlow() {
-        if glowPanel == nil {
-            let panel = NSPanel(
-                contentRect: NSRect(x: 0, y: 0, width: NotchHomeZoneLayout.zoneWidth,
-                                    height: NotchHomeZoneLayout.zoneHeight + 60),
-                styleMask: [.borderless, .nonactivatingPanel],
-                backing: .buffered, defer: false)
-            panel.isOpaque = false
-            panel.backgroundColor = .clear
-            panel.hasShadow = false
-            panel.ignoresMouseEvents = true          // ambient: never takes the pointer
-            panel.level = .popUpMenu
-            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
-            panel.contentView = NSHostingView(rootView: GlowHost(state: glowState))
-            glowPanel = panel
-        }
-        // Anchor on the active screen's top-center zone; never re-fronts the rail (separate panel).
-        let point = NSEvent.mouseLocation
-        let zone = metrics(for: point).map { zoneRectFor($0) } ?? .zero
-        if zone != .zero, let panel = glowPanel {
-            var frame = panel.frame
-            frame.origin = CGPoint(x: zone.midX - frame.width / 2, y: zone.minY)
-            panel.setFrame(frame, display: true)
-            panel.orderFrontRegardless()
-        }
-    }
-
-    private func tearDownGlow() {
-        glowPanel?.orderOut(nil)                      // synchronous teardown
-    }
-
-    private struct GlowHost: View {
-        @ObservedObject var state: GlowState
-        var body: some View { NotchAmbientGlow(isActive: state.isActive) }
-    }
 }

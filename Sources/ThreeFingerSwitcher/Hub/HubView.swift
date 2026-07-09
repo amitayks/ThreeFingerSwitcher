@@ -74,11 +74,11 @@ final class HubContext {
     let models: ModelManager
     let permissions: PermissionsService
 
-    /// The gesture-preview rehearse seam (§2.3 / §2.4): a `HubGesturePreview` binds its `liveDots` to
-    /// this controller's published dots and registers as the active rehearse target on appear. The
-    /// coordinator routes the touch feed in and consults its `ownsGestures` to suppress the real
-    /// recognizer while rehearsing. Wired by `AppCoordinator.makeHubContext`.
-    var rehearse: HubRehearseController?
+    /// The gesture-preview VISIBILITY gate. `AppCoordinator` flips `isActive` false the instant the Hub
+    /// window closes / miniaturizes and true when it returns, so every `HubGesturePreview`'s self-playing
+    /// `TimelineView` stops when the Hub is off screen and never spins the main thread while hidden (see
+    /// `docs/postmortem-idle-cpu-spin.md`). Injected into the SwiftUI environment by `HubView`.
+    let previewActivity = HubPreviewActivity()
 
     // §11.2 Real demo content — the SAME providers the First Touch wizard uses (`WizardContext`),
     // so the Hub previews render the actual switcher/launcher seeded with the user's real windows +
@@ -97,6 +97,10 @@ final class HubContext {
 
     // AI feature page.
     var onDownloadModel: () -> Void = {}
+    /// Download a SPECIFIC capability fleet model (image / ternary / video) the user just enabled in the
+    /// roster. Routes to the EXISTING `ModelManager` download path in the coordinator — no new seam. A
+    /// failure surfaces through the manager's per-row `.failed` state, never a false "Done".
+    var onDownloadCapabilityModel: (ModelDescriptor) -> Void = { _ in }
 
     // AI feature page — Background autonomy (`ai-background-autonomy`, §7). The whitelist editor binds
     // directly to `settings.agentWhitelistPaths` / `agentWhitelistCommands` (no provider needed). The
@@ -196,6 +200,8 @@ struct HubView: View {
                 .frame(minWidth: 540, minHeight: 480)
         }
         .frame(minWidth: 820, minHeight: 580)
+        // Every gesture preview observes this to halt its self-playing clock while the Hub is off screen.
+        .environmentObject(context.previewActivity)
     }
 
     /// A rail of destinations that collapses to icons-only (names as tooltips) to save horizontal space,

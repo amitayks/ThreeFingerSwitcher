@@ -2,36 +2,15 @@ import SwiftUI
 import CoreGraphics
 
 /// The §12 holder behind the Window-Switcher preview: it owns the **real** `SwitcherModel` (rendered by a
-/// real `SwitcherView`) and drives it IN SYNC with the demonstrated teaching gesture, so the highlight and
-/// the Space-row reel move exactly as the ghost hand performs the move. The §11.5 launcher analogue is
-/// `HubLauncherDemo`; this is its switcher counterpart.
-///
-/// ## The deterministic teaching story
-/// Three fingers slide to **open** the switcher; then ONE finger lifts and the two resting fingers
-/// **navigate** — UP to the second Space-row, back DOWN to the first, then SIDEWAYS across the windows in
-/// the row, then a lift. `HubSwitcherDemo.teachingGesture(openLength:)` encodes the hand motion (a single
-/// `GesturePose.DemoGesture` whose strokes change finger count via the connected-stroke `gapAfter: 0`
-/// seam — open on three, then lift one and travel on two). This holder maps the hand's centroid back to
-/// model state:
-///   - `reset()` — the demo's `onOpen` (once per loop): snap to the home row + first window so each pass
-///     teaches the same story.
-///   - `navigate(_:)` — the demo's `onScrub` (every 2-finger frame): map the centroid to (row, column).
-///     A hand lifted above the home band selects the row ABOVE home; the hand's x selects the window across
-///     the row. Every navigate stroke is PURE-AXIS (vertical OR horizontal), so mapping both axes each
-///     frame is safe — the idle axis rests at its home value and re-selects the home row / first column.
+/// real `SwitcherView`), seeded once with the user's real windows so the preview shows the actual switcher.
+/// The model is **static** — the ghost-hand autoplay plays the teaching gesture *over* it, but nothing drives
+/// the model in sync (the old `HubDemoDriver`-driven form was removed to stop the idle main-thread spin; see
+/// `docs/postmortem-idle-cpu-spin.md`). The only live behavior kept is the window-size control, which
+/// re-solves the grid so the static preview cards grow/shrink as the user drags the slider.
 @MainActor
 final class HubSwitcherDemo: ObservableObject {
-    /// The real model the preview renders and the strokes drive.
+    /// The real model the preview renders (seeded once, not driven).
     let model = SwitcherModel()
-
-    /// The home Space-row the demo rests on — row 0 (the bottom of the reel), so an "up" step always has a
-    /// row to reach. Set at `seed`.
-    private var homeRow = 0
-
-    // NOTE: A REAL swipe is NOT rehearsed in-section. On a real swipe the genuine switcher overlay itself
-    // rises (driven by the real recognizer, with its commit/Mission-Control neutralized by
-    // `AppCoordinator.switcherDemoActive`), so this holder only drives the IDLE self-playing teaching loop.
-    // The "grow into the ACTUAL switcher" is that real overlay, not an in-section scale-up.
 
     // MARK: - Seeding
 
@@ -40,10 +19,9 @@ final class HubSwitcherDemo: ObservableObject {
     /// (bottom) row's first window. Synchronous frames (icons / already-cached thumbnails) carry over;
     /// the page re-runs `seedThumbnails` against THIS model so live-capture retries land here.
     func seed(from source: SwitcherModel, canvas: CGSize, maxScale: CGFloat) {
-        homeRow = 0
         model.setCanvas(canvas)
         model.setMaxScale(maxScale)
-        model.setRows(source.rows, labels: source.rowLabels, startRow: homeRow, column: 0)
+        model.setRows(source.rows, labels: source.rowLabels, startRow: 0, column: 0)
         for (id, image) in source.thumbnails { model.setThumbnail(image, for: id) }
     }
 
@@ -51,34 +29,6 @@ final class HubSwitcherDemo: ObservableObject {
     /// smoothly as the user drags the "Window size" slider — the slider and the preview move together.
     func setMaxScale(_ scale: CGFloat) {
         withAnimation(.easeInOut(duration: 0.25)) { model.setMaxScale(scale) }
-    }
-
-    // MARK: - Driving (called by the demo driver's closures)
-
-    /// Loop start (`onOpen`): snap back to the home row + first window so every pass teaches the same story.
-    func reset() {
-        if model.currentRow != homeRow {
-            withAnimation(.easeInOut(duration: 0.28)) { model.setRow(homeRow) }
-        } else if model.selectedIndex != 0 {
-            model.setColumn(0)
-        }
-    }
-
-    /// A 2-finger navigate frame (`onScrub`): map the ghost hand's centroid to (row, column).
-    func navigate(_ centroid: CGPoint) {
-        // Row: a hand lifted above the home band selects the row ABOVE home; back in the band → home.
-        let wantsUp = centroid.y <= Self.upBand
-        let targetRow = wantsUp ? min(model.rowCount - 1, homeRow + 1) : homeRow
-        if targetRow != model.currentRow {
-            withAnimation(.easeInOut(duration: 0.3)) { model.setRow(targetRow) }
-            return   // let the row slide settle before also moving the column this frame
-        }
-        // Column: the sideways window scrub, meaningful only on the home row. Map x across the pad to the
-        // window index (snapped), stepping only on a change so the highlight doesn't strobe.
-        guard targetRow == homeRow, model.windows.count > 1 else { return }
-        let p = Self.progressX(centroid.x)
-        let col = min(model.windows.count - 1, max(0, Int((p * CGFloat(model.windows.count - 1)).rounded())))
-        if col != model.selectedIndex { model.setColumn(col) }
     }
 
     /// The switcher's rendered natural size (grid content + chrome), so the preview can compute a scale that
@@ -90,32 +40,24 @@ final class HubSwitcherDemo: ObservableObject {
             width: content.width + 2 * SwitcherLayout.gridContainerPadding + gutter,
             height: content.height + 2 * SwitcherLayout.gridContainerPadding + 10 + SwitcherLayout.titleAreaHeight)
     }
+}
 
-    // MARK: - Layout constants (shared with the gesture builders so the hand and the model stay in sync)
+// MARK: - Teaching + hover gesture builders (autoplay scripts for the ghost hand)
 
+extension HubSwitcherDemo {
     /// The resting (home-row) band: the 2-finger nav begins here and the sideways scrub stays here.
     static let homeY: CGFloat = 0.58
     /// The "second row" band the up-stroke reaches.
     static let upY: CGFloat = 0.26
-    /// Below this y the hand counts as "up" (selects the row above home) — sits between `upY` and `homeY`.
-    static let upBand: CGFloat = 0.42
-    /// The sideways scrub travels x across this range; mapped 0…1 to the windows in the row.
+    /// The sideways scrub travels x across this range.
     static let scrubLeft: CGFloat = 0.28
     static let scrubRight: CGFloat = 0.80
 
-    private static func progressX(_ x: CGFloat) -> CGFloat {
-        min(1, max(0, (x - scrubLeft) / (scrubRight - scrubLeft)))
-    }
-}
-
-// MARK: - Teaching + hover gesture builders
-
-extension HubSwitcherDemo {
-    /// The deterministic teaching gesture. Three-finger **open** (a short horizontal swipe whose length
-    /// scales with the activation threshold so it reads as "just enough to trigger"), then — CONNECTED, no
-    /// lift (`gapAfter: 0`) — ONE finger lifts and the two resting fingers go UP to the second row, back
-    /// DOWN to the first, then SIDEWAYS across the windows, then a lift and loop. The coordinates match this
-    /// holder's centroid→model mapping so the highlight tracks the hand.
+    /// The deterministic teaching gesture the ghost hand autoplays. Three-finger **open** (a short horizontal
+    /// swipe whose length scales with the activation threshold so it reads as "just enough to trigger"), then
+    /// — CONNECTED, no lift (`gapAfter: 0`, so two fingers lift while two stay down) — ONE finger lifts and the
+    /// two resting fingers go UP to the second row, back DOWN to the first, then SIDEWAYS across the windows,
+    /// then a lift and loop.
     static func teachingGesture(openLength: CGFloat) -> GesturePose.DemoGesture {
         let openL = max(0.10, min(0.46, openLength))
         let xL = scrubLeft, xR = scrubRight, yB = homeY, yT = upY
@@ -210,11 +152,10 @@ struct SwitcherActionMap: View {
     }
 }
 
-// MARK: - The idle teaching miniature
+// MARK: - The idle teaching miniature (static)
 
-/// The Switcher preview miniature: the real `SwitcherView` scaled to fit the available width, playing the
-/// idle teaching loop. It does NOT grow on a real swipe — the "grow into the ACTUAL switcher" is the genuine
-/// switcher overlay itself rising (neutralized so it never fires); see `AppCoordinator.switcherDemoActive`.
+/// The Switcher preview miniature: the real `SwitcherView` scaled to fit the available width, showing the
+/// seeded windows. It is **static** — the ghost-hand autoplay plays over it; the model is not driven.
 struct SwitcherDemoMiniature: View {
     @ObservedObject var demo: HubSwitcherDemo
 

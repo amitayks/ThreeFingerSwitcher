@@ -2,9 +2,9 @@ import XCTest
 import CoreGraphics
 @testable import ThreeFingerSwitcherCore
 
-/// Tests for the §12 Window-Switcher teaching preview: the deterministic teaching gesture grammar, the
-/// activation-threshold → open-swipe-length mapping, and the `HubSwitcherDemo` holder that drives the real
-/// `SwitcherModel` (row + column) in sync with the demonstrated hand.
+/// Tests for the §12 Window-Switcher teaching preview: the deterministic teaching gesture grammar (the
+/// autoplay script the ghost hand loops), the activation-threshold → open-swipe-length mapping, and the
+/// `HubSwitcherDemo` holder that seeds the real `SwitcherModel` the (static) preview renders.
 @MainActor
 final class HubSwitcherDemoTests: XCTestCase {
 
@@ -48,30 +48,11 @@ final class HubSwitcherDemoTests: XCTestCase {
                        "clamps below the min threshold")
     }
 
-    func testNavigateMovesUpToSecondRowAndBack() {
+    func testSeedLandsOnHomeRowFirstWindow() {
         let demo = seededDemo()
-        XCTAssertEqual(demo.model.currentRow, 0, "the demo rests on the home (bottom) row")
-        demo.navigate(CGPoint(x: HubSwitcherDemo.scrubLeft, y: HubSwitcherDemo.upY))
-        XCTAssertEqual(demo.model.currentRow, 1, "an up-stroke moves to the row above home")
-        demo.navigate(CGPoint(x: HubSwitcherDemo.scrubLeft, y: HubSwitcherDemo.homeY))
-        XCTAssertEqual(demo.model.currentRow, 0, "coming back down returns to the home row")
-    }
-
-    func testNavigateScrubsWindowsOnHomeRow() {
-        let demo = seededDemo()
-        demo.navigate(CGPoint(x: HubSwitcherDemo.scrubLeft, y: HubSwitcherDemo.homeY))
-        XCTAssertEqual(demo.model.selectedIndex, 0, "the left of the pad selects the first window")
-        demo.navigate(CGPoint(x: HubSwitcherDemo.scrubRight, y: HubSwitcherDemo.homeY))
-        XCTAssertEqual(demo.model.selectedIndex, demo.model.windows.count - 1,
-                       "the right of the pad selects the last window in the row")
-    }
-
-    func testResetReturnsHome() {
-        let demo = seededDemo()
-        demo.navigate(CGPoint(x: HubSwitcherDemo.scrubLeft, y: HubSwitcherDemo.upY))   // go up a row
-        demo.reset()
-        XCTAssertEqual(demo.model.currentRow, 0, "reset snaps back to the home row each loop")
-        XCTAssertEqual(demo.model.selectedIndex, 0, "reset snaps back to the first window")
+        XCTAssertEqual(demo.model.currentRow, 0, "the seeded preview rests on the home (bottom) row")
+        XCTAssertEqual(demo.model.selectedIndex, 0, "the seeded preview highlights the first window")
+        XCTAssertEqual(demo.model.rowCount, 2, "both Space-rows are seeded")
     }
 
     func testSetMaxScaleResolvesGrid() {

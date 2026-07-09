@@ -28,6 +28,17 @@ enum NotchHomeZoneLayout {
     static let cardHeight: CGFloat = 92
     static let cardSpacing: CGFloat = 12
     static let padding: CGFloat = 14
+
+    /// The in-place EXPANDED conversation panel's content-fit solve (`notch-native-conversations` D4):
+    /// a fixed comfortable reading size clamped to fractions of the visible frame (small screens stay
+    /// sane; content scrolls inside). Same anchor functions as the rail — only the content size differs.
+    static func solveExpanded(visibleFrame: CGRect) -> CGSize {
+        let maxW = visibleFrame.width > 1 ? visibleFrame.width * 0.46 : expandedWidth
+        let maxH = visibleFrame.height > 1 ? visibleFrame.height * 0.62 : expandedHeight
+        return CGSize(width: min(expandedWidth, maxW), height: min(expandedHeight, maxH))
+    }
+    static let expandedWidth: CGFloat = 560
+    static let expandedHeight: CGFloat = 520
     /// The resting zone (the reveal target + the ambient-glow host) — a slim top-center tab.
     static let zoneWidth: CGFloat = 120
     static let zoneHeight: CGFloat = 10
@@ -88,6 +99,14 @@ enum NotchAttachment: Equatable {
 /// the view-model the overlay renders. `@MainActor` — UI state.
 @MainActor
 final class NotchHomeZoneViewModel: ObservableObject {
+    /// What the panel is showing (`notch-native-conversations` D4): the card RAIL, or ONE session
+    /// EXPANDED in place into its conversation view. The same panel and chrome serve both — never a
+    /// second panel.
+    enum Mode: Equatable {
+        case rail
+        case expanded(AgentSessionID)
+    }
+
     @Published var sessions: [ParkedSession] = []
     /// The current attachment mode + notch cutout (set by the controller before each reveal/reposition).
     /// Defaults to `.tab` so the view is well-defined before the first geometry solve.
@@ -96,6 +115,11 @@ final class NotchHomeZoneViewModel: ObservableObject {
     /// at the top-center), `true` spreads it out to full size. The controller flips it inside `withAnimation`
     /// on reveal (→ true) and animated hide (→ false), so the panel grows out of / recedes into the notch.
     @Published var isExpanded: Bool = false
+    /// Rail vs in-place expanded conversation (`notch-native-conversations` D4).
+    @Published var mode: Mode = .rail
+    /// The engine driving the currently-expanded session's conversation (set by the controller on
+    /// expand, cleared on collapse). The expanded view observes it directly.
+    @Published var engine: NotchSessionEngine?
     /// True iff at least one parked session is in `.needsYou` — drives the ambient glow.
     var hasNeedsYou: Bool { sessions.contains { $0.state == .needsYou } }
 }
@@ -112,10 +136,28 @@ final class NotchHomeZoneOverlayController {
     let model = NotchHomeZoneViewModel()
     private var panel: SwitcherPanel?
 
-    /// A card was pulled back (clicked / dragged down) — restore that session as the active canvas.
-    var onRestore: ((AgentSessionID) -> Void)?
-    /// A card was discarded.
+    /// A card was clicked — expand that session IN PLACE into its conversation view.
+    var onExpand: ((AgentSessionID) -> Void)?
+    /// The "+ New chat" card was activated — create a fresh session (durable at birth) and expand it.
+    var onNewSession: (() -> Void)?
+    /// The expanded conversation asked to collapse (chevron / Esc / notch-nub click).
+    var onCollapse: (() -> Void)?
+    /// A card was discarded (deletion — from the card's context menu or the expanded header).
     var onDiscard: ((AgentSessionID) -> Void)?
+
+    /// Flip the panel's key-capability while the expanded composer is focused (`notch-native-conversations`
+    /// D5): the panel stays `.nonactivatingPanel` (becoming key never activates the app; the front app
+    /// keeps focus) and NEVER becomes main. Dropping key BEFORE any order-out is the caller's job on
+    /// collapse/teardown paths (the focus-leak ordering).
+    func setKeyCapable(_ on: Bool) {
+        guard let panel else { return }
+        panel.keyInteractive = on
+        if on {
+            panel.makeKey()
+        } else if panel.isKeyWindow {
+            panel.resignKey()
+        }
+    }
 
     private func makePanel() -> SwitcherPanel {
         // The initial content rect is the one-card floor; the controller's content-fit solve resizes it to
@@ -144,8 +186,11 @@ final class NotchHomeZoneOverlayController {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         panel.contentView = NSHostingView(rootView: NotchHomeZoneRailView(
             model: model,
-            onRestore: { [weak self] id in self?.onRestore?(id) },
-            onDiscard: { [weak self] id in self?.onDiscard?(id) }
+            onExpand: { [weak self] id in self?.onExpand?(id) },
+            onNewSession: { [weak self] in self?.onNewSession?() },
+            onCollapse: { [weak self] in self?.onCollapse?() },
+            onDiscard: { [weak self] id in self?.onDiscard?(id) },
+            onComposerFocusChanged: { [weak self] focused in self?.setKeyCapable(focused) }
         ))
         return panel
     }
@@ -189,6 +234,9 @@ final class NotchHomeZoneOverlayController {
     /// (the ghost-on-Space-switch landmine) — used for restore/disable where the teardown must be immediate.
     func hide(animated: Bool) {
         guard let panel else { return }
+        // Drop key BEFORE any order-out (D5 ordering): a panel holding key through its teardown can
+        // strand first-responder state on a Space switch. Harmless when it was never key.
+        setKeyCapable(false)
         guard animated else {
             pendingHide?.cancel(); pendingHide = nil
             model.isExpanded = false
@@ -215,8 +263,13 @@ final class NotchHomeZoneOverlayController {
 /// text lives behind an opt-in disclosure on the restored canvas, never here).
 struct NotchHomeZoneRailView: View {
     @ObservedObject var model: NotchHomeZoneViewModel
-    let onRestore: (AgentSessionID) -> Void
+    let onExpand: (AgentSessionID) -> Void
+    let onNewSession: () -> Void
+    let onCollapse: () -> Void
     let onDiscard: (AgentSessionID) -> Void
+    /// The composer focus seam (`notch-native-conversations` D5): the controller flips the panel's
+    /// key-capability so keystrokes reach the field only while it is focused.
+    let onComposerFocusChanged: (Bool) -> Void
 
     private var isAttached: Bool {
         if case .notch = model.attachment { return true }
@@ -224,20 +277,23 @@ struct NotchHomeZoneRailView: View {
     }
 
     var body: some View {
-        GeometryReader { geo in
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: NotchHomeZoneLayout.cardSpacing) {
-                    ForEach(model.sessions) { session in
-                        NotchParkedCard(session: session,
-                                        onRestore: { onRestore(session.id) },
-                                        onDiscard: { onDiscard(session.id) })
-                    }
+        Group {
+            switch model.mode {
+            case .rail:
+                railBody
+            case let .expanded(id):
+                if let engine = model.engine {
+                    NotchConversationView(
+                        engine: engine,
+                        session: model.sessions.first { $0.id == id },
+                        isAttached: isAttached,
+                        onCollapse: onCollapse,
+                        onDelete: { onDiscard(id) },
+                        onComposerFocusChanged: onComposerFocusChanged)
+                } else {
+                    // Defensive: an expanded id with no engine (discarded underneath) renders the rail.
+                    railBody
                 }
-                .padding(.horizontal, NotchHomeZoneLayout.padding)
-                // Center the cards across the whole panel (both axes): `minWidth` centers a few sessions
-                // instead of left-hugging them yet still allows horizontal scroll when they overflow;
-                // `minHeight` centers the row vertically so it sits clear of the notch that overlaps the top.
-                .frame(minWidth: geo.size.width, minHeight: geo.size.height, alignment: .center)
             }
         }
         .background(chromeFill)
@@ -248,6 +304,28 @@ struct NotchHomeZoneRailView: View {
         // inside `withAnimation(.easeInOut)`, which drives this transition.
         .scaleEffect(model.isExpanded ? 1 : Self.seedScale, anchor: .top)
         .opacity(model.isExpanded ? 1 : 0)
+    }
+
+    /// The card rail (the `.rail` mode body): the persistent "+ New chat" card, then one card per
+    /// session. Present even with zero sessions — the dock is never an empty dead end.
+    private var railBody: some View {
+        GeometryReader { geo in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: NotchHomeZoneLayout.cardSpacing) {
+                    NotchNewChatCard(action: onNewSession)
+                    ForEach(model.sessions) { session in
+                        NotchParkedCard(session: session,
+                                        onExpand: { onExpand(session.id) },
+                                        onDiscard: { onDiscard(session.id) })
+                    }
+                }
+                .padding(.horizontal, NotchHomeZoneLayout.padding)
+                // Center the cards across the whole panel (both axes): `minWidth` centers a few sessions
+                // instead of left-hugging them yet still allows horizontal scroll when they overflow;
+                // `minHeight` centers the row vertically so it sits clear of the notch that overlaps the top.
+                .frame(minWidth: geo.size.width, minHeight: geo.size.height, alignment: .center)
+            }
+        }
     }
 
     /// The collapsed seed scale — small enough to read as emerging from the notch, non-zero so the anchor
@@ -306,14 +384,42 @@ private struct NotchPanelBorderShape: Shape {
     }
 }
 
-/// One parked-session card: a title + a state badge. Clicking it pulls it back (restore).
+/// The persistent "+ New chat" card (`notch-native-conversations`): the notch is the ONLY birthplace of
+/// conversational sessions, so the rail always offers one — including on an empty dock.
+struct NotchNewChatCard: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 8) {
+                Image(systemName: "plus.bubble")
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundStyle(Color.accentColor)
+                Text("New chat")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .frame(width: NotchHomeZoneLayout.cardWidth,
+                   height: NotchHomeZoneLayout.cardHeight)
+            .padding(10)
+            .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [5, 4]))
+                .foregroundStyle(.white.opacity(0.18)))
+        }
+        .buttonStyle(.plain)
+        .help("Start a new conversation")
+    }
+}
+
+/// One parked-session card: a title + a state badge. Clicking it expands it in place.
 struct NotchParkedCard: View {
     let session: ParkedSession
-    let onRestore: () -> Void
+    let onExpand: () -> Void
     let onDiscard: () -> Void
 
     var body: some View {
-        Button(action: onRestore) {
+        Button(action: onExpand) {
             VStack(alignment: .leading, spacing: 6) {
                 Text(session.title.isEmpty ? "Session" : session.title)
                     .font(.system(size: 12, weight: .semibold))
@@ -345,7 +451,11 @@ struct ParkStateBadge: View {
             label("Thinking…", system: "ellipsis", tint: .secondary)
         case .idle where badgeCount > 0, .active where badgeCount > 0:
             label("\(badgeCount) new", system: "checkmark.circle.fill", tint: .green)
-        case .idle, .active:
+        case .active:
+            // The foreground session: expanded right now, or collapsed while its turn still streams
+            // (the engine keeps it `.active` so the background scheduler never double-advances it).
+            label("Working…", system: "circle.dotted", tint: .secondary)
+        case .idle:
             label("Parked", system: "moon.zzz", tint: .secondary)
         case .needsYou:
             label("Needs you", system: "exclamationmark.circle.fill", tint: .accentColor)
@@ -363,22 +473,343 @@ struct ParkStateBadge: View {
     }
 }
 
-/// The ambient needs-you glow on the resting zone — a soft, slow pulse present IFF any session is
-/// `.needsYou` (the controller toggles `isActive`). Reuses `PulseHalo`/`BreathingGlowBackdrop`
-/// (`WizardMotion`) so it reads as the same app. Never modal, never a sound, never re-fronts the panel;
-/// `allowsHitTesting(false)` keeps it ambient. Hosted in its own slim non-activating panel by the
-/// controller so it can sit on the resting zone independent of the rail's reveal.
-struct NotchAmbientGlow: View {
-    let isActive: Bool
+/// The in-place EXPANDED conversation (`notch-native-conversations` D4): one session's thread + composer
+/// inside the same merged-notch chrome. A cursor-and-keyboard surface — Approve/Skip and Copy are
+/// buttons; Enter sends; Esc collapses. The panel becomes key ONLY while the composer is focused (the
+/// `onComposerFocusChanged` seam), so the previously-front app keeps focus otherwise.
+struct NotchConversationView: View {
+    @ObservedObject var engine: NotchSessionEngine
+    /// The session's rail row (title/state), when it still exists.
+    let session: ParkedSession?
+    /// Attached (merged-notch, over the physical top) vs tab mode — drives the top headroom.
+    let isAttached: Bool
+    let onCollapse: () -> Void
+    let onDelete: () -> Void
+    let onComposerFocusChanged: (Bool) -> Void
+
+    @State private var composerText = ""
+    @State private var thinkingExpanded = false
+    @FocusState private var composerFocused: Bool
 
     var body: some View {
-        ZStack {
-            if isActive {
-                BreathingGlowBackdrop(color: .accentColor)
-                PulseHalo(color: .accentColor, size: 80, intensity: 0.9)
+        VStack(alignment: .leading, spacing: 0) {
+            header
+                // Attached mode: the panel's top band sits behind the physical notch — keep the header
+                // clear of it (the same headroom idea the centered rail uses).
+                .padding(.top, isAttached ? 34 : 10)
+                .padding(.horizontal, 14)
+            Divider().opacity(0.25).padding(.vertical, 8)
+            thread
+                .padding(.horizontal, 14)
+            composer
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+        }
+        .onChange(of: composerFocused) { _, focused in onComposerFocusChanged(focused) }
+        // Collapse on Esc from anywhere in the view (the composer owns key events while focused).
+        .onExitCommand { onCollapse() }
+        .onDisappear { onComposerFocusChanged(false) }   // never leave the panel key-capable behind
+    }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "text.bubble.fill")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
+            Text(engine.conversation?.title ?? session?.title ?? "Conversation")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1).truncationMode(.middle)
+            Spacer()
+            Button(action: onDelete) {
+                Image(systemName: "trash")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Delete this session")
+            Button(action: onCollapse) {
+                Image(systemName: "chevron.up")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Collapse back to the dock")
+        }
+    }
+
+    // MARK: Thread
+
+    private var thread: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    if engine.conversation?.messages.isEmpty ?? true {
+                        emptyHint
+                    }
+                    ForEach(engine.conversation?.messages ?? []) { message in
+                        turnBubble(message)
+                    }
+                    if !engine.thinking.isEmpty {
+                        thinkingSection
+                    }
+                    toolStepsList
+                    stateExtras
+                    Color.clear.frame(height: 1).id(Self.tailID)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 2)
+            }
+            .onChange(of: engine.conversation?.messages.count ?? 0) {
+                withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(Self.tailID, anchor: .bottom) }
+            }
+            .onChange(of: streamingPartial) {
+                proxy.scrollTo(Self.tailID, anchor: .bottom)
             }
         }
-        .frame(width: NotchHomeZoneLayout.zoneWidth, height: NotchHomeZoneLayout.zoneHeight + 60)
-        .allowsHitTesting(false)
+    }
+
+    private static let tailID = "notch-conversation-tail"
+
+    private var streamingPartial: String {
+        if case let .conversing(partial) = engine.state { return partial }
+        return ""
+    }
+
+    private var emptyHint: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "text.bubble")
+                .font(.system(size: 24, weight: .light))
+                .foregroundStyle(.secondary)
+            Text("Ask anything — this chat lives here at the notch until it expires or you delete it.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 24)
+    }
+
+    @ViewBuilder
+    private func turnBubble(_ message: AgentMessage) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Text(message.role == .user ? "You" : message.role == .assistant ? "AI" : "Context")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary).textCase(.uppercase)
+                Spacer()
+                if message.role == .assistant, !message.text.isEmpty {
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(message.text, forType: .string)
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Copy this answer")
+                }
+            }
+            BidiText(text: message.text.isEmpty ? "…" : message.text, fontSize: 13)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10)
+            .fill(message.role == .user ? Color.accentColor.opacity(0.12) : Color.white.opacity(0.05)))
+    }
+
+    /// The in-flight assistant turn + per-state extras: the streaming bubble, the approval card with
+    /// Approve/Skip buttons, the bounded failed card, and the availability hint.
+    @ViewBuilder
+    private var stateExtras: some View {
+        switch engine.state {
+        case .loadingModel:
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Loading the model…").font(.system(size: 12)).foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 4)
+        case let .conversing(partial):
+            VStack(alignment: .leading, spacing: 3) {
+                Text("AI").font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary).textCase(.uppercase)
+                BidiText(text: partial.isEmpty ? "…" : partial, fontSize: 13)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.05)))
+        case let .awaitingApproval(review):
+            approvalCard(review)
+        case let .failed(message):
+            failedCard(message)
+        case .unavailable:
+            VStack(alignment: .leading, spacing: 4) {
+                Label("AI is unavailable", systemImage: "exclamationmark.circle.fill")
+                    .font(.system(size: 12, weight: .semibold)).foregroundStyle(.orange)
+                Text("Enable AI commands and download the model in the Hub, then send again.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.05)))
+        case .idle, .awaitingTurn:
+            EmptyView()
+        }
+    }
+
+    /// A paused tool step's review card — resolved by BUTTONS (the notch is the cursor world; the
+    /// launcher's two-finger compass is not imported here).
+    private func approvalCard(_ review: TaskReview) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if case let .action(title, fields, _) = review {
+                Label(title, systemImage: "exclamationmark.shield.fill")
+                    .font(.system(size: 13, weight: .semibold)).foregroundStyle(.orange)
+                ForEach(Array(fields.enumerated()), id: \.offset) { _, field in
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(field.label).font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary).textCase(.uppercase)
+                        Text(field.value).font(.system(size: 12)).foregroundStyle(.white)
+                            .naturalTextDirection(for: field.value)
+                    }
+                }
+            } else {
+                Label("This step needs your approval", systemImage: "exclamationmark.shield.fill")
+                    .font(.system(size: 13, weight: .semibold)).foregroundStyle(.orange)
+            }
+            HStack(spacing: 8) {
+                Button { engine.approve() } label: {
+                    Label("Approve", systemImage: "checkmark.circle.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                Button { engine.skip() } label: {
+                    Label("Skip", systemImage: "arrow.uturn.forward")
+                        .font(.system(size: 12, weight: .medium))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.orange.opacity(0.08)))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.orange.opacity(0.35)))
+    }
+
+    /// The bounded, non-blocking failed card: a clean headline only; raw detail is not rendered here
+    /// (one taxonomy, one translator — the headline came through `AIError.message(for:)`).
+    private func failedCard(_ message: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("Something went wrong", systemImage: "exclamationmark.triangle.fill")
+                .font(.system(size: 12, weight: .semibold)).foregroundStyle(.red)
+            Text(message).font(.system(size: 11)).foregroundStyle(.secondary)
+                .lineLimit(3).truncationMode(.middle)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.red.opacity(0.06)))
+    }
+
+    /// The assistant's live reasoning, collapsed to one tappable row (the canvas's collapsible-thinking
+    /// idea, compacted for the notch surface).
+    private var thinkingSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button { thinkingExpanded.toggle() } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 11, weight: .semibold)).foregroundStyle(Color.accentColor)
+                    Text("Thinking").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+                    Spacer()
+                    Image(systemName: thinkingExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if thinkingExpanded {
+                ScrollView {
+                    BidiText(text: engine.thinking, fontSize: 11, color: .secondaryLabelColor)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                }
+                .frame(maxHeight: 110)
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.04)))
+    }
+
+    /// The route loop's ran tool steps — a compact status list (summary + glyph per step).
+    @ViewBuilder
+    private var toolStepsList: some View {
+        if !engine.toolSteps.isEmpty {
+            VStack(alignment: .leading, spacing: 5) {
+                ForEach(Array(engine.toolSteps.enumerated()), id: \.offset) { _, step in
+                    HStack(alignment: .firstTextBaseline, spacing: 7) {
+                        Image(systemName: Self.stepGlyph(step.status))
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(Self.stepColor(step.status))
+                        Text(step.summary.isEmpty ? step.tool : step.summary)
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .lineLimit(2).truncationMode(.middle)
+                    }
+                }
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.04)))
+        }
+    }
+
+    private static func stepGlyph(_ status: ToolStepStatus) -> String {
+        switch status {
+        case .done: return "checkmark.circle.fill"
+        case .declined: return "minus.circle.fill"
+        case .failed: return "exclamationmark.triangle.fill"
+        case .awaitingApproval: return "exclamationmark.shield.fill"
+        }
+    }
+
+    private static func stepColor(_ status: ToolStepStatus) -> Color {
+        switch status {
+        case .done: return .green
+        case .declined: return .secondary
+        case .failed: return .red
+        case .awaitingApproval: return .orange
+        }
+    }
+
+    // MARK: Composer
+
+    private var composer: some View {
+        HStack(spacing: 8) {
+            TextField("Message…", text: $composerText)
+                .textFieldStyle(.plain)
+                .focused($composerFocused)
+                .font(.system(size: 13))
+                .foregroundStyle(.white)
+                .onSubmit(sendComposer)
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.07)))
+                .overlay(RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(Color.accentColor.opacity(composerFocused ? 0.5 : 0.15)))
+            Button(action: sendComposer) {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.system(size: 20)).foregroundStyle(Color.accentColor)
+            }
+            .buttonStyle(.plain)
+            .help("Send")
+        }
+    }
+
+    private func sendComposer() {
+        let text = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        composerText = ""
+        engine.send(text)
     }
 }

@@ -20,47 +20,25 @@ struct HubFeatureHeader<Miniature: View>: View {
     var subtitle: String
     /// The feature's master enable — the same persisted `AppSettings` preference as before.
     @Binding var isOn: Bool
-    /// OPTIONAL rehearse wiring: a page's stable preview token. When BOTH this and `rehearseController`
-    /// are non-nil, the preview is wrapped in `RehearsablePreview` so real ≥2-finger touch drives its
-    /// dots; otherwise the bare ghost-loop preview renders (existing call sites are unaffected).
-    var rehearseToken: UUID? = nil
-    /// OPTIONAL rehearse wiring: the shared `HubRehearseController` (from `HubContext.rehearse`). Pairs
-    /// with `rehearseToken`; `nil` ⇒ the preview is not rehearsable (ghost loop only).
-    var rehearseController: HubRehearseController? = nil
 
     init(
         preview: HubGesturePreview<Miniature>,
         icon: String,
         title: String,
         subtitle: String,
-        isOn: Binding<Bool>,
-        rehearseToken: UUID? = nil,
-        rehearseController: HubRehearseController? = nil
+        isOn: Binding<Bool>
     ) {
         self.preview = preview
         self.icon = icon
         self.title = title
         self.subtitle = subtitle
         self._isOn = isOn
-        self.rehearseToken = rehearseToken
-        self.rehearseController = rehearseController
     }
 
     var body: some View {
         VStack(spacing: 16) {
-            previewContent
-            masterToggleRow
-        }
-    }
-
-    /// The preview, wrapped for live rehearsal when both rehearse inputs are supplied — otherwise the
-    /// bare ghost-loop preview (the prior behavior, so existing usage is byte-for-byte unchanged).
-    @ViewBuilder
-    private var previewContent: some View {
-        if let rehearseToken, let rehearseController {
-            RehearsablePreview(token: rehearseToken, controller: rehearseController, preview: preview)
-        } else {
             preview
+            masterToggleRow
         }
     }
 
@@ -88,7 +66,7 @@ private struct HubFeatureHeaderPreviewHost: View {
     @State private var on = true
     var body: some View {
         HubFeatureHeader(
-            preview: HubGesturePreview(fingers: 3, attractAxis: .horizontal) {
+            preview: HubGesturePreview(gesture: GesturePose.switcherDemo()) {
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
                     .fill(.thinMaterial)
                     .frame(height: 120)
@@ -99,6 +77,7 @@ private struct HubFeatureHeaderPreviewHost: View {
             subtitle: "Switch windows with three fingers; switch Spaces by sliding up/down.",
             isOn: $on
         )
+        .environmentObject(HubPreviewActivity())
         .frame(width: 360)
         .padding()
     }

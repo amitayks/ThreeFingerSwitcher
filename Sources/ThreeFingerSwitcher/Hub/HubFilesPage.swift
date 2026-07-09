@@ -9,49 +9,35 @@ import AppKit
 // Sections, top to bottom: opt-in · Roots (the entry column) · Appearance · Behavior.
 
 struct FilesPage: View {
-    /// Stable identity for this page's gesture preview (see `SwitcherPage.previewToken`).
-    static let previewToken = UUID()
-
     let context: HubContext
     @ObservedObject private var settings: AppSettings
 
-    /// §11.5 — the REAL launcher showing its FILES band: a `LauncherView` over the user's actual bands with
-    /// a synthetic Files band appended (the last band, like Clipboard / AI), driven by `filesJourney`
-    /// (`bandJourney(bandFraction: 0.66, inSurface: .lift)`) — the full path: 4-finger open → 2-finger
-    /// traverse to the Files band → land/lift to open. The Files band here is a STATIC seeded band (the user's
-    /// configured roots, no live `FilesColumnController` / drill controller — keeping the preview a pure,
-    /// presentation-only seeded model). The holder's `scrub` traverses toward the Files band (the last band)
-    /// in sync with the traverse stroke.
-    @StateObject private var demo: HubLauncherDemo
-    @StateObject private var driver: HubDemoDriver
+    /// §11.5 — the REAL launcher showing its FILES band: a `LauncherView` over the user's actual bands with a
+    /// synthetic Files band appended (the last band, like Clipboard / AI), seeded once and landed on it so the
+    /// static preview shows the Files band. The ghost-hand autoplay plays `filesJourney`
+    /// (`bandJourney(bandFraction: 0.66, inSurface: .lift)`) over it — 4-finger open → 2-finger traverse to
+    /// the Files band → land/lift; the model is not driven and does not grow (see
+    /// `docs/postmortem-idle-cpu-spin.md`). The Files band is a STATIC seeded band (the user's configured
+    /// roots, no live `FilesColumnController` / drill controller).
+    @StateObject private var demo = HubLauncherDemo()
     @State private var seeded = false
-    /// The hover-demo override pushed into the preview's driver by the drill-resolution binding rows:
-    /// hovering a row demos that action's currently-bound excursion as a directed candidate gesture. `nil`
-    /// ⇒ the base open→band→lift journey. (Driven form — mirrors the AI page's `demoGesture` bridge.)
-    @State private var demoGesture: GesturePose.DemoGesture?
+    /// The hover-demo override pushed into the preview by the drill-resolution binding rows: hovering a row
+    /// demos that action's currently-bound excursion as a directed candidate gesture. `nil` ⇒ the base
+    /// open→band→lift journey. (Mirrors the AI page's `hoverGesture` bridge.)
+    @State private var hoverGesture: GesturePose.DemoGesture?
     /// The excursion the hovered binding row maps to — stashed by the picker's `demoAxis` closure (an
     /// event-handler call) so the `demo` closure can build the matching directed candidate gesture. The
-    /// shared `HubBindingPicker` speaks `GesturePose.Axis`; this bridges its hover signal to the driven
-    /// preview's `DemoGesture` candidate without changing the component (the AI page's exact idiom).
+    /// shared `HubBindingPicker` speaks `GesturePose.Axis`; this bridges its hover signal to the preview's
+    /// `DemoGesture` candidate without changing the component (the AI page's exact idiom).
     @State private var hoveredExcursion: GestureBindings.FilesExcursion?
 
     init(context: HubContext) {
         self.context = context
         _settings = ObservedObject(wrappedValue: context.settings)
-        let holder = HubLauncherDemo()
-        _demo = StateObject(wrappedValue: holder)
-        let driver = HubDemoDriver(
-            gesture: Self.filesJourney,
-            onScrub: { [weak holder] centroid in holder?.idleNavigate(centroid) },
-            onOpen: { [weak holder] in holder?.idleOpen() })
-        driver.onRehearse = { [weak holder] centroid, fingers in
-            if let centroid { holder?.rehearseFrame(centroid, fingerCount: fingers) } else { holder?.rehearseEnd() }
-        }
-        _driver = StateObject(wrappedValue: driver)
     }
 
     /// The preview's attract journey: open the four-finger launcher → traverse to the Files band → land
-    /// and lift to open. The hover-demo override (`demoGesture`) plays a candidate drill excursion instead.
+    /// and lift to open. The hover-demo override (`hoverGesture`) plays a candidate drill excursion instead.
     private static let filesJourney = GesturePose.bandJourney(bandFraction: 0.66, inSurface: .lift)
 
     /// The coarse axis a Files-drill excursion sweeps along — the `GesturePose.Axis` the shared
@@ -94,14 +80,11 @@ struct FilesPage: View {
                                       seedThumbnails: context.seedThumbnails,
                                       launcherBands: context.launcherBands)
         // The user's real bands (clipboard / AI off here — this page demos the Files band), then a static
-        // Files band appended last, built from the configured roots (no live drill controller).
+        // Files band appended last, built from the configured roots (no live drill controller). Land the
+        // static preview on the Files band (the last band).
         let base = models.makeLauncherModel(clipboardOn: false, aiOn: false,
                                             dwell: settings.dwellToArmDuration)
-        demo.seed(from: appendingFilesBand(to: base),
-                  mode: .bandJourney, dwell: settings.dwellToArmDuration,
-                  activation: CGFloat(settings.launcherActivationThreshold),
-                  itemStep: CGFloat(settings.launcherStepDistance),
-                  bandStep: CGFloat(settings.launcherContextStepDistance))
+        demo.seed(from: appendingFilesBand(to: base), landOnLastBand: true)
     }
 
     /// Build a fresh `LauncherModel` that is `base` plus a synthetic **Files band** appended as the last
@@ -150,18 +133,15 @@ struct FilesPage: View {
                 subtitle: "A four-finger Files band — pilot your local folders, preview, and open by trackpad.") {
             HubSection(footnote: "Adds a local-only column navigator as a band in the four-finger launcher: drill into your folders horizontally, highlight vertically, lift to deliver the item to the app you came from — or open it (your choice) — and add a finger for the action menu. Reads the local filesystem on demand — no new permission, no logout, nothing copied off this Mac. Off by default.") {
                 HubFeatureHeader(
-                    preview: HubGesturePreview(driver: driver) {
+                    preview: HubGesturePreview(gesture: Self.filesJourney, hoverGesture: hoverGesture) {
                         FilesDemoMiniature(demo: demo)
                     },
                     icon: HubDestination.files.systemImage,
                     title: HubDestination.files.title,
                     subtitle: "Pilot your local folders, preview, and open them by trackpad.",
-                    isOn: $settings.filesBandEnabled,
-                    rehearseToken: Self.previewToken,
-                    rehearseController: context.rehearse
+                    isOn: $settings.filesBandEnabled
                 )
                 .onAppear { seedIfNeeded() }
-                .onChange(of: demoGesture) { _, new in driver.hoverGesture = new }
             }
 
             drillBindingSection
@@ -170,9 +150,6 @@ struct FilesPage: View {
             appearanceSection
             behaviorSection
         }
-        // A real rehearsal morphs the preview into the actual launcher (showing the Files band) at real size,
-        // floating over the page, navigable — never fires.
-        .overlay { GrownLauncherOverlay(demo: demo) }
     }
 
     // MARK: - Action menu (the +1-finger menu — what it offers, per type)
@@ -335,7 +312,7 @@ struct FilesPage: View {
                     // directed candidate for the hovered excursion; on exit, clear the override. Lift
                     // excursions have a nil axis but a real candidate (the land-and-open journey), so key the
                     // enter/exit off `hoveredExcursion` being set rather than the axis being non-nil.
-                    demoGesture = hoveredExcursion.map { candidate(for: $0) }
+                    hoverGesture = hoveredExcursion.map { candidate(for: $0) }
                     hoveredExcursion = nil
                 }
             )
@@ -622,14 +599,11 @@ struct FilesPage: View {
 
 /// The §14 Files-page miniature: the **real** `LauncherView` over the holder's seeded model (the user's bands
 /// + a synthetic Files band appended last), shown small (preview scale) — the preview "playing its part." It
-/// does NOT grow in place; while a real rehearsal is live it recedes so attention goes to the grown,
-/// actual-size launcher floating over the page (`GrownLauncherOverlay`, applied at the page body). No hits.
+/// is **static** (the ghost-hand autoplay plays over it; the model is not driven) and takes no hits.
 private struct FilesDemoMiniature: View {
-    @ObservedObject var demo: HubLauncherDemo
     @ObservedObject var model: LauncherModel
 
     init(demo: HubLauncherDemo) {
-        _demo = ObservedObject(wrappedValue: demo)
         _model = ObservedObject(wrappedValue: demo.model)
     }
 
@@ -643,7 +617,5 @@ private struct FilesDemoMiniature: View {
             .scaleEffect(scale)
             .frame(width: n.width * scale, height: h * scale)
             .allowsHitTesting(false)
-            .opacity(demo.playing ? 0.2 : 1)
-            .animation(.easeInOut(duration: 0.25), value: demo.playing)
     }
 }

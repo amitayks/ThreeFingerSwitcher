@@ -51,12 +51,18 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         switcherThumbnails: thumbnails
     )
 
-    /// The notch home zone + parked-session lifecycle (`ai-parked-sessions`): the durable store, the
-    /// one-active-now scheduler (K-ready for the batched runtime), the lifecycle coordinator, and the
-    /// cursor-reveal rail. Gated by the agent feature (here: `aiCommandsEnabled`).
+    /// The notch home zone + notch-native sessions (`ai-parked-sessions` + `notch-native-conversations`):
+    /// the durable store, the one-active-now scheduler (K-ready for the batched runtime), the lifecycle
+    /// coordinator, the cursor-reveal rail, and the per-session conversation engines (born at the notch,
+    /// expanded in place). Gated by the agent feature (here: `aiCommandsEnabled`).
     private lazy var parkController = ParkController(
         maxParked: settings.agentMaxParkedSessions,
-        autoDismissCountdown: settings.agentParkAutoDismissCountdown)
+        autoDismissCountdown: settings.agentParkAutoDismissCountdown,
+        // `unowned`: the coordinator owns the controller and outlives it (app-lifetime singleton), so the
+        // factory can't be called after self is gone; `weak` would force a nonsensical fallback engine.
+        engineFactory: { [unowned self] in self.makeNotchSessionEngine() },
+        // The shared ledger, for the purge-delete gesture only (`notch-conversation-gestures`).
+        auditLog: auditLog)
 
     /// Coarse repeating timer that runs the parked-session auto-dismiss pass (design D1): a terminal or
     /// idle-past-countdown session is dismissed FOREVER. Installed/torn down alongside `parkController`'s
@@ -64,12 +70,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     private var parkAutoDismissTimer: Timer?
     /// How often the auto-dismiss pass runs (a minute is plenty for a 5-minute default countdown).
     private static let parkAutoDismissInterval: TimeInterval = 60
-
-    /// Accumulated UP overscroll travel (in `canvasResolveThreshold` units) while the canvas is at its
-    /// bottom — the consumer-side bridge from the recognizer's discrete `±1` to the higher overscroll-park
-    /// threshold (`OverscrollPark.shouldPark`). The recognizer stays UNTOUCHED; this mirrors the existing
-    /// `canvasDiscardAccum` step-accumulation precedent. Reset on a non-up resolve or once a park fires.
-    private var canvasOverscrollAccum: CGFloat = 0
 
     // Four-finger launcher.
     private let favoritesStore = FavoritesStore.shared
@@ -98,7 +98,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         // task 6.1 FIRE path): a generic "Ask…" opens showing the seed and WAITING; a preset (Fix Grammar,
         // Translate, a task) pre-fills + auto-sends turn 1. Firing does NOT dismiss the overlay (the overlay
         // handles that exception).
-        onAICommand: { [weak self] command in self?.aiCommandExecutor.fireConversational(command) },
+        onAICommand: { [weak self] command in self?.aiCommandExecutor.fire(command) },
         // Persist the folder picked at fire time for a choose-folder-at-launch item, so its chooser
         // re-opens there next time (the item is the single source of truth for its last-used folder).
         onPromptedFolderChosen: { [weak self] itemID, bandID, folder in
@@ -362,19 +362,33 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         },
         loadLanguage: { [weak self] id in self?.settings.rememberedLanguage(for: id) },
         saveLanguage: { [weak self] id, lang in self?.settings.rememberLanguage(lang, for: id) },
-        reasoning: { [weak self] in self?.settings.aiReasoningEnabled ?? false },
-        registry: aiToolRegistry,
-        candidateSource: aiToolCandidateSource,
-        // Active-skill allow-list (`wire-memory-skills`): the bound skill's `toolNames` are always offered
-        // as candidates while it drives the conversation. Resolves through the live store (user skills,
-        // post-reload) with a synchronous built-in projection fallback (so it works before the async load).
-        skillTools: { [aiSkillStore] id in
-            (aiSkillStore.manifest(id: id)
-                ?? SkillStore.builtInManifests().first { $0.id == id })?.toolNames ?? []
-        },
-        // Background autonomy: nil when `.backgroundAutonomy` is locked (the plain foreground path).
-        backgroundRunner: aiBackgroundRunner
+        reasoning: { [weak self] in self?.settings.aiReasoningEnabled ?? false }
     )
+
+    /// The notch-session conversation engine factory (`notch-native-conversations` D1): each notch session
+    /// with a live foreground turn gets its own engine; `ParkController` owns the instances. The engine
+    /// carries the tool-routing/skills/background-autonomy seams the executor shed when the command band
+    /// reverted to one-shot presets.
+    private func makeNotchSessionEngine() -> NotchSessionEngine {
+        NotchSessionEngine(
+            modelManager: modelManager,
+            selection: selectionService,
+            contextProvider: { [weak self] in
+                FireContext(capturedAppName: self?.capturedFrontApp?.localizedName)
+            },
+            reasoning: { [weak self] in self?.settings.aiReasoningEnabled ?? false },
+            registry: aiToolRegistry,
+            candidateSource: aiToolCandidateSource,
+            // Active-skill allow-list (`wire-memory-skills`): the bound skill's `toolNames` are always
+            // offered as candidates while it drives the conversation. Resolves through the live store
+            // (user skills, post-reload) with a synchronous built-in projection fallback.
+            skillTools: { [aiSkillStore] id in
+                (aiSkillStore.manifest(id: id)
+                    ?? SkillStore.builtInManifests().first { $0.id == id })?.toolNames ?? []
+            },
+            // Background autonomy: nil when `.backgroundAutonomy` is locked (the plain foreground path).
+            backgroundRunner: aiBackgroundRunner)
+    }
 
     // Per-app keyboard language (opt-in; remembers and re-selects the input source per app/site). Gated
     // on its OWN toggle, independent of the switcher master enable. The store holds the learned
@@ -433,10 +447,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     // The unified configuration Hub: one reusable window, its navigation state, and the wiring context.
     private var hubWindow: NSWindow?
     private let hubNav = HubNavigation()
-    /// The Hub gesture-preview rehearse seam (§2.3 / §2.4): at most one previewed page registers as the
-    /// active rehearse target; this controller publishes the live fingertips and the ownership verdict.
-    /// Shared between the touch feed (below) and every `HubGesturePreview` via `HubContext`.
-    private let hubRehearse = HubRehearseController()
     private lazy var hubContext: HubContext = makeHubContext()
     /// The Space the Hub was last presented on (captured in `showHub`). Used to place the synthetic
     /// Hub switcher entry on its own Space-row — the Hub deliberately does NOT join all Spaces, so it
@@ -482,54 +492,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     /// untouched; this only mirrors frames).
     var onWizardTouchFrame: ((TouchFrame) -> Void)?
 
-    /// Tap on the touch stream for the Hub's gesture-preview **rehearse** seam (§2.3). Unlike the wizard
-    /// mirror this is NOT read-only: while a Hub preview is the active rehearse target with ≥2 fingers
-    /// down, the frame is routed here and the recognizer is SKIPPED (`hubPreviewOwnsGestures`), so
-    /// rehearsing never fires the real feature. `HubRehearseController` extracts the live fingertips.
-    var onHubPreviewTouchFrame: ((TouchFrame) -> Void)?
-
-    /// The Hub-preview analogue of `wizardOwnsGestures`: true while a Hub preview is being rehearsed on
-    /// the real trackpad (a preview is the active target AND ≥2 fingers are down). When true, the touch
-    /// frame is routed to the preview and `recognizer.feed(_:)` is skipped — the gate closes (and normal
-    /// feeding resumes) the instant the fingers lift or the preview loses focus. Guarded against the
-    /// wizard so the two ownerships never both apply (their windows are never up together, but defensive).
-    ///
-    /// FAIL-SAFE on the Hub window's key state: suppression can ONLY happen while the Hub is the **key
-    /// window** (the user is actively in front of it, i.e. genuinely rehearsing). If the Hub is closed or
-    /// merely backgrounded, this is false no matter what — so a registration that went stale (SwiftUI
-    /// `.onDisappear` is unreliable on window close) can never keep swallowing the switcher/launcher after
-    /// the Hub is gone. Reading `isKeyWindow` here is consistent with `wizardOwnsGestures` reading
-    /// `wizardWindow?.isVisible` on the same frame path.
-    private var hubPreviewOwnsGestures: Bool {
-        guard hubWindow?.isKeyWindow == true else { return false }
-        guard !wizardOwnsGestures else { return false }
-        // The SWITCHER preview is rehearsed by running the REAL switcher overlay with its commit neutralized
-        // (`switcherDemoActive`), so the 3-finger switcher gesture must NOT be suppressed here — the genuine
-        // overlay needs to show. Its 4-finger LAUNCHER, however, stays suppressed so the launcher can't open
-        // over the Hub. Every other preview keeps the full in-section rehearsal (complete suppression).
-        if hubRehearse.activeTarget == SwitcherPage.previewToken {
-            return currentFingerCount >= 4
-        }
-        return hubRehearse.ownsGestures
-    }
-
-    /// Latched at activation: this in-flight switcher gesture is a Hub teaching run (the user is rehearsing
-    /// on the Switcher section), so its commit raises nothing and its Mission-Control synthesis is inert —
-    /// the genuine overlay is shown purely to teach. Decided ONCE at activation so a mid-gesture key-window
-    /// flicker can't flip it.
-    private var switcherDemoGestureInFlight = false
-
-    /// True while the user is rehearsing on the Hub's SWITCHER section: the genuine switcher overlay runs to
-    /// teach, but every real side effect (commit/raise, Mission Control) is neutralized. Gated on the app
-    /// being active + the Hub visible — robust to key-window flicker, which is what made the real switcher
-    /// "sometimes" fire from the section. When the user is NOT in the Hub (another app active), this is
-    /// false, so the switcher behaves entirely normally.
-    private var switcherDemoActive: Bool {
-        guard !wizardOwnsGestures else { return false }
-        guard hubRehearse.activeTarget == SwitcherPage.previewToken else { return false }
-        return (hubWindow?.isVisible == true) && NSApp.isActive
-    }
-
     init() {
         recognizer.delegate = self
         keyboardSwitcher.delegate = self
@@ -537,26 +499,17 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         touchEngine.onFrame = { [weak self] frame in
             guard let self else { return }
             self.currentFingerCount = frame.fingerCount
-            // The wizard's live-hand act still mirrors every frame (read-only). The Hub rehearse seam
-            // also always sees the frame (so its ≥2-finger gate + lift-clear stay accurate), but it
-            // additionally OWNS the gesture while rehearsing: when it does, the real recognizer is
-            // skipped so the rehearsal can't open the launcher / switch a window / fire a command.
+            // The wizard's live-hand act still mirrors every frame (read-only). The Hub gesture previews are
+            // pure autoplay (they don't read the touch feed), so nothing else taps the stream here.
             self.onWizardTouchFrame?(frame)
-            self.onHubPreviewTouchFrame?(frame)
-            guard !self.hubPreviewOwnsGestures else { return }
             self.recognizer.feed(frame)
         }
         scrollTap.consumePredicate = { [weak self] in
             guard let self else { return false }
-            // Also swallow scroll while an ARMED Hub rehearsal owns the gesture (a ≥3-finger trigger
-            // relaxed to two): without this the relaxed two-finger movement would scroll the Hub page
-            // underneath the preview. An un-armed two-finger move keeps `hubPreviewOwnsGestures` false, so
-            // ordinary page scrolling still passes through.
             return Self.shouldConsumeScroll(fingerCount: self.currentFingerCount,
                                             launcherOpen: self.launcherOverlay.isVisible,
                                             switcherOpen: self.overlay.isVisible,
                                             canvasActive: self.launcherOverlay.canvasActive)
-                || self.hubPreviewOwnsGestures
         }
         thumbnails.onThumbnail = { [weak self] id, image in
             self?.overlay.model.setThumbnail(image, for: id)
@@ -579,48 +532,23 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         )
         launcherOverlay.onCommitCanvas = { [weak self] in
             guard let self else { return }
-            // A fresh two-finger DOWN swipe commits. A CONVERSATIONAL session (an open thread) extracts the
-            // LATEST assistant turn to the output target (design D5); a one-shot fire routes the ready
-            // result / reviewed side effect via `commit()`. Errors surface in the executor's `.failed`
-            // state (the canvas is already dismissed by the controller, but the executor records them).
-            //
-            // Bug 1 / Bug 3 / D3: a COMMITTED conversational result removes its durable parked row FOREVER —
-            // `extractLatest()` fires the executor's `onTaskComplete` seam (wired to the authoritative
-            // `discard(_:)`), so no explicit discard is needed here. A one-shot `commit()` has no session id.
+            // A fresh two-finger DOWN swipe commits: route the ready result / reviewed side effect via
+            // `commit()`. Errors surface in the executor's `.failed` state (the canvas is already
+            // dismissed by the controller, but the executor records them).
             Task { @MainActor in
-                if self.aiCommandExecutor.conversation != nil {
-                    await self.aiCommandExecutor.extractLatest()
-                } else {
-                    try? await self.aiCommandExecutor.commit()
-                }
+                try? await self.aiCommandExecutor.commit()
             }
         }
         launcherOverlay.onDiscardCanvas = { [weak self] in
-            guard let self else { return }
-            // Bug 1 / D3: a DISMISSED restored canvas removes its durable parked row FOREVER. Capture the
-            // session id BEFORE `cancel()` clears the conversation, then route it through the authoritative
-            // `discard(_:)` path (idempotent — a one-shot fire or an already-removed restore is a no-op).
-            let sessionID = self.aiCommandExecutor.conversation?.id
-            self.aiCommandExecutor.cancel()
-            if let sessionID { self.parkController.discard(sessionID) }
+            // A one-shot fire is ephemeral: a discard cancels the in-flight generation and resets — it
+            // has no session, no parked row, nothing durable to clean up (notch-native-conversations).
+            self?.aiCommandExecutor.cancel()
         }
-        // Overscroll-park (`ai-parked-sessions` §7.3): the executor hands its live conversation to the park
-        // controller (durable store + scheduler) WITHOUT cancelling the in-flight turn; the controller keeps
-        // advancing it in the background and surfaces it on the notch rail. `parkCanvas()` calls
-        // `parkHandoff()` (which invokes this seam) then recedes the overlay.
-        aiCommandExecutor.onPark = { [weak self] conversation in self?.parkController.park(conversation) }
-        launcherOverlay.onParkCanvas = { [weak self] in self?.aiCommandExecutor.parkHandoff() }
-        // Bug 3 / D1: a finished foreground op (a committed conversational result) is a TERMINAL outcome —
-        // its parked row, if any, is removed FOREVER through the authoritative discard path (so a completed
-        // task never lingers on the rail). Idempotent for a session that was never parked.
-        aiCommandExecutor.onTaskComplete = { [weak self] id in self?.parkController.discard(id) }
-        // Pull-back-to-active (task 6.2): the rail hands the stored conversation back; the executor re-binds
-        // to it (`.awaitingTurn`) and the canvas re-opens rendering the restored thread (a typed follow-up
-        // resumes it). The controller clears the rail row / glow as part of the restore.
-        parkController.onRestoreConversation = { [weak self] conversation in
-            guard let self else { return }
-            self.aiCommandExecutor.restoreConversation(conversation)
-            self.launcherOverlay.restoreCanvas(title: conversation.title)
+        // Notch conversation flick grammar (`notch-conversation-gestures`): the recognizer watches
+        // two-finger flick excursions only while a conversation is expanded. Driven from the controller's
+        // single choke point so the mode can never be left stuck on after a collapse from any path.
+        parkController.onExpandedChanged = { [weak self] expanded in
+            self?.recognizer.notchConversationActive = expanded
         }
         // Screen-region (vision) command: the launcher already dismissed to reveal the desktop. Run the
         // interactive region picker; on a drag, capture the designated region and re-open the canvas
@@ -638,31 +566,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
                     Task { @MainActor in
                         let outcome = await self.selectionService.captureScreenRegion(rect)
                         self.launcherOverlay.showCanvas(for: command)
-                        self.aiCommandExecutor.fireConversational(command, screenCapture: outcome)
-                    }
-                }
-            }
-        }
-        // Composer "attach screenshot" (Bug 6 / design D2): the canvas is OPEN — run the SAME interactive
-        // region picker the screen-region command uses, but on a drag STAGE the captured bytes via
-        // `attachScreenshot(data)` instead of firing a one-shot command, then leave the canvas as-is so the
-        // user can attach more or send. A click-without-drag cancels (nothing staged). Screen capture stays
-        // off the executor seam (per `SelectionProviding`): the coordinator owns the capture and only hands
-        // the executor the encoded bytes. A captured-but-empty/permission outcome stages nothing (the
-        // screenshot affordance is a convenience, not a one-shot — no `.failed`/`.noInput` canvas flip here).
-        launcherOverlay.onAttachCanvasScreenshot = { [weak self] in
-            guard let self else { return }
-            self.regionPicker.show { [weak self] resolution in
-                guard let self else { return }
-                switch resolution {
-                case .cancel:
-                    break   // defused — nothing captured, nothing staged
-                case let .region(rect):
-                    Task { @MainActor in
-                        let outcome = await self.selectionService.captureScreenRegion(rect)
-                        if case let .captured(data) = outcome {
-                            self.aiCommandExecutor.attachScreenshot(data)
-                        }
+                        self.aiCommandExecutor.fire(command, screenCapture: outcome)
                     }
                 }
             }
@@ -987,9 +891,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         guard !wizardOwnsGestures else { return }
         // A ⌘-Tab session owns the overlay: the trackpad gesture defers rather than clobber it (D7).
         guard switcherOwner != .keyboard else { return }
-        // Decide ONCE whether this gesture is a Hub teaching run (rehearsing on the Switcher section): if so
-        // the genuine overlay still rises to teach, but its commit/Mission-Control are neutralized below.
-        switcherDemoGestureInFlight = switcherDemoActive
         _ = openSwitcher(owner: .trackpad)
     }
 
@@ -1097,7 +998,15 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
 
     func gestureDidTriggerMissionControl(up: Bool) {
         guard !wizardOwnsGestures else { return }   // no OS overviews over the wizard's stage
-        guard !switcherDemoActive else { return }   // a Hub teaching swipe never opens Mission Control
+        // The DOWN swipe maps to the configured down-action: when the swipe-down minimize-all opt-in is on,
+        // genuinely minimize every current-Space window (reveal the desktop, Windows Win+D) instead of the
+        // synthesized App Exposé. The recognizer emits the same one-shot down intent either way — only the
+        // action selected here differs. UP is always Mission Control.
+        if !up && settings.swipeDownMinimizesAll {
+            windowService.minimizeAllWindows()
+            missionControlOpen = false   // no overview opened; nothing for a later commit to dismiss
+            return
+        }
         // A fresh three-finger vertical swipe while we own the gesture: open the OS overview
         // ourselves (the native gesture is disabled to a scroll, which the scroll tap consumes).
         MissionControl.trigger(up: up)
@@ -1152,15 +1061,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
 
     func gestureDidCommit() {
         switcherOwner = .none   // the session is ending regardless of which branch below runs
-        // A Hub teaching run: the genuine overlay was shown only to demonstrate — dismiss it and raise
-        // NOTHING (no window, no Space change). This is what keeps the Switcher section from ever firing the
-        // real switcher even though the real overlay is what the user sees.
-        if switcherDemoGestureInFlight {
-            switcherDemoGestureInFlight = false
-            overlay.hide()
-            stopPreviewRefresh()
-            return
-        }
         guard overlay.isVisible, let window = overlay.model.selectedWindow else {
             overlay.hide()
             stopPreviewRefresh()
@@ -1201,8 +1101,20 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             missionControlOpen = false
             MissionControl.dismiss()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                self?.windowService.raise(window)
+                self?.raiseCommitted(window)
             }
+        } else {
+            raiseCommitted(window)
+        }
+    }
+
+    /// Raise a committed switcher/⌘-Tab selection, un-minimizing it first when it is a minimized window
+    /// (present only with the include-minimized-windows opt-in). `raiseDeminimizing` clears `kAXMinimized` —
+    /// which restores the window's prior position/size — then runs the same hardened `raise`; a non-minimized
+    /// selection raises exactly as before.
+    private func raiseCommitted(_ window: WindowInfo) {
+        if window.isMinimized {
+            windowService.raiseDeminimizing(window)
         } else {
             windowService.raise(window)
         }
@@ -1210,7 +1122,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
 
     func gestureDidCancel() {
         switcherOwner = .none
-        switcherDemoGestureInFlight = false
         overlay.hide()
         stopPreviewRefresh()
     }
@@ -1230,7 +1141,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     /// Refuses (returns false, leaving the session armed to retry) while onboarding owns the stage or a
     /// trackpad gesture already owns the overlay (D7).
     func keyboardSwitcherOpen() -> Bool {
-        guard !wizardOwnsGestures, !switcherDemoActive else { return false }
+        guard !wizardOwnsGestures else { return false }
         guard switcherOwner != .trackpad else { return false }
         switcherOwner = .keyboard
         DispatchQueue.main.async { [weak self] in
@@ -1424,12 +1335,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     /// further gated by `canvasAtTop` at the call site (binding-independent); `discard`/`ignore` are not.
     enum CanvasResolveDecision: Equatable { case commit, discard, ignore }
 
-    /// The travel one discrete up-resolve represents, in the same normalized units as the recognizer's
-    /// `canvasResolveThreshold` (the recognizer fires a `±1` resolve once an excursion crosses that
-    /// threshold). Used to accumulate UP overscroll toward the higher `agentOverscrollParkThreshold` at the
-    /// consumer seam (the recognizer stays untouched). Matches the recognizer's private resolve threshold.
-    static let canvasOverscrollStep: CGFloat = 0.12
-
     /// Pure decision: given the recognizer's axis-locked excursion (exactly one of `dx`/`dy` non-zero) and
     /// the user's `canvas` binding, resolve which action it performs (`add-gesture-previews-and-bindings`
     /// §9.3). The recognizer's sign convention is fixed: `dy<0 → swipeDown`, `dy>0 → swipeUp`,
@@ -1459,53 +1364,32 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     /// recognizer has already axis-locked; the performed excursion is mapped to an action through the
     /// user's **configured canvas binding** (`add-gesture-previews-and-bindings` §9.3). Defaults reproduce
     /// today's grammar exactly: down = commit-at-top, up = ignore, left = dismiss, spare (right) = discard.
+    /// A fresh two-finger FLICK while a notch conversation is expanded (`notch-conversation-gestures`):
+    /// fast UP minimizes it into the notch dock (the standard collapse — persisted, background-scheduled,
+    /// an in-flight turn untouched); fast RIGHT purge-deletes the session (authoritative discard + the
+    /// audit-ledger purge — no trace, no log line). Fast DOWN and fast LEFT are reserved no-ops. Soft
+    /// scrubs never reach here (the D4 classifier emits nothing for them), so thread scrolling is native.
+    func notchConversationResolve(dx: Int, dy: Int) {
+        guard let id = parkController.expandedID else { return }
+        if dy > 0 {
+            parkController.collapse()          // fast up → minimize to the dock
+        } else if dx > 0 {
+            parkController.purge(id)           // fast right → gone everywhere, no trace
+        }
+        // dy < 0 (fast down) and dx < 0 (fast left): reserved — deliberately nothing.
+    }
+
     func launcherCanvasResolve(dx: Int, dy: Int) {
         guard launcherOverlay.canvasActive else { return }
-        // Overscroll-park (`ai-parked-sessions` §7.3, design D4): a pure-UP resolve while the canvas is
-        // already at its BOTTOM accumulates toward the higher overscroll threshold; once the accumulated
-        // travel crosses `agentOverscrollParkThreshold` (above `canvasResolveThreshold`, so reading the
-        // canvas / a normal scroll-to-bottom never parks), the canvas PARKS instead of ignoring/scrolling.
-        // The recognizer is UNTOUCHED — it still emits raw `±1`; the accumulation mirrors the existing
-        // `canvasDiscardAccum` precedent. This is the spatial companion of the at-top commit guard (TOP =
-        // act, BOTTOM = stash).
-        if dx == 0, dy > 0 {
-            if aiCommandExecutor.canvasAtBottom {
-                // Each up-resolve represents one `canvasResolveThreshold`-sized excursion past the bottom.
-                canvasOverscrollAccum += AppCoordinator.canvasOverscrollStep
-                if OverscrollPark.shouldPark(
-                    dy: canvasOverscrollAccum,
-                    canvasAtBottom: true,
-                    overscrollThreshold: CGFloat(settings.agentOverscrollParkThreshold)) {
-                    canvasOverscrollAccum = 0
-                    launcherOverlay.parkCanvas()
-                    return
-                }
-            } else {
-                canvasOverscrollAccum = 0   // off the bottom → the up-pan is a scroll, not an overscroll
-            }
-        } else {
-            canvasOverscrollAccum = 0       // any non-up resolve breaks the overscroll accumulation
-        }
         switch AppCoordinator.canvasResolveDecision(dx: dx, dy: dy, binding: settings.gestureBindings.canvas) {
         case .commit:
-            // Tool-step approval (task 2.8/3.1): when the route loop is paused awaiting a decision, DOWN
-            // APPROVES the pending step (it does not extract an answer). The at-top guard still applies (the
-            // review card is short and at the top, so it passes trivially); it is read BEFORE the commit
-            // path so the in-place extract is never reached mid-approval.
-            guard aiCommandExecutor.canvasAtTop else { return }
-            if aiCommandExecutor.state.isAwaitingApproval {
-                aiCommandExecutor.approve()
-                return
-            }
             // The commit-bound excursion applies — but ONLY when the canvas is scrolled to the TOP. Off the
             // top the same two-finger pan is the user SCROLLING the response/thinking back up (the native
             // scroll already handled it), so it must not insert the result. This at-top guard is
             // binding-independent: it holds for whatever excursion is bound to commit.
-            launcherOverlay.resolveCanvasCommit()   // at top → apply (extract latest / replace / run task)
+            guard aiCommandExecutor.canvasAtTop else { return }
+            launcherOverlay.resolveCanvasCommit()   // at top → apply (replace / paste / run task)
         case .discard:
-            // RIGHT-when-`.awaitingApproval` SKIPS the pending tool step (the loop resumes and may pivot) —
-            // the same mnemonic as discard, but it does NOT tear the canvas down (the thread continues).
-            if aiCommandExecutor.state.isAwaitingApproval, aiCommandExecutor.skip() { return }
             launcherOverlay.discardCanvas()
         case .ignore:
             break                                   // no-op (e.g. default up scrolls toward the tail)
@@ -3198,9 +3082,9 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             // Authoritatively pause the self-playing gesture previews whenever the Hub leaves the screen
             // and resume them when it returns. The window + its SwiftUI tree are kept alive for reuse, so
             // SwiftUI's `.onDisappear` is unreliable on close/miniaturize — without this the previews'
-            // 30 Hz `HubDemoDriver` loops keep ticking after the Hub is closed, driving the demo models +
-            // re-rendering the offscreen overlay on the main run loop and starving the real
-            // switcher/launcher gesture. Registered once (the window is reused), scoped to THIS window.
+            // `TimelineView` clocks keep ticking on the main run loop after the Hub is closed, pinning the
+            // main thread (see `docs/postmortem-idle-cpu-spin.md`). Flipping the shared `previewActivity`
+            // flag stops every clock. Registered once (the window is reused), scoped to THIS window.
             let nc = NotificationCenter.default
             for name in [NSWindow.willCloseNotification, NSWindow.didMiniaturizeNotification] {
                 nc.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
@@ -3213,9 +3097,8 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             hubWindow = window
         }
         present(hubWindow)
-        // Re-arm the previews in case the Hub was previously closed/minimized (the window — and so the
-        // paused drivers — are reused). Idempotent: a no-op on the first open (no drivers mounted yet;
-        // their own `.onAppear` starts them) and when already running.
+        // Re-arm the previews in case the Hub was previously closed/minimized (the window — and so its
+        // paused SwiftUI tree — are reused). Idempotent.
         resumeHubPreviews()
         // Remember which Space the Hub now lives on so the synthetic switcher entry lands in that
         // Space's row. `present` activates + makes the Hub key on the current Space, so the current
@@ -3223,20 +3106,18 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         hubSpaceID = SpaceService.currentModel()?.currentSpaceIDs.first
     }
 
-    /// Pause the Hub's self-playing gesture previews (and clear any rehearse target) — called when the
-    /// Hub leaves the screen. Stops every `HubDemoDriver` loop via the authoritative notification so none
-    /// can keep running on the main run loop after the Hub is gone, and resets the rehearse controller so
-    /// no stale target lingers (belt-and-suspenders alongside the `hubPreviewOwnsGestures` `isKeyWindow`
-    /// fail-safe).
+    /// Pause the Hub's self-playing gesture previews — called when the Hub leaves the screen (close /
+    /// miniaturize). Flips the shared visibility flag false so every `HubGesturePreview` refuses to run its
+    /// `TimelineView`, so none keeps ticking on the main run loop after the Hub is gone (SwiftUI's
+    /// `.onDisappear` does not fire on an NSWindow close while the window is reused). See
+    /// `docs/postmortem-idle-cpu-spin.md`.
     private func pauseHubPreviews() {
-        NotificationCenter.default.post(name: .hubPreviewsPause, object: nil)
-        hubRehearse.reset()
+        hubContext.previewActivity.isActive = false
     }
 
-    /// Resume the previews when the Hub returns to the screen (reopen / deminiaturize). `HubDemoDriver`
-    /// restart is idempotent — the loop only re-arms if it had been stopped.
+    /// Resume the previews when the Hub returns to the screen (reopen / deminiaturize). Idempotent.
     private func resumeHubPreviews() {
-        NotificationCenter.default.post(name: .hubPreviewsResume, object: nil)
+        hubContext.previewActivity.isActive = true
     }
 
     /// Wire the Hub's references and callbacks once. Closures are weak-self so the context never
@@ -3248,16 +3129,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
                              clipboard: clipboardStore,
                              models: modelManager,
                              permissions: permissions)
-        // §2.3 rehearse seam: hand the shared rehearse controller to the previewed pages (each
-        // `HubGesturePreview` binds its `liveDots` to it and registers as the active target), and route
-        // the touch feed into it. Contacts are mapped to normalized points HERE (the `OMSTouchData`
-        // boundary) so `HubRehearseController` stays Core-pure. An empty frame (lift) ingests as 0
-        // fingers → the gate closes (dots clear, recognizer resumes).
-        ctx.rehearse = hubRehearse
-        onHubPreviewTouchFrame = { [weak self] frame in
-            let contacts = frame.contacts.map { CGPoint(x: CGFloat($0.position.x), y: CGFloat($0.position.y)) }
-            self?.hubRehearse.ingest(fingerCount: frame.fingerCount, contacts: contacts)
-        }
         // §11.2 Real demo content for the gesture previews — the SAME providers `makeWizardContext`
         // wires, so the Hub renders the real switcher/launcher seeded with the user's content. No new
         // permission (these read already-available state / reuse granted Screen Recording).
