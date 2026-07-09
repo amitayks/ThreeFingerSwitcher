@@ -22,14 +22,20 @@ enum WindowOrdering {
         let spaceIdx: Int
         let z: Int
         let appRank: Int
+        /// Minimized windows sort AFTER live ones within a Space-row (they carry no focus recency and are
+        /// "put away"), mirroring the Dock-preview `dockPreviewOrder`. Defaulted so call sites and tests that
+        /// predate the include-minimized-windows opt-in stay source-compatible.
+        var isMinimized: Bool = false
     }
 
     /// True when `a` should sort before `b`. Primary `winRank` ascending (most-recent first), then
-    /// current-Space first, then Space index, then z-order, with `appRank` as the final tiebreak.
+    /// current-Space first, then Space index, then live-before-minimized within the Space, then z-order,
+    /// with `appRank` as the final tiebreak.
     static func before(_ a: Key, _ b: Key) -> Bool {
         if a.winRank != b.winRank { return a.winRank < b.winRank }       // most-recently-focused first
         if a.onCurrent != b.onCurrent { return a.onCurrent && !b.onCurrent } // current Space first
         if a.spaceIdx != b.spaceIdx { return a.spaceIdx < b.spaceIdx }   // Mission Control order
+        if a.isMinimized != b.isMinimized { return !a.isMinimized }     // live windows before minimized (within a Space)
         if a.z != b.z { return a.z < b.z }                              // z-order within Space
         return a.appRank < b.appRank                                     // final tiebreak (effectively unreachable)
     }

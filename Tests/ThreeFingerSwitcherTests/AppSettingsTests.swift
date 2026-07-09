@@ -506,6 +506,102 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertFalse(settings.aiReasoningEnabled, "reset must not flip the reasoning opt-in")
     }
 
+    // MARK: - Minimized windows in the switcher + minimize-all-on-down opt-ins
+
+    /// Both opt-ins default OFF (preserve today's behavior: minimized windows excluded, down-swipe = App
+    /// Exposé) and match their `Defaults` literals.
+    func testMinimizeOptInsDefaultOff() {
+        let settings = makeSettings()
+        XCTAssertFalse(settings.includeMinimizedWindows, "include-minimized must default OFF")
+        XCTAssertFalse(settings.swipeDownMinimizesAll, "swipe-down-minimize-all must default OFF")
+        XCTAssertEqual(settings.includeMinimizedWindows, AppSettings.Defaults.includeMinimizedWindows)
+        XCTAssertEqual(settings.swipeDownMinimizesAll, AppSettings.Defaults.swipeDownMinimizesAll)
+        XCTAssertFalse(AppSettings.Defaults.includeMinimizedWindows, "the Defaults literal is false")
+        XCTAssertFalse(AppSettings.Defaults.swipeDownMinimizesAll, "the Defaults literal is false")
+    }
+
+    /// `includeMinimizedWindows` round-trips through the documented raw key and persists both ways while
+    /// the minimize-all trigger is off (its normal, independent use — it also helps manually-minimized windows).
+    func testIncludeMinimizedWindowsPersistsAcrossInstances() {
+        let writer = makeSettings()
+        writer.includeMinimizedWindows = true
+        XCTAssertEqual(defaults.object(forKey: "includeMinimizedWindows") as? Bool, true, "writes the documented key")
+
+        let reader = AppSettings(defaults: defaults)
+        XCTAssertTrue(reader.includeMinimizedWindows, "persists across instances")
+
+        reader.includeMinimizedWindows = false
+        XCTAssertFalse(AppSettings(defaults: defaults).includeMinimizedWindows, "the off state persists too (trigger off)")
+    }
+
+    /// Enabling the minimize-all-on-down trigger AUTO-ENABLES minimized reachability, so the windows it
+    /// minimizes are never stranded. The auto-enable persists.
+    func testSwipeDownMinimizesAllAutoEnablesReachability() {
+        let writer = makeSettings()
+        XCTAssertFalse(writer.includeMinimizedWindows, "precondition: reachability off")
+
+        writer.swipeDownMinimizesAll = true
+
+        XCTAssertTrue(writer.includeMinimizedWindows, "enabling minimize-all turns reachability on")
+        XCTAssertEqual(defaults.object(forKey: "swipeDownMinimizesAll") as? Bool, true, "trigger persisted")
+        XCTAssertEqual(defaults.object(forKey: "includeMinimizedWindows") as? Bool, true, "auto-enabled reachability persisted")
+        let reader = AppSettings(defaults: defaults)
+        XCTAssertTrue(reader.swipeDownMinimizesAll)
+        XCTAssertTrue(reader.includeMinimizedWindows, "both persist across a relaunch")
+    }
+
+    /// The coupling guard is enforced at the MODEL level: reachability cannot be turned off while the
+    /// minimize-all trigger is on (an attempt is reverted), so minimize-all can never strand its windows.
+    func testReachabilityLockedOnWhileMinimizeAllOn() {
+        let settings = makeSettings()
+        settings.swipeDownMinimizesAll = true   // auto-enables reachability
+
+        settings.includeMinimizedWindows = false   // attempt to disable while the trigger is on
+
+        XCTAssertTrue(settings.includeMinimizedWindows, "reachability stays ON while minimize-all is on")
+        XCTAssertEqual(defaults.object(forKey: "includeMinimizedWindows") as? Bool, true, "the locked-on value is persisted")
+    }
+
+    /// Turning the trigger OFF does not force reachability off (it's independently useful), but it UNLOCKS
+    /// it — reachability can then be disabled normally.
+    func testDisablingMinimizeAllUnlocksReachability() {
+        let settings = makeSettings()
+        settings.swipeDownMinimizesAll = true    // reachability auto-on + locked
+        settings.swipeDownMinimizesAll = false   // unlock; reachability stays on (independent value)
+        XCTAssertTrue(settings.includeMinimizedWindows, "disabling the trigger does not force reachability off")
+
+        settings.includeMinimizedWindows = false // now allowed
+        XCTAssertFalse(settings.includeMinimizedWindows, "reachability can be turned off once the trigger is off")
+    }
+
+    /// `resetToDefaults()` clears BOTH opt-ins to off even when both were on — the reset order (trigger
+    /// first) means the coupling guard does not re-enable reachability.
+    func testResetToDefaultsClearsBothMinimizeOptIns() {
+        let settings = makeSettings()
+        settings.swipeDownMinimizesAll = true    // both on now
+        XCTAssertTrue(settings.includeMinimizedWindows)
+
+        settings.resetToDefaults()
+
+        XCTAssertFalse(settings.swipeDownMinimizesAll, "trigger resets to off")
+        XCTAssertFalse(settings.includeMinimizedWindows, "reachability resets to off (not re-locked by the guard)")
+        let reader = AppSettings(defaults: defaults)
+        XCTAssertFalse(reader.swipeDownMinimizesAll, "the off states persist")
+        XCTAssertFalse(reader.includeMinimizedWindows)
+    }
+
+    /// Older settings (neither key present) decode with both opt-ins OFF, pre-existing settings untouched.
+    func testOlderSettingsDecodeWithMinimizeOptInsOff() {
+        defaults.set(0.0777, forKey: "stepDistance")
+        XCTAssertNil(defaults.object(forKey: "includeMinimizedWindows"), "precondition: no key on disk")
+        XCTAssertNil(defaults.object(forKey: "swipeDownMinimizesAll"), "precondition: no key on disk")
+
+        let settings = AppSettings(defaults: defaults)
+        XCTAssertFalse(settings.includeMinimizedWindows, "absent key falls back to OFF")
+        XCTAssertFalse(settings.swipeDownMinimizesAll, "absent key falls back to OFF")
+        XCTAssertEqual(settings.stepDistance, 0.0777, accuracy: eps, "pre-existing settings untouched")
+    }
+
     // MARK: - Isolation
 
     /// Two instances on different suites must not share state, proving suite isolation.

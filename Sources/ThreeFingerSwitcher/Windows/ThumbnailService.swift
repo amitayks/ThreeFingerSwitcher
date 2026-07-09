@@ -76,9 +76,22 @@ final class ThumbnailService {
     /// windows still capture; minimized windows never reach here (`snapshot()`'s `isSwitchable` excludes them).
     func prefetch(_ windows: [WindowInfo]) {
         guard CGPreflightScreenCaptureAccess() else { return }
-        let targets = windows.filter { !inFlight.contains($0.id) }
+        // Skip minimized windows: macOS renders no fresh pixels for a minimized window, so a live capture
+        // would be wasted/degraded. They keep their seeded last-good frame or icon and surface live only on
+        // commit (which un-minimizes). Load-bearing now that the include-minimized-windows opt-in can list them.
+        let targets = windows.filter { !inFlight.contains($0.id) && !$0.isMinimized }
         guard !targets.isEmpty else { return }
         Task { await self.refreshBatch(targets) }
+    }
+
+    /// Capture the given windows NOW and AWAIT completion — used to grab each window's live frame right
+    /// before it is minimized (the three-finger-down flow), so the switcher can later show a real last-good
+    /// frame for the minimized window instead of a bare icon. Reuses the shared-enumeration batch (same clean-
+    /// presentation + motion gates); the caller must invoke this while the windows are still on screen, then
+    /// minimize once it returns, so a mid-genie frame is never grabbed.
+    func captureNow(_ windows: [WindowInfo]) async {
+        guard CGPreflightScreenCaptureAccess() else { return }
+        await refreshBatch(windows.filter { !inFlight.contains($0.id) })
     }
 
     /// Capture every cleanly-presented window in `windows` from ONE shared `SCShareableContent` enumeration

@@ -178,6 +178,20 @@ struct SwitcherView: View {
                     .aspectRatio(contentMode: .fit)
                     .frame(width: min(64, size.width * 0.5), height: min(64, size.height * 0.5))
             }
+            // Minimized affordance (include-minimized-windows opt-in): a badge marks a card whose window is
+            // minimized — it shows its last-good/icon frame (never a live capture) and de-minimizes on commit.
+            // Mirrors the Dock-preview treatment.
+            if window.isMinimized {
+                VStack {
+                    Spacer()
+                    Text("Minimized")
+                        .font(.system(size: 9, weight: .semibold))
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color.black.opacity(0.55), in: Capsule())
+                        .foregroundStyle(.white)
+                        .padding(4)
+                }
+            }
         }
         .frame(width: size.width, height: size.height)
         .overlay(
@@ -185,5 +199,6 @@ struct SwitcherView: View {
                 .strokeBorder(selected ? Color.accentColor : Color.white.opacity(0.10),
                               lineWidth: selected ? 3 : 1)
         )
+        .opacity(window.isMinimized && !selected ? 0.7 : 1)   // dim a non-selected minimized card (Dock parity)
     }
 }

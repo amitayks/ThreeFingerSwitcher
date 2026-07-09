@@ -1003,7 +1003,15 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         // synthesized App Exposé. The recognizer emits the same one-shot down intent either way — only the
         // action selected here differs. UP is always Mission Control.
         if !up && settings.swipeDownMinimizesAll {
-            windowService.minimizeAllWindows()
+            // Capture each current-Space window's live frame BEFORE minimizing so the switcher shows a real
+            // last-good preview for the minimized window (not a bare icon); THEN minimize. The capture is
+            // awaited so it grabs the still-on-screen frames, never a mid-genie one. (A tabbed window is one
+            // merged window here, so only its front frame is captured — its background tabs keep the icon.)
+            let toCapture = windowService.currentSpaceMinimizableWindows()
+            Task { [weak self] in
+                await self?.thumbnails.captureNow(toCapture)
+                self?.windowService.minimizeAllWindows()
+            }
             missionControlOpen = false   // no overview opened; nothing for a later commit to dismiss
             return
         }

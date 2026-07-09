@@ -524,6 +524,39 @@ final class AppSettings: ObservableObject {
     /// tap and OFF removes it (native ⌘-Tab restored immediately). Default OFF; older settings decode OFF.
     @Published var commandTabSwitcher: Bool { didSet { defaults.set(commandTabSwitcher, forKey: Keys.commandTabSwitcher) } }
 
+    /// Opt-in: include minimized windows in the switcher and ⌘-Tab (flagged + badged), with selection
+    /// un-minimizing the window in place. Independent of `includeNonStandardWindows`. Like the dock/⌘-Tab
+    /// opt-ins it relocates NO native gesture, needs NO re-login, and requests NO new permission (it reuses
+    /// the already-granted Accessibility read/raise). A pure behavior tunable — it resets to OFF. Default OFF.
+    /// Locked ON while `swipeDownMinimizesAll` is on (else that gesture strands the windows it minimizes).
+    @Published var includeMinimizedWindows: Bool {
+        didSet {
+            // Coupling guard (model level): minimize-all-on-down is unusable without reachability, so it
+            // cannot be turned off while that opt-in is on. The re-entrant set-true terminates (the guard
+            // condition is then false) and persists ON.
+            if !includeMinimizedWindows && swipeDownMinimizesAll {
+                includeMinimizedWindows = true
+                return
+            }
+            defaults.set(includeMinimizedWindows, forKey: Keys.includeMinimizedWindows)
+        }
+    }
+
+    /// Opt-in: a fresh three-finger DOWN swipe minimizes every current-Space window (revealing the desktop,
+    /// Windows Win+D style) instead of synthesizing App Exposé. Only *effective* while the Space-row vertical
+    /// opt-in (`manageVerticalGesture`) is effective — otherwise the OS owns three-finger vertical and the app
+    /// never sees the down-swipe. Enabling it auto-enables `includeMinimizedWindows` so the minimized windows
+    /// are never stranded. No relocation, no re-login, no new permission of its own. Resets to OFF. Default OFF.
+    @Published var swipeDownMinimizesAll: Bool {
+        didSet {
+            defaults.set(swipeDownMinimizesAll, forKey: Keys.swipeDownMinimizesAll)
+            // Reachability is what makes the minimized windows recoverable; enabling the trigger turns it on.
+            if swipeDownMinimizesAll && !includeMinimizedWindows {
+                includeMinimizedWindows = true
+            }
+        }
+    }
+
     /// The language last chosen for `commandID`, or nil if none has been chosen yet (cold start).
     func rememberedLanguage(for commandID: UUID) -> String? { aiCommandLanguages[commandID.uuidString] }
 
@@ -643,6 +676,8 @@ final class AppSettings: ObservableObject {
         keyboardLanguageAllowBrowserControl = defaults.object(forKey: Keys.keyboardLanguageAllowBrowserControl) as? Bool ?? Defaults.keyboardLanguageAllowBrowserControl
         showDockPreviews = defaults.object(forKey: Keys.showDockPreviews) as? Bool ?? Defaults.showDockPreviews
         commandTabSwitcher = defaults.object(forKey: Keys.commandTabSwitcher) as? Bool ?? Defaults.commandTabSwitcher
+        includeMinimizedWindows = defaults.object(forKey: Keys.includeMinimizedWindows) as? Bool ?? Defaults.includeMinimizedWindows
+        swipeDownMinimizesAll = defaults.object(forKey: Keys.swipeDownMinimizesAll) as? Bool ?? Defaults.swipeDownMinimizesAll
     }
 
     func resetToDefaults() {
@@ -656,6 +691,10 @@ final class AppSettings: ObservableObject {
         // A pure behavior tunable (no system side effect / permission / download), so — like `wrapAtEnds`
         // and `requireExactlyThree` — it resets back to its strict default.
         includeNonStandardWindows = Defaults.includeNonStandardWindows
+        // Pure behavior tunables (no relocation / permission / download), so both reset to OFF. Order
+        // matters: clear the minimize-all trigger FIRST so the coupling guard does not re-enable reachability.
+        swipeDownMinimizesAll = Defaults.swipeDownMinimizesAll
+        includeMinimizedWindows = Defaults.includeMinimizedWindows
         rowStepDistance = Defaults.rowStepDistance
         // Resolution-gesture bindings (incl. the folded reverse-direction switcher axes) reset to today's
         // behavior — a single source of truth for the former `reverseDirection` / `reverseVerticalDirection`.
@@ -842,6 +881,8 @@ final class AppSettings: ObservableObject {
         static let keyboardLanguageAllowBrowserControl = false   // opt-in; Apple Events host reader (per-browser permission)
         static let showDockPreviews = false        // opt-in; Dock-hover window previews (no re-login, no new permission)
         static let commandTabSwitcher = false      // opt-in; drive the switcher from ⌘-Tab (no re-login, no new permission)
+        static let includeMinimizedWindows = false // opt-in; show minimized windows in the switcher + ⌘-Tab (de-minimize on select)
+        static let swipeDownMinimizesAll = false   // opt-in; three-finger down minimizes all current-Space windows (reveal desktop)
     }
 
     private enum Keys {
@@ -927,5 +968,7 @@ final class AppSettings: ObservableObject {
         static let keyboardLanguageAllowBrowserControl = "keyboardLanguageAllowBrowserControl"
         static let showDockPreviews = "showDockPreviews"
         static let commandTabSwitcher = "commandTabSwitcher"
+        static let includeMinimizedWindows = "includeMinimizedWindows"
+        static let swipeDownMinimizesAll = "swipeDownMinimizesAll"
     }
 }

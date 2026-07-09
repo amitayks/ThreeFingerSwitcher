@@ -29,6 +29,12 @@ final class WindowService {
     private let watchdogDelay: TimeInterval = 0.180
     private let maxRecoveries = 2
 
+    /// The un-minimize genie animation runs ~250–400ms. When committing a MINIMIZED window we defer the
+    /// raise (and therefore its +180ms watchdog) past this delay so the front+focus lands on the settled
+    /// window, not mid-animation — a raise during the genie makes macOS re-composite the window (a visible
+    /// flash) and the watchdog would otherwise fire mid-genie and re-raise it. 0.4s clears the genie.
+    private let deminimizeSettleDelay: TimeInterval = 0.4
+
     /// Persistent AX-element cache keyed by CGWindowID (Bug A raise — the AltTab/HyperSwitch strategy).
     /// A fresh `_AXUIElementCreateWithRemoteToken` brute force can't reach an off-Space Chromium window,
     /// but an element captured while the window WAS reachable stays valid across Spaces — so we can
@@ -269,7 +275,10 @@ final class WindowService {
                 axElement: element,
                 isOnCurrentSpace: onCurrent,
                 spaceID: placement.space,
-                spaceIndex: model.indexBySpace[placement.space] ?? Int.max
+                spaceIndex: model.indexBySpace[placement.space] ?? Int.max,
+                // Only minimized windows that passed the relaxed gate reach here, so the flag is false unless
+                // the opt-in is on; gating the AX read keeps the default (setting-off) hot path unchanged.
+                isMinimized: settings.includeMinimizedWindows ? axBool(element, kAXMinimizedAttribute as String) : false
             )
             rows.append((info, focus.rank(wid), mru.rank(m.pid), onCurrent, model.indexBySpace[placement.space] ?? Int.max, placement.z))
         }
@@ -282,9 +291,46 @@ final class WindowService {
         // z-order for never-focused windows. Routed through the pure `WindowOrdering` helper so the
         // sort key is unit-testable without AppKit/AX.
         WindowOrdering.sort(&rows) { r in
-            WindowOrdering.Key(winRank: r.winRank, onCurrent: r.onCurrent, spaceIdx: r.spaceIdx, z: r.z, appRank: r.appRank)
+            WindowOrdering.Key(winRank: r.winRank, onCurrent: r.onCurrent, spaceIdx: r.spaceIdx, z: r.z, appRank: r.appRank, isMinimized: r.window.isMinimized)
         }
-        return rows.map(\.window)
+        var ordered = rows.map(\.window)
+
+        // Include-minimized-windows opt-in: the CGS per-Space candidate set may omit minimized windows (they
+        // are not composited), so relaxing `isSwitchable` alone can't surface them. Supplement with the
+        // Dock-preview mechanism — read each app's `kAXWindowsAttribute` (which lists current-Space PLUS
+        // minimized windows) and append any minimized window the snapshot missed, placed on the current
+        // Space and after the live windows. This is the robust path for the core loop (a down-swipe
+        // minimizes current-Space windows → they reappear here). Off-Space minimized windows appear only if
+        // they already came through the CGS candidate set above (spike-dependent — acceptable v1).
+        if settings.includeMinimizedWindows {
+            let present = Set(ordered.map(\.id))
+            let curSpace = model.currentSpaceIDs.first
+            let curIndex = curSpace.flatMap { model.indexBySpace[$0] } ?? Int.max
+            var extras: [(wid: CGWindowID, el: AXUIElement, app: NSRunningApplication)] = []
+            for app in appsByPid.values {
+                for (wid, el) in currentSpaceElements(pid: app.processIdentifier) {
+                    guard !present.contains(wid),
+                          axBool(el, kAXMinimizedAttribute as String),
+                          isSwitchable(el) else { continue }
+                    extras.append((wid, el, app))
+                }
+            }
+            extras.sort { $0.wid < $1.wid }   // stable id order so re-lists don't restrobe (mirrors dockPreviewOrder)
+            if !extras.isEmpty {
+                let extraMeta = metadata(for: extras.map(\.wid))
+                for e in extras {
+                    elementCache[e.wid] = e.el   // keep it resolvable at commit even if the app moves off-Space
+                    let title = axString(e.el, kAXTitleAttribute as String) ?? extraMeta[e.wid]?.name ?? (e.app.localizedName ?? "")
+                    ordered.append(WindowInfo(
+                        id: e.wid, pid: e.app.processIdentifier, appName: e.app.localizedName ?? "",
+                        title: title, appIcon: e.app.icon, frame: extraMeta[e.wid]?.bounds ?? .zero,
+                        realFrame: axFrame(e.el), axElement: e.el, isOnCurrentSpace: true,
+                        spaceID: curSpace, spaceIndex: curIndex, isMinimized: true
+                    ))
+                }
+            }
+        }
+        return ordered
     }
 
     /// Legacy current-Space-only enumeration (today's behavior). Used when off-Space support is
@@ -434,12 +480,85 @@ final class WindowService {
     @discardableResult
     func raiseDeminimizing(_ window: WindowInfo) -> Bool {
         guard let el = resolveElement(window) else { return false }
-        if window.isMinimized || axBool(el, kAXMinimizedAttribute as String) {
-            // Clearing kAXMinimized deminiaturizes the window so the subsequent raise can front it.
-            AXUIElementSetAttributeValue(el, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        let wasMinimized = window.isMinimized || axBool(el, kAXMinimizedAttribute as String)
+        guard wasMinimized else {
+            raise(window)   // not minimized: raise immediately, exactly as before
+            return true
         }
-        raise(window)
+        // Clearing kAXMinimized deminiaturizes the window — a ~300ms genie that on its own fronts the
+        // window. Raising / asserting focus WHILE it plays makes macOS re-composite the window (a visible
+        // flash), and the +180ms watchdog would fire mid-genie and re-raise it (the "comes to front, then
+        // flashes" symptom). So clear minimized now and defer the single hardened raise until the animation
+        // settles: one clean front+focus, no mid-flight re-raise.
+        AXUIElementSetAttributeValue(el, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        DispatchQueue.main.asyncAfter(deadline: .now() + deminimizeSettleDelay) { [weak self] in
+            MainActor.assumeIsolated { self?.raise(window) }
+        }
         return true
+    }
+
+    /// The current-Space, non-minimized, switchable windows (all regular apps) as `WindowInfo`, each with a
+    /// resolvable `CGWindowID`. Used by the three-finger-down flow to CAPTURE these windows' live frames
+    /// BEFORE `minimizeAllWindows()` runs, so the switcher can show each minimized window's real last-good
+    /// frame instead of a bare app icon. (Windows without a `CGWindowID` are omitted from capture but are
+    /// still minimized by `minimizeAllWindows()`, which is id-agnostic.) A tabbed window is one merged window
+    /// here, so only that one live frame is captured — background tabs, which have no pixels of their own,
+    /// keep the icon after they split on minimize (an accepted limitation of native window tabbing).
+    func currentSpaceMinimizableWindows() -> [WindowInfo] {
+        guard AXIsProcessTrusted() else { return [] }
+        let selfPid = getpid()
+        let apps = NSWorkspace.shared.runningApplications.filter {
+            $0.activationPolicy == .regular && $0.processIdentifier != selfPid && !$0.isTerminated
+        }
+        var result: [WindowInfo] = []
+        for app in apps {
+            let appEl = AXUIElementCreateApplication(app.processIdentifier)
+            guard let wins = axCopy(appEl, kAXWindowsAttribute as String) as? [AXUIElement] else { continue }
+            for el in wins {
+                if axBool(el, kAXMinimizedAttribute as String) { continue }   // only currently-live windows can be captured
+                guard isSwitchable(el), let wid = axWindowID(el) else { continue }
+                let frame = axFrame(el)
+                elementCache[wid] = el
+                result.append(WindowInfo(
+                    id: wid, pid: app.processIdentifier, appName: app.localizedName ?? "",
+                    title: axString(el, kAXTitleAttribute as String) ?? (app.localizedName ?? ""),
+                    appIcon: app.icon, frame: frame, realFrame: frame,
+                    axElement: el, isOnCurrentSpace: true, spaceID: nil, spaceIndex: 0
+                ))
+            }
+        }
+        return result
+    }
+
+    /// Minimize every switchable window on the CURRENT Space — a real `kAXMinimized` write per window (into
+    /// the Dock), revealing the desktop. This is a genuine minimize (Windows Win+D), NOT the native
+    /// slide-aside "Show Desktop" (`com.apple.showdesktop.awake`): the windows go to the Dock and are
+    /// recoverable via the switcher / ⌘-Tab (with the include-minimized-windows opt-in) or the Dock preview.
+    /// It reuses the switcher's `isSwitchable` gate — excluding our own app, floating/non-standard surfaces,
+    /// and windows already minimized (so it is idempotent) — and operates on the current Space only
+    /// (`kAXWindowsAttribute` lists current-Space + minimized windows; the minimized ones are skipped, and
+    /// off-Space windows are not returned). A single window's failed write does not block the rest. Returns
+    /// `(minimized, failed)` counts so a caller has observable state rather than a silent success; nothing is
+    /// surfaced as an app-modal alert.
+    @discardableResult
+    func minimizeAllWindows() -> (minimized: Int, failed: Int) {
+        guard AXIsProcessTrusted() else { return (0, 0) }
+        let selfPid = getpid()
+        let apps = NSWorkspace.shared.runningApplications.filter {
+            $0.activationPolicy == .regular && $0.processIdentifier != selfPid && !$0.isTerminated
+        }
+        var minimized = 0, failed = 0
+        for app in apps {
+            let appEl = AXUIElementCreateApplication(app.processIdentifier)
+            guard let wins = axCopy(appEl, kAXWindowsAttribute as String) as? [AXUIElement] else { continue }
+            for el in wins {
+                if axBool(el, kAXMinimizedAttribute as String) { continue }   // already minimized: idempotent skip
+                guard isSwitchable(el) else { continue }                       // standard window gate; floating panels excluded by subrole
+                let err = AXUIElementSetAttributeValue(el, kAXMinimizedAttribute as CFString, kCFBooleanTrue)
+                if err == .success { minimized += 1 } else { failed += 1 }
+            }
+        }
+        return (minimized, failed)
     }
 
     /// **Transient, reversible** front-raise for the Dock-preview peek: bring `window` to the front so
@@ -787,7 +906,10 @@ final class WindowService {
     private let minRelaxedWindowDimension: CGFloat = 100
 
     private func isSwitchable(_ axWin: AXUIElement) -> Bool {
-        if axBool(axWin, kAXMinimizedAttribute as String) { return false }
+        // Minimized windows are dropped by default; the include-minimized-windows opt-in admits them (the
+        // switcher then badges them and commits via the un-minimize path). `minimizeAllWindows()` skips
+        // already-minimized windows BEFORE this gate, so relaxing here never re-minimizes one.
+        if axBool(axWin, kAXMinimizedAttribute as String), !settings.includeMinimizedWindows { return false }
         let role = axString(axWin, kAXRoleAttribute as String)
         guard role == (kAXWindowRole as String) else { return false }
         // Relaxed gate (`includeNonStandardWindows`): any window-role element is switchable regardless

@@ -23,10 +23,11 @@ final class WindowOrderingTests: XCTestCase {
         let spaceIdx: Int
         let z: Int
         let appRank: Int
+        var isMinimized: Bool = false
     }
 
     private func key(_ r: Row) -> WindowOrdering.Key {
-        WindowOrdering.Key(winRank: r.winRank, onCurrent: r.onCurrent, spaceIdx: r.spaceIdx, z: r.z, appRank: r.appRank)
+        WindowOrdering.Key(winRank: r.winRank, onCurrent: r.onCurrent, spaceIdx: r.spaceIdx, z: r.z, appRank: r.appRank, isMinimized: r.isMinimized)
     }
 
     private func sortedIDs(_ rows: [Row]) -> [Int] {
@@ -142,5 +143,35 @@ final class WindowOrderingTests: XCTestCase {
 
         // Assert
         XCTAssertEqual(ids, [2, 1], "Lower z wins before appRank is consulted")
+    }
+
+    // MARK: - Minimized windows sort last within a Space (include-minimized-windows opt-in)
+
+    /// Within the same Space, a minimized window sorts AFTER a live one — even when the minimized window
+    /// has a lower z — because `isMinimized` breaks the tie before z. Mirrors the Dock `dockPreviewOrder`.
+    func testMinimizedSortsAfterLiveWithinSpace() {
+        // Arrange: both never-focused, same current Space; the minimized one has the LOWER z.
+        let live = Row(id: 1, winRank: Int.max, onCurrent: true, spaceIdx: 0, z: 5, appRank: 0, isMinimized: false)
+        let minimized = Row(id: 2, winRank: Int.max, onCurrent: true, spaceIdx: 0, z: 0, appRank: 0, isMinimized: true)
+
+        // Act
+        let ids = sortedIDs([minimized, live])
+
+        // Assert: live leads despite its higher z — minimized is pushed to the tail of the row.
+        XCTAssertEqual(ids, [1, 2], "A minimized window sorts after a live one within the same Space")
+    }
+
+    /// The minimized discriminator sits BELOW `onCurrent`/`spaceIdx` in the ladder: it only orders windows
+    /// that are otherwise tied on Space. A minimized current-Space window still precedes a live off-Space one.
+    func testMinimizedFlagDoesNotOverrideCurrentSpace() {
+        // Arrange: a minimized current-Space window vs a live off-Space window (both never-focused).
+        let minimizedCurrent = Row(id: 1, winRank: Int.max, onCurrent: true, spaceIdx: 5, z: 9, appRank: 0, isMinimized: true)
+        let liveOffSpace = Row(id: 2, winRank: Int.max, onCurrent: false, spaceIdx: 0, z: 0, appRank: 0, isMinimized: false)
+
+        // Act
+        let ids = sortedIDs([liveOffSpace, minimizedCurrent])
+
+        // Assert: current-Space still wins — the minimized flag never overrides the Space ladder.
+        XCTAssertEqual(ids, [1, 2], "Current-Space wins before the minimized discriminator is consulted")
     }
 }
