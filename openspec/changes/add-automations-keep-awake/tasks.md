@@ -48,8 +48,8 @@
 
 ## 9. Verify
 
-- [x] 9.1 Core logic executed & green via an **isolated SwiftPM package** (the real `KeepAwakeController` + `DisplayBrightness` + `AutomationKind`, `.swiftLanguageMode(.v5)`): 13 tests pass. NOTE: the repo's committed `main` HEAD does **not** build standalone — it references ~dozens of types/members (`MediaRuntime`, `NotchSessionEngine`, `VideoProvider`, `FullPotentialCapability`, …) that live only in the user's **uncommitted** working tree (453 pre-existing errors), so full-target `swift test` can't run on this base. 6 of 7 edited files are byte-identical to HEAD; the AppCoordinator edit anchors were verified present in the WIP version too.
-- [ ] 9.2 `xcodebuild` compile-verify the app/GemmaRuntime target — blocked by the same non-building base; re-run once the user's WIP is committed
+- [x] 9.1 **Full `ThreeFingerSwitcherCore` build green** and **full `swift test` green (1514 tests, 0 failures)** against the primary working tree (which has the in-flight `AI/Media`/`VideoProvider`/etc. WIP present, so Core compiles). My 17 tests pass against the real model. (The committed HEAD *without* that WIP doesn't build standalone — that's a pre-existing repo condition, unrelated to this change.) One build slip found + fixed post-merge: a stray `@ViewBuilder` stacking on `automationEditor` that stripped it from `valueControl` (commit `14665ab`).
+- [ ] 9.2 `xcodebuild` app/GemmaRuntime target — not run (MLX); no changes to the app/GemmaRuntime targets and Core is green, so expected to build. User to confirm with the signed build.
 - [ ] 9.3 On-device (user-run, stable-signed): add Keep Awake to a band, fire it → all displays dim + Mac won't sleep/lock; walk away, return, first touch restores brightness; quit while active restores brightness; menu-bar shows Active + Stop
 
 ## 10. Addendum — configurable dim level + inspector description
