@@ -8,15 +8,32 @@ import XCTest
 final class AutomationItemCodableTests: XCTestCase {
 
     func testAutomationItemRoundTrips() throws {
+        // No dim level set → decodes back with nil (interpreted as minimum).
         let item = LaunchItem(title: "Keep Awake",
                               icon: .sfSymbol("cup.and.saucer.fill"),
                               kind: .automation(.keepAwake))
         let data = try JSONEncoder().encode(item)
         let decoded = try JSONDecoder().decode(LaunchItem.self, from: data)
         XCTAssertEqual(decoded, item)
-        guard case .automation(.keepAwake) = decoded.kind else {
-            return XCTFail("expected .automation(.keepAwake), got \(decoded.kind)")
+        guard case let .automation(kind, dimPercent) = decoded.kind else {
+            return XCTFail("expected .automation, got \(decoded.kind)")
         }
+        XCTAssertEqual(kind, .keepAwake)
+        XCTAssertNil(dimPercent, "no dim level set → nil (minimum)")
+    }
+
+    func testAutomationItemWithDimLevelRoundTrips() throws {
+        let item = LaunchItem(title: "Keep Awake",
+                              icon: .sfSymbol("cup.and.saucer.fill"),
+                              kind: .automation(.keepAwake, dimPercent: 30))
+        let data = try JSONEncoder().encode(item)
+        let decoded = try JSONDecoder().decode(LaunchItem.self, from: data)
+        XCTAssertEqual(decoded, item)
+        guard case let .automation(kind, dimPercent) = decoded.kind else {
+            return XCTFail("expected .automation, got \(decoded.kind)")
+        }
+        XCTAssertEqual(kind, .keepAwake)
+        XCTAssertEqual(dimPercent, 30)
     }
 
     func testAutomationKindRoundTrips() throws {

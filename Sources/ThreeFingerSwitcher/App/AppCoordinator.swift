@@ -111,10 +111,11 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             self?.favoritesStore.updateItem(itemID, inBand: bandID) { $0.kind = $0.kind.withLastFolder(folder) }
         },
         // An automation item TOGGLES its stateful owner (start if inactive, stop if active) — not a
-        // one-shot completion. v1 has one automation: Keep Awake.
-        onAutomation: { [weak self] kind in
+        // one-shot completion. v1 has one automation: Keep Awake, dimming to the item's configured level.
+        onAutomation: { [weak self] kind, dimPercent in
             switch kind {
-            case .keepAwake: self?.keepAwakeController.toggle()
+            case .keepAwake:
+                self?.keepAwakeController.toggle(dimTo: KeepAwakeController.fraction(fromPercent: dimPercent))
             }
         }
     )

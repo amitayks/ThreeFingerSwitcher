@@ -39,11 +39,12 @@ final class LaunchService {
     /// the folder back onto the item (its remembered last folder). Injected like `onAICommand` so
     /// `LaunchService` stays decoupled/testable; no-op by default / in tests.
     private let onPromptedFolderChosen: (UUID, UUID, URL) -> Void
-    /// Called when an `.automation` item is fired. Wired by the coordinator to TOGGLE the automation's
-    /// stateful owner (`KeepAwakeController`) — start if inactive, stop if active. Injected like
-    /// `onAICommand` so `LaunchService` stays decoupled from the automation's state; no-op by default /
-    /// in tests. Unlike every other kind, firing an automation is a toggle, not a one-shot completion.
-    private let onAutomation: (AutomationKind) -> Void
+    /// Called when an `.automation` item is fired — `(kind, dimPercent)`. Wired by the coordinator to
+    /// TOGGLE the automation's stateful owner (`KeepAwakeController`) — start if inactive, stop if
+    /// active — passing the item's configured dim level (nil = minimum). Injected like `onAICommand` so
+    /// `LaunchService` stays decoupled from the automation's state; no-op by default / in tests. Unlike
+    /// every other kind, firing an automation is a toggle, not a one-shot completion.
+    private let onAutomation: (AutomationKind, Double?) -> Void
 
     init(favoritesProvider: @escaping () -> Favorites,
          mover: WindowRelocating? = nil,
@@ -52,7 +53,7 @@ final class LaunchService {
          onSpaceSwitch: @escaping () -> Void = {},
          onAICommand: @escaping (AICommand) -> Void = { _ in },
          onPromptedFolderChosen: @escaping (UUID, UUID, URL) -> Void = { _, _, _ in },
-         onAutomation: @escaping (AutomationKind) -> Void = { _ in }) {
+         onAutomation: @escaping (AutomationKind, Double?) -> Void = { _, _ in }) {
         self.favoritesProvider = favoritesProvider
         self.mover = mover ?? NullWindowMover()
         self.goToWindow = goToWindow
@@ -82,11 +83,12 @@ final class LaunchService {
             perform(action, adjustment: adjustment, toClipboard: toClipboard ?? false)
         case .preset:
             firePreset(item, inBand: band)
-        case .automation(let kind):
+        case .automation(let kind, let dimPercent):
             // Toggle the automation's stateful owner (start if inactive, stop if active). Like
             // `.aiCommand`, this is NOT a one-shot that completes on the lift — it enters/leaves a
-            // persistent mode owned outside the launcher (see `onAutomation`).
-            onAutomation(kind)
+            // persistent mode owned outside the launcher (see `onAutomation`). `dimPercent` carries the
+            // item's configured dim level (nil = minimum) through to the owner.
+            onAutomation(kind, dimPercent)
         case .clipboardEntry(let entry):
             pasteEntry(entry)
         case .fileEntry:

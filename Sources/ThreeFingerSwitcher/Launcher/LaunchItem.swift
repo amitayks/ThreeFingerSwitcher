@@ -218,7 +218,10 @@ enum LaunchItemKind: Codable, Equatable {
     /// to the app-side owner, so the launcher stays decoupled from the automation's state. The
     /// associated `AutomationKind` is a `String`-raw enum; a record written before automations existed
     /// simply has no such item, and existing automation items round-trip unchanged (no schema bump).
-    case automation(AutomationKind)
+    /// `dimPercent` (0…100) is Keep Awake's configurable dim level — how dark the displays go while
+    /// active; **Optional** so the synthesized decoder uses `decodeIfPresent` and an item saved before
+    /// the setting existed decodes to `nil` (interpreted as minimum), exactly like `.action`'s later values.
+    case automation(AutomationKind, dimPercent: Double? = nil)
     /// A clipboard-history entry shown in the synthetic Clipboard band. **Synthetic and ephemeral**:
     /// built at launcher-open from `ClipboardStore`, never created in the editor and never written
     /// into the persisted `Favorites` record. Firing it pastes the entry into the captured front app.

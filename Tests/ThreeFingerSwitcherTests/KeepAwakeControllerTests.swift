@@ -171,6 +171,33 @@ final class KeepAwakeControllerTests: XCTestCase {
         XCTAssertTrue(r.setLog.isEmpty)
     }
 
+    // MARK: - Configurable dim level
+
+    func testStartDimsToConfiguredLevelAndHeartbeatRepinsThere() {
+        let r = Recorder()
+        let c = makeController(r)
+        c.start(dimTo: 0.1)                    // 10%, not minimum
+        XCTAssertEqual(r.current[1], 0.1)
+        XCTAssertEqual(r.current[2], 0.1)
+
+        r.current[1] = 0.9                      // something raises it
+        c.heartbeatTick()
+        XCTAssertEqual(r.current[1], 0.1, "heartbeat re-pins to the configured level, not 0")
+
+        c.stop()
+        XCTAssertEqual(r.current[1], 0.8, "restore is independent of the dim level")
+        XCTAssertEqual(r.current[2], 0.5)
+    }
+
+    func testFractionFromPercentClampsAndDefaultsToMinimum() {
+        XCTAssertEqual(KeepAwakeController.fraction(fromPercent: nil), 0)
+        XCTAssertEqual(KeepAwakeController.fraction(fromPercent: 0), 0)
+        XCTAssertEqual(KeepAwakeController.fraction(fromPercent: 50), 0.5, accuracy: 0.0001)
+        XCTAssertEqual(KeepAwakeController.fraction(fromPercent: 100), 1)
+        XCTAssertEqual(KeepAwakeController.fraction(fromPercent: 150), 1, "clamped high")
+        XCTAssertEqual(KeepAwakeController.fraction(fromPercent: -10), 0, "clamped low")
+    }
+
     // MARK: - onActiveChanged
 
     func testOnActiveChangedFiresOnStartAndStop() {

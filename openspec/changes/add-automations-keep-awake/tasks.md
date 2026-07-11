@@ -51,3 +51,12 @@
 - [x] 9.1 Core logic executed & green via an **isolated SwiftPM package** (the real `KeepAwakeController` + `DisplayBrightness` + `AutomationKind`, `.swiftLanguageMode(.v5)`): 13 tests pass. NOTE: the repo's committed `main` HEAD does **not** build standalone — it references ~dozens of types/members (`MediaRuntime`, `NotchSessionEngine`, `VideoProvider`, `FullPotentialCapability`, …) that live only in the user's **uncommitted** working tree (453 pre-existing errors), so full-target `swift test` can't run on this base. 6 of 7 edited files are byte-identical to HEAD; the AppCoordinator edit anchors were verified present in the WIP version too.
 - [ ] 9.2 `xcodebuild` compile-verify the app/GemmaRuntime target — blocked by the same non-building base; re-run once the user's WIP is committed
 - [ ] 9.3 On-device (user-run, stable-signed): add Keep Awake to a band, fire it → all displays dim + Mac won't sleep/lock; walk away, return, first touch restores brightness; quit while active restores brightness; menu-bar shows Active + Stop
+
+## 10. Addendum — configurable dim level + inspector description
+
+- [x] 10.1 Model: `.automation(AutomationKind, dimPercent: Double? = nil)` (Optional, decode-safe, no schema bump)
+- [x] 10.2 `KeepAwakeController.start(dimTo:)`/`toggle(dimTo:)` honor the level; heartbeat re-pins to it; `fraction(fromPercent:)` helper (clamped, nil→minimum); restore stays independent of the level
+- [x] 10.3 Fire seam carries the level: `onAutomation: (AutomationKind, Double?)`; `AppCoordinator` converts percent→fraction and passes to `toggle(dimTo:)`
+- [x] 10.4 Inspector `automationEditor`: shows the automation's description (`kind.detail`) + a "Dim to N%" slider (0–100, step 5) persisting `dimPercent`; `inspectorHeight` branch
+- [x] 10.5 Tests: dim-to-level + heartbeat re-pin-there + restore-independent; `fraction(fromPercent:)` clamping; `.automation(.keepAwake, dimPercent:)` round-trip. Isolated package green (15 tests)
+- [x] 10.6 Specs updated: `automations` (configurable dim level + in-editor description requirement), `launch-items` (optional per-automation setting)

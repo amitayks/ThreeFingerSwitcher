@@ -56,10 +56,15 @@ final class KeepAwakeController {
         case armed           // active + armed: the next contact stops us
     }
 
-    /// The minimum level we dim to. `DisplayServices` clamps to the panel's real floor.
+    /// The default dim level (minimum). `DisplayServices` clamps to the panel's real floor.
     static let dimLevel: Float = 0
     /// Heartbeat cadence: re-pin brightness + re-declare user activity.
     static let heartbeatInterval: TimeInterval = 300
+
+    /// Convert an item's optional 0…100 dim percent (nil = minimum) to a clamped 0…1 brightness fraction.
+    static func fraction(fromPercent percent: Double?) -> Float {
+        Float(max(0, min(100, percent ?? 0)) / 100)
+    }
 
     private let effects: Effects
     private let heartbeatInterval: TimeInterval
@@ -72,6 +77,8 @@ final class KeepAwakeController {
     private var savedBrightness: [CGDirectDisplayID: Float] = [:]
     private var activityToken: NSObjectProtocol?
     private var heartbeat: Timer?
+    /// The 0…1 level the current session dims to (and the heartbeat re-pins to).
+    private var activeDimLevel: Float = KeepAwakeController.dimLevel
 
     init(effects: Effects = .live,
          heartbeatInterval: TimeInterval = KeepAwakeController.heartbeatInterval) {
@@ -81,20 +88,21 @@ final class KeepAwakeController {
 
     // MARK: - Toggle / start / stop
 
-    /// Fire semantics: start if inactive, stop if active.
-    func toggle() { isActive ? stop() : start() }
+    /// Fire semantics: start if inactive, stop if active. `dimTo` (0…1) is the level to dim to on start.
+    func toggle(dimTo level: Float = KeepAwakeController.dimLevel) { isActive ? stop() : start(dimTo: level) }
 
-    func start() {
+    func start(dimTo level: Float = KeepAwakeController.dimLevel) {
         guard !isActive else { return }
         isActive = true
         arm = .awaitingEmpty
+        activeDimLevel = level
         // Snapshot + dim every controllable display. A display whose brightness can't be read is left
         // untouched (nothing to restore) — never a failure (design D6).
         savedBrightness.removeAll()
         for display in effects.activeDisplays() {
-            guard let level = effects.getBrightness(display) else { continue }
-            savedBrightness[display] = level
-            effects.setBrightness(display, Self.dimLevel)
+            guard let current = effects.getBrightness(display) else { continue }
+            savedBrightness[display] = current
+            effects.setBrightness(display, level)
         }
         // Hold the no-sleep / no-lock assertion for the whole session.
         activityToken = effects.beginActivity()
@@ -147,7 +155,7 @@ final class KeepAwakeController {
     func heartbeatTick() {
         guard isActive else { return }
         for display in savedBrightness.keys {
-            effects.setBrightness(display, Self.dimLevel)
+            effects.setBrightness(display, activeDimLevel)
         }
         effects.declareUserActive()
     }

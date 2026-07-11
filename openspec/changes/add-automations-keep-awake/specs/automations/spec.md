@@ -15,7 +15,7 @@ The system SHALL support **automations**: launcher items that toggle a persisten
 - **THEN** an automation item is added to the active band, movable and duplicable like any other item
 
 ### Requirement: Keep Awake blocks sleep and lock while dimming the displays
-Keep Awake SHALL, while active, prevent the Mac from sleeping (system sleep), the display from sleeping, and the idle screen from locking, so background work keeps running. It SHALL achieve this by holding a system activity assertion for the duration (blocking idle system sleep and idle display sleep), acquired via public OS API and requiring **no new permission or entitlement**. On start it SHALL set every active display to its minimum brightness so the screen is dark but on. Keeping the display on but dark is deliberate — the screen is not put to sleep; it is dimmed.
+Keep Awake SHALL, while active, prevent the Mac from sleeping (system sleep), the display from sleeping, and the idle screen from locking, so background work keeps running. It SHALL achieve this by holding a system activity assertion for the duration (blocking idle system sleep and idle display sleep), acquired via public OS API and requiring **no new permission or entitlement**. On start it SHALL set every active display to its **configured dim level** (minimum by default) so the screen is dark but on. Keeping the display on but dark is deliberate — the screen is not put to sleep; it is dimmed.
 
 The system SHALL NOT claim to prevent sleep in situations the OS forces regardless of assertions — notably a laptop whose lid is closed (except in clamshell mode on power with an external display) will still sleep. This is an accepted limitation, not a failure.
 
@@ -30,6 +30,21 @@ The system SHALL NOT claim to prevent sleep in situations the OS forces regardle
 #### Scenario: Undimmable display is skipped, never fails
 - **WHEN** a connected display's brightness cannot be read or set
 - **THEN** that display is left unchanged and Keep Awake still starts (no crash, no permission prompt)
+
+### Requirement: Keep Awake's dim level is configurable per item, with an in-editor description
+The Keep Awake automation item SHALL carry a configurable **dim level** (0–100%) that sets how dark the displays go while active; absent a configured value it SHALL default to minimum (0%). The value SHALL persist with the item and be decode-safe (an item saved before the level existed decodes to the default with no schema bump). The launcher editor's item inspector SHALL, for an automation item, show a plain-language **description of what the automation does** and a control to set the dim level. Stopping SHALL always restore each display to the brightness captured at start regardless of the configured dim level (the level controls only the active "in" brightness, not the restore).
+
+#### Scenario: Configure the dim level in the inspector
+- **WHEN** the user selects a Keep Awake item in the editor
+- **THEN** the inspector shows a description of the automation and a dim-level control, and changing it persists to the item
+
+#### Scenario: Dim to the configured level
+- **WHEN** Keep Awake with a configured dim level of N% is started
+- **THEN** every controllable active display is set to N% (not necessarily minimum), and the periodic heartbeat re-pins to N%
+
+#### Scenario: Restore is independent of the dim level
+- **WHEN** Keep Awake stops
+- **THEN** each dimmed display returns to the brightness captured at start, whatever the configured dim level was
 
 ### Requirement: Keep Awake re-asserts on a periodic heartbeat
 While Keep Awake is active, the system SHALL, on a periodic heartbeat of approximately five minutes, re-pin every controllable active display to minimum brightness and re-declare user activity, as a safety net against another process raising the brightness or an idle timer the sleep assertion does not cover. The heartbeat SHALL be a plain timer performing no continuously-animating UI work (so it cannot cause a runaway idle-CPU loop).

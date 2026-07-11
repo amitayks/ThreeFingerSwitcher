@@ -991,6 +991,9 @@ private struct ItemInspector: View {
                     screenshotClipboardControl(action: action, adjustment: adjustment, toClipboard: toClipboard ?? false)
                 }
             }
+            if case let .automation(kind, dimPercent) = item.kind {
+                automationEditor(kind: kind, dimPercent: dimPercent)
+            }
             if case let .claudeProject(folder, _, claudePath) = item.kind {
                 claudeProjectEditor(folder, claudePath: claudePath)
             }
@@ -1321,6 +1324,7 @@ private struct ItemInspector: View {
         case .script: return 360
         case .path:   return 250
         case .claudeProject, .terminalCommand, .claudeProjectPrompt, .terminalCommandPrompt: return 400
+        case .automation: return 340
         default:      break
         }
         if case let .action(action, _, _) = item.kind {
@@ -1363,6 +1367,30 @@ private struct ItemInspector: View {
     private enum ValueChoice: Hashable { case step, set, change }
 
     @ViewBuilder
+    /// Inspector for an automation item: a plain-language description of what it does, plus (for Keep
+    /// Awake) a "Dim to N%" control. `dimPercent` nil = minimum (0%). Restore-on-stop is automatic and
+    /// independent of this level, so the caption explains it.
+    @ViewBuilder
+    private func automationEditor(kind: AutomationKind, dimPercent: Double?) -> some View {
+        let pct = dimPercent ?? 0
+        VStack(alignment: .leading, spacing: 8) {
+            Text(kind.detail)
+                .font(.callout).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Divider()
+            Text("Dim to \(Int(pct))%")
+            Slider(value: Binding(
+                get: { pct },
+                set: { p in
+                    let clamped = max(0, min(100, p.rounded()))
+                    store.updateItem(item.id, inBand: bandID) { $0.kind = .automation(kind, dimPercent: clamped) }
+                }), in: 0...100, step: 5)
+            Text("How dark every display goes while active (0% = darkest). Your original brightness is restored when you stop it — the first trackpad touch after you walk away.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     private func valueControl(action: SystemAction, adjustment: ValueAdjustment?) -> some View {
         let noun = action.controlsVolume ? "volume" : "brightness"
         Picker("Value", selection: Binding(
