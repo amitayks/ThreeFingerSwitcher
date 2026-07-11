@@ -85,6 +85,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         if !coordinator.isTrackpadAvailable { toggle.isEnabled = false }
         groups.append([toggle, quickAddMenuItem()])
 
+        // Keep Awake fallback: while the automation is active (screen dimmed near-black), surface a
+        // checked "Active — Stop" line as a fire escape so brightness can always be recovered even if
+        // the trackpad first-touch stop misbehaves. Its own group, present only while active.
+        if coordinator.keepAwakeActive {
+            let keepAwake = NSMenuItem(title: "Keep Awake — Active", action: #selector(stopKeepAwake), keyEquivalent: "")
+            keepAwake.target = self
+            keepAwake.state = .on
+            groups.append([keepAwake])
+        }
+
         // Diagnostics — surfaced here (their own group) only when the "Show diagnostic tools"
         // preference is on; hidden everywhere otherwise. Read at rebuild time, so the menu always
         // reflects the current preference the next time it opens.
@@ -135,6 +145,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     @objc private func openHub() { coordinator.showHub() }
     @objc private func toggleEnabled() { coordinator.toggleEnabled() }
+    @objc private func stopKeepAwake() { coordinator.stopKeepAwake() }
     @objc private func addFrontApp(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? UUID else { return }
         coordinator.addFrontAppToBand(id)

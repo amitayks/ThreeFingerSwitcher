@@ -35,4 +35,14 @@ enum DisplayBrightness {
         guard let setFn else { return false }
         return setFn(display, min(max(value, 0), 1)) == 0
     }
+
+    /// Every currently active (drawable) display. Used by Keep Awake to dim/restore all displays, not
+    /// just the main one. Returns an empty list if the display list can't be read (never a crash).
+    static func activeDisplays() -> [CGDirectDisplayID] {
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else { return [] }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetActiveDisplayList(count, &ids, &count) == .success else { return [] }
+        return Array(ids.prefix(Int(count)))
+    }
 }

@@ -39,6 +39,11 @@ final class LaunchService {
     /// the folder back onto the item (its remembered last folder). Injected like `onAICommand` so
     /// `LaunchService` stays decoupled/testable; no-op by default / in tests.
     private let onPromptedFolderChosen: (UUID, UUID, URL) -> Void
+    /// Called when an `.automation` item is fired. Wired by the coordinator to TOGGLE the automation's
+    /// stateful owner (`KeepAwakeController`) — start if inactive, stop if active. Injected like
+    /// `onAICommand` so `LaunchService` stays decoupled from the automation's state; no-op by default /
+    /// in tests. Unlike every other kind, firing an automation is a toggle, not a one-shot completion.
+    private let onAutomation: (AutomationKind) -> Void
 
     init(favoritesProvider: @escaping () -> Favorites,
          mover: WindowRelocating? = nil,
@@ -46,7 +51,8 @@ final class LaunchService {
          frontAppProvider: @escaping () -> NSRunningApplication? = { NSWorkspace.shared.frontmostApplication },
          onSpaceSwitch: @escaping () -> Void = {},
          onAICommand: @escaping (AICommand) -> Void = { _ in },
-         onPromptedFolderChosen: @escaping (UUID, UUID, URL) -> Void = { _, _, _ in }) {
+         onPromptedFolderChosen: @escaping (UUID, UUID, URL) -> Void = { _, _, _ in },
+         onAutomation: @escaping (AutomationKind) -> Void = { _ in }) {
         self.favoritesProvider = favoritesProvider
         self.mover = mover ?? NullWindowMover()
         self.goToWindow = goToWindow
@@ -54,6 +60,7 @@ final class LaunchService {
         self.onSpaceSwitch = onSpaceSwitch
         self.onAICommand = onAICommand
         self.onPromptedFolderChosen = onPromptedFolderChosen
+        self.onAutomation = onAutomation
     }
 
     // MARK: - Fire
@@ -75,6 +82,11 @@ final class LaunchService {
             perform(action, adjustment: adjustment, toClipboard: toClipboard ?? false)
         case .preset:
             firePreset(item, inBand: band)
+        case .automation(let kind):
+            // Toggle the automation's stateful owner (start if inactive, stop if active). Like
+            // `.aiCommand`, this is NOT a one-shot that completes on the lift — it enters/leaves a
+            // persistent mode owned outside the launcher (see `onAutomation`).
+            onAutomation(kind)
         case .clipboardEntry(let entry):
             pasteEntry(entry)
         case .fileEntry:

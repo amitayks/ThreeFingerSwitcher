@@ -71,6 +71,12 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     /// How often the auto-dismiss pass runs (a minute is plenty for a 5-minute default countdown).
     private static let parkAutoDismissInterval: TimeInterval = 60
 
+    /// The Keep Awake automation's stateful owner (`automations`). Idle until a `.automation(.keepAwake)`
+    /// item is fired (which toggles it via `LaunchService.onAutomation`). Fed the touch stream for its
+    /// first-touch-to-stop arming, and force-stopped on quit / will-sleep so a dimmed screen is never
+    /// stranded. `onActiveChanged` is wired in `init` to rebuild the menu-bar "Active / Stop" line.
+    private let keepAwakeController = KeepAwakeController()
+
     // Four-finger launcher.
     private let favoritesStore = FavoritesStore.shared
     private let launcherOverlay = LauncherOverlayController()
@@ -103,6 +109,13 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         // re-opens there next time (the item is the single source of truth for its last-used folder).
         onPromptedFolderChosen: { [weak self] itemID, bandID, folder in
             self?.favoritesStore.updateItem(itemID, inBand: bandID) { $0.kind = $0.kind.withLastFolder(folder) }
+        },
+        // An automation item TOGGLES its stateful owner (start if inactive, stop if active) — not a
+        // one-shot completion. v1 has one automation: Keep Awake.
+        onAutomation: { [weak self] kind in
+            switch kind {
+            case .keepAwake: self?.keepAwakeController.toggle()
+            }
         }
     )
 
@@ -502,6 +515,9 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             // The wizard's live-hand act still mirrors every frame (read-only). The Hub gesture previews are
             // pure autoplay (they don't read the touch feed), so nothing else taps the stream here.
             self.onWizardTouchFrame?(frame)
+            // Keep Awake's first-touch-to-stop arming (non-consuming — a no-op unless it's active, and it
+            // never swallows the frame; the recognizer still sees it below).
+            self.keepAwakeController.noteTouch(fingerCount: frame.fingerCount)
             self.recognizer.feed(frame)
         }
         scrollTap.consumePredicate = { [weak self] in
@@ -555,6 +571,8 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         parkController.onExpandedChanged = { [weak self] expanded in
             self?.recognizer.notchConversationActive = expanded
         }
+        // Keep Awake flips active/inactive → rebuild the menu bar so its "Active / Stop" fallback tracks.
+        keepAwakeController.onActiveChanged = { [weak self] in self?.onStateChange?() }
         // Screen-region (vision) command: the launcher already dismissed to reveal the desktop. Run the
         // interactive region picker; on a drag, capture the designated region and re-open the canvas
         // firing the executor with the captured image (the executor maps a permission gap → .failed and an
@@ -752,6 +770,15 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
 
     func toggleEnabled() { isEnabled ? disable() : enable() }
 
+    // MARK: - Keep Awake (menu-bar fallback + guaranteed teardown)
+
+    /// Whether the Keep Awake automation is currently running — drives the menu-bar "Active / Stop" line.
+    var keepAwakeActive: Bool { keepAwakeController.isActive }
+
+    /// Stop Keep Awake (restore brightness + release the assertion). The menu-bar fallback stop, and the
+    /// force-restore path called on quit so a dimmed-to-black screen is never left behind. Idempotent.
+    func stopKeepAwake() { keepAwakeController.stop() }
+
     /// Guards `observeEnabledToggle` against re-entrancy: `enable()`/`disable()` themselves set
     /// `settings.enabled`, which re-emits on this publisher. Without the guard, the no-trackpad case
     /// (where `enable()` cannot set `isEnabled = true`, so its `guard !isEnabled` never trips) would
@@ -810,6 +837,10 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     }
 
     private func handleWillSleep() {
+        // Stand Keep Awake down BEFORE the isEnabled guard: if the machine sleeps anyway (e.g. lid
+        // close forces it despite the assertion), restore brightness + release the assertion now so we
+        // wake into a clean state. Idempotent, so it's harmless when inactive.
+        keepAwakeController.stop()
         // Drop any in-flight gesture/overlay so we don't wake into a half-committed state.
         guard isEnabled else { return }
         recognizer.reset()

@@ -50,6 +50,7 @@ private enum SourceCategory: String, CaseIterable, Identifiable {
     case urls = "URLs"
     case scripts = "Scripts"
     case actions = "Actions"
+    case automations = "Automations"
     case aiCommands = "AI Command"
     case claudeProject = "Claude Project"
     case terminal = "Open in Terminal"
@@ -65,6 +66,7 @@ private enum SourceCategory: String, CaseIterable, Identifiable {
         case .urls: return "link"
         case .scripts: return "terminal.fill"
         case .actions: return "bolt.horizontal.fill"
+        case .automations: return "gearshape.2.fill"
         case .aiCommands: return "wand.and.stars"
         case .claudeProject: return "sparkles"
         case .terminal: return "terminal"
@@ -77,7 +79,7 @@ private enum SourceCategory: String, CaseIterable, Identifiable {
     var hint: String {
         switch self {
         case .urls, .scripts, .paths, .claudeProject, .terminal, .claudeProjectPrompt, .terminalPrompt: return "Add"
-        case .apps, .shortcuts, .actions, .aiCommands, .presets: return "Browse"
+        case .apps, .shortcuts, .actions, .automations, .aiCommands, .presets: return "Browse"
         }
     }
 }
@@ -241,6 +243,7 @@ private struct SourcePicker: View {
                 case .apps:      AppBrowser { add($0) }
                 case .shortcuts: ShortcutBrowser { add($0) }
                 case .actions:   ActionBrowser { add($0) }
+                case .automations: AutomationBrowser { add($0) }
                 case .aiCommands: AICommandSource(store: store) { add($0) }
                 case .presets:   PresetComposer(store: store) { add($0) }
                 // Immediate-add sources never drill in (handled by `activate`); never reached.
@@ -393,6 +396,31 @@ private struct ActionBrowser: View {
                 }
             }
             .padding(.vertical, 8)
+        }
+    }
+}
+
+/// Source for automations: a browser over `AutomationKind`, mirroring `ActionBrowser`. Each automation
+/// is a toggle-style item (`.automation(kind)`) — firing it starts/stops a persistent mode rather than
+/// running a one-shot effect. v1 lists exactly one: Keep Awake.
+private struct AutomationBrowser: View {
+    let onPick: (LaunchItem) -> Void
+    var body: some View {
+        ScrollView {
+            LazyVGrid(columns: sourceGridColumns, spacing: 12) {
+                ForEach(AutomationKind.allCases) { automation in
+                    Button {
+                        onPick(LaunchItem(title: automation.title,
+                                          icon: .sfSymbol(automation.symbol),
+                                          kind: .automation(automation)))
+                    } label: {
+                        GridTile(title: automation.title, subtitle: "Automation") { SourceSymbol(name: automation.symbol) }
+                    }
+                    .buttonStyle(PickTileButtonStyle())
+                    .help(automation.detail)
+                }
+            }
+            .padding(12)
         }
     }
 }
@@ -1791,7 +1819,7 @@ private func naturalIcon(for kind: LaunchItemKind) -> ItemIcon? {
     switch kind {
     case .app: return .appDefault
     case .path: return .fileIcon
-    case .url, .shortcut, .script, .action, .preset, .clipboardEntry, .fileEntry, .aiCommand, .claudeProject, .terminalCommand, .claudeProjectPrompt, .terminalCommandPrompt: return nil
+    case .url, .shortcut, .script, .action, .automation, .preset, .clipboardEntry, .fileEntry, .aiCommand, .claudeProject, .terminalCommand, .claudeProjectPrompt, .terminalCommandPrompt: return nil
     }
 }
 
@@ -2011,6 +2039,7 @@ private func kindLabel(_ kind: LaunchItemKind) -> String {
     case .shortcut: return "Shortcut"
     case .script: return "Script"
     case .action: return "Action"
+    case .automation: return "Automation"
     case .preset: return "Preset"
     case .clipboardEntry: return "Clipboard"
     case .fileEntry: return "File Entry"

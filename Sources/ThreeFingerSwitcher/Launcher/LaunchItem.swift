@@ -151,6 +151,30 @@ enum SystemAction: String, Codable, Equatable, CaseIterable, Identifiable {
     }
 }
 
+/// A built-in **automation** — a toggle-style launcher item that starts/stops a persistent mode
+/// (see the `automations` capability), as opposed to a one-shot `SystemAction`. Firing an automation
+/// item toggles it. Extensible — add a case here + handle it in the automation owner (wired via
+/// `LaunchService.onAutomation` → `KeepAwakeController` in the app). v1 defines exactly one.
+enum AutomationKind: String, Codable, Equatable, CaseIterable, Identifiable {
+    /// Keep the Mac awake — block system sleep, display sleep, and the idle screen lock — with every
+    /// display dimmed to minimum, so background agents keep running while the screen is dark. A
+    /// trackpad touch (after the triggering gesture lifts) stops it and restores brightness.
+    case keepAwake
+
+    var id: String { rawValue }
+    var title: String { meta.title }
+    var symbol: String { meta.symbol }
+    var detail: String { meta.detail }
+
+    private var meta: (title: String, symbol: String, detail: String) {
+        switch self {
+        case .keepAwake:
+            return ("Keep Awake", "cup.and.saucer.fill",
+                    "Dim every display and keep the Mac awake — no sleep or lock — so background agents keep running. Touch the trackpad to stop and restore brightness.")
+        }
+    }
+}
+
 /// How firing an `.app` item should produce a usable window. Resolution order is: an item's own
 /// override (if set) → its band's `defaultAppStrategy`. `.newInstance` is never chosen by `.smart`.
 enum AppStrategy: String, Codable, Equatable, CaseIterable {
@@ -186,6 +210,15 @@ enum LaunchItemKind: Codable, Equatable {
     case action(SystemAction, ValueAdjustment? = nil, screenshotToClipboard: Bool? = nil)
     /// An ordered composite that fires other items (referenced by id). "Work mode" / "Home mode".
     case preset(itemIDs: [UUID])
+    /// A built-in **automation** — a toggle-style item that starts/stops a persistent mode
+    /// (`automations` capability). **Persisted, first-class band item** (like `.action`): authored
+    /// from the editor's Automations source and stored in the `Favorites` record, so it can live in
+    /// any band. Firing it TOGGLES the automation (start if inactive, stop if active) rather than
+    /// running a one-shot effect — the toggle is routed out of `fire` via `LaunchService.onAutomation`
+    /// to the app-side owner, so the launcher stays decoupled from the automation's state. The
+    /// associated `AutomationKind` is a `String`-raw enum; a record written before automations existed
+    /// simply has no such item, and existing automation items round-trip unchanged (no schema bump).
+    case automation(AutomationKind)
     /// A clipboard-history entry shown in the synthetic Clipboard band. **Synthetic and ephemeral**:
     /// built at launcher-open from `ClipboardStore`, never created in the editor and never written
     /// into the persisted `Favorites` record. Firing it pastes the entry into the captured front app.
@@ -271,8 +304,9 @@ struct LaunchItem: Codable, Equatable, Identifiable {
         case .script, .preset, .claudeProject, .terminalCommand, .claudeProjectPrompt, .terminalCommandPrompt: return true
         // `.aiCommand` reports its own success/failure through the executor's canvas state, not the
         // launcher's fire notification, so it is not "consequential" in this sense. `.fileEntry`
-        // never flows through `fire` (the Files band resolves it via its own open path).
-        case .app, .path, .url, .shortcut, .action, .clipboardEntry, .aiCommand, .fileEntry: return false
+        // never flows through `fire` (the Files band resolves it via its own open path). `.automation`
+        // toggles a mode whose feedback IS the dimming/undimming, not a fire notification.
+        case .app, .path, .url, .shortcut, .action, .clipboardEntry, .aiCommand, .fileEntry, .automation: return false
         }
     }
 }
