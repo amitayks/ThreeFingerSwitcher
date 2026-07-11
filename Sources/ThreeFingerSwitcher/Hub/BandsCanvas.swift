@@ -1366,7 +1366,6 @@ private struct ItemInspector: View {
     /// percentage, or change by a percentage.
     private enum ValueChoice: Hashable { case step, set, change }
 
-    @ViewBuilder
     /// Inspector for an automation item: a plain-language description of what it does, plus (for Keep
     /// Awake) a "Dim to N%" control. `dimPercent` nil = minimum (0%). Restore-on-stop is automatic and
     /// independent of this level, so the caption explains it.
@@ -1391,6 +1390,7 @@ private struct ItemInspector: View {
         }
     }
 
+    @ViewBuilder
     private func valueControl(action: SystemAction, adjustment: ValueAdjustment?) -> some View {
         let noun = action.controlsVolume ? "volume" : "brightness"
         Picker("Value", selection: Binding(
