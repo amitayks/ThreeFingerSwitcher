@@ -140,18 +140,11 @@ struct ClipboardBandView: View {
 struct ClipboardValueView: View {
     let entry: ClipboardEntry
 
-    /// Hard render caps applied to the STRING itself (not just via `.lineLimit`, which does NOT clamp
-    /// layout inside a vertical `ScrollView` — the height is unbounded, so every line lays out anyway).
-    /// A modest byte size can still be a huge number of lines (e.g. ~1400 short lines ≈ 15 KB), and a
-    /// non-lazy `ScrollView` + `Text` laying out that many line fragments freezes the main thread. So we
-    /// bound BOTH the character count and the line count before the text ever reaches `Text`.
-    private static let previewMaxChars = 8_000
-    private static let previewMaxLines = 200
-
     var body: some View {
         switch entry.kind {
         case .text, .richText, .url:
-            textPreview
+            // Debounced so a fast scrub glides past items without paying their layout cost (see the view).
+            ClipboardTextPreview(entry: entry)
         case .image:
             // The band entry carries no image bytes (dropped in `bandWindow`); load + downsample the
             // selected image on demand, one at a time, cancelling superseded loads on scrub.
@@ -161,40 +154,6 @@ struct ClipboardValueView: View {
         case .color:
             colorSwatch
         }
-    }
-
-    // MARK: Text preview (bounded)
-
-    @ViewBuilder
-    private var textPreview: some View {
-        // Compute the hard-capped display string + font ONCE (not on every body eval). `display` is
-        // guaranteed ≤ previewMaxChars and ≤ previewMaxLines, so `Text` lays out a small, bounded string.
-        let display = boundedDisplay
-        let mono = Self.looksMonospaced(display.text)
-        ScrollView {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(display.text)
-                    .font(.system(size: 13, design: mono ? .monospaced : .default))
-                    .textSelection(.disabled)
-                    .lineLimit(Self.previewMaxLines)
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                if display.truncated {
-                    Text("Preview truncated — the full content will be pasted.")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
-        }
-    }
-
-    // MARK: Decoded content
-
-    /// The plain text to render, hard-capped to `previewMaxChars` and `previewMaxLines`. Reports truncation
-    /// combined with the band's byte-level truncation so the footer shows.
-    private var boundedDisplay: (text: String, truncated: Bool) {
-        let capped = Self.capForPreview(previewText, maxChars: Self.previewMaxChars, maxLines: Self.previewMaxLines)
-        return (capped.text, capped.truncated || entry.isPreviewTruncated)
     }
 
     /// Pure (testable): cap `raw` to at most `maxChars` characters AND `maxLines` lines — whichever binds
@@ -213,19 +172,6 @@ struct ClipboardValueView: View {
             truncated = true
         }
         return (s, truncated)
-    }
-
-    /// The bounded plain text for the preview (already byte-truncated at band-build time), decoded once.
-    private var previewText: String {
-        if let d = entry.data(for: ClipboardUTI.plainText) ?? entry.data(for: ClipboardUTI.url),
-           let s = String(data: d, encoding: .utf8) { return s }
-        return entry.key
-    }
-
-    /// Heuristic: text that looks like code/structured data renders monospaced. Runs over the bounded
-    /// preview string (≤ cap), so it's cheap regardless of the original payload size.
-    private static func looksMonospaced(_ t: String) -> Bool {
-        t.contains("{") || t.contains(";") || t.contains("\t") || t.contains("()")
     }
 
     private var fileURL: URL? {
@@ -289,6 +235,68 @@ struct FilePreview: View {
         } else {
             image = NSWorkspace.shared.icon(forFile: url.path)
         }
+    }
+}
+
+/// The text / url / rich-text value preview, rendered **on settle**. Every scrub step republishes the
+/// selection, so without debouncing SwiftUI would lay out each passed item's `Text` on the main thread —
+/// the "little lag" landing on a big item. Here `.task(id:)` waits a short settle window before rendering;
+/// a scrub that moves on within that window cancels the pending render, so a fast swipe glides past items
+/// without laying any of them out. The last rendered text stays visible meanwhile (no blank/flicker), and
+/// the heavy layout happens exactly once — for the item you actually stop on. The content is also hard-
+/// capped (lines + chars) so even that one render is cheap.
+private struct ClipboardTextPreview: View {
+    let entry: ClipboardEntry
+
+    /// Kept small: a preview only needs enough to recognize the content, and fewer lines = faster layout.
+    private static let maxChars = 6_000
+    private static let maxLines = 120
+    /// Settle window — a scrub landing elsewhere within this cancels the pending render (skip-on-swipe).
+    private static let settle = Duration.milliseconds(60)
+
+    private struct Rendered: Equatable { let text: String; let mono: Bool; let truncated: Bool }
+    @State private var shown: Rendered?
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+                if let shown {
+                    Text(shown.text)
+                        .font(.system(size: 13, design: shown.mono ? .monospaced : .default))
+                        .textSelection(.disabled)
+                        .lineLimit(Self.maxLines)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                    if shown.truncated {
+                        Text("Preview truncated — the full content will be pasted.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+        }
+        .task(id: entry.id) {
+            try? await Task.sleep(for: Self.settle)
+            guard !Task.isCancelled else { return }   // scrubbed past this item — skip its render entirely
+            let capped = ClipboardValueView.capForPreview(Self.plainText(entry),
+                                                          maxChars: Self.maxChars, maxLines: Self.maxLines)
+            shown = Rendered(text: capped.text,
+                             mono: Self.looksMonospaced(capped.text),
+                             truncated: capped.truncated || entry.isPreviewTruncated)
+        }
+    }
+
+    /// The entry's plain text (already byte-bounded at band-build time), decoded once when it settles.
+    private static func plainText(_ entry: ClipboardEntry) -> String {
+        if let d = entry.data(for: ClipboardUTI.plainText) ?? entry.data(for: ClipboardUTI.url),
+           let s = String(data: d, encoding: .utf8) { return s }
+        return entry.key
+    }
+
+    /// Heuristic: text that looks like code/structured data renders monospaced. Runs over the capped
+    /// preview string, so it's cheap regardless of the original payload size.
+    private static func looksMonospaced(_ t: String) -> Bool {
+        t.contains("{") || t.contains(";") || t.contains("\t") || t.contains("()")
     }
 }
 
