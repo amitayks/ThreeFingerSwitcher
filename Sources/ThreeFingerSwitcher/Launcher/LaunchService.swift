@@ -45,6 +45,12 @@ final class LaunchService {
     /// `LaunchService` stays decoupled from the automation's state; no-op by default / in tests. Unlike
     /// every other kind, firing an automation is a toggle, not a one-shot completion.
     private let onAutomation: (AutomationKind, Double?) -> Void
+    /// Resolves a clipboard entry id to its **fully-materialized** entry at fire time. The band carries
+    /// only bounded/light preview entries (image bytes dropped, large text truncated — see
+    /// `ClipboardStore.bandWindow`), so paste must fetch the complete representations by id to restore the
+    /// whole payload, not the truncated preview. Wired by the coordinator to `ClipboardStore.materializedEntry`;
+    /// defaults to nil (falls back to the passed entry), keeping `LaunchService` decoupled/testable.
+    private let clipboardResolver: (UUID) -> ClipboardEntry?
 
     init(favoritesProvider: @escaping () -> Favorites,
          mover: WindowRelocating? = nil,
@@ -53,7 +59,8 @@ final class LaunchService {
          onSpaceSwitch: @escaping () -> Void = {},
          onAICommand: @escaping (AICommand) -> Void = { _ in },
          onPromptedFolderChosen: @escaping (UUID, UUID, URL) -> Void = { _, _, _ in },
-         onAutomation: @escaping (AutomationKind, Double?) -> Void = { _, _ in }) {
+         onAutomation: @escaping (AutomationKind, Double?) -> Void = { _, _ in },
+         clipboardResolver: @escaping (UUID) -> ClipboardEntry? = { _ in nil }) {
         self.favoritesProvider = favoritesProvider
         self.mover = mover ?? NullWindowMover()
         self.goToWindow = goToWindow
@@ -62,6 +69,7 @@ final class LaunchService {
         self.onAICommand = onAICommand
         self.onPromptedFolderChosen = onPromptedFolderChosen
         self.onAutomation = onAutomation
+        self.clipboardResolver = clipboardResolver
     }
 
     // MARK: - Fire
@@ -209,7 +217,12 @@ final class LaunchService {
     /// focus). Uses only the already-held Accessibility permission (the synthesized ⌘V). The chosen
     /// entry becomes the current clipboard. A stale file reference is harmless (it just won't paste).
     private func pasteEntry(_ entry: ClipboardEntry) {
-        Self.writeToPasteboard(entry)
+        // The band item carries only a bounded preview (truncated text / no image bytes); resolve the
+        // FULL entry by id so the whole original content is pasted. Fall back to the passed entry if the
+        // resolver is absent or the entry was evicted mid-session (safer than crashing — worst case a
+        // truncated text pastes).
+        let full = clipboardResolver(entry.id) ?? entry
+        Self.writeToPasteboard(full)
         guard let app = frontApp() else { return }
         // The non-activating overlay never took key focus, so the captured app is still frontmost;
         // re-assert activation defensively, then synthesize ⌘V to its process.

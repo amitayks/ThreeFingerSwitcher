@@ -104,6 +104,7 @@ final class ClipboardStoreTests: XCTestCase {
         let store = ClipboardStore(directory: dir)
         store.insert(entry("alpha", at: 100))
         store.insert(entry("beta", at: 200))
+        store.flush()   // persistence is async now — flush for a deterministic reload
 
         let reloaded = ClipboardStore(directory: dir)
         XCTAssertEqual(reloaded.count, 2)
@@ -116,6 +117,7 @@ final class ClipboardStoreTests: XCTestCase {
         let store = ClipboardStore(directory: dir)
         store.insert(entry("pinme", at: 100, id: id))
         XCTAssertEqual(store.togglePin(id: id), true)
+        store.flush()
 
         let reloaded = ClipboardStore(directory: dir)
         XCTAssertTrue(reloaded.recentWindow(limit: 10).first?.pinned ?? false)
@@ -130,6 +132,7 @@ final class ClipboardStoreTests: XCTestCase {
                                  representations: [ClipboardUTI.png: .inline(big)],
                                  fingerprint: "img:1")
         store.insert(img)
+        store.flush()   // blob write is off-main now — flush before inspecting disk
 
         // A blob file should exist on disk (payload not stored inline in the index).
         let blobs = (try? FileManager.default.contentsOfDirectory(atPath: dir.appendingPathComponent("blobs").path)) ?? []
@@ -158,5 +161,76 @@ final class ClipboardStoreTests: XCTestCase {
         store.insert(entry("keep", at: 100, pinned: true))
         store.clear(includingPinned: true)
         XCTAssertTrue(store.isEmpty)
+    }
+
+    // MARK: Bounded band window + on-demand materialization (large-item perf)
+
+    func testBandWindowTruncatesLargeTextAndFlags() {
+        let store = ClipboardStore(directory: tempDir())
+        let big = String(repeating: "A", count: ClipboardStore.previewByteCap * 4)
+        store.insert(entry(big, at: 100))
+        let banded = store.bandWindow(limit: 10).first
+        XCTAssertEqual(banded?.isPreviewTruncated, true)
+        let bytes = banded?.data(for: ClipboardUTI.plainText)?.count ?? 0
+        XCTAssertLessThanOrEqual(bytes, ClipboardStore.previewByteCap, "band text is capped to previewByteCap")
+        XCTAssertGreaterThan(bytes, 0)
+    }
+
+    func testBandWindowKeepsSmallTextWhole() {
+        let store = ClipboardStore(directory: tempDir())
+        store.insert(entry("short line", at: 100))
+        let banded = store.bandWindow(limit: 10).first
+        XCTAssertEqual(banded?.isPreviewTruncated, false)
+        XCTAssertEqual(banded?.data(for: ClipboardUTI.plainText).flatMap { String(data: $0, encoding: .utf8) },
+                       "short line")
+    }
+
+    func testBandWindowDropsImageBytes() {
+        let store = ClipboardStore(directory: tempDir())
+        let img = ClipboardEntry(capturedAt: Date(timeIntervalSince1970: 100), kind: .image, key: "Image",
+                                 representations: [ClipboardUTI.png: .inline(Data(repeating: 0xAB, count: 200_000))],
+                                 fingerprint: "img:1")
+        store.insert(img)
+        XCTAssertTrue(store.bandWindow(limit: 10).first?.representations.isEmpty ?? false,
+                      "the band image entry carries no bytes (loaded on demand)")
+    }
+
+    func testMaterializedEntryReturnsFullContentNotPreview() {
+        let store = ClipboardStore(directory: tempDir())
+        let big = String(repeating: "Z", count: ClipboardStore.previewByteCap * 3)
+        let id = UUID()
+        store.insert(entry(big, at: 100, id: id))
+        // Band is truncated; the on-demand full fetch restores the whole payload (for faithful paste).
+        XCTAssertLessThanOrEqual(store.bandWindow(limit: 10).first?.data(for: ClipboardUTI.plainText)?.count ?? .max,
+                                 ClipboardStore.previewByteCap)
+        let full = store.materializedEntry(id: id)?.data(for: ClipboardUTI.plainText)
+            .flatMap { String(data: $0, encoding: .utf8) }
+        XCTAssertEqual(full, big)
+        XCTAssertNil(store.materializedEntry(id: UUID()), "unknown id → nil")
+    }
+
+    func testLargeTextExternalizedKeepsIndexSmall() throws {
+        let dir = tempDir()
+        let store = ClipboardStore(directory: dir)
+        let big = String(repeating: "Q", count: 1_000_000)   // ~1 MB
+        // Bounded fingerprint, mirroring the monitor (which hashes) — fingerprints live inline in the
+        // index, so an unbounded raw-text fingerprint would itself defeat the "index stays small" goal.
+        let e = ClipboardEntry(capturedAt: Date(timeIntervalSince1970: 100), kind: .text,
+                               key: ClipboardKey.fromText(big),
+                               representations: [ClipboardUTI.plainText: .inline(Data(big.utf8))],
+                               fingerprint: "text:deadbeef")
+        store.insert(e)
+        store.flush()
+        let indexBytes = try Data(contentsOf: dir.appendingPathComponent("index.json")).count
+        XCTAssertLessThan(indexBytes, 50_000, "index must not embed the 1 MB payload (blob-externalized)")
+    }
+
+    func testTransientTruncationFlagIsNotPersisted() throws {
+        let dir = tempDir()
+        let store = ClipboardStore(directory: dir)
+        store.insert(entry("x", at: 100))
+        store.flush()
+        let json = String(data: try Data(contentsOf: dir.appendingPathComponent("index.json")), encoding: .utf8) ?? ""
+        XCTAssertFalse(json.contains("isPreviewTruncated"), "transient band flag must stay out of the schema")
     }
 }

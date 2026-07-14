@@ -49,6 +49,47 @@ final class ClipboardMonitorTests: XCTestCase {
         XCTAssertTrue(store.isEmpty, "concealed content is never recorded")
     }
 
+    func testFingerprintIsBoundedForLargeText() {
+        let pb = pasteboard()
+        let big = String(repeating: "A", count: 1_000_000)   // 1 MB, under the capture ceiling
+        pb.setString(big, forType: .string)
+        let store = ClipboardStore(directory: tempDir())
+        let monitor = ClipboardMonitor(store: store, pasteboard: pb, sourceAppProvider: { nil })
+
+        monitor.capture()
+
+        let fp = store.recentWindow(limit: 1).first?.fingerprint ?? ""
+        XCTAssertTrue(fp.hasPrefix("text:"))
+        XCTAssertLessThan(fp.count, 40, "fingerprint is a bounded hash, not the raw payload")
+        XCTAssertFalse(fp.contains(big), "the raw content must not be embedded in the fingerprint")
+    }
+
+    func testIdenticalLargeTextStillDeDuplicatesViaHash() {
+        let pb = pasteboard()
+        let big = String(repeating: "B", count: 500_000)
+        pb.setString(big, forType: .string)
+        let store = ClipboardStore(directory: tempDir())
+        let monitor = ClipboardMonitor(store: store, pasteboard: pb, sourceAppProvider: { nil })
+
+        monitor.capture()
+        pb.clearContents(); pb.setString(big, forType: .string)   // identical content again
+        monitor.capture()
+
+        XCTAssertEqual(store.count, 1, "identical large content de-dups via its bounded fingerprint")
+    }
+
+    func testOversizedPayloadIsNotRecorded() {
+        let pb = pasteboard()
+        pb.setString("0123456789abcdef", forType: .string)   // 16 bytes
+        let store = ClipboardStore(directory: tempDir())
+        let monitor = ClipboardMonitor(store: store, pasteboard: pb, sourceAppProvider: { nil })
+        monitor.maxCaptureBytes = 8   // lower the ceiling below the payload
+
+        monitor.capture()
+
+        XCTAssertTrue(store.isEmpty, "a payload over the capture ceiling is skipped, not partially recorded")
+    }
+
     func testDeDuplicatesOnRecapture() {
         let pb = pasteboard()
         pb.setString("same", forType: .string)

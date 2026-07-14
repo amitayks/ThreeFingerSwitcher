@@ -81,6 +81,17 @@ struct ClipboardEntry: Codable, Equatable, Identifiable {
     /// Device provenance. Optional + additive: `nil` (absent in legacy indexes) and `.local` both mean
     /// "captured on this Mac"; `.peer` means it arrived over the device link. See `isPeer`.
     var origin: ClipboardOrigin?
+    /// Transient, **band-only** marker: true when the band's bounded preview omitted part of a larger
+    /// payload (so the preview UI can say "truncated — full content will paste"). Derived at band-build
+    /// time (`ClipboardStore.boundedForBand`); deliberately **excluded from `CodingKeys`** so it is never
+    /// persisted and the on-disk schema is unchanged.
+    var isPreviewTruncated: Bool = false
+
+    /// Persisted keys only — `isPreviewTruncated` is intentionally absent so it stays transient and the
+    /// index format is unchanged. Optionals (`sourceApp`, `origin`) still decode-if-present (legacy compat).
+    private enum CodingKeys: String, CodingKey {
+        case id, capturedAt, kind, key, sourceApp, pinned, representations, fingerprint, origin
+    }
 
     init(id: UUID = UUID(),
          capturedAt: Date,

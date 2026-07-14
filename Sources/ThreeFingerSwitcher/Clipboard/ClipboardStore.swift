@@ -22,10 +22,17 @@ final class ClipboardStore {
     static let currentSchemaVersion = 1
     /// Inline payloads larger than this are externalized to a blob file on save.
     private static let blobThreshold = 16 * 1024
+    /// Upper bound on the bytes a **band** item carries for its value preview. Textual payloads are
+    /// truncated to this at band-build time so the band never holds (or renders) a large payload; the
+    /// full content is materialized on demand for paste. Small payloads (≤ this) pass through whole.
+    static let previewByteCap = 16 * 1024
 
     private let directory: URL
     private var blobsDir: URL { directory.appendingPathComponent("blobs", isDirectory: true) }
     private var indexURL: URL { directory.appendingPathComponent("index.json") }
+    /// Serial queue for disk persistence (blob writes + index write + orphan prune) so a large payload's
+    /// I/O never blocks the capture (main) thread. Saves are serialized → last-writer-wins ordering.
+    private let ioQueue = DispatchQueue(label: "app.threefingerswitcher.clipboardstore.io")
 
     var retention: Retention
 
@@ -59,6 +66,24 @@ final class ClipboardStore {
     /// preview / paste paths never touch disk.
     func recentWindow(limit: Int) -> [ClipboardEntry] {
         Self.recentWindow(entries, limit: limit).map(materialized)
+    }
+
+    /// The band slice as **light** entries: same recent-window as `recentWindow`, but each entry passed
+    /// through `boundedForBand` instead of `materialized` — textual payloads truncated to `previewByteCap`,
+    /// image bytes dropped, RTF dropped — so building the band never loads a full large payload into memory
+    /// (opening the band with big entries can't OOM). The full content is materialized on demand for the
+    /// selected preview / paste (`materializedEntry(id:)`). Use this for the launcher band; use
+    /// `recentWindow` where full bytes are needed (e.g. the device-link outbound send).
+    func bandWindow(limit: Int) -> [ClipboardEntry] {
+        Self.recentWindow(entries, limit: limit).map(boundedForBand)
+    }
+
+    /// The single, fully-materialized entry for `id` (all blob payloads resolved to inline), or nil if the
+    /// id is unknown (e.g. evicted/cleared). On-demand full fetch for the paste path and the image preview,
+    /// which the light `bandWindow` entries deliberately don't carry.
+    func materializedEntry(id: UUID) -> ClipboardEntry? {
+        guard let entry = entries.first(where: { $0.id == id }) else { return nil }
+        return materialized(entry)
     }
 
     /// All entries (materialized), newest first — for settings / diagnostics.
@@ -176,19 +201,39 @@ final class ClipboardStore {
         return index
     }
 
+    /// Persist off the main thread: snapshot the entries on the actor, then do the disk work (blob writes +
+    /// index write + orphan prune) on the serial `ioQueue`, so a large payload's I/O never blocks capture.
+    /// Durability is now asynchronous — call `flush()` when a synchronous guarantee is required (tests, app
+    /// termination). The in-memory `entries` are always inline, so a concurrent bounded band read never
+    /// races a blob write (only new, content-hashed blobs are written, and only once).
     private func save() {
-        try? FileManager.default.createDirectory(at: blobsDir, withIntermediateDirectories: true)
-        // Externalize large inline payloads to blobs so the index JSON stays small.
-        let externalized = entries.map(externalizedForStorage)
-        let record = StoredIndex(schemaVersion: Self.currentSchemaVersion, entries: externalized)
-        guard let data = try? JSONEncoder().encode(record) else { return }
-        try? data.write(to: indexURL, options: .atomic)
-        // Prune against the names the just-written index references (the in-memory entries are still
-        // inline, so they can't be the source of truth for which blobs are live).
-        pruneOrphanBlobs(keeping: referencedBlobs(externalized))
+        let snapshot = entries
+        let blobs = blobsDir
+        let index = indexURL
+        ioQueue.async {
+            Self.persist(snapshot, schemaVersion: Self.currentSchemaVersion, blobsDir: blobs, indexURL: index)
+        }
     }
 
-    private func referencedBlobs(_ entries: [ClipboardEntry]) -> Set<String> {
+    /// Block until all queued persistence has been written. For deterministic durability where async would
+    /// race a subsequent read (a test that reloads the store, or an app-termination flush).
+    func flush() { ioQueue.sync {} }
+
+    /// The disk half of `save`, run on `ioQueue`. `nonisolated static` so it touches no actor state — every
+    /// input (the entries snapshot, the directory URLs) is passed in, keeping it safe to run off-main.
+    nonisolated private static func persist(_ entries: [ClipboardEntry], schemaVersion: Int,
+                                            blobsDir: URL, indexURL: URL) {
+        try? FileManager.default.createDirectory(at: blobsDir, withIntermediateDirectories: true)
+        // Externalize large inline payloads to blobs so the index JSON stays small.
+        let externalized = entries.map { externalizedForStorage($0, blobsDir: blobsDir) }
+        let record = StoredIndex(schemaVersion: schemaVersion, entries: externalized)
+        guard let data = try? JSONEncoder().encode(record) else { return }
+        try? data.write(to: indexURL, options: .atomic)
+        // Prune against the names the just-written index references.
+        pruneOrphanBlobs(keeping: referencedBlobs(externalized), blobsDir: blobsDir)
+    }
+
+    nonisolated private static func referencedBlobs(_ entries: [ClipboardEntry]) -> Set<String> {
         Set(entries.flatMap { entry in
             entry.representations.values.compactMap { payload -> String? in
                 if case let .blob(name) = payload { return name }; return nil
@@ -198,14 +243,14 @@ final class ClipboardStore {
 
     /// Write large inline payloads to blob files and replace them with `.blob` references for storage.
     /// Small payloads stay inline. Deterministic blob names (by content) make re-saves idempotent.
-    private func externalizedForStorage(_ entry: ClipboardEntry) -> ClipboardEntry {
+    nonisolated private static func externalizedForStorage(_ entry: ClipboardEntry, blobsDir: URL) -> ClipboardEntry {
         var e = entry
         e.representations = entry.representations.mapValues { payload in
             switch payload {
             case .blob:
                 return payload   // already external
             case .inline(let data):
-                guard data.count > Self.blobThreshold else { return payload }
+                guard data.count > blobThreshold else { return payload }
                 let name = "\(entry.id.uuidString)-\(stableName(for: data)).bin"
                 let url = blobsDir.appendingPathComponent(name)
                 if !FileManager.default.fileExists(atPath: url.path) {
@@ -233,15 +278,96 @@ final class ClipboardStore {
         return e
     }
 
+    /// Produce a **light** copy of an entry for the band: carry only what the band needs to list + preview
+    /// it, with textual payloads truncated to `previewByteCap` (read boundedly — never the whole blob) and
+    /// image bytes dropped. Sets `isPreviewTruncated` when a payload was cut. The full content is fetched on
+    /// demand via `materializedEntry(id:)` for the selected-image preview and the paste path.
+    private func boundedForBand(_ entry: ClipboardEntry) -> ClipboardEntry {
+        var e = entry
+        var reps: [String: ClipboardPayload] = [:]
+        var truncated = false
+
+        /// Keep a textual UTI's payload, bounded to the cap and trimmed to a valid UTF-8 boundary.
+        func keepBoundedText(_ uti: String) {
+            guard let payload = entry.representations[uti],
+                  let bounded = boundedData(payload, cap: Self.previewByteCap) else { return }
+            reps[uti] = .inline(Self.validUTF8Prefix(bounded.data))
+            if bounded.truncated { truncated = true }
+        }
+        /// Keep a small payload whole (color/file-url are tiny; resolve a blob defensively).
+        func keepWhole(_ uti: String) {
+            guard let payload = entry.representations[uti], let data = materializedData(payload) else { return }
+            reps[uti] = .inline(data)
+        }
+
+        switch entry.kind {
+        case .text:
+            keepBoundedText(ClipboardUTI.plainText)
+        case .url:
+            keepBoundedText(ClipboardUTI.plainText)
+            keepBoundedText(ClipboardUTI.url)
+        case .richText:
+            keepBoundedText(ClipboardUTI.plainText)   // drop the (potentially large) RTF; preview uses plain text
+        case .color:
+            keepWhole(ClipboardUTI.color)
+        case .file:
+            keepWhole(ClipboardUTI.fileURL)            // a short path; QuickLook preview loads from the URL
+        case .image:
+            break                                      // image bytes dropped — preview loads on demand
+        }
+
+        e.representations = reps
+        e.isPreviewTruncated = truncated
+        return e
+    }
+
+    /// Read at most `cap` bytes of a payload (inline slice or a bounded prefix of the blob file), and
+    /// report whether the source was larger than the cap. Never reads a whole oversized blob into memory.
+    private func boundedData(_ payload: ClipboardPayload, cap: Int) -> (data: Data, truncated: Bool)? {
+        switch payload {
+        case .inline(let d):
+            if d.count <= cap { return (d, false) }
+            return (Data(d.prefix(cap)), true)
+        case .blob(let name):
+            let url = blobsDir.appendingPathComponent(name)
+            guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+            defer { try? handle.close() }
+            // Read cap+1 bytes so a full-cap read is distinguishable from "exactly cap and no more".
+            let chunk = (try? handle.read(upToCount: cap + 1)) ?? Data()
+            if chunk.count > cap { return (Data(chunk.prefix(cap)), true) }
+            return (chunk, false)
+        }
+    }
+
+    /// Fully resolve a small payload to bytes (inline or blob). For color/file-url, which are tiny.
+    private func materializedData(_ payload: ClipboardPayload) -> Data? {
+        switch payload {
+        case .inline(let d): return d
+        case .blob(let name): return try? Data(contentsOf: blobsDir.appendingPathComponent(name))
+        }
+    }
+
+    /// Drop trailing bytes until `data` is a valid UTF-8 string (a bounded read may split a multi-byte
+    /// code point at the cap). UTF-8 code points are ≤ 4 bytes, so this trims at most 3 bytes.
+    private static func validUTF8Prefix(_ data: Data) -> Data {
+        var d = data
+        var guardCount = 0
+        while !d.isEmpty && guardCount < 4 && String(data: d, encoding: .utf8) == nil {
+            d = d.dropLast()
+            guardCount += 1
+        }
+        return Data(d)
+    }
+
     /// Remove blob files not in the `referenced` set (the live blob names of the written index).
-    private func pruneOrphanBlobs(keeping referenced: Set<String>) {
+    nonisolated private static func pruneOrphanBlobs(keeping referenced: Set<String>, blobsDir: URL) {
         guard let files = try? FileManager.default.contentsOfDirectory(at: blobsDir, includingPropertiesForKeys: nil) else { return }
         for file in files where !referenced.contains(file.lastPathComponent) {
             try? FileManager.default.removeItem(at: file)
         }
     }
 
-    private func stableName(for data: Data) -> String {
+    nonisolated private static func stableName(for data: Data) -> String {
         // Cheap, dependency-free content hash (FNV-1a 64-bit) for a deterministic blob filename.
         var hash: UInt64 = 0xcbf29ce484222325
         for byte in data {

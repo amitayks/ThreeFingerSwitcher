@@ -20,6 +20,13 @@ final class ClipboardMonitor {
     /// Bundle ids whose copies are never recorded.
     var excludedBundleIDs: Set<String> = []
 
+    /// Hard per-item ceiling on a single captured payload. A copy whose total inline bytes exceed this
+    /// is skipped rather than recorded (no partial/corrupt entry) — a defensive guard, independent of the
+    /// aggregate retention byte-cap, so a pathological multi-hundred-MB copy never enters the store.
+    /// Overridable (tests lower it to avoid allocating the full ceiling).
+    static let defaultMaxCaptureBytes = 64 * 1024 * 1024
+    var maxCaptureBytes = ClipboardMonitor.defaultMaxCaptureBytes
+
     private var timer: Timer?
     private var lastChangeCount: Int
     /// One pasteboard `changeCount` to skip capturing (a self-write we just made, e.g. auto-pasting a
@@ -101,6 +108,8 @@ final class ClipboardMonitor {
         guard ClipboardCapture.shouldRecord(sourceBundleID: sourceID, excluded: excludedBundleIDs) else { return }
         guard let kind = ClipboardCapture.classify(types: types),
               let entry = makeEntry(kind: kind, item: item, sourceID: sourceID) else { return }
+        // Defensive cap: never ingest a pathologically large single payload.
+        guard entry.inlineByteSize <= maxCaptureBytes else { return }
         store.insert(entry)
     }
 
@@ -150,7 +159,10 @@ final class ClipboardMonitor {
             reps[ClipboardUTI.url] = .inline(data)
             reps[ClipboardUTI.plainText] = .inline(data)
             key = ClipboardKey.fromText(str)
-            fingerprint = "url:\(str)"
+            // Fingerprint from a bounded content hash, never the raw string — a `data:` URL can be huge,
+            // and the fingerprint lives inline in the index (never externalized), so embedding raw content
+            // would bloat the index and make de-dup/save scale with payload size.
+            fingerprint = "url:\(Self.hash(data))"
 
         case .text:
             guard let str = item.string(forType: .init(ClipboardUTI.plainText)),
@@ -158,7 +170,9 @@ final class ClipboardMonitor {
                   let data = str.data(using: .utf8) else { return nil }
             reps[ClipboardUTI.plainText] = .inline(data)
             key = ClipboardKey.fromText(str)
-            fingerprint = "text:\(str)"
+            // Bounded content hash, not the raw text: keeps the index small and de-dup/save O(1) in the
+            // payload size (identical content still hashes identically, so de-dup is unchanged).
+            fingerprint = "text:\(Self.hash(data))"
         }
 
         return ClipboardEntry(capturedAt: Date(), kind: kind, key: key,

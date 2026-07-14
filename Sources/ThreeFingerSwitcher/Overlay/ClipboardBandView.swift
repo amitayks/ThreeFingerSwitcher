@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ImageIO
 import QuickLookThumbnailing
 
 /// The Clipboard band's master-detail body: a multi-line list of truncated **keys** on the left and a
@@ -139,20 +140,22 @@ struct ClipboardBandView: View {
 struct ClipboardValueView: View {
     let entry: ClipboardEntry
 
+    /// Hard render caps applied to the STRING itself (not just via `.lineLimit`, which does NOT clamp
+    /// layout inside a vertical `ScrollView` — the height is unbounded, so every line lays out anyway).
+    /// A modest byte size can still be a huge number of lines (e.g. ~1400 short lines ≈ 15 KB), and a
+    /// non-lazy `ScrollView` + `Text` laying out that many line fragments freezes the main thread. So we
+    /// bound BOTH the character count and the line count before the text ever reaches `Text`.
+    private static let previewMaxChars = 8_000
+    private static let previewMaxLines = 200
+
     var body: some View {
         switch entry.kind {
         case .text, .richText, .url:
-            ScrollView {
-                Text(text ?? "")
-                    .font(.system(size: 13, design: monospaced ? .monospaced : .default))
-                    .textSelection(.disabled)
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-            }
+            textPreview
         case .image:
-            if let image {
-                Image(nsImage: image).resizable().scaledToFit()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else { placeholder("photo") }
+            // The band entry carries no image bytes (dropped in `bandWindow`); load + downsample the
+            // selected image on demand, one at a time, cancelling superseded loads on scrub.
+            ClipboardImagePreview(entryID: entry.id)
         case .file:
             if let url = fileURL { FilePreview(url: url) } else { placeholder("doc") }
         case .color:
@@ -160,20 +163,69 @@ struct ClipboardValueView: View {
         }
     }
 
+    // MARK: Text preview (bounded)
+
+    @ViewBuilder
+    private var textPreview: some View {
+        // Compute the hard-capped display string + font ONCE (not on every body eval). `display` is
+        // guaranteed ≤ previewMaxChars and ≤ previewMaxLines, so `Text` lays out a small, bounded string.
+        let display = boundedDisplay
+        let mono = Self.looksMonospaced(display.text)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(display.text)
+                    .font(.system(size: 13, design: mono ? .monospaced : .default))
+                    .textSelection(.disabled)
+                    .lineLimit(Self.previewMaxLines)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                if display.truncated {
+                    Text("Preview truncated — the full content will be pasted.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+    }
+
     // MARK: Decoded content
 
-    private var text: String? {
-        entry.data(for: ClipboardUTI.plainText).flatMap { String(data: $0, encoding: .utf8) } ?? entry.key
+    /// The plain text to render, hard-capped to `previewMaxChars` and `previewMaxLines`. Reports truncation
+    /// combined with the band's byte-level truncation so the footer shows.
+    private var boundedDisplay: (text: String, truncated: Bool) {
+        let capped = Self.capForPreview(previewText, maxChars: Self.previewMaxChars, maxLines: Self.previewMaxLines)
+        return (capped.text, capped.truncated || entry.isPreviewTruncated)
     }
 
-    /// Heuristic: show text that looks like code/structured data in a monospaced font.
-    private var monospaced: Bool {
-        guard let t = text else { return false }
-        return t.contains("{") || t.contains(";") || t.contains("\t") || t.contains("()")
+    /// Pure (testable): cap `raw` to at most `maxChars` characters AND `maxLines` lines — whichever binds
+    /// first — so a large or many-line payload can never drive an unbounded TextKit layout (the freeze on a
+    /// 1000+-line item). A modest byte size can still hide a huge line count (short lines), so both bound.
+    static func capForPreview(_ raw: String, maxChars: Int, maxLines: Int) -> (text: String, truncated: Bool) {
+        var s = raw
+        var truncated = false
+        if s.count > maxChars {
+            s = String(s.prefix(maxChars))
+            truncated = true
+        }
+        let parts = s.split(separator: "\n", maxSplits: maxLines, omittingEmptySubsequences: false)
+        if parts.count > maxLines {
+            s = parts.prefix(maxLines).joined(separator: "\n")
+            truncated = true
+        }
+        return (s, truncated)
     }
 
-    private var image: NSImage? {
-        (entry.data(for: ClipboardUTI.png) ?? entry.data(for: ClipboardUTI.tiff)).flatMap { NSImage(data: $0) }
+    /// The bounded plain text for the preview (already byte-truncated at band-build time), decoded once.
+    private var previewText: String {
+        if let d = entry.data(for: ClipboardUTI.plainText) ?? entry.data(for: ClipboardUTI.url),
+           let s = String(data: d, encoding: .utf8) { return s }
+        return entry.key
+    }
+
+    /// Heuristic: text that looks like code/structured data renders monospaced. Runs over the bounded
+    /// preview string (≤ cap), so it's cheap regardless of the original payload size.
+    private static func looksMonospaced(_ t: String) -> Bool {
+        t.contains("{") || t.contains(";") || t.contains("\t") || t.contains("()")
     }
 
     private var fileURL: URL? {
@@ -237,6 +289,65 @@ struct FilePreview: View {
         } else {
             image = NSWorkspace.shared.icon(forFile: url.path)
         }
+    }
+}
+
+/// Loads and downsamples the full image for a clipboard entry **on demand**. The band entry carries no
+/// image bytes (`ClipboardStore.bandWindow` drops them to keep the band lightweight), so this fetches the
+/// full entry by id from the shared store (the same singleton the coordinator uses) and downsamples off the
+/// main thread via ImageIO — so a giant source image never fully decodes into memory. `.task(id:)` cancels
+/// a superseded load when the selection scrubs to another entry, so only one image is ever resident (the
+/// crash we fix: the old band held every windowed entry's full image bytes at once).
+private struct ClipboardImagePreview: View {
+    let entryID: UUID
+    @State private var image: NSImage?
+    @State private var loaded = false
+
+    /// Longest-edge budget for the downsampled preview — crisp enough on-screen, bounded in memory.
+    private static let maxPixel: CGFloat = 1400
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(nsImage: image).resizable().scaledToFit()
+            } else if loaded {
+                Image(systemName: "photo").font(.system(size: 48)).foregroundStyle(.secondary)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .task(id: entryID) { await load() }
+    }
+
+    @MainActor
+    private func load() async {
+        image = nil
+        loaded = false
+        // Fetch the full entry (with image bytes) from the shared store, then downsample off-main.
+        guard let entry = ClipboardStore.shared.materializedEntry(id: entryID),
+              let data = entry.data(for: ClipboardUTI.png) ?? entry.data(for: ClipboardUTI.tiff) else {
+            loaded = true
+            return
+        }
+        let maxPixel = Self.maxPixel
+        let img = await Task.detached(priority: .userInitiated) { Self.downsample(data, maxPixel: maxPixel) }.value
+        guard !Task.isCancelled else { return }   // scrubbed away mid-load — drop this result
+        image = img
+        loaded = true
+    }
+
+    /// Downsample image bytes so the longest edge is `maxPixel`, decoding straight to the target size
+    /// (ImageIO never fully decodes the source). Returns nil for undecodable data.
+    nonisolated private static func downsample(_ data: Data, maxPixel: CGFloat) -> NSImage? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
     }
 }
 

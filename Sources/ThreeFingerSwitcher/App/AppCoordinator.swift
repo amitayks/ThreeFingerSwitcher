@@ -117,7 +117,10 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             case .keepAwake:
                 self?.keepAwakeController.toggle(dimTo: KeepAwakeController.fraction(fromPercent: dimPercent))
             }
-        }
+        },
+        // The band carries only bounded/light clipboard previews (see `bandWindow`); resolve the FULL
+        // entry by id at fire time so paste restores the complete payload, not the truncated preview.
+        clipboardResolver: { [weak self] id in self?.clipboardStore.materializedEntry(id: id) }
     )
 
     /// Frontmost app captured at launcher-open time (target for `.action(.closeFrontWindow)`).
@@ -1278,7 +1281,9 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         var bands = fav.bands
         var clipboardBandIndex: Int?
         if settings.keepClipboardHistory {
-            let entries = clipboardStore.recentWindow(limit: settings.clipboardRecentWindow)
+            // `bandWindow` (not `recentWindow`): light entries with bounded previews so building the band
+            // never loads full large payloads into memory. Full content is resolved on demand for paste.
+            let entries = clipboardStore.bandWindow(limit: settings.clipboardRecentWindow)
             bands.append(ClipboardBandBuilder.build(from: entries))
             clipboardBandIndex = bands.count - 1
         }
@@ -3033,7 +3038,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         ctx.launcherBands = { [weak self] clipboardOn, aiOn in
             guard let self else { return [] }
             let clipboard: ContextBand? = clipboardOn ? {
-                let entries = self.clipboardStore.recentWindow(limit: self.settings.clipboardRecentWindow)
+                let entries = self.clipboardStore.bandWindow(limit: self.settings.clipboardRecentWindow)
                 return ClipboardBandBuilder.build(
                     from: entries.isEmpty ? WizardSampleContent.clipboardEntries() : entries)
             }() : nil
@@ -3207,7 +3212,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         ctx.launcherBands = { [weak self] clipboardOn, aiOn in
             guard let self else { return [] }
             let clipboard: ContextBand? = clipboardOn ? {
-                let entries = self.clipboardStore.recentWindow(limit: self.settings.clipboardRecentWindow)
+                let entries = self.clipboardStore.bandWindow(limit: self.settings.clipboardRecentWindow)
                 return ClipboardBandBuilder.build(
                     from: entries.isEmpty ? WizardSampleContent.clipboardEntries() : entries)
             }() : nil
