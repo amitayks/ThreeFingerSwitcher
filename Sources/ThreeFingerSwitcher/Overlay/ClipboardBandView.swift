@@ -251,8 +251,11 @@ private struct ClipboardTextPreview: View {
     /// Kept small: a preview only needs enough to recognize the content, and fewer lines = faster layout.
     private static let maxChars = 6_000
     private static let maxLines = 120
-    /// Settle window — a scrub landing elsewhere within this cancels the pending render (skip-on-swipe).
-    private static let settle = Duration.milliseconds(60)
+    /// Settle window — a scrub landing elsewhere within this cancels a *heavy* item's pending render
+    /// (skip-on-swipe). Light items skip the wait entirely, so normal scrubbing has no perceptible delay.
+    private static let settle = Duration.milliseconds(55)
+    /// Above this many lines a render costs enough to be worth deferring; at or below it renders at once.
+    private static let heavyLineBudget = 40
 
     private struct Rendered: Equatable { let text: String; let mono: Bool; let truncated: Bool }
     @State private var shown: Rendered?
@@ -276,14 +279,28 @@ private struct ClipboardTextPreview: View {
             }
         }
         .task(id: entry.id) {
-            try? await Task.sleep(for: Self.settle)
-            guard !Task.isCancelled else { return }   // scrubbed past this item — skip its render entirely
             let capped = ClipboardValueView.capForPreview(Self.plainText(entry),
                                                           maxChars: Self.maxChars, maxLines: Self.maxLines)
+            // Only many-line items are worth deferring; light ones render at once (no settle delay). A fast
+            // scrub cancels a heavy item's pending render before it fires, so it's skipped, not laid out.
+            if Self.lineCount(capped.text) > Self.heavyLineBudget {
+                try? await Task.sleep(for: Self.settle)
+                guard !Task.isCancelled else { return }
+            }
             shown = Rendered(text: capped.text,
                              mono: Self.looksMonospaced(capped.text),
                              truncated: capped.truncated || entry.isPreviewTruncated)
         }
+    }
+
+    /// Newline count, early-exiting past the heavy budget (so it's O(budget), not O(text)).
+    private static func lineCount(_ text: String) -> Int {
+        var n = 0
+        for c in text where c == "\n" {
+            n += 1
+            if n > heavyLineBudget { return n }
+        }
+        return n
     }
 
     /// The entry's plain text (already byte-bounded at band-build time), decoded once when it settles.

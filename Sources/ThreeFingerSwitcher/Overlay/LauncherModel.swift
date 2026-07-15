@@ -154,9 +154,10 @@ final class LauncherModel: ObservableObject {
     /// Called when a RIGHT step pins/unpins the selected clipboard entry (wired to the store).
     var onPinToggle: ((LaunchItem) -> Void)?
 
-    /// How many fine horizontal steps must accumulate before a clipboard pin / previous-band action
-    /// fires — so pinning needs a *deliberate* horizontal excursion, not the fine item step. Set from
-    /// settings on `show`; defaults to a deliberate few.
+    /// How many fine horizontal steps must accumulate before a clipboard **pin** (RIGHT) fires — so
+    /// pinning needs a *deliberate* horizontal excursion, not the fine item step. LEFT (exit to the band
+    /// list) is deliberately NOT gated by this — it fires on a single step (see `stepClipboardHorizontal`).
+    /// Set from settings on `show`; defaults to a deliberate few.
     var clipboardPinStepThreshold: Int = 3
     /// Signed accumulator of fine horizontal steps within the current clipboard excursion.
     private var clipHorizAccum = 0
@@ -424,22 +425,32 @@ final class LauncherModel: ObservableObject {
         }
     }
 
-    /// Clipboard-band horizontal: a *deliberate* excursion (≥ `clipboardPinStepThreshold` fine steps)
-    /// fires once — RIGHT toggles the selected entry's pin (selection stays put), LEFT crosses back to
-    /// the band list (the Clipboard band stays active, so vertical from there reaches the previous
-    /// band). The action is latched until the accumulator returns to centre, so one flick = one action
-    /// (no rapid re-toggling within a small movement).
+    /// Clipboard-band horizontal — the two directions are intentionally asymmetric:
+    ///
+    /// - **LEFT → exit** to the band list on a **single step**, as quick as the grid's column-0 escape, so
+    ///   leaving the Clipboard band never needs a big swipe. Exit fires once the accumulator is *below*
+    ///   centre (`< 0`): a fresh left step from centre exits immediately, while relaxing back from a right
+    ///   pin flick passes through centre first, so it never accidentally exits. (Vertical scrub resets the
+    ///   accumulator — see `stepVertical` — so a diagonal drift can't strand a partial excursion.)
+    /// - **RIGHT → pin** stays a *deliberate* excursion (≥ `clipboardPinStepThreshold` fine steps), latched
+    ///   until the accumulator returns to centre, so a fine horizontal jitter never accidentally pins and a
+    ///   held offset doesn't re-toggle.
+    ///
+    /// The Clipboard band stays active on a LEFT exit, so vertical from the band list reaches the previous band.
     private func stepClipboardHorizontal(_ dir: Int) {
         clipHorizAccum += dir
         if clipHorizAccum == 0 { clipHorizLatched = false }   // returned to centre: ready for the next flick
-        guard !clipHorizLatched, abs(clipHorizAccum) >= max(1, clipboardPinStepThreshold) else { return }
-        clipHorizLatched = true
-        if clipHorizAccum > 0 {
+        if dir > 0 {
+            // RIGHT → pin (deliberate, latched).
+            guard !clipHorizLatched, clipHorizAccum >= max(1, clipboardPinStepThreshold) else { return }
+            clipHorizLatched = true
             guard let item = selectedItem else { return }
             sessionPinToggles.formSymmetricDifference([item.id])   // toggle (next flick = back to original)
             onPinToggle?(item)
-        } else if bands.count > 1 {
-            focus = .bands                          // left → back to the band list (Clipboard stays active)
+        } else {
+            // LEFT → exit on a single deliberate step below centre.
+            guard clipHorizAccum < 0, bands.count > 1 else { return }
+            focus = .bands
             resetClipboardHoriz()
         }
     }

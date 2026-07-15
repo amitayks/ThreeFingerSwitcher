@@ -125,6 +125,32 @@ final class ClipboardNavigationTests: XCTestCase {
         XCTAssertTrue(model.currentBandIsClipboard)
     }
 
+    func testSingleLeftStepExitsToBandList() {
+        let (model, _) = makeModel()
+        model.clipboardPinStepThreshold = 3          // pin stays deliberate; exit must NOT need the threshold
+        XCTAssertEqual(model.focus, .grid, "starts in the key list")
+        model.stepHorizontal(-1)                     // ONE left step
+        XCTAssertEqual(model.focus, .bands, "a single LEFT step exits the clipboard band quickly (like the grid's column-0 escape)")
+        XCTAssertTrue(model.currentBandIsClipboard, "the Clipboard band stays active")
+    }
+
+    func testRelaxingBackFromAPinFlickDoesNotExit() {
+        let (model, _) = makeModel()
+        var toggled = 0
+        model.onPinToggle = { _ in toggled += 1 }
+        model.clipboardPinStepThreshold = 3
+        for _ in 0..<3 { model.stepHorizontal(1) }   // deliberate right flick → pin
+        XCTAssertEqual(toggled, 1)
+        XCTAssertEqual(model.focus, .grid)
+        // Relaxing the offset back toward centre emits LEFT steps — these must NOT exit.
+        model.stepHorizontal(-1)   // accum +2 (latched)
+        model.stepHorizontal(-1)   // accum +1
+        model.stepHorizontal(-1)   // accum 0 (unlatch)
+        XCTAssertEqual(model.focus, .grid, "returning to centre after a pin flick does not exit")
+        model.stepHorizontal(-1)   // accum -1 → a deliberate left past centre
+        XCTAssertEqual(model.focus, .bands, "a left past centre then exits")
+    }
+
     func testVerticalDoesNotPin() {
         let (model, _) = makeModel()
         var toggled = 0
