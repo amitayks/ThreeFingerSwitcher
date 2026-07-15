@@ -305,19 +305,8 @@ final class ParkedSessionsTests: XCTestCase {
         // No `failed` row was created — discard removed it cleanly (cancellation is not a failure).
     }
 
-    // MARK: - 5. Overscroll-park + anchor + reveal models
-
-    func testOverscrollParkOnlyAtBottomAboveThreshold() {
-        let threshold: CGFloat = 0.22
-        // At bottom + over threshold → park.
-        XCTAssertTrue(OverscrollPark.shouldPark(dy: 0.3, canvasAtBottom: true, overscrollThreshold: threshold))
-        // At bottom but below threshold → scroll, not park.
-        XCTAssertFalse(OverscrollPark.shouldPark(dy: 0.1, canvasAtBottom: true, overscrollThreshold: threshold))
-        // Not at bottom → never park, even with a big excursion.
-        XCTAssertFalse(OverscrollPark.shouldPark(dy: 0.9, canvasAtBottom: false, overscrollThreshold: threshold))
-        // Downward excursion (negative dy) → never park (that's the at-top commit direction).
-        XCTAssertFalse(OverscrollPark.shouldPark(dy: -0.5, canvasAtBottom: true, overscrollThreshold: threshold))
-    }
+    // MARK: - 5. Anchor + reveal models (overscroll-park was removed by `notch-native-conversations`:
+    // sessions are born at the notch; the launcher canvas is one-shot-only and never parks)
 
     func testAnchorNotchVsTab() {
         let visible = CGRect(x: 0, y: 0, width: 1440, height: 900)
@@ -397,6 +386,23 @@ final class ParkedSessionsTests: XCTestCase {
         let clampedH = NotchHomeZoneLayout.solve(count: 1, visibleFrame: shortScreen)
         XCTAssertLessThan(clampedH.contentSize.height, NotchHomeZoneLayout.railHeight)
         XCTAssertTrue(clampedH.overflowsVertically)
+    }
+
+    /// The dock is NON-scrollable and sizes to HUG every rendered card — the persistent "+ New chat" card
+    /// PLUS one per session (the `sessions.count + 1` the controller passes) — so it EXPANDS as sessions are
+    /// added and never scrolls within the parked-session cap.
+    func testRailHugsNewChatCardAndExpandsWithoutScrolling() {
+        let visible = CGRect(x: 0, y: 0, width: 1512, height: 949)     // this Mac's default visible frame
+
+        // 2 sessions render 3 cards (new-chat + 2): the panel must hug all 3, no scroll.
+        let two = NotchHomeZoneLayout.solve(count: 2 + 1, visibleFrame: visible)
+        XCTAssertEqual(two.contentSize.width, NotchHomeZoneLayout.naturalWidth(count: 3), accuracy: 0.001)
+        XCTAssertFalse(two.overflowsHorizontally)
+
+        // The full parked cap (6 sessions → 7 cards) still hugs without overflowing on a 14".
+        let full = NotchHomeZoneLayout.solve(count: 6 + 1, visibleFrame: visible)
+        XCTAssertFalse(full.overflowsHorizontally)
+        XCTAssertGreaterThan(full.contentSize.width, two.contentSize.width)   // expands with more sessions
     }
 
     func testRevealModelLifecycle() {
@@ -520,6 +526,28 @@ final class ParkedSessionsTests: XCTestCase {
         XCTAssertEqual(wide.maxY, notch.maxY, accuracy: 0.001)
     }
 
+    /// The attached rail panel is sized so that centering the card row yields SYMMETRIC vertical padding of
+    /// `notch.height + railNotchClearance` on top and bottom — the cards clear the notch by the small
+    /// clearance and sit balanced (not shoved to the bottom).
+    func testAttachedRailCentersCardsWithNotchClearance() {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let notch = CGRect(x: 620, y: 862, width: 200, height: 38)
+        let contentH = NotchHomeZoneLayout.attachedRailContentHeight(notchHeight: notch.height)
+        let panel = NotchHomeZoneAnchor.attachedPanelRect(
+            contentSize: CGSize(width: NotchHomeZoneLayout.oneCardWidth, height: contentH),
+            notch: notch, screenFrame: screen)
+
+        // Total panel = card + 2*(notch + clearance).
+        let expectedTotal = NotchHomeZoneLayout.cardHeight + 2 * (notch.height + NotchHomeZoneLayout.railNotchClearance)
+        XCTAssertEqual(panel.height, expectedTotal, accuracy: 0.001)
+        // Centering the card row gives equal top/bottom padding = notch + clearance (symmetric, balanced).
+        let vPad = (panel.height - NotchHomeZoneLayout.cardHeight) / 2
+        XCTAssertEqual(vPad, notch.height + NotchHomeZoneLayout.railNotchClearance, accuracy: 0.001)
+        // …so the visible gap below the notch is exactly the small clearance (cards clear the notch).
+        XCTAssertEqual(vPad - notch.height, NotchHomeZoneLayout.railNotchClearance, accuracy: 0.001)
+        XCTAssertEqual(panel.maxY, notch.maxY, accuracy: 0.001)     // still welded to the physical top
+    }
+
     /// The attached live zone is one contiguous region spanning the panel, the nub, AND the notch band, so a
     /// cursor moving UP into the notch docks (never grace-dismisses) — the attached analogue of `liveZoneRect`.
     func testAttachedLiveZoneUnionsNotchAndDocks() {
@@ -544,6 +572,91 @@ final class ParkedSessionsTests: XCTestCase {
                                   zoneRect: nub, railFrame: panel, liveZone: live, now: 5.0), .reveal)
     }
 
+    /// The reveal TRIGGER in attached mode is the physical notch cutout (extended down by the small
+    /// cross-tolerance), welded to the physical top — so the rail reveals only when the cursor crosses UP
+    /// behind the notch, never on the resting nub below it.
+    func testNotchTriggerRectIsTheCutoutBehindTheNotch() {
+        let notch = CGRect(x: 620, y: 862, width: 200, height: 38)
+        let trigger = NotchHomeZoneAnchor.notchTriggerRect(notch: notch)
+        XCTAssertEqual(trigger.maxY, notch.maxY, accuracy: 0.001)                    // top welded to the physical top
+        XCTAssertEqual(trigger.midX, notch.midX, accuracy: 0.5)                      // centered on the notch
+        XCTAssertEqual(trigger.width, notch.width, accuracy: 0.001)                  // spans the cutout width
+        XCTAssertEqual(trigger.minY, notch.minY - NotchHomeZoneAnchor.notchCrossTolerance, accuracy: 0.001)
+        XCTAssertTrue(trigger.contains(CGPoint(x: notch.midX, y: notch.midY)))       // behind the notch → triggers
+        XCTAssertTrue(trigger.contains(CGPoint(x: notch.midX, y: notch.minY)))       // right at the notch edge → triggers
+    }
+
+    /// The notchless/external reveal trigger is a thin band hugging the physical top edge at top-center,
+    /// spanning from just under the menu bar up to the physical top — the "slam to the top edge" mimic.
+    func testTopEdgeTriggerRectHugsPhysicalTop() {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let visible = CGRect(x: 0, y: 0, width: 1440, height: 876)               // 24pt menu bar
+        let trigger = NotchHomeZoneAnchor.topEdgeTriggerRect(width: 120, visibleFrame: visible, screenFrame: screen)
+        XCTAssertEqual(trigger.minY, visible.maxY, accuracy: 0.001)              // bottom just under the menu bar
+        XCTAssertEqual(trigger.maxY, screen.maxY, accuracy: 0.001)              // top at the physical top edge
+        XCTAssertEqual(trigger.midX, visible.midX, accuracy: 0.5)              // centered
+        XCTAssertEqual(trigger.width, 120, accuracy: 0.001)
+    }
+
+    /// The behavioral heart of the change: fed the notch cutout as its trigger, the reveal model reveals
+    /// ONLY when the cursor is behind the notch — a cursor on the resting nub *below* the notch (while
+    /// hidden) does NOT reveal (`.idle`); crossing UP into the notch does (`.reveal`).
+    func testRevealFiresOnlyBehindNotchNotOnNub() {
+        let screen = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let notch = CGRect(x: 620, y: 862, width: 200, height: 38)
+        let nub = NotchHomeZoneAnchor.attachedNubRect(size: CGSize(width: 120, height: 10),
+                                                      notch: notch, screenFrame: screen)
+        let trigger = NotchHomeZoneAnchor.notchTriggerRect(notch: notch)
+        let live = NotchHomeZoneAnchor.attachedLiveZone(nub: nub, panel: nil, notch: notch)
+        let model = NotchRevealModel(graceInterval: 0.25)
+
+        // Cursor grazing the nub BELOW the notch while hidden → no reveal (the whole point of the change).
+        XCTAssertEqual(model.feed(cursor: CGPoint(x: nub.midX, y: nub.midY),
+                                  zoneRect: trigger, railFrame: nil, liveZone: live, now: 0), .idle)
+        // Cursor crosses UP behind the notch → reveal.
+        XCTAssertEqual(model.feed(cursor: CGPoint(x: notch.midX, y: notch.midY),
+                                  zoneRect: trigger, railFrame: nil, liveZone: live, now: 0.1), .reveal)
+        // Now shown, dropping back down onto the nub keeps it open (the nub is inside the live zone).
+        XCTAssertEqual(model.feed(cursor: CGPoint(x: nub.midX, y: nub.midY),
+                                  zoneRect: trigger, railFrame: nil, liveZone: live, now: 0.2), .reveal)
+    }
+
+    /// The reveal DWELL (Hub-configurable): with a non-zero dwell the cursor must stay in the trigger
+    /// CONTINUOUSLY for the dwell before the rail reveals; leaving the trigger cancels an in-progress dwell
+    /// (a re-entry restarts it); once shown, keep-open is instant (no dwell).
+    func testRevealDwellDelaysRevealAndCancelsOnLeave() {
+        let trigger = CGRect(x: 100, y: 800, width: 120, height: 32)
+        let inside = CGPoint(x: trigger.midX, y: trigger.midY)
+        let outside = CGPoint(x: 5, y: 5)
+
+        let model = NotchRevealModel(graceInterval: 0.25, dwellInterval: 0.3)
+        // Enter the trigger → dwelling, nothing shown yet.
+        XCTAssertEqual(model.feed(cursor: inside, zoneRect: trigger, railFrame: nil, now: 0), .idle)
+        XCTAssertTrue(model.isDwelling)
+        XCTAssertEqual(model.state, .hidden)
+        // Before the dwell elapses → still idle.
+        XCTAssertEqual(model.feed(cursor: inside, zoneRect: trigger, railFrame: nil, now: 0.2), .idle)
+        XCTAssertEqual(model.state, .hidden)
+        // Past the dwell → reveals, dwell cleared.
+        XCTAssertEqual(model.feed(cursor: inside, zoneRect: trigger, railFrame: nil, now: 0.31), .reveal)
+        XCTAssertEqual(model.state, .shown)
+        XCTAssertFalse(model.isDwelling)
+
+        // Leaving the trigger mid-dwell cancels it; a re-entry restarts the countdown from that moment.
+        let m2 = NotchRevealModel(graceInterval: 0.25, dwellInterval: 0.3)
+        XCTAssertEqual(m2.feed(cursor: inside, zoneRect: trigger, railFrame: nil, now: 0), .idle)
+        XCTAssertTrue(m2.isDwelling)
+        XCTAssertEqual(m2.feed(cursor: outside, zoneRect: trigger, railFrame: nil, now: 0.1), .idle)   // left → cancel
+        XCTAssertFalse(m2.isDwelling)
+        XCTAssertEqual(m2.feed(cursor: inside, zoneRect: trigger, railFrame: nil, now: 0.2), .idle)    // re-enter → restart
+        XCTAssertEqual(m2.feed(cursor: inside, zoneRect: trigger, railFrame: nil, now: 0.45), .idle)   // 0.25 since restart < 0.3
+        XCTAssertEqual(m2.feed(cursor: inside, zoneRect: trigger, railFrame: nil, now: 0.51), .reveal) // 0.31 since restart
+
+        // A zero dwell reveals immediately (the model default, preserving pre-dwell behavior).
+        let instant = NotchRevealModel(graceInterval: 0.25)   // dwellInterval defaults to 0
+        XCTAssertEqual(instant.feed(cursor: inside, zoneRect: trigger, railFrame: nil, now: 0), .reveal)
+    }
+
     // MARK: - 5.4 AppSettings keys
 
     func testAgentParkSettingsDefaultsAndReset() {
@@ -553,6 +666,7 @@ final class ParkedSessionsTests: XCTestCase {
         XCTAssertEqual(settings.agentParkIdleTimeout, 30 * 60, accuracy: 0.5)
         XCTAssertEqual(settings.agentParkAutoDismissCountdown, 300, accuracy: 0.5)
         XCTAssertEqual(settings.agentOverscrollParkThreshold, 0.22, accuracy: 0.0001)
+        XCTAssertEqual(settings.agentNotchRevealDwell, 0.3, accuracy: 0.0001)
         // Flick scroll-vs-flick tuning (D4): defaults + reset round-trip.
         XCTAssertEqual(settings.flickVelocityThreshold, 0.8, accuracy: 0.0001)
         XCTAssertEqual(settings.flickLiftWindow, 0.12, accuracy: 0.0001)
@@ -560,6 +674,7 @@ final class ParkedSessionsTests: XCTestCase {
         settings.agentParkIdleTimeout = 5
         settings.agentParkAutoDismissCountdown = 42
         settings.agentOverscrollParkThreshold = 0.5
+        settings.agentNotchRevealDwell = 0.75
         settings.flickVelocityThreshold = 1.5
         settings.flickLiftWindow = 0.3
         settings.resetToDefaults()
@@ -567,105 +682,230 @@ final class ParkedSessionsTests: XCTestCase {
         XCTAssertEqual(settings.agentParkIdleTimeout, 30 * 60, accuracy: 0.5)
         XCTAssertEqual(settings.agentParkAutoDismissCountdown, 300, accuracy: 0.5)
         XCTAssertEqual(settings.agentOverscrollParkThreshold, 0.22, accuracy: 0.0001)
+        XCTAssertEqual(settings.agentNotchRevealDwell, 0.3, accuracy: 0.0001)
         XCTAssertEqual(settings.flickVelocityThreshold, 0.8, accuracy: 0.0001)
         XCTAssertEqual(settings.flickLiftWindow, 0.12, accuracy: 0.0001)
     }
 
-    // MARK: - 7/8. ParkController glue (the app-side scheduler/store/rail coordinator)
+    // MARK: - 7/8. ParkController glue (`notch-native-conversations`: sessions born at the notch,
+    // expanded in place, collapsed back to background — no canvas park/restore bridge)
 
-    func testParkControllerParkUpsertsAndRepublishes() {
+    private final class NullSelection: SelectionProviding {
+        func readSelectedText() async -> String? { nil }
+        func readClipboardText() -> String? { nil }
+        func readClipboardImage() -> Data? { nil }
+        @discardableResult func replaceSelection(_ text: String) async -> Bool { true }
+        @discardableResult func pasteAtCursor(_ text: String) async -> Bool { true }
+    }
+    private final class FakeDownloader: ModelDownloading, @unchecked Sendable {
+        let payload: Data; init(payload: Data) { self.payload = payload }
+        func download(_ d: ModelDescriptor, to dest: URL, progress: @Sendable (Double) -> Void) async throws -> Data { progress(1); return payload }
+    }
+    /// A loaded manager whose runtime factory returns `runtime` (for glue tests that RUN turns).
+    private func loadedManager(_ runtime: LLMRuntime) async throws -> ModelManager {
+        let payload = Data("w".utf8)
+        let registry = ModelCatalog(models: [ModelDescriptor(id: "m", displayName: "M", sizeBytes: 1,
+            integritySHA: ModelManager.sha256Hex(payload), downloadURL: URL(string: "https://x.invalid/m")!,
+            capabilities: [.text, .vision], quantization: .qat4bit)], defaultModelID: "m")
+        let m = ModelManager(registry: registry, downloader: FakeDownloader(payload: payload), optedIn: true,
+                             storageRoot: tempDir(), runtimeFactory: { _ in runtime })
+        try await m.downloadAndVerify(registry.models[0]); return m
+    }
+    /// A cold manager for glue tests that never run a turn (session verbs only).
+    private func coldManager() -> ModelManager {
+        let payload = Data("w".utf8)
+        let registry = ModelCatalog(models: [ModelDescriptor(id: "m", displayName: "M", sizeBytes: 1,
+            integritySHA: ModelManager.sha256Hex(payload), downloadURL: URL(string: "https://x.invalid/m")!,
+            capabilities: [.text], quantization: .qat4bit)], defaultModelID: "m")
+        return ModelManager(registry: registry, downloader: FakeDownloader(payload: payload), optedIn: false,
+                            storageRoot: tempDir(), runtimeFactory: { _ in StubLLMRuntime(interTokenDelayNanos: 0) })
+    }
+    private func makeCtrl(store: ParkedSessionStore, manager: ModelManager? = nil,
+                          audit: AuditLog? = nil) -> ParkController {
+        let m = manager ?? coldManager()
+        return ParkController(store: store, maxParked: 6, autoDismissCountdown: 60,
+                              engineFactory: { NotchSessionEngine(modelManager: m, selection: NullSelection()) },
+                              auditLog: audit)
+    }
+    private func waitUntil(_ p: @MainActor () -> Bool, _ timeout: TimeInterval = 3,
+                           file: StaticString = #filePath, line: UInt = #line) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !p() && Date() < deadline { try? await Task.sleep(nanoseconds: 2_000_000) }
+        XCTAssertTrue(p(), "condition not met", file: file, line: line)
+    }
+    /// Seed a stored session directly (the pre-existing-sessions path a relaunch would produce).
+    private func seedStored(_ store: ParkedSessionStore, _ id: AgentSessionID, _ title: String = "T",
+                            state: ParkState = .idle, badge: Int = 0) {
+        try? store.upsert(ParkedSession(id: id, title: title, state: state, badgeCount: badge,
+                                        nextRunAt: nil, updatedAt: Date()),
+                          conversation: conversation(id, title))
+    }
+
+    func testNewSessionIsDurableAtBirthAndExpanded() {
         let store = InMemoryParkedSessionStore()
-        let ctrl = ParkController(store: store, maxParked: 6, autoDismissCountdown: 60)
-        let id = sid()
-        ctrl.park(conversation(id, "Draft"))
-        // Stored under the same identity and visible to the scheduler/rail.
+        let ctrl = makeCtrl(store: store)
+        let id = ctrl.newSession()
+        // Durable at birth: the conversation + row exist BEFORE any turn ran.
         XCTAssertNotNil(store.conversation(id))
-        XCTAssertEqual(store.all().first?.title, "Draft")
-        XCTAssertEqual(store.all().first?.state, .parked)
-        XCTAssertEqual(ctrl.notch.overlayModelSessionsForTest.count, 1)
+        XCTAssertEqual(store.all().first?.id, id)
+        XCTAssertEqual(store.all().first?.state, .active, "the expanded (foreground) row is .active")
+        XCTAssertEqual(store.all().first?.badgeCount, 0)
+        XCTAssertEqual(ctrl.expandedID, id)
+        XCTAssertNotNil(ctrl.engineForTest(id), "an engine is bound to the newborn session")
+        XCTAssertEqual(ctrl.engineForTest(id)?.conversation?.id, id)
     }
 
-    func testParkControllerRestoreHandsConversationAndRemovesAtSource() {
+    func testExpandBindsStoredConversationAndClearsBadge() {
         let store = InMemoryParkedSessionStore()
-        let ctrl = ParkController(store: store, maxParked: 6, autoDismissCountdown: 60)
         let id = sid()
-        // Park, then simulate a (non-terminal) background result (badge bumped, state idle).
-        ctrl.park(conversation(id, "Draft"))
-        ctrl.didAdvance(id, result: ToolStepResult(tool: "t", status: .done, summary: "ok"))
-        XCTAssertGreaterThan(store.all().first?.badgeCount ?? 0, 0)
+        seedStored(store, id, "Draft", state: .idle, badge: 3)
+        let ctrl = makeCtrl(store: store)
 
-        var handed: AgentConversation?
-        ctrl.onRestoreConversation = { handed = $0 }
-        ctrl.restore(id)
-        // The stored conversation was handed back (same identity); the durable row is REMOVED AT SOURCE
-        // (Bug 1 / D3) — the canvas now owns it, so no orphaned `.active` row survives.
-        XCTAssertEqual(handed?.id, id)
-        XCTAssertNil(store.conversation(id))
-        XCTAssertTrue(store.all().isEmpty)
-        XCTAssertTrue(ctrl.notch.overlayModelSessionsForTest.isEmpty)
+        ctrl.expand(id)
+        XCTAssertEqual(ctrl.expandedID, id)
+        XCTAssertEqual(store.all().first?.state, .active, "an expanded session's row is foreground-active")
+        XCTAssertEqual(store.all().first?.badgeCount, 0, "expanding clears the unseen-result badge")
+        XCTAssertEqual(ctrl.engineForTest(id)?.conversation?.id, id, "the engine bound the stored conversation")
+        XCTAssertNotNil(store.conversation(id), "expand NEVER removes the durable row (sessions never leave the notch)")
     }
 
-    func testParkControllerDiscardRemoves() {
+    func testExpandNeedsYouClearsGlowViaRepublish() {
         let store = InMemoryParkedSessionStore()
-        let ctrl = ParkController(store: store, maxParked: 6, autoDismissCountdown: 60)
         let id = sid()
-        ctrl.park(conversation(id))
+        seedStored(store, id, "Esc", state: .needsYou, badge: 1)
+        let ctrl = makeCtrl(store: store)
+        XCTAssertTrue(ctrl.notch.hasNeedsYouForTest, "seeded needs-you lights the glow")
+
+        ctrl.expand(id)
+        XCTAssertFalse(ctrl.notch.hasNeedsYouForTest,
+                       "expanding the last needs-you session clears the ambient glow (the addressing begins)")
+    }
+
+    func testCollapseIdlePersistsAndDropsEngine() {
+        let store = InMemoryParkedSessionStore()
+        let ctrl = makeCtrl(store: store)
+        let id = ctrl.newSession()
+
+        ctrl.collapse()
+        XCTAssertNil(ctrl.expandedID)
+        XCTAssertEqual(store.all().first?.state, .idle, "a collapsed idle session returns to the background set")
+        XCTAssertNotNil(store.conversation(id), "collapse persists the conversation")
+        XCTAssertNil(ctrl.engineForTest(id), "an idle collapsed session holds no engine (recreated on expand)")
+    }
+
+    func testCollapseMidTurnKeepsTurnRunningThenBadges() async throws {
+        let stub = StubLLMRuntime(scriptedTokens: Array(repeating: "x", count: 40),
+                                  interTokenDelayNanos: 5_000_000)
+        let manager = try await loadedManager(stub)
+        let store = InMemoryParkedSessionStore()
+        let ctrl = makeCtrl(store: store, manager: manager)
+        let id = ctrl.newSession()
+        let engine = try XCTUnwrap(ctrl.engineForTest(id))
+
+        engine.send("U1")
+        await waitUntil { if case .conversing = engine.state { return true }; return false }
+
+        ctrl.collapse()   // the load-bearing contract: does NOT cancel the in-flight turn
+        XCTAssertNil(ctrl.expandedID)
+        XCTAssertEqual(store.all().first?.state, .active,
+                       "a collapsed-mid-turn session stays .active (never handed to the background scheduler)")
+        XCTAssertNotNil(ctrl.engineForTest(id), "the engine stays alive detached until the turn settles")
+
+        // The detached turn settles: conversation persisted with the assistant turn, row idles + badges.
+        await waitUntil({ store.conversation(id)?.messages.count == 2 }, 5)
+        XCTAssertEqual(store.all().first?.state, .idle)
+        XCTAssertEqual(store.all().first?.badgeCount, 1, "the settled background turn is an unseen result")
+        XCTAssertNil(ctrl.engineForTest(id), "the detached engine is dropped once its turn settled")
+        XCTAssertFalse(stub.observedCancellation, "collapse never cancelled the turn")
+    }
+
+    func testExpandAnotherCollapsesCurrentFirst() {
+        let store = InMemoryParkedSessionStore()
+        let a = sid(); let b = sid()
+        seedStored(store, a, "A"); seedStored(store, b, "B")
+        let ctrl = makeCtrl(store: store)
+
+        ctrl.expand(a)
+        XCTAssertEqual(ctrl.expandedID, a)
+        ctrl.expand(b)
+        XCTAssertEqual(ctrl.expandedID, b, "exactly one session is expanded at a time")
+        XCTAssertEqual(store.all().first { $0.id == a }?.state, .idle, "the previous session collapsed to idle")
+        XCTAssertEqual(store.all().first { $0.id == b }?.state, .active)
+        XCTAssertNil(ctrl.engineForTest(a), "the previous session's idle engine was dropped")
+    }
+
+    func testDiscardRemovesEverywhereIncludingExpanded() {
+        let store = InMemoryParkedSessionStore()
+        let ctrl = makeCtrl(store: store)
+        let id = ctrl.newSession()
+
         ctrl.discard(id)
         XCTAssertNil(store.conversation(id))
         XCTAssertTrue(store.all().isEmpty)
-        XCTAssertTrue(ctrl.notch.overlayModelSessionsForTest.isEmpty)   // rail view-model cleared (Bug 1)
+        XCTAssertNil(ctrl.expandedID, "discarding the expanded session collapses the panel")
+        XCTAssertNil(ctrl.engineForTest(id))
+        XCTAssertTrue(ctrl.notch.overlayModelSessionsForTest.isEmpty)   // rail view-model cleared
     }
 
-    /// Bug 1 / D3: park → restore (durable row removed at source) → dismiss the restored canvas through the
-    /// authoritative `discard(_:)` path → EVERY layer is purged (store, scheduler, rail view-model).
-    func testRestoreThenDismissPurgesAllLayers() {
-        let store = InMemoryParkedSessionStore()
-        let ctrl = ParkController(store: store, maxParked: 6, autoDismissCountdown: 60)
-        let id = sid()
-        ctrl.park(conversation(id, "Draft"))
-        XCTAssertEqual(store.all().first?.state, .parked)
-
-        // Restore: the row is removed at source; capture the conversation the canvas re-binds to.
-        var handed: AgentConversation?
-        ctrl.onRestoreConversation = { handed = $0 }
-        ctrl.restore(id)
-        XCTAssertEqual(handed?.id, id)
-
-        // Simulate the restored-canvas dismissal through the authoritative path (the AppCoordinator seam).
-        ctrl.discard(id)
-
-        XCTAssertNil(store.conversation(id))
-        XCTAssertTrue(store.all().isEmpty)
-        XCTAssertTrue(ctrl.parkScheduler.runnableSessions(now: Date(), maxSlots: 8).isEmpty)
-        XCTAssertTrue(ctrl.notch.overlayModelSessionsForTest.isEmpty)
-    }
-
-    /// Bug 1 / D3 relaunch invariant: a discarded restored session must NOT be rebuilt from disk on a
-    /// fresh store over the same directory.
-    func testDiscardedSessionDoesNotSurviveRelaunch() {
+    /// The relaunch half of durable-at-birth: a session created moments before quit — no completed turn —
+    /// rebuilds from disk; a discarded one does not.
+    func testJustBornSessionSurvivesRelaunchAndDiscardedDoesNot() {
         let dir = tempDir()
-        let id = sid()
+        let born: AgentSessionID
+        let discarded: AgentSessionID
         do {
             let store = DiskParkedSessionStore(directory: dir)
-            let ctrl = ParkController(store: store, maxParked: 6, autoDismissCountdown: 60)
-            ctrl.park(conversation(id, "Persist"))
-            ctrl.onRestoreConversation = { _ in }
-            ctrl.restore(id)     // removes at source
-            ctrl.discard(id)     // authoritative dismissal (idempotent here)
+            let ctrl = makeCtrl(store: store)
+            born = ctrl.newSession()
+            ctrl.collapse()
+            discarded = ctrl.newSession()
+            ctrl.discard(discarded)
         }
-        // A fresh store over the SAME dir must rebuild EMPTY (the discarded row left no file behind).
         let reopened = DiskParkedSessionStore(directory: dir)
-        XCTAssertTrue(reopened.all().isEmpty)
-        XCTAssertNil(reopened.conversation(id))
+        XCTAssertNotNil(reopened.conversation(born), "a just-born session survives relaunch")
+        XCTAssertEqual(reopened.all().map(\.id), [born])
+        XCTAssertNil(reopened.conversation(discarded), "a deleted session leaves nothing behind")
     }
 
-    /// Bug 3 / D1: a TERMINAL background `.done` (`taskComplete: true`) auto-dismisses the row FOREVER on
-    /// the spot — a finished task never lingers on the rail.
+    /// The quick-action firewall (`ai-command-band` delta): a one-shot fire has NO session machinery at
+    /// all — nothing it does can reach the notch store/scheduler (they are not even connected; the
+    /// executor lost its conversation/park seams in the revert). The store stays empty across a full fire.
+    func testQuickActionsNeverTouchTheNotchStore() async throws {
+        let store = InMemoryParkedSessionStore()
+        let ctrl = makeCtrl(store: store)
+        _ = ctrl   // the live rail exists; a quick action must never populate it
+
+        let stub = StubLLMRuntime(scriptedTokens: ["fixed"], interTokenDelayNanos: 0)
+        let manager = try await loadedManager(stub)
+        final class Sel: SelectionProviding {
+            func readSelectedText() async -> String? { "teh txt" }
+            func readClipboardText() -> String? { nil }
+            func readClipboardImage() -> Data? { nil }
+            @discardableResult func replaceSelection(_ text: String) async -> Bool { true }
+            @discardableResult func pasteAtCursor(_ text: String) async -> Bool { true }
+        }
+        final class Disp: TaskDispatching {
+            func prepare(_ kind: TaskKind, resolvedPrompt: String, source: TaskSource, reasoning: Bool) async -> TaskReview { .unavailable(reason: "unused") }
+            func execute(_ review: TaskReview) async throws {}
+        }
+        let executor = AICommandExecutor(modelManager: manager, selection: Sel(), dispatcher: Disp())
+        let command = AICommand(name: "Fix", icon: .emoji("✍️"), input: .selection,
+                                promptTemplate: "Fix: {input}", output: .previewOnly)
+        executor.fire(command)
+        await waitUntil { if case .ready = executor.state { return true }; return false }
+        try await executor.commit()
+
+        XCTAssertTrue(store.all().isEmpty, "a full quick-action fire+commit left no notch dock row")
+        XCTAssertTrue(ctrl.notch.overlayModelSessionsForTest.isEmpty)
+    }
+
+    /// Bug 3 / D1 (unchanged by the pivot): a TERMINAL background `.done` (`taskComplete: true`)
+    /// auto-dismisses the row FOREVER on the spot — a finished task never lingers on the rail.
     func testTerminalDoneAutoDismisses() {
         let store = InMemoryParkedSessionStore()
-        let ctrl = ParkController(store: store, maxParked: 6, autoDismissCountdown: 60)
         let id = sid()
-        ctrl.park(conversation(id, "Finish"))
+        seedStored(store, id, "Finish", state: .parked)
+        let ctrl = makeCtrl(store: store)
         ctrl.didAdvance(id, result: ToolStepResult(tool: "t", status: .done, summary: "ok"),
                         taskComplete: true)
         XCTAssertNil(store.conversation(id))
@@ -677,9 +917,9 @@ final class ParkedSessionsTests: XCTestCase {
     /// session stays available — only a finished task auto-dismisses.
     func testIntermediateDoneDoesNotDismiss() {
         let store = InMemoryParkedSessionStore()
-        let ctrl = ParkController(store: store, maxParked: 6, autoDismissCountdown: 60)
         let id = sid()
-        ctrl.park(conversation(id, "Step"))
+        seedStored(store, id, "Step", state: .parked)
+        let ctrl = makeCtrl(store: store)
         ctrl.didAdvance(id, result: ToolStepResult(tool: "t", status: .done, summary: "ok"),
                         taskComplete: false)
         XCTAssertNotNil(store.conversation(id))
@@ -689,9 +929,9 @@ final class ParkedSessionsTests: XCTestCase {
 
     func testParkControllerEscalateSetsNeedsYouForGlow() {
         let store = InMemoryParkedSessionStore()
-        let ctrl = ParkController(store: store, maxParked: 6, autoDismissCountdown: 60)
         let id = sid()
-        ctrl.park(conversation(id))
+        seedStored(store, id, state: .parked)
+        let ctrl = makeCtrl(store: store)
         ctrl.escalate(id, reason: "dangerous write")
         XCTAssertEqual(store.all().first?.state, .needsYou)
         // The rail view-model reflects needs-you → the controller lights the ambient glow.
@@ -700,12 +940,72 @@ final class ParkedSessionsTests: XCTestCase {
 
     func testParkControllerSchedulerSeamIsKReady() {
         let store = InMemoryParkedSessionStore()
-        let ctrl = ParkController(store: store, maxParked: 6, autoDismissCountdown: 60)
-        ctrl.park(conversation(sid()))
-        ctrl.park(conversation(sid()))
+        seedStored(store, sid(), state: .parked)
+        seedStored(store, sid(), state: .parked)
+        let ctrl = makeCtrl(store: store)
         // The exposed seam is the SerialParkScheduler: one active now regardless of slots, but the protocol
         // shape serves K (the batched runtime fills more) with no change.
         XCTAssertLessThanOrEqual(ctrl.parkScheduler.runnableSessions(now: Date(), maxSlots: 1).count, 1)
         XCTAssertLessThanOrEqual(ctrl.parkScheduler.runnableSessions(now: Date(), maxSlots: 8).count, 1)
+    }
+
+    // MARK: - 9. Purge-delete + the expanded-state choke point (`notch-conversation-gestures`)
+
+    private func auditRecord(_ s: AgentSessionID, tool: String) -> AuditRecord {
+        AuditRecord(sessionID: s, tool: tool, policy: .auto, argumentsSummary: "a",
+                    outcome: .done, wasBackground: true, timestamp: Date(timeIntervalSince1970: 1))
+    }
+
+    func testPurgeRemovesStoreEngineAndAuditWhilePlainDiscardKeepsLedger() {
+        let store = InMemoryParkedSessionStore()
+        let audit = InMemoryAuditLog(cap: 100)
+        let ctrl = makeCtrl(store: store, audit: audit)
+
+        let purged = ctrl.newSession()
+        ctrl.collapse()
+        let kept = ctrl.newSession()
+        ctrl.collapse()
+        audit.record(auditRecord(purged, tool: "p1"))
+        audit.record(auditRecord(kept, tool: "k1"))
+        audit.record(auditRecord(purged, tool: "p2"))
+
+        ctrl.expand(purged)
+        ctrl.purge(purged)
+        // Everything about the purged session is gone: row, conversation, engine, audit records.
+        XCTAssertNil(store.conversation(purged))
+        XCTAssertNil(ctrl.engineForTest(purged))
+        XCTAssertNil(ctrl.expandedID, "purging the expanded session collapses the panel")
+        XCTAssertEqual(audit.recent(limit: 10).map(\.tool), ["k1"],
+                       "only the purged session's ledger entries vanish")
+
+        // A PLAIN discard on the sibling keeps its ledger entries (the purge is the single carve-out).
+        ctrl.discard(kept)
+        XCTAssertNil(store.conversation(kept))
+        XCTAssertEqual(audit.recent(limit: 10).map(\.tool), ["k1"],
+                       "a plain delete leaves the audit ledger intact")
+    }
+
+    func testOnExpandedChangedFiresOnTransitionsWithoutBlips() {
+        let store = InMemoryParkedSessionStore()
+        let a = sid(); let b = sid()
+        seedStored(store, a, "A"); seedStored(store, b, "B")
+        let ctrl = makeCtrl(store: store)
+        var published: [Bool] = []
+        ctrl.onExpandedChanged = { published.append($0) }
+
+        ctrl.expand(a)
+        XCTAssertEqual(published, [true])
+        ctrl.expand(b)
+        XCTAssertEqual(published, [true], "expand-another stays expanded — no false blip")
+        ctrl.collapse()
+        XCTAssertEqual(published, [true, false])
+        _ = ctrl.newSession()
+        XCTAssertEqual(published, [true, false, true], "a new session expands")
+        ctrl.discard(ctrl.expandedID!)
+        XCTAssertEqual(published, [true, false, true, false], "discarding the expanded session publishes false")
+        ctrl.expand(a)
+        XCTAssertEqual(published, [true, false, true, false, true])
+        ctrl.setEnabled(false)
+        XCTAssertEqual(published, [true, false, true, false, true, false], "feature-off collapses and publishes")
     }
 }

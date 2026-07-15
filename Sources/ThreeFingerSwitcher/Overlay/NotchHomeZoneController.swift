@@ -53,6 +53,13 @@ final class NotchHomeZoneController {
         overlay.onDiscard = { [weak self] id in self?.onDiscard?(id) }
     }
 
+    /// Set the reveal DWELL — how long the cursor must stay crossed behind the notch before the rail reveals
+    /// (0 ⇒ immediate). Live-settable from the Hub; takes effect on the next reveal (an in-flight dwell is
+    /// left to complete against its current deadline).
+    func setRevealDwell(_ interval: TimeInterval) {
+        reveal.dwellInterval = max(0, interval)
+    }
+
     func setEnabled(_ on: Bool) {
         guard on != enabled else { return }
         enabled = on
@@ -101,7 +108,9 @@ final class NotchHomeZoneController {
             rect = NotchHomeZoneAnchor.railRect(zone: zoneRectFor(m), size: size,
                                                 visibleFrame: m.visibleFrame)
         }
-        overlay.reveal(at: rect)
+        // Stretch the border out to the expanded size (a fluid frame animation) when already shown; a hidden
+        // panel (new chat straight to expanded) grows from the notch point via the first-show spring instead.
+        overlay.reveal(at: rect, animateResize: true)
         manageRefreshTimer()
     }
 
@@ -117,7 +126,8 @@ final class NotchHomeZoneController {
         guard let m = metrics(for: point) ?? NSScreen.main.flatMap(metricsFor) else { return }
         overlay.model.sessions = sessionsProvider()
         overlay.model.attachment = attachmentFor(m)
-        overlay.reveal(at: railRectFor(m, zone: zoneRectFor(m)))
+        // Stretch the border back down to the rail size (fluid frame animation).
+        overlay.reveal(at: railRectFor(m, zone: zoneRectFor(m)), animateResize: true)
         manageRefreshTimer()
     }
 
@@ -131,14 +141,20 @@ final class NotchHomeZoneController {
         // only via explicit collapse, feature-off, or the synchronous teardown paths.
         if isConversationExpanded { return }
         let zone = zoneRectFor(m)
-        // Edge-gate: only compute when something is shown or the cursor is near the top-center zone.
-        guard overlay.isVisible || nearTopZone(point, zone: zone, metrics: m) else { return }
+        // The reveal TRIGGER: the cursor must cross UP *behind the notch* (notched display) or slam to the
+        // physical top edge (notchless/external) — not merely graze the resting zone below it. The nub/zone
+        // stays only as a keep-open bridge inside the live region (below). See docs/notch-geometry-reference.md.
+        let trigger = triggerRectFor(m)
+        // Edge-gate: compute when something is shown, a dwell is in progress (so it can be advanced OR
+        // cancelled once the cursor leaves the trigger), or the cursor is near the trigger / live region.
+        guard overlay.isVisible || reveal.isDwelling
+                || nearTopZone(point, zone: zone, trigger: trigger, metrics: m) else { return }
 
         let railFrame = overlay.isVisible ? overlay.frame : nil
         // The ONE contiguous live region (zone + connecting band + container, extended up into the notch
         // pixels) — so moving the cursor UP into the notch keeps the rail .shown (docks), never dismisses.
         let liveZone = liveZoneFor(m, zone: zone, rail: railFrame)
-        let decision = reveal.feed(cursor: point, zoneRect: zone, railFrame: railFrame,
+        let decision = reveal.feed(cursor: point, zoneRect: trigger, railFrame: railFrame,
                                    liveZone: liveZone, now: now())
 
         switch decision {
@@ -167,8 +183,9 @@ final class NotchHomeZoneController {
 
     private func manageRefreshTimer() {
         // Pause the re-feed while an animated recede is in flight (isReceding) — otherwise each tick would
-        // re-issue the dismiss and the recede would never complete.
-        let wantTimer = overlay.isVisible && !overlay.isReceding
+        // re-issue the dismiss and the recede would never complete. Also run it while a reveal DWELL is
+        // counting down, so a perfectly still cursor (no move events) still reveals once the dwell elapses.
+        let wantTimer = (overlay.isVisible && !overlay.isReceding) || reveal.isDwelling
         if wantTimer, refreshTimer == nil {
             refreshTimer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.tick() }
@@ -229,13 +246,33 @@ final class NotchHomeZoneController {
         return NotchHomeZoneAnchor.zoneRect(size: zoneSize, visibleFrame: m.visibleFrame, safeAreaTop: m.safeAreaTop)
     }
 
+    /// The reveal TRIGGER region (distinct from the resting zone/nub, which only bridges keep-open): the
+    /// physical notch cutout on a notched display — reveal fires ONLY when the cursor crosses UP behind the
+    /// notch — or a thin top-edge band at top-center on a notchless/external display (slam to the top edge).
+    private func triggerRectFor(_ m: ScreenMetrics) -> CGRect {
+        if let notch = m.notch {
+            return NotchHomeZoneAnchor.notchTriggerRect(notch: notch)
+        }
+        return NotchHomeZoneAnchor.topEdgeTriggerRect(width: zoneSize.width,
+                                                      visibleFrame: m.visibleFrame,
+                                                      screenFrame: m.screenFrame)
+    }
+
     /// The revealed panel: in attached mode it merges into the notch (top at the physical top, content band
     /// below); else it hangs flush below the tab. Both hug their sessions via the shared content-fit solve.
     private func railRectFor(_ m: ScreenMetrics, zone: CGRect) -> CGRect {
-        let solved = NotchHomeZoneLayout.solve(count: overlay.model.sessions.count, visibleFrame: m.visibleFrame)
+        // The rail always renders the persistent "+ New chat" card PLUS one per session, so the width solve
+        // must count that extra card — otherwise the panel is one card too narrow and the row scrolls. The
+        // dock is non-scrollable: it hugs all cards and EXPANDS as sessions are added.
+        let cardCount = overlay.model.sessions.count + 1
+        let solved = NotchHomeZoneLayout.solve(count: cardCount, visibleFrame: m.visibleFrame)
         if let notch = m.notch {
+            // Size the panel taller so that CENTERING the row (in the view) yields symmetric padding of
+            // `notch.height + a little` on top and bottom — the cards clear the notch and sit balanced.
+            let contentH = NotchHomeZoneLayout.attachedRailContentHeight(notchHeight: notch.height)
+            let contentSize = CGSize(width: solved.contentSize.width, height: contentH)
             return NotchHomeZoneAnchor.attachedPanelRect(
-                contentSize: solved.contentSize, notch: notch, screenFrame: m.screenFrame)
+                contentSize: contentSize, notch: notch, screenFrame: m.screenFrame)
         }
         return NotchHomeZoneAnchor.railRect(zone: zone, size: solved.contentSize, visibleFrame: m.visibleFrame)
     }
@@ -254,15 +291,17 @@ final class NotchHomeZoneController {
         return .tab
     }
 
-    /// Edge-gate: the cursor is near the top-center resting zone OR anywhere in the contiguous live region
-    /// (cheap idle, like `nearDockEdge`). Widened to cover the connecting band + the notch pixels above
-    /// the zone so the cursor isn't dropped on the way UP into the notch (the dismiss-on-move-into-notch bug).
-    private func nearTopZone(_ point: CGPoint, zone: CGRect, metrics m: ScreenMetrics) -> Bool {
+    /// Edge-gate: the cursor is near the contiguous live region OR near the reveal trigger (cheap idle, like
+    /// `nearDockEdge`). Covers the connecting band + the notch pixels above the zone so the cursor isn't
+    /// dropped on the way UP into the notch (the dismiss-on-move-into-notch bug); the trigger is included
+    /// explicitly because the notchless top-edge band sits ABOVE the menu-bar-capped live region.
+    private func nearTopZone(_ point: CGPoint, zone: CGRect, trigger: CGRect, metrics m: ScreenMetrics) -> Bool {
         guard zone != .zero else { return false }
         let railFrame = overlay.isVisible ? overlay.frame : nil
         let live = liveZoneFor(m, zone: zone, rail: railFrame)
-        // A small slack ring around the contiguous live region (the `nearDockEdge` slop) for reveal trigger.
+        // A small slack ring (the `nearDockEdge` slop) around both the live region and the reveal trigger.
         return live.insetBy(dx: -40, dy: -8).contains(point)
+            || trigger.insetBy(dx: -40, dy: -8).contains(point)
     }
 
 }

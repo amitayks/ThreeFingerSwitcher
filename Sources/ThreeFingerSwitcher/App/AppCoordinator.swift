@@ -58,6 +58,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     private lazy var parkController = ParkController(
         maxParked: settings.agentMaxParkedSessions,
         autoDismissCountdown: settings.agentParkAutoDismissCountdown,
+        revealDwell: settings.agentNotchRevealDwell,
         // `unowned`: the coordinator owns the controller and outlives it (app-lifetime singleton), so the
         // factory can't be called after self is gone; `weak` would force a nonsensical fallback engine.
         engineFactory: { [unowned self] in self.makeNotchSessionEngine() },
@@ -1937,6 +1938,13 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
                     self?.parkController.setEnabled(on)
                     self?.setParkAutoDismissEnabled(on)
                 }
+            }
+            .store(in: &cancellables)
+        // Live-update the notch reveal dwell as the Hub slider moves.
+        settings.$agentNotchRevealDwell
+            .dropFirst()
+            .sink { [weak self] dwell in
+                MainActor.assumeIsolated { self?.parkController.setRevealDwell(dwell) }
             }
             .store(in: &cancellables)
     }

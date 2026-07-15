@@ -528,6 +528,11 @@ struct AIPage: View {
     @ViewBuilder private var parkedSessionsSection: some View {
         HubSection("Parked sessions",
                    footnote: "A conversation you park to the notch waits for you here. Untouched past this countdown — or once its task finishes — it's dismissed for good (only ongoing work and sessions that need you stay). Raise the cap to keep more parked at once.") {
+            LabeledSlider(title: "Reveal dwell (seconds)", value: $settings.agentNotchRevealDwell,
+                          range: 0...1, format: "%.2f",
+                          help: "How long the cursor must linger behind the notch before the dock opens. Keeps a quick pass through the notch — reaching for the menu bar or another corner — from popping it. Set to 0 to open instantly. Default 0.30s.")
+                .disabled(!settings.aiCommandsEnabled)
+
             LabeledSlider(title: "Auto-dismiss after (minutes)", value: autoDismissMinutes,
                           range: 1...30, format: "%.0f",
                           help: "How long a parked, idle session waits before it's dismissed forever. Default 5 minutes.")

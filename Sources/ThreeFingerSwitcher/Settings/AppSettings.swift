@@ -354,6 +354,10 @@ final class AppSettings: ObservableObject {
     /// ABOVE the incidental scroll threshold (`canvasResolveThreshold`) so a normal scroll-to-bottom
     /// never parks.
     @Published var agentOverscrollParkThreshold: Double { didSet { defaults.set(agentOverscrollParkThreshold, forKey: Keys.agentOverscrollParkThreshold) } }
+    /// A small **dwell** the cursor must remain crossed behind the notch before the parked-session dock
+    /// reveals (`ai-parked-sessions`) — so a quick pass THROUGH the notch (reaching for the menu bar, or
+    /// travelling to another corner) doesn't pop the dock. Seconds; `0` reveals immediately. Default 0.3.
+    @Published var agentNotchRevealDwell: TimeInterval { didSet { defaults.set(agentNotchRevealDwell, forKey: Keys.agentNotchRevealDwell) } }
     /// Peak smoothed centroid velocity (normalized units/sec) a canvas excursion must reach before its
     /// lift counts as a FLICK (commit/park) rather than a slow reading-scroll (D4). A sub-threshold peak —
     /// or fingers held down without a prompt lift — is SCROLL and never resolves the canvas. Run-verify
@@ -651,6 +655,7 @@ final class AppSettings: ObservableObject {
         agentParkIdleTimeout = defaults.object(forKey: Keys.agentParkIdleTimeout) as? TimeInterval ?? Defaults.agentParkIdleTimeout
         agentParkAutoDismissCountdown = defaults.object(forKey: Keys.agentParkAutoDismissCountdown) as? TimeInterval ?? Defaults.agentParkAutoDismissCountdown
         agentOverscrollParkThreshold = defaults.object(forKey: Keys.agentOverscrollParkThreshold) as? Double ?? Defaults.agentOverscrollParkThreshold
+        agentNotchRevealDwell = defaults.object(forKey: Keys.agentNotchRevealDwell) as? TimeInterval ?? Defaults.agentNotchRevealDwell
         flickVelocityThreshold = defaults.object(forKey: Keys.flickVelocityThreshold) as? Double ?? Defaults.flickVelocityThreshold
         flickLiftWindow = defaults.object(forKey: Keys.flickLiftWindow) as? Double ?? Defaults.flickLiftWindow
         agentWhitelistPaths = defaults.object(forKey: Keys.agentWhitelistPaths) as? [String] ?? Defaults.agentWhitelistPaths
@@ -740,6 +745,7 @@ final class AppSettings: ObservableObject {
         agentParkIdleTimeout = Defaults.agentParkIdleTimeout
         agentParkAutoDismissCountdown = Defaults.agentParkAutoDismissCountdown
         agentOverscrollParkThreshold = Defaults.agentOverscrollParkThreshold
+        agentNotchRevealDwell = Defaults.agentNotchRevealDwell
         flickVelocityThreshold = Defaults.flickVelocityThreshold
         flickLiftWindow = Defaults.flickLiftWindow
         // `aiCommandsEnabled` (a consent-gated opt-in that allows a multi-gigabyte download) and the
@@ -852,6 +858,7 @@ final class AppSettings: ObservableObject {
         static let agentParkIdleTimeout: TimeInterval = 30 * 60   // RETIRED (D1): legacy summarize-and-sleep
         static let agentParkAutoDismissCountdown: TimeInterval = 300   // 5 min idle → auto-dismiss forever (D1)
         static let agentOverscrollParkThreshold = 0.22            // above canvasResolveThreshold (0.12)
+        static let agentNotchRevealDwell: TimeInterval = 0.3      // dwell behind the notch before the dock reveals
         static let flickVelocityThreshold = 0.8                   // peak normalized vel/sec; below = reading-scroll (D4, run-verify)
         static let flickLiftWindow = 0.12                         // seconds from last fast frame to lift (D4, run-verify)
         static let agentWhitelistPaths: [String] = []             // trust nothing arbitrary on a fresh install
@@ -943,6 +950,7 @@ final class AppSettings: ObservableObject {
         static let agentParkIdleTimeout = "agentParkIdleTimeout"
         static let agentParkAutoDismissCountdown = "agentParkAutoDismissCountdown"
         static let agentOverscrollParkThreshold = "agentOverscrollParkThreshold"
+        static let agentNotchRevealDwell = "agentNotchRevealDwell"
         static let flickVelocityThreshold = "flickVelocityThreshold"
         static let flickLiftWindow = "flickLiftWindow"
         static let agentWhitelistPaths = "agentWhitelistPaths"

@@ -50,20 +50,36 @@ When a parked session escalates to **needs-you** (a dangerous write or required 
 - **WHEN** no parked session is in needs-you
 - **THEN** no needs-you signal is shown
 
-### Requirement: Cursor-to-notch reveals a scrollable rail of parked sessions
-Moving the cursor to the notch home zone SHALL reveal a **rail** of parked-session cards, **always including the persistent "+ New chat" card**. On a notched display the rail SHALL **emerge from the notch as a downward extension** — its top spanning up behind the notch (reaching the physical top), the cards spreading **downward** below the notch; on a notchless/external display the rail SHALL **hang below** the top-center tab. The rail SHALL be **horizontally scrollable** when it overflows. The reveal SHALL reuse the edge-gated cursor-reveal pattern (a passive global cursor monitor needing **no new permission**; geometry read only when the cursor is near the zone while hidden; a unified live area — the zone, the rail, **and the notch band** — with a grace-period dismiss, so moving the cursor **up into the notch docks** rather than dismisses; a coarse re-feed while shown). The grace-period dismiss SHALL apply **only while the panel is in rail mode** (an expanded conversation never grace-dismisses). The panel SHALL **spread** open and closed with a smooth **ease-in-out** animation anchored at its top edge — growing out of the notch on reveal and receding back into it on the grace-dismiss. Teardown for the grace-dismiss MAY defer the order-out until the recede completes, but restore and feature-off teardown SHALL remain **synchronous** (the ghost-on-Space-switch path).
+### Requirement: Crossing behind the notch reveals an expanding rail of parked sessions
+Crossing the cursor **up behind the notch** SHALL reveal a **rail** of parked-session cards, **always including the persistent "+ New chat" card**. The reveal trigger SHALL be the physical notch cutout itself — the rail reveals ONLY when the cursor crosses UP into the notch band (its usable "behind the notch" space, reachable because within the notch's horizontal span the cursor travels up to the physical top), **never** when it merely grazes the resting strip below the notch. On a **notchless/external** display, which has no notch to cross, the trigger SHALL be a **thin band hugging the physical top edge at top-center** (slamming the cursor to the very top edge), mimicking the same deliberate gesture. On a notched display the rail SHALL **emerge from the notch as a downward extension** — its top spanning up behind the notch (reaching the physical top), the cards spreading **downward** below the notch; on a notchless/external display the rail SHALL **hang below** the top-center tab. The rail SHALL be **non-scrollable**: the panel SHALL be sized to **hug every rendered card** (the persistent "+ New chat" card plus one per session) and SHALL **expand** as sessions are added rather than scrolling, up to a screen-fraction safety ceiling. On a notched display the panel SHALL be sized so the **centered** card row has **symmetric** vertical padding of the **notch height plus a small clearance** on top and bottom — so the cards clear the notch (never clipped at the head) and sit **balanced**, not shoved to the bottom. The reveal SHALL reuse the edge-gated cursor-reveal pattern (a passive global cursor monitor needing **no new permission**; geometry read only when the cursor is near the trigger/live region while hidden; a unified live area — the resting zone, the rail, **and the notch band** — with a grace-period dismiss, so once shown, moving the cursor **up into the notch OR back down onto the rail docks** rather than dismisses; a coarse re-feed while shown). The resting strip below the notch SHALL remain a keep-open bridge inside the live area (it just no longer triggers the reveal). The reveal SHALL be gated by a small, **user-configurable dwell**: the cursor SHALL remain crossed behind the notch (inside the trigger) **continuously** for the dwell before the rail reveals, so a quick pass THROUGH the notch (reaching for the menu bar or travelling to another corner) does not pop the dock; leaving the trigger before the dwell elapses SHALL cancel it (a re-entry restarts it), a dwell of **zero** SHALL reveal immediately, and the reveal timing SHALL not depend on continued cursor movement (a perfectly still cursor still reveals once the dwell elapses). The dwell SHALL apply to the hidden→shown transition ONLY (keep-open is instant). The grace-period dismiss SHALL apply **only while the panel is in rail mode** (an expanded conversation never grace-dismisses). The panel SHALL open and close by **growing from a point behind the notch to the full dock and shrinking back** — a fluid, spring-driven "droplet" spread anchored at its top edge, so the panel's **border itself stretches out of the point** (unfurling downward and out to both sides) and shrinks back into it. There SHALL be **no opacity fade** — the animation is geometric (the shape/border stretching), not a cross-fade. A **rail↔expanded** size change (opening a card / new chat into the conversation panel, or collapsing back) SHALL likewise **stretch the border between the two sizes** rather than snapping or fading. Teardown for the grace-dismiss MAY defer the order-out until the shrink completes, but restore and feature-off teardown SHALL remain **synchronous** (the ghost-on-Space-switch path).
 
-#### Scenario: Cursor near the notch reveals the rail
-- **WHEN** the cursor moves to the notch home zone
+#### Scenario: Crossing behind the notch reveals the rail
+- **WHEN** the cursor crosses up behind the notch (into the notch band on a notched display), or slams to the physical top edge at top-center on a notchless/external display
 - **THEN** the rail of parked-session cards — always including the "+ New chat" card — is revealed, emerging downward from the notch on a notched display, or hanging below the tab on a notchless/external display
 
-#### Scenario: The panel spreads open and closed with ease-in-out
-- **WHEN** the rail is revealed and later grace-dismissed
-- **THEN** it spreads open out of the notch and recedes back into it on a smooth ease-in-out animation anchored at the top edge, and a reveal arriving mid-recede cancels the recede and re-spreads
+#### Scenario: Grazing the strip below the notch does not reveal
+- **WHEN** the cursor moves across the resting strip just below the notch (without crossing up into the notch band) while the rail is hidden
+- **THEN** the rail is NOT revealed (only crossing behind the notch triggers it)
 
-#### Scenario: The rail scrolls when it overflows
-- **WHEN** there are more parked sessions than fit across the rail
-- **THEN** the rail scrolls horizontally to reach the rest
+#### Scenario: A dwell gates the reveal
+- **WHEN** a reveal dwell is configured and the cursor crosses behind the notch but leaves the trigger before the dwell elapses
+- **THEN** the rail does not reveal; it reveals only once the cursor stays crossed behind the notch continuously for the dwell (a dwell of zero reveals immediately, and a still cursor still reveals)
+
+#### Scenario: The panel grows from a point and shrinks back (no fade)
+- **WHEN** the rail is revealed and later grace-dismissed
+- **THEN** it grows from a point behind the notch to the full dock (its border stretching out of the point, no opacity fade) and shrinks back into the point on a fluid spring anchored at the top edge, and a reveal arriving mid-shrink cancels the teardown
+
+#### Scenario: Opening or closing a conversation stretches the border between sizes
+- **WHEN** a card is opened (or a new chat created) into the expanded conversation panel, or the conversation is collapsed back to the rail
+- **THEN** the panel's border fluidly stretches between the rail size and the expanded size (rather than snapping or fading), the frame animation running to completion without a per-tick reposition snapping it
+
+#### Scenario: The dock expands with each session rather than scrolling
+- **WHEN** a new session is added to the dock
+- **THEN** the panel widens to hug all cards (the "+ New chat" card plus one per session) and the rail does not scroll (within the parked-session cap)
+
+#### Scenario: Cards sit balanced and clear of the notch
+- **WHEN** the rail is revealed on a notched display
+- **THEN** the panel is sized so the centered card row has symmetric padding of the notch height plus a small clearance on top and bottom — the cards clear the notch (none clipped behind it) and sit balanced, not shoved to the bottom
 
 #### Scenario: Moving up into the notch docks rather than dismisses
 - **WHEN** the rail is shown and the cursor moves up into the notch band above the resting zone

@@ -10,6 +10,12 @@ final class NotchRevealModel {
     /// from the zone to the rail (or a brief edge slip) without a flicker.
     let graceInterval: TimeInterval
 
+    /// A small DWELL the cursor must stay continuously inside the reveal trigger before the rail reveals —
+    /// so a quick pass THROUGH the notch (reaching for the menu bar, travelling to another corner) doesn't
+    /// pop the dock. `0` reveals immediately. Runtime-settable from the Hub. Applies to the hidden→shown
+    /// transition ONLY (keep-open is instant). While a dwell is pending, `feed` returns `.idle`.
+    var dwellInterval: TimeInterval
+
     enum State: Equatable { case hidden, shown }
     enum Decision: Equatable {
         /// Nothing shown; ensure the rail is closed.
@@ -22,9 +28,15 @@ final class NotchRevealModel {
 
     private(set) var state: State = .hidden
     private var graceDeadline: TimeInterval?
+    private var dwellDeadline: TimeInterval?
 
-    init(graceInterval: TimeInterval = 0.25) {
+    /// True while a reveal dwell is counting down (cursor is in the trigger but the dwell hasn't elapsed) —
+    /// the controller keeps its re-feed timer alive on this so a perfectly still cursor still reveals.
+    var isDwelling: Bool { dwellDeadline != nil }
+
+    init(graceInterval: TimeInterval = 0.25, dwellInterval: TimeInterval = 0) {
         self.graceInterval = graceInterval
+        self.dwellInterval = dwellInterval
     }
 
     /// Advance the lifecycle for a cursor sample.
@@ -42,12 +54,31 @@ final class NotchRevealModel {
               railFrame: CGRect?,
               liveZone: CGRect? = nil,
               now: TimeInterval) -> Decision {
-        // 1. Cursor over the resting zone → reveal/keep and clear any grace.
+        // 1. Cursor over the reveal trigger.
         if zoneRect.contains(cursor) {
             graceDeadline = nil
-            state = .shown
-            return .reveal
+            // Already shown → keep open instantly (no dwell for keep-open).
+            if state == .shown {
+                dwellDeadline = nil
+                return .reveal
+            }
+            // Hidden → require a short DWELL first, so a quick pass THROUGH the notch doesn't pop the dock.
+            if dwellInterval <= 0 {
+                dwellDeadline = nil
+                state = .shown
+                return .reveal
+            }
+            let deadline = dwellDeadline ?? (now + dwellInterval)
+            dwellDeadline = deadline
+            if now >= deadline {
+                dwellDeadline = nil
+                state = .shown
+                return .reveal
+            }
+            return .idle                 // still dwelling — nothing shown yet
         }
+        // Cursor left the trigger before the dwell elapsed → cancel it (a fresh entry restarts the dwell).
+        dwellDeadline = nil
         // 2. Cursor anywhere in the contiguous live zone while shown (the rail, the connecting band, OR the
         //    notch pixels above the zone) → keep it open. Falls back to the rail frame when no live zone is
         //    supplied. This is the "move into the notch docks instead of dismisses" guarantee (design D5).

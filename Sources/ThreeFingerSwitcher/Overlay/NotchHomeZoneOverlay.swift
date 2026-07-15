@@ -21,13 +21,24 @@ struct NotchRailLayout: Equatable {
                                       overflowsVertically: false)
 }
 
-/// Layout metrics + the content-fit solve for the notch home-zone rail. The rail is a horizontally
-/// scrollable row of parked cards that EMERGES FROM the notch and hugs its sessions (no hardcoded width).
+/// Layout metrics + the content-fit solve for the notch home-zone rail. The rail is a NON-scrollable row
+/// of parked cards that EMERGES FROM the notch and HUGS its sessions (no hardcoded width) — it EXPANDS as
+/// cards are added rather than scrolling. The `overflows*` flags remain as safety signals (a pathological
+/// count beyond the parked-session cap) but no longer drive a scroll view.
 enum NotchHomeZoneLayout {
     static let cardWidth: CGFloat = 168
     static let cardHeight: CGFloat = 92
     static let cardSpacing: CGFloat = 12
+    /// Horizontal chrome padding (each side of the card row).
     static let padding: CGFloat = 14
+    /// The card row is **centered** in the panel with **symmetric** vertical padding. On a notched display
+    /// that padding is the **notch height + a little** (`railNotchClearance`) on BOTH the top and the bottom
+    /// — so the row clears the notch by a small gap and sits balanced (never shoved to the bottom). Because
+    /// it depends on the runtime notch height, the attached panel height is computed by the controller
+    /// (which knows the cutout); this constant is only the "a little". On a notchless/external display there
+    /// is no notch to clear, so a fixed comfortable vertical padding (`railTabVerticalPadding`) is used.
+    static let railNotchClearance: CGFloat = 8
+    static let railTabVerticalPadding: CGFloat = 16
 
     /// The in-place EXPANDED conversation panel's content-fit solve (`notch-native-conversations` D4):
     /// a fixed comfortable reading size clamped to fractions of the visible frame (small screens stay
@@ -48,7 +59,17 @@ enum NotchHomeZoneLayout {
     static let maxWidthFraction: CGFloat = 0.86
     static let maxHeightFraction: CGFloat = 0.60
 
-    static var railHeight: CGFloat { padding * 2 + cardHeight }
+    /// The tab-mode (notchless) rail content height: the card row centered with `railTabVerticalPadding`
+    /// on top and bottom. The attached (notched) height is computed per-notch via `attachedRailContentHeight`.
+    static var railHeight: CGFloat { cardHeight + 2 * railTabVerticalPadding }
+
+    /// The below-notch content height to hand `attachedPanelRect` so the card row ends up **centered** in the
+    /// merged panel with `notchHeight + railNotchClearance` padding on the top and bottom. `attachedPanelRect`
+    /// re-adds the notch band on top of this, so it is `card + notch + 2*clearance` — making the total panel
+    /// `card + 2*(notch + clearance)`, which centered yields the symmetric notch-clearing padding.
+    static func attachedRailContentHeight(notchHeight: CGFloat) -> CGFloat {
+        cardHeight + notchHeight + 2 * railNotchClearance
+    }
 
     /// Rail width for `count` cards, clamped to the available screen width (scrolls when it overflows).
     /// Retained as the width primitive `solve` builds on; a single card hugs to a one-card floor.
@@ -67,10 +88,11 @@ enum NotchHomeZoneLayout {
     static var oneCardWidth: CGFloat { padding * 2 + cardWidth }
 
     /// Solve the content-fit size for `count` parked cards within `visibleFrame` (design D5): width hugs
-    /// the cards (chrome + sum + spacing), clamped to `maxWidthFraction` of the visible width with a
-    /// one-card floor (overflow → horizontal scroll); height is a single band (`railHeight`), clamped to
-    /// `maxHeightFraction` of the visible height (overflow → vertical scroll). Mirrors
-    /// `SwitcherLayout.solveGrid`'s contentSize + overflow-flag contract.
+    /// the cards (chrome + sum + spacing) so the dock EXPANDS per card, clamped to `maxWidthFraction` of the
+    /// visible width with a one-card floor (a safety ceiling for the pathological beyond-cap case — the dock
+    /// is non-scrollable, so past the ceiling it clips rather than scrolls); height is a single band
+    /// (`railHeight`), clamped to `maxHeightFraction` of the visible height. Mirrors `SwitcherLayout.solveGrid`'s
+    /// contentSize + overflow-flag contract (the `overflows*` flags are retained as signals only).
     static func solve(count: Int, visibleFrame: CGRect) -> NotchRailLayout {
         let maxW = visibleFrame.width > 1 ? visibleFrame.width * maxWidthFraction : naturalWidth(count: count)
         let maxH = visibleFrame.height > 1 ? visibleFrame.height * maxHeightFraction : railHeight
@@ -198,19 +220,30 @@ final class NotchHomeZoneOverlayController {
     var isVisible: Bool { panel?.isVisible ?? false }
     var frame: CGRect { panel?.frame ?? .zero }
 
-    /// The ease-in-out spread duration (reveal grow / animated-hide recede), shared by both directions.
-    static let spreadDuration: TimeInterval = 0.3
+    /// The fluid "droplet" spread duration — the orderOut delay after an animated shrink, and the duration
+    /// of the rail↔expanded frame stretch.
+    static let spreadDuration: TimeInterval = 0.34
+    /// The spring driving the grow-from-a-point (reveal) / shrink-to-a-point (hide) content scale — a fluid
+    /// droplet spread (a touch of settle, no bounce-heavy overshoot).
+    private static let growSpring: Animation = .spring(response: 0.42, dampingFraction: 0.78)
     /// A scheduled animated-hide teardown, cancelled if a fresh reveal arrives mid-recede.
     private var pendingHide: DispatchWorkItem?
     /// True while an animated recede is in flight (its `orderOut` is scheduled but not yet run) — the
     /// controller reads this to pause its re-feed timer so it doesn't re-trigger the recede every tick.
     var isReceding: Bool { pendingHide != nil }
+    /// True while a rail↔expanded frame STRETCH is animating — per-tick reposition setFrames are skipped so
+    /// they don't snap the frame and kill the stretch mid-flight.
+    private var isResizing = false
 
-    /// Reveal or reposition the rail at `rect` and spread it OUT of the notch (ease-in-out). Handles the
-    /// first show (orders front) and per-tick reanchor (repositions only — never re-fronts a visible panel,
-    /// so a layer above like a menu is never stomped, matching the Dock-preview `move(to:)` discipline). A
-    /// reveal arriving during an animated recede cancels the pending teardown and re-spreads.
-    func reveal(at rect: CGRect) {
+    /// Reveal / resize / reposition the panel at `rect`. Three paths, all fade-free:
+    /// - **First show** → place at the target instantly, order front, and GROW the whole panel (border and
+    ///   all) out of a point behind the notch via a spring on the content scale (anchored at the top).
+    /// - **Mode change** (`animateResize`, rail↔expanded) → STRETCH the window frame to the new size fluidly
+    ///   (the SwiftUI shape fills the window, so the frame edge IS the border).
+    /// - **Per-tick reanchor** → reposition instantly (never re-fronts a visible panel — matching the
+    ///   Dock-preview `move(to:)` discipline — and skipped entirely while a stretch is mid-flight).
+    /// A reveal arriving during an animated recede cancels the pending teardown.
+    func reveal(at rect: CGRect, animateResize: Bool = false) {
         pendingHide?.cancel(); pendingHide = nil
         let panel = self.panel ?? makePanel()
         self.panel = panel
@@ -221,17 +254,46 @@ final class NotchHomeZoneOverlayController {
             panel.hasShadow = !attached
             panel.invalidateShadow()
         }
-        let wasVisible = panel.isVisible
-        panel.setFrame(rect, display: true)
-        if !wasVisible { panel.orderFrontRegardless() }
+        if !panel.isVisible {
+            // FIRST SHOW: seed the panel as a point behind the notch, order front, then spring it open.
+            model.isExpanded = false
+            panel.setFrame(rect, display: true)
+            panel.orderFrontRegardless()
+            withAnimation(Self.growSpring) { model.isExpanded = true }
+            return
+        }
+        if animateResize, panel.frame != rect {
+            // MODE CHANGE (rail↔expanded): stretch the border to the new size.
+            model.isExpanded = true
+            animateFrame(to: rect)
+            return
+        }
+        // PER-TICK reanchor: reposition instantly (skipped while a stretch is mid-flight so it isn't snapped),
+        // and RE-GROW if this reveal arrived mid-shrink (the pending grace-dismiss teardown was just cancelled
+        // above) so the panel springs back open instead of staying collapsed as a point.
+        if !isResizing { panel.setFrame(rect, display: true) }
         if !model.isExpanded {
-            withAnimation(.easeInOut(duration: Self.spreadDuration)) { model.isExpanded = true }
+            withAnimation(Self.growSpring) { model.isExpanded = true }
         }
     }
 
-    /// Tear down the rail. `animated` recedes it back INTO the notch (ease-in-out) then orders out on
-    /// completion — used for the gentle grace-dismiss. `animated == false` is the **synchronous** `orderOut`
-    /// (the ghost-on-Space-switch landmine) — used for restore/disable where the teardown must be immediate.
+    /// Fluidly stretch the panel's window frame to `rect` (the rail↔expanded border stretch). One-shot and
+    /// self-terminating — the idle-CPU-spin landmine is about *perpetual* animations; this settles and stops.
+    private func animateFrame(to rect: CGRect) {
+        guard let panel else { return }
+        isResizing = true
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = Self.spreadDuration
+            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1)   // fluid ease-out
+            panel.animator().setFrame(rect, display: true)
+        }, completionHandler: { [weak self] in
+            MainActor.assumeIsolated { self?.isResizing = false }
+        })
+    }
+
+    /// Tear down the rail. `animated` SHRINKS it back into the point behind the notch (spring on the scale,
+    /// no fade) then orders out on completion — the gentle grace-dismiss. `animated == false` is the
+    /// **synchronous** `orderOut` (the ghost-on-Space-switch landmine) — restore/disable, teardown immediate.
     func hide(animated: Bool) {
         guard let panel else { return }
         // Drop key BEFORE any order-out (D5 ordering): a panel holding key through its teardown can
@@ -244,7 +306,7 @@ final class NotchHomeZoneOverlayController {
             return
         }
         if pendingHide != nil { return }           // already receding — don't restart the animation
-        withAnimation(.easeInOut(duration: Self.spreadDuration)) { model.isExpanded = false }
+        withAnimation(Self.growSpring) { model.isExpanded = false }
         let work = DispatchWorkItem { [weak self] in
             self?.panel?.orderOut(nil)
             self?.pendingHide = nil
@@ -254,7 +316,7 @@ final class NotchHomeZoneOverlayController {
     }
 }
 
-/// The rail: a horizontally-scrollable row of parked cards. In attached mode it's a **plain black rounded
+/// The rail: a NON-scrollable row of parked cards that hugs and EXPANDS with its sessions. In attached mode it's a **plain black rounded
 /// rectangle** whose top edge reaches the physical top so its black simply spans up **behind** the (also
 /// black) notch — no cutout is carved, because both are black and read as one shape. The whole container
 /// spreads out of / recedes into the notch on the controller's ease-in-out `isExpanded` transition. The
@@ -299,38 +361,37 @@ struct NotchHomeZoneRailView: View {
         .background(chromeFill)
         .overlay(chromeStroke)
         .clipShape(chromeShape)
-        // The smooth ease-in-out SPREAD: the whole panel grows out of / recedes into the notch, anchored at
-        // its TOP edge, so it unfurls downward AND out to both sides. The controller flips `isExpanded`
-        // inside `withAnimation(.easeInOut)`, which drives this transition.
+        // The fluid "droplet" SPREAD: the whole panel — border and all — GROWS from a point behind the notch
+        // to full size (reveal) and shrinks back (hide), anchored at its TOP edge so it unfurls downward AND
+        // out to both sides. Driven by the controller's spring on `isExpanded`. There is NO opacity fade —
+        // the border itself stretches out of the point (rail↔expanded resizes stretch the window frame).
         .scaleEffect(model.isExpanded ? 1 : Self.seedScale, anchor: .top)
-        .opacity(model.isExpanded ? 1 : 0)
     }
 
     /// The card rail (the `.rail` mode body): the persistent "+ New chat" card, then one card per
     /// session. Present even with zero sessions — the dock is never an empty dead end.
+    ///
+    /// NON-scrollable: the panel is sized (by the shared `solve`, counting this same "+ New chat" card) to
+    /// HUG every rendered card, so the dock simply EXPANDS as sessions are added rather than scrolling. The
+    /// panel is **height-sized by the controller** so that simply CENTERING the row here yields the intended
+    /// symmetric vertical padding — the notch height + a little on a notched display (so the cards clear the
+    /// notch and sit balanced), or a fixed gap in tab mode.
     private var railBody: some View {
-        GeometryReader { geo in
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: NotchHomeZoneLayout.cardSpacing) {
-                    NotchNewChatCard(action: onNewSession)
-                    ForEach(model.sessions) { session in
-                        NotchParkedCard(session: session,
-                                        onExpand: { onExpand(session.id) },
-                                        onDiscard: { onDiscard(session.id) })
-                    }
-                }
-                .padding(.horizontal, NotchHomeZoneLayout.padding)
-                // Center the cards across the whole panel (both axes): `minWidth` centers a few sessions
-                // instead of left-hugging them yet still allows horizontal scroll when they overflow;
-                // `minHeight` centers the row vertically so it sits clear of the notch that overlaps the top.
-                .frame(minWidth: geo.size.width, minHeight: geo.size.height, alignment: .center)
+        HStack(spacing: NotchHomeZoneLayout.cardSpacing) {
+            NotchNewChatCard(action: onNewSession)
+            ForEach(model.sessions) { session in
+                NotchParkedCard(session: session,
+                                onExpand: { onExpand(session.id) },
+                                onDiscard: { onDiscard(session.id) })
             }
         }
+        .padding(.horizontal, NotchHomeZoneLayout.padding)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
 
-    /// The collapsed seed scale — small enough to read as emerging from the notch, non-zero so the anchor
-    /// stays well-defined during the spread (a literal `0` collapses the frame and the anchor with it).
-    private static let seedScale: CGFloat = 0.06
+    /// The collapsed seed scale — a near-point at the notch the panel springs out of; non-zero so the
+    /// `.top` scale anchor stays well-defined during the grow (a literal `0` collapses the anchor with it).
+    private static let seedScale: CGFloat = 0.03
 
     /// The chrome silhouette. Attached mode is a plain rounded rectangle with a **flat top** (square top
     /// corners so it grows cleanly from the physical top / behind the notch) and rounded bottom corners; the

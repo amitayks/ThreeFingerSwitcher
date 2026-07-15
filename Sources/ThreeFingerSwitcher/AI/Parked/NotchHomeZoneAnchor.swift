@@ -22,6 +22,20 @@ enum NotchHomeZoneAnchor {
         return clamp(CGRect(origin: origin, size: size), within: visibleFrame)
     }
 
+    /// The reveal TRIGGER on a notchless/external display — the "cross behind the notch" gesture mimicked
+    /// where there is no notch: a thin band hugging the PHYSICAL top edge at top-center, spanning from just
+    /// under the menu bar (`visibleFrame.maxY`) up to the physical top (`screenFrame.maxY`), `width` wide and
+    /// centered, clamped horizontally. Revealing requires slamming the cursor to the very top edge (an
+    /// infinite-depth Fitts's-law target), not merely grazing the strip below the menu bar. See
+    /// `docs/notch-geometry-reference.md`.
+    static func topEdgeTriggerRect(width: CGFloat, visibleFrame: CGRect, screenFrame: CGRect) -> CGRect {
+        let bottom = visibleFrame.maxY
+        let height = max(screenFrame.maxY - bottom, 1)
+        let origin = CGPoint(x: visibleFrame.midX - width / 2, y: bottom)
+        return clampHorizontally(CGRect(origin: origin, size: CGSize(width: width, height: height)),
+                                 within: screenFrame)
+    }
+
     /// The rail EMERGES FROM the notch (design D5): its TOP edge is FLUSH at the notch / menu-bar lower
     /// edge — i.e. flush at the resting zone's TOP (`zone.maxY`), ZERO gap — and it grows DOWNWARD (Cocoa:
     /// smaller y). Top-centered on the zone, clamped on-screen (shift-only, never resized). This replaces
@@ -78,6 +92,21 @@ enum NotchHomeZoneAnchor {
     static func attachedNubRect(size: CGSize, notch: CGRect, screenFrame: CGRect) -> CGRect {
         let origin = CGPoint(x: notch.midX - size.width / 2, y: notch.minY - size.height)
         return clampHorizontally(CGRect(origin: origin, size: size), within: screenFrame)
+    }
+
+    /// A cursor may cross UP *behind* the physical notch — within the notch's x-span its y reaches the
+    /// physical top (`screenFrame.maxY`), the black cutout occluding it (see `docs/notch-geometry-reference.md`).
+    /// Extending the trigger DOWN by this much lets a cursor that stops *right at* the notch's bottom edge
+    /// still count, guarding against the OS soft-clamping the pointer at `notch.minY`. Kept tiny so the
+    /// trigger stays "behind the notch," never the old graze-below-the-notch zone.
+    static let notchCrossTolerance: CGFloat = 2
+
+    /// The reveal TRIGGER in attached (notched) mode: the physical notch cutout itself (extended down by
+    /// `notchCrossTolerance`), so the rail reveals ONLY when the cursor crosses UP behind the notch — never
+    /// when it grazes the resting nub strip below it. The top stays welded to the physical top.
+    static func notchTriggerRect(notch: CGRect, tolerance: CGFloat = notchCrossTolerance) -> CGRect {
+        CGRect(x: notch.minX, y: notch.minY - tolerance,
+               width: notch.width, height: notch.height + tolerance)
     }
 
     /// The expanded/merged panel: centered on the notch, its TOP reaching the PHYSICAL top (`notch.maxY`)
