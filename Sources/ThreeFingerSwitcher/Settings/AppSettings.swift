@@ -829,7 +829,7 @@ final class AppSettings: ObservableObject {
         static let clipboardMaxAgeDays = 0.0       // 0 = no age cap
         static let clipboardPollInterval = 0.5     // change-counter poll cadence (seconds)
         static let clipboardEdgeAcceleration = 1.0 // edge-scroll acceleration sensitivity
-        static let clipboardPinDistance = 0.22     // deliberate horizontal flick to pin / leave (≈3 item steps)
+        static let clipboardPinDistance = 0.08     // deliberate horizontal flick to pin (≈2 item steps); left-exit is a single step
         static let clipboardExcludedApps: [String] = []
         static let aiCommandsEnabled = false       // opt-in; gates the AI band + model download/residency
         static let aiSelectedModelID: String? = nil  // nil = registry default model

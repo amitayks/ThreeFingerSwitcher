@@ -336,8 +336,8 @@ struct ClipboardPage: View {
                               help: "How quickly the list speeds up when you hold a finger at the trackpad edge to scroll a long history.")
                     .disabled(!settings.keepClipboardHistory)
                 LabeledSlider(title: "Pin flick distance", value: $settings.clipboardPinDistance,
-                              range: 0.10...0.45, format: "%.3f",
-                              help: "How far you swipe sideways on an entry to pin it (right) or jump to the previous band (left). Larger = more deliberate; one flick pins once.")
+                              range: 0.06...0.45, format: "%.3f",
+                              help: "How far you swipe right on an entry to pin it. Larger = more deliberate; one flick pins once. (Swiping left to leave the band is always a single quick step.)")
                     .disabled(!settings.keepClipboardHistory)
             }
             HubSection("History") {

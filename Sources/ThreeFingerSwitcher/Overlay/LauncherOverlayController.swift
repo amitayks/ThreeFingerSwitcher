@@ -56,9 +56,10 @@ final class LauncherOverlayController {
     private var edgeTicks = 0
     /// Acceleration sensitivity (≥1); higher accelerates faster. Set from settings on `show`.
     var edgeAcceleration: Double = 1.0
-    /// Deliberate horizontal steps required before a clipboard pin / previous-band action fires. Set
-    /// from settings on `show`; pushed into the model so pinning isn't twitchy.
-    var clipboardPinSteps: Int = 3
+    /// Deliberate horizontal steps required before a clipboard **pin** (RIGHT) or the canvas discard-flick
+    /// fires. Set from settings on `show`; pushed into the model so pinning isn't twitchy. (Left-exit from
+    /// the clipboard band is a single quick step, not gated by this.)
+    var clipboardPinSteps: Int = 2
 
     // MARK: - Show / navigate
 

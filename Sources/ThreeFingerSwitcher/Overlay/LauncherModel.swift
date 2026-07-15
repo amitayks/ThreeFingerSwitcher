@@ -157,8 +157,8 @@ final class LauncherModel: ObservableObject {
     /// How many fine horizontal steps must accumulate before a clipboard **pin** (RIGHT) fires — so
     /// pinning needs a *deliberate* horizontal excursion, not the fine item step. LEFT (exit to the band
     /// list) is deliberately NOT gated by this — it fires on a single step (see `stepClipboardHorizontal`).
-    /// Set from settings on `show`; defaults to a deliberate few.
-    var clipboardPinStepThreshold: Int = 3
+    /// Set from settings on `show`; defaults to a deliberate couple.
+    var clipboardPinStepThreshold: Int = 2
     /// Signed accumulator of fine horizontal steps within the current clipboard excursion.
     private var clipHorizAccum = 0
     /// True once an action fired this excursion; cleared only when the accumulator returns to centre,
