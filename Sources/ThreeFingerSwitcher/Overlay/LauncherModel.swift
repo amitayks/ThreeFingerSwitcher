@@ -439,9 +439,15 @@ final class LauncherModel: ObservableObject {
     /// The Clipboard band stays active on a LEFT exit, so vertical from the band list reaches the previous band.
     private func stepClipboardHorizontal(_ dir: Int) {
         clipHorizAccum += dir
-        if clipHorizAccum == 0 { clipHorizLatched = false }   // returned to centre: ready for the next flick
+        // Release the pin latch as soon as the excursion retreats one step below the level that fired it
+        // (hysteresis), NOT only at dead centre. So a second right flick re-toggles (unpin) with the same
+        // small effort as the pin — you don't have to unwind all the way back to centre first (which felt
+        // "stuck" / like extra steps). Exit stays gated on going *below* centre, so relaxing never exits.
+        if clipHorizLatched, clipHorizAccum <= max(1, clipboardPinStepThreshold) - 1 {
+            clipHorizLatched = false
+        }
         if dir > 0 {
-            // RIGHT → pin (deliberate, latched).
+            // RIGHT → pin / unpin (deliberate, latched until it retreats a step).
             guard !clipHorizLatched, clipHorizAccum >= max(1, clipboardPinStepThreshold) else { return }
             clipHorizLatched = true
             guard let item = selectedItem else { return }

@@ -116,6 +116,32 @@ final class ClipboardNavigationTests: XCTestCase {
         XCTAssertFalse(model.isPinned(model.selectedItem!), "two deliberate flicks return to unpinned")
     }
 
+    func testUnpinReArmsWithoutFullReturnToCentre() {
+        // Hysteresis: after pinning, the latch releases one step below the fired level, so a second right
+        // flick unpins with the same small effort as the pin — no full unwind back to centre needed.
+        let (model, _) = makeModel()
+        model.clipboardPinStepThreshold = 2
+        var toggled = 0
+        model.onPinToggle = { _ in toggled += 1 }
+        model.stepHorizontal(1); model.stepHorizontal(1)    // pin (2 right steps)
+        XCTAssertEqual(toggled, 1)
+        XCTAssertTrue(model.isPinned(model.selectedItem!))
+        model.stepHorizontal(-1)   // relax ONE step → latch releases (not a full return to centre)
+        model.stepHorizontal(1)    // right flick → unpin
+        XCTAssertEqual(toggled, 2, "unpin re-toggles with the same effort as pin")
+        XCTAssertFalse(model.isPinned(model.selectedItem!))
+        XCTAssertEqual(model.focus, .grid, "staying on the item — a relax+flick never exits")
+    }
+
+    func testHoldingRightPastThresholdDoesNotReToggle() {
+        let (model, _) = makeModel()
+        model.clipboardPinStepThreshold = 2
+        var toggled = 0
+        model.onPinToggle = { _ in toggled += 1 }
+        for _ in 0..<6 { model.stepHorizontal(1) }   // one long right hold, well past threshold
+        XCTAssertEqual(toggled, 1, "holding right toggles once, not repeatedly (latched until it retreats)")
+    }
+
     func testDeliberateLeftFlickReturnsToBandList() {
         let (model, _) = makeModel()
         model.clipboardPinStepThreshold = 3
