@@ -76,7 +76,21 @@ public final class ModelManager: ObservableObject {
         }
     }
 
-    public let registry: ModelRegistry
+    public let registry: ModelCatalog
+    /// The FLEET registry (addendum §C1), consumed for multi-model residency/eviction (`ai-model-fleet`).
+    /// Optional + additive: nil → today's single-model behavior over `registry` (a fleet-of-one is also
+    /// valid as an explicit one-member fleet). Holds chat/ternary/image/video + the cloud members.
+    public let fleet: ModelRegistry?
+    /// The pure residency/eviction planner (design D3). The manager is the ONLY place its plan is APPLIED
+    /// (evict → load); the planner itself never touches Metal or the provisioner.
+    private let residencyPlanner: ResidencyPlanner
+    /// The unified-memory budget the planner spends against (48 GB target by default).
+    private let fleetBudgetBytes: UInt64
+    /// Injected live free-memory probe (no Metal in Core; the real backend probes unified memory). Pure
+    /// value in tests so the residency math is deterministic.
+    private let fleetFreeBytes: @Sendable () -> UInt64
+    /// Gates + routes cloud members behind `fleetCloudEscalationEnabled` (consumed, not owned — task 6).
+    private let cloudGate: FleetCloudGate
     private let downloader: ModelDownloading
     /// Builds the `LLMRuntime` for a verified descriptor. Injectable so tests resolve a `StubLLMRuntime`
     /// and the real slice swaps in `GemmaMLXRuntime` without touching this type.
@@ -105,6 +119,13 @@ public final class ModelManager: ObservableObject {
 
     /// The resident runtime once loaded; nil means not loaded (notDownloaded/ready/evicted).
     private var residentRuntime: LLMRuntime?
+    /// The single in-flight heavy load (`fix-model-load-coalescing-and-gpu-cache`): at most ONE
+    /// provisioner run exists at any moment, and every racing caller shares it. Nil when no load is in
+    /// flight. See `coalescedLoad`.
+    private var loadTask: Task<LLMRuntime, Error>?
+    /// The descriptor id `loadTask` is loading — a racing caller for the SAME id joins; a caller for a
+    /// DIFFERENT id drains the in-flight load first (never two provisioners at once).
+    private var loadTaskDescriptorID: String?
     /// The descriptor actually resident in `residentRuntime`. Decoupled from `activeDescriptor` because
     /// the latter follows the user's *displayed* selection (via `showStatus`) and may point at a
     /// different model than the one loaded in memory — eviction/delete must act on the resident one.
@@ -115,7 +136,7 @@ public final class ModelManager: ObservableObject {
     /// Unused on the provisioner path (the pipeline owns the weights on disk).
     private var verifiedBytes: Data?
 
-    public init(registry: ModelRegistry = .standard,
+    public init(registry: ModelCatalog = .standard,
                 downloader: ModelDownloading,
                 optedIn: Bool = false,
                 storageRoot: URL? = nil,
@@ -123,10 +144,20 @@ public final class ModelManager: ObservableObject {
                 provisioner: ModelProvisioner? = nil,
                 provisionedOnDisk: @escaping @Sendable (ModelDescriptor) -> Bool = { _ in false },
                 provisionedDelete: @escaping @Sendable (ModelDescriptor) -> Void = { _ in },
+                fleet: ModelRegistry? = nil,
+                residencyPlanner: ResidencyPlanner = ResidencyPlanner(),
+                fleetBudgetBytes: UInt64 = FleetRoster.unifiedBudget48GB,
+                fleetFreeBytes: @escaping @Sendable () -> UInt64 = { FleetRoster.unifiedBudget48GB },
+                cloudGate: FleetCloudGate = FleetCloudGate(),
                 runtimeFactory: @escaping @Sendable (ModelDescriptor) throws -> LLMRuntime = { descriptor in
                     StubLLMRuntime(capabilities: descriptor.capabilities)
                 }) {
         self.registry = registry
+        self.fleet = fleet
+        self.residencyPlanner = residencyPlanner
+        self.fleetBudgetBytes = fleetBudgetBytes
+        self.fleetFreeBytes = fleetFreeBytes
+        self.cloudGate = cloudGate
         self.downloader = downloader
         self.optedIn = optedIn
         self.storageRoot = storageRoot ?? Self.defaultStorageRoot()
@@ -202,6 +233,25 @@ public final class ModelManager: ObservableObject {
         let onDisk = isOnDisk(descriptor)   // probe BEFORE repointing (the byte path keys off activeDescriptor)
         activeDescriptor = descriptor
         state = onDisk ? .ready : .notDownloaded
+    }
+
+    /// A READ-ONLY, non-mutating per-descriptor lifecycle status — the fleet roster's multi-row status
+    /// surface (each row needs its OWN status, but the displayed `state` describes only one descriptor at
+    /// a time). Returns: `.loaded` if `descriptor` is the resident runtime; the live in-flight `state`
+    /// (downloading/verifying/loading/failed) if it is the descriptor that in-flight `state` currently
+    /// describes; `.ready` if its weights are on disk; else `.notDownloaded`. Pure disk probe — safe to
+    /// call from a view body, and (unlike `showStatus`) it never mutates `activeDescriptor`/`state`.
+    public func status(for descriptor: ModelDescriptor) -> ModelLifecycleState {
+        if residentRuntime != nil, residentDescriptor?.id == descriptor.id { return .loaded }
+        // An in-flight (or failed) lifecycle belongs to whichever descriptor is currently active; reflect
+        // it on that row so its download progress / failure shows where the user triggered it.
+        if activeDescriptor?.id == descriptor.id {
+            switch state {
+            case .downloading, .verifying, .loading, .failed: return state
+            case .notDownloaded, .ready, .loaded: break
+            }
+        }
+        return isOnDisk(descriptor) ? .ready : .notDownloaded
     }
 
     /// Whether `descriptor`'s weights are present on disk: the per-descriptor probe on the provisioner
@@ -356,16 +406,67 @@ public final class ModelManager: ObservableObject {
 
     // MARK: - Load / residency / evict
 
+    /// Single-flight gate for the heavy load (`fix-model-load-coalescing-and-gpu-cache`). The load
+    /// paths are `@MainActor` but AWAIT the multi-second provisioner, so before this gate two racing
+    /// callers (a user turn + a background advance, two quick sends, …) each observed
+    /// `residentRuntime == nil` and ran the provisioner TWICE — two full ~17 GB weight sets resident at
+    /// once (caught live in the unified log), a swap storm on a 48 GB machine that reads as "the model
+    /// loads every time" and slows every response after.
+    ///
+    /// Semantics: a caller for the SAME descriptor JOINS the in-flight load and shares its one result
+    /// (and its one failure — which clears the task, so a later retry starts fresh). A caller for a
+    /// DIFFERENT descriptor DRAINS the in-flight load first (never two provisioners at once), then runs
+    /// its own body — every body begins with a warm re-check, so a drain that already made the needed
+    /// runtime resident never re-loads. The shared load runs in its OWN task: a joiner that gets
+    /// cancelled abandons the wait, but the load itself completes (one caller's discard must never kill
+    /// another caller's load — and a completed load makes the next trigger warm).
+    private func coalescedLoad(_ descriptorID: String,
+                               body: @escaping @MainActor () async throws -> LLMRuntime) async throws -> LLMRuntime {
+        while let inFlight = loadTask {
+            if loadTaskDescriptorID == descriptorID {
+                return try await inFlight.value   // JOIN: one provisioner run serves every racer
+            }
+            _ = try? await inFlight.value         // DRAIN a different descriptor's load, then re-check
+        }
+        let task = Task { @MainActor [self] in
+            defer {
+                // Runs synchronously at body end — before any awaiter resumes — so it can only clear
+                // THIS task (a successor is registered only by a later `coalescedLoad` call).
+                loadTask = nil
+                loadTaskDescriptorID = nil
+            }
+            return try await body()
+        }
+        loadTask = task
+        loadTaskDescriptorID = descriptorID
+        return try await task.value
+    }
+
     /// Lazy-load the verified weights into a resident runtime. Idempotent: if already loaded for the
     /// same descriptor, returns the resident runtime WITHOUT re-loading (residency between calls). The
     /// weights must be verified first (`.ready`/`.loaded`), else this reports `modelMissing`.
+    /// Concurrent callers share ONE load (`coalescedLoad`) — the cold cost is paid exactly once.
     @discardableResult
     public func loadIfNeeded() async throws -> LLMRuntime {
         guard optedIn else {
             throw RuntimeError.unavailable(reason: "AI commands opt-in is off")
         }
         // Already resident → no cold-load cost paid again. (On the provisioner path the runtime is
-        // already resident after `downloadAndVerify`, so this is the warm hit.)
+        // already resident after `downloadAndVerify`, so this is the warm hit.) Stays ahead of the
+        // gate so the streaming-turn hot path never pays a task hop.
+        if let runtime = residentRuntime {
+            state = .loaded
+            return runtime
+        }
+        let target = activeDescriptor ?? registry.defaultDescriptor ?? registry.models.first
+        return try await coalescedLoad(target?.id ?? "") { [self] in
+            try await loadIfNeededBody()
+        }
+    }
+
+    /// The actual load body behind the single-flight gate. Begins with the warm re-check (a drained
+    /// in-flight load may already have made the runtime resident).
+    private func loadIfNeededBody() async throws -> LLMRuntime {
         if let runtime = residentRuntime {
             state = .loaded
             return runtime
@@ -444,6 +545,122 @@ public final class ModelManager: ObservableObject {
         return try await loadIfNeeded()
     }
 
+    // MARK: - Fleet residency (ai-model-fleet)
+
+    /// Admit a fleet member by id under the 48 GB budget (the §C1 `ModelRegistry.ensureResident`, D4).
+    ///
+    /// Runs the PURE `ResidencyPlanner` over the fleet descriptors, EVICTS each planned id via the
+    /// EXISTING evict path, then LOADS the target via the EXISTING `ModelProvisioner` / `runtimeFactory`
+    /// — NO new provisioning seam. Cases:
+    ///  - **Cloud target** → a residency no-op: it never touches the provisioner / never loads weights;
+    ///    it routes through the cloud gate (`cloudDisabled` when off, the escalation seam when on, D5).
+    ///  - **Fleet-of-one / co-resident** → the plan is `{admit:[target], evict:[]}` → byte-for-byte
+    ///    today's lazy-load-and-keep-resident behavior.
+    ///  - **Eviction** → the plan names GPU-lane victims (chat) to evict; we evict the resident runtime if
+    ///    it is among them, then load the target.
+    ///  - **Infeasible** → throws `FleetError.cannotAdmit`; the displayed state settles `.failed`, never a
+    ///    false `.loaded`.
+    @discardableResult
+    public func ensureResident(_ id: String) async throws -> LLMRuntime? {
+        guard optedIn else {
+            throw RuntimeError.unavailable(reason: "AI commands opt-in is off")
+        }
+        guard let fleet else {
+            // No fleet wired → fall back to today's single-model load over the value catalog.
+            return try await loadIfNeeded()
+        }
+        guard let target = fleet.descriptors().first(where: { $0.id == id }) else {
+            throw RuntimeError.modelMissing
+        }
+
+        // Cloud member: residency no-op. Route through the gate (off → cloudDisabled; on → escalation).
+        if target.provider == .cloud {
+            try await cloudGate.select(target)
+            return nil
+        }
+
+        // The pure plan over the fleet, against the live free-memory probe (D3). Infeasible → fail.
+        let resident = fleet.resident().map(\.id)
+        let plan = residencyPlanner.plan(target: id,
+                                         descriptors: fleet.descriptors(),
+                                         budgetBytes: fleetBudgetBytes,
+                                         freeBytes: fleetFreeBytes(),
+                                         currentlyResident: resident)
+        if plan.infeasible {
+            let details = plan.evict.isEmpty ? nil
+                : "Tried to evict: \(plan.evict.joined(separator: ", "))"
+            let err = FleetError.cannotAdmit(modelName: target.displayName, evictedDetails: details)
+            let presented = AIError.message(for: err)
+            // Observable failure for THIS selection — never a false "loaded" (D7).
+            activeDescriptor = target
+            state = .failed(reason: presented.headline, details: presented.details)
+            throw err
+        }
+
+        // Apply the plan: EVICT each named id via the existing evict path (the manager holds one resident
+        // runtime in Core; if that resident is among the victims, evict it). The fleet's full multi-runtime
+        // co-residency is only realized in the user's stable-signed build — Core proves the math + wiring.
+        if let residentDesc = residentDescriptor, plan.evict.contains(residentDesc.id) {
+            evict()
+        }
+        // Tell the fleet bookkeeping to admit the target (records residency; pure for FleetRoster).
+        try await fleet.ensureResident(id)
+
+        // LOAD the target through the EXISTING path (provisioner real / runtimeFactory dev-stub).
+        return try await loadDescriptor(target)
+    }
+
+    /// Load a SPECIFIC descriptor resident through the existing seams (a fleet target). Reuses
+    /// `runProvisioner` (real path) / `runtimeFactory` (dev path) — no new provisioning logic.
+    /// Concurrent callers share ONE load (`coalescedLoad`).
+    @discardableResult
+    private func loadDescriptor(_ descriptor: ModelDescriptor) async throws -> LLMRuntime {
+        // Warm hit: already the resident runtime → no cold load.
+        if let runtime = residentRuntime, residentDescriptor?.id == descriptor.id {
+            state = .loaded
+            return runtime
+        }
+        return try await coalescedLoad(descriptor.id) { [self] in
+            try await loadDescriptorBody(descriptor)
+        }
+    }
+
+    /// The actual per-descriptor load body behind the single-flight gate (warm re-check first — a
+    /// drained in-flight load may already have made this descriptor resident).
+    private func loadDescriptorBody(_ descriptor: ModelDescriptor) async throws -> LLMRuntime {
+        if let runtime = residentRuntime, residentDescriptor?.id == descriptor.id {
+            state = .loaded
+            return runtime
+        }
+        guard hardwareSupports(descriptor) else {
+            state = .failed(reason: "This Mac cannot run \(descriptor.displayName)")
+            throw RuntimeError.unavailable(reason: "Unsupported hardware for \(descriptor.id)")
+        }
+        activeDescriptor = descriptor
+        if let provisioner {
+            guard provisionedOnDisk(descriptor) else { throw RuntimeError.modelMissing }
+            try await runProvisioner(descriptor, provisioner: provisioner, mode: .load)
+            guard let runtime = residentRuntime else { throw RuntimeError.modelMissing }
+            return runtime
+        }
+        // Dev/byte path: build the stub runtime resident for this descriptor.
+        state = .loading
+        do {
+            let runtime = try runtimeFactory(descriptor)
+            residentRuntime = runtime
+            residentDescriptor = descriptor
+            state = .loaded
+            return runtime
+        } catch {
+            let presented = AIError.message(for: error)
+            state = .failed(reason: presented.headline, details: presented.details)
+            throw error
+        }
+    }
+
+    /// The fleet's currently-resident descriptors (the §C1 `resident()` view), or `[]` with no fleet.
+    public func fleetResident() -> [ModelDescriptor] { fleet?.resident() ?? [] }
+
     /// The currently resident runtime, if loaded (nil otherwise). Exposed for tests / introspection.
     public var currentRuntime: LLMRuntime? { residentRuntime }
 
@@ -454,6 +671,12 @@ public final class ModelManager: ObservableObject {
     /// provisioner branch, "Evict from memory" would leave the row stuck showing "Loaded" while nothing
     /// is resident.
     public func evict() {
+        // An eviction (opt-in off, memory pressure, a fleet plan) also CANCELS any in-flight load —
+        // otherwise the load would complete after this and silently resurrect a resident model. The
+        // provisioner observes the cancellation and rewinds state; joiners get `.cancelled`.
+        loadTask?.cancel()
+        loadTask = nil
+        loadTaskDescriptorID = nil
         let descriptor = residentDescriptor
         residentRuntime = nil
         residentDescriptor = nil

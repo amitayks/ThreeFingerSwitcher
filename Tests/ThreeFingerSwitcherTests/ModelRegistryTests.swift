@@ -7,7 +7,7 @@ import XCTest
 /// requirement fails clearly instead of degrading.
 final class ModelRegistryTests: XCTestCase {
 
-    private let registry = ModelRegistry.standard
+    private let registry = ModelCatalog.standard
 
     func testStandardRegistryHasTheThreeKnownEntries() {
         let ids = Set(registry.models.map(\.id))
@@ -40,7 +40,7 @@ final class ModelRegistryTests: XCTestCase {
 
     func testSelectionFailsClearlyWhenNoModelSatisfies() {
         // A registry whose only model is text-only cannot serve a vision command.
-        let textOnly = ModelRegistry(
+        let textOnly = ModelCatalog(
             models: [ModelDescriptor(
                 id: "text-only",
                 displayName: "Text Only",
@@ -62,7 +62,7 @@ final class ModelRegistryTests: XCTestCase {
     func testSelectionFallsBackToFirstQualifyingWhenDefaultDisqualified() throws {
         // Make the default text-only; a vision requirement should then pick the next qualifying entry
         // (the 26B-A4B comes before 12B in curated order).
-        var r = ModelRegistry.standard
+        var r = ModelCatalog.standard
         r.defaultModelID = "gemma-4-12b" // default is audio-capable but we ask for something it has too
         // Ask for vision: 12B qualifies and is the default, so it is preferred.
         let chosen = try r.selectModel(requiring: [.vision])
@@ -70,7 +70,7 @@ final class ModelRegistryTests: XCTestCase {
     }
 
     func testDefaultSwitchIsAOneLineChange() throws {
-        var r = ModelRegistry.standard
+        var r = ModelCatalog.standard
         r.defaultModelID = "gemma-4-26b-a4b" // the documented speed alternative
         let chosen = try r.selectModel(requiring: [.text])
         XCTAssertEqual(chosen.id, "gemma-4-26b-a4b", "switching the default re-routes selection")

@@ -9,21 +9,25 @@ import Foundation
 struct BackgroundToolRunner: Sendable {
     let resolver: BackgroundPolicyResolver
     let audit: AuditLog
-    /// The parked-sessions escalation seam (`.dangerous` while parked → `.needsYou` + glow). nil in a
-    /// pure foreground context.
-    let scheduler: ParkScheduler?
+    /// The parked-sessions escalation seam (`.dangerous` while parked → `.needsYou` + badge). Routed
+    /// through the CONTROLLER (`ParkController.escalate` — persist + repaint), never a raw scheduler
+    /// mutation, so a background needs-you survives relaunch and repaints the rail
+    /// (`refactor-park-and-background-agents`). nil in a pure foreground context. Called OFF the main
+    /// actor — the injector hops as needed.
+    let onEscalate: (@Sendable (AgentSessionID, String) -> Void)?
     /// The session's current park state (keyed lookup; `.active` foreground by default).
     let parkStateOf: @Sendable (AgentSessionID) -> ParkState
     /// The routed call's whitelist target (per-tool; `.none` by default — calendar/contacts are never
     /// whitelist-lowerable).
     let targetOf: @Sendable (RoutedCall) -> PolicyTarget
 
-    init(resolver: BackgroundPolicyResolver, audit: AuditLog, scheduler: ParkScheduler? = nil,
+    init(resolver: BackgroundPolicyResolver, audit: AuditLog,
+         onEscalate: (@Sendable (AgentSessionID, String) -> Void)? = nil,
          parkStateOf: @escaping @Sendable (AgentSessionID) -> ParkState = { _ in .active },
          targetOf: @escaping @Sendable (RoutedCall) -> PolicyTarget = { _ in .none }) {
         self.resolver = resolver
         self.audit = audit
-        self.scheduler = scheduler
+        self.onEscalate = onEscalate
         self.parkStateOf = parkStateOf
         self.targetOf = targetOf
     }
@@ -45,10 +49,12 @@ struct BackgroundToolRunner: Sendable {
         case .foreground:
             result = await registry.run(call, gate: gate)   // the canvas approval gate owns confirm here
         case .waitParked:
+            // The loop PAUSES on this status (`.pausedAwaitingUser`) — the step is genuinely pending,
+            // resolved when the user brings the session back; never silently skipped-and-continued.
             result = ToolStepResult(tool: call.descriptor.name, status: .awaitingApproval,
                                     summary: "Waiting for your approval.")
         case let .escalate(reason):
-            scheduler?.escalate(sessionID, reason: reason)
+            onEscalate?(sessionID, reason)
             result = ToolStepResult(tool: call.descriptor.name, status: .awaitingApproval, summary: reason)
         }
 

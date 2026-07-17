@@ -1,18 +1,17 @@
 import Foundation
 
-/// The pure parked-session lifecycle (design §7 / D1): max-count eviction (idle-only) and the
-/// idle-/terminal auto-dismiss countdown. `now:` is injected so eviction-victim selection + dismissability
-/// are deterministic. MLX-free Core.
+/// The pure parked-session lifecycle: max-count eviction (idle-only) and the OPT-IN idle expiry
+/// countdown. `now:` is injected so eviction-victim selection + dismissability are deterministic.
+/// MLX-free Core.
 ///
-/// Per D1 the old summarize-and-sleep flow (`ParkSleepRequesting` + `sleepable`) is RETIRED: a session
-/// idle past its countdown — or one whose task COMPLETED — is DISMISSED FOREVER through the same
-/// authoritative discard path as a manual dismiss, never summarized-and-slept.
+/// There is NO terminal auto-dismiss (`refactor-park-and-background-agents`): a settled turn never
+/// removes a session. Expiry defaults OFF (countdown 0 = never) and NEVER touches a session with unseen
+/// results — deletion is otherwise the user's alone (discard/purge), with eviction as the soft bound.
 struct ParkLifecycle {
     /// Soft target for the parked set; when exceeded, the least-recently-updated IDLE session is evicted.
     var maxParked: Int
-    /// How long a non-protected `.parked`/`.idle` session may sit idle before it is AUTO-DISMISSED forever
-    /// (design D1, one user-configurable countdown, default 300s). A `.completed` (terminal) row is
-    /// dismissed immediately regardless of age.
+    /// How long an `.idle`, fully-seen session may sit before it is auto-dismissed forever. `<= 0`
+    /// DISABLES expiry entirely (the default — sessions never age out unless the user opts in).
     var autoDismissCountdown: TimeInterval
 
     init(maxParked: Int, autoDismissCountdown: TimeInterval) {
@@ -20,16 +19,18 @@ struct ParkLifecycle {
         self.autoDismissCountdown = autoDismissCountdown
     }
 
-    /// Sessions to AUTO-DISMISS FOREVER (design D1): every TERMINAL (`.completed`) row regardless of age,
-    /// PLUS every non-protected (`.parked`/`.idle`) row whose idle age exceeds `autoDismissCountdown`.
-    /// `.active`/`.needsYou` are NEVER touched (the user's attention / a pending escalation is protected).
+    /// Sessions to AUTO-DISMISS FOREVER under the opt-in expiry: `.idle` rows with NO unseen results
+    /// (`badgeCount == 0` — an unseen answer protects its session indefinitely) whose idle age exceeds
+    /// the countdown. `.active`/`.needsYou` (protected) and `.parked` (pending work — streaming, dormant
+    /// on an approval, or scheduled) are NEVER touched. A countdown of 0 (the default) dismisses nothing.
     /// Pure; `now:` injected. Each returned id is routed through the authoritative `discard(_:)` path.
     func dismissable(_ sessions: [ParkedSession], now: Date) -> [AgentSessionID] {
-        sessions
+        guard autoDismissCountdown > 0 else { return [] }
+        return sessions
             .filter { session in
-                if session.state.isProtectedFromAging { return false }   // active/needsYou never dismissed
-                if session.state.isTerminal { return true }              // completed → dismiss now
-                return now.timeIntervalSince(session.updatedAt) > autoDismissCountdown
+                session.state == .idle
+                    && session.badgeCount == 0
+                    && now.timeIntervalSince(session.updatedAt) > autoDismissCountdown
             }
             .map(\.id)
     }

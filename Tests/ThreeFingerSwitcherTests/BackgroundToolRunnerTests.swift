@@ -18,11 +18,15 @@ final class BackgroundToolRunnerTests: XCTestCase {
         func canHandle(_ tool: String) -> Bool { list.contains { $0.name == tool } }
         func run(_ call: RoutedCall, gate: ApprovalGate) async -> ToolStepResult { runCalled = true; return result }
     }
-    private final class SpyScheduler: ParkScheduler, @unchecked Sendable {
-        private(set) var escalated: [(AgentSessionID, String)] = []
-        func runnableSessions(now: Date, maxSlots: Int) -> [AgentSessionID] { [] }
-        func didAdvance(_ id: AgentSessionID, result: ToolStepResult, taskComplete: Bool) {}
-        func escalate(_ id: AgentSessionID, reason: String) { escalated.append((id, reason)) }
+    /// Records escalations routed through the runner's `onEscalate` callback (the controller seam —
+    /// `refactor-park-and-background-agents` replaced the raw scheduler reference).
+    private final class EscalationSpy: @unchecked Sendable {
+        private let lock = NSLock()
+        private var recorded: [(AgentSessionID, String)] = []
+        var escalated: [(AgentSessionID, String)] { lock.lock(); defer { lock.unlock() }; return recorded }
+        func record(_ id: AgentSessionID, _ reason: String) {
+            lock.lock(); recorded.append((id, reason)); lock.unlock()
+        }
     }
 
     private func desc(_ name: String, _ policy: WritePolicyTier) -> ToolDescriptor {
@@ -32,8 +36,9 @@ final class BackgroundToolRunnerTests: XCTestCase {
     private func call(_ d: ToolDescriptor) -> RoutedCall {
         RoutedCall(descriptor: d, route: ToolRoute(tool: d.name, argumentsJSON: "{}"), userText: "u", source: TaskSource())
     }
-    private func runner(parkState: ParkState, audit: AuditLog, scheduler: SpyScheduler? = nil) -> BackgroundToolRunner {
-        BackgroundToolRunner(resolver: BackgroundPolicyResolver(), audit: audit, scheduler: scheduler,
+    private func runner(parkState: ParkState, audit: AuditLog, onEscalate: EscalationSpy? = nil) -> BackgroundToolRunner {
+        BackgroundToolRunner(resolver: BackgroundPolicyResolver(), audit: audit,
+                             onEscalate: onEscalate.map { spy in { spy.record($0, $1) } },
                              parkStateOf: { _ in parkState })
     }
 
@@ -66,15 +71,15 @@ final class BackgroundToolRunnerTests: XCTestCase {
 
     func testParkedDangerousEscalatesAndAudits() async {
         let audit = InMemoryAuditLog()
-        let spy = SpyScheduler()
+        let spy = EscalationSpy()
         let d = desc("launch_claude", .dangerous)
         let c = FakeContributor([d], result: ToolStepResult(tool: d.name, status: .done, summary: "x"))
         let id = AgentSessionID()
-        let r = await runner(parkState: .parked, audit: audit, scheduler: spy)
+        let r = await runner(parkState: .parked, audit: audit, onEscalate: spy)
             .run(call(d), sessionID: id, registry: ToolRegistry([c]), gate: AutoApproveGate())
         XCTAssertEqual(r.status, .awaitingApproval)
         XCTAssertFalse(c.runCalled, "a parked .dangerous step never fires without foreground approval")
-        XCTAssertEqual(spy.escalated.count, 1, "it escalates to the foreground via the scheduler")
+        XCTAssertEqual(spy.escalated.count, 1, "it escalates through the controller-routed callback")
         XCTAssertEqual(spy.escalated.first?.0, id)
         XCTAssertEqual(audit.recent(limit: 5).first?.policy, .dangerous)
     }
@@ -105,6 +110,46 @@ final class BackgroundToolRunnerTests: XCTestCase {
         let result = await loop.run(context: RouteContext(messages: [AgentMessage(role: .user, text: "save it")]))
         XCTAssertEqual(result.outcome, .answered(text: "done"))
         XCTAssertEqual(audit.recent(limit: 5).count, 1, "the loop's tool step was routed through the runner + audited")
+    }
+
+    /// `refactor-park-and-background-agents`: a parked `.confirm` step PAUSES the loop — the step is
+    /// neither run nor skipped, and NO final answer is fabricated over the phantom work (the old
+    /// `continue` on `.awaitingApproval` marched on and synthesized a completion).
+    func testAgentLoopPausesOnParkedConfirmWithoutFabricatingAnAnswer() async {
+        let audit = InMemoryAuditLog()
+        let d = desc("send_to", .confirm)
+        let contributor = FakeContributor([d], result: ToolStepResult(tool: d.name, status: .done, summary: "sent"))
+        let bg = BackgroundToolRunner(resolver: BackgroundPolicyResolver(), audit: audit,
+                                      parkStateOf: { _ in .parked })
+        let rt = RoutingRuntime(routes: ["{\"tool\":\"send_to\"}", "{\"tool\":\"\"}"],
+                                answer: ["should never stream"])
+        let loop = AgentLoop(runtime: rt, registry: ToolRegistry([contributor]),
+                             candidateSource: KeywordToolCandidateSource(all: [d]),
+                             gate: AutoApproveGate(), backgroundRunner: bg)
+        let result = await loop.run(context: RouteContext(messages: [AgentMessage(role: .user, text: "send it")]))
+        XCTAssertEqual(result.outcome, .pausedAwaitingUser, "a parked confirm pauses honestly")
+        XCTAssertFalse(contributor.runCalled, "the pending step never fired")
+        XCTAssertEqual(result.steps.last?.status, .awaitingApproval, "the pending step is observable state")
+    }
+
+    /// A parked `.dangerous` step pauses the loop AND escalates through the controller-routed callback.
+    func testAgentLoopPausesAndEscalatesOnParkedDangerous() async {
+        let audit = InMemoryAuditLog()
+        let spy = EscalationSpy()
+        let d = desc("launch_claude", .dangerous)
+        let contributor = FakeContributor([d], result: ToolStepResult(tool: d.name, status: .done, summary: "x"))
+        let bg = BackgroundToolRunner(resolver: BackgroundPolicyResolver(), audit: audit,
+                                      onEscalate: { spy.record($0, $1) },
+                                      parkStateOf: { _ in .parked })
+        let rt = RoutingRuntime(routes: ["{\"tool\":\"launch_claude\"}", "{\"tool\":\"\"}"],
+                                answer: ["should never stream"])
+        let loop = AgentLoop(runtime: rt, registry: ToolRegistry([contributor]),
+                             candidateSource: KeywordToolCandidateSource(all: [d]),
+                             gate: AutoApproveGate(), backgroundRunner: bg)
+        let result = await loop.run(context: RouteContext(messages: [AgentMessage(role: .user, text: "go")]))
+        XCTAssertEqual(result.outcome, .pausedAwaitingUser)
+        XCTAssertFalse(contributor.runCalled, "the dangerous step never fired in the background")
+        XCTAssertEqual(spy.escalated.count, 1, "the escalation reached the controller seam")
     }
 
     /// A minimal routing runtime: structured() dequeues scripted route JSON; generate() streams an answer.

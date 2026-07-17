@@ -11,6 +11,7 @@
 import Foundation
 import ThreeFingerSwitcherCore
 import Gemma4Swift
+import MLX
 
 /// The composition root for the real, in-process Gemma 4 runtime.
 public enum GemmaRuntime {
@@ -55,6 +56,7 @@ public enum GemmaRuntime {
                                         cpuLaneUnlocked: Bool = false,
                                         batchedRuntimeUnlocked: Bool = false) -> ModelManager {
         configureModelStorage()   // relocate the model store off purgeable ~/Library/Caches (see below)
+        configureGPUCacheLimit()  // bound the MLX Metal buffer cache (see below)
         // Install the CPU ternary lane ONLY when the gate is on (returns nil when OFF → GPU lane alone,
         // today's behavior). Weights live under the same model cache root the chat path loads from, keyed
         // off the ternary fleet descriptor's HF repo path (mirrors `makeImageRuntime`'s weights dir).
@@ -162,6 +164,7 @@ public enum GemmaRuntime {
     @MainActor
     public static func makeImageRuntime(imageModelID: String?) -> MediaRuntime? {
         configureModelStorage()   // ensure the non-purgeable model root is in effect (idempotent)
+        configureGPUCacheLimit()  // ensure the bounded Metal buffer cache is in effect (idempotent)
         guard let descriptor = ImageModelCatalog.selected(imageModelID: imageModelID) else {
             return nil   // unknown id → rejected, no dead-end tool
         }
@@ -174,6 +177,21 @@ public enum GemmaRuntime {
         return MFluxImageRuntime(descriptor: descriptor,
                                  weightsURL: weightsURL,
                                  outputDirectory: MediaGallery.defaultRoot())
+    }
+
+    /// Bound MLX's Metal buffer cache (`fix-model-load-coalescing-and-gpu-cache`). By default the cache
+    /// is UNBOUNDED: every freed generation buffer is retained for reuse and never returned to the OS —
+    /// measured live as **24 GB of dirty IOAccelerator memory for a ~17 GB model after one short chat**,
+    /// creeping further with use (the vendored pipeline clears it only on `unload()`). 2 GB is enough to
+    /// recycle per-token scratch across a streaming turn while letting a settled app's footprint track
+    /// the model size; generation beyond the limit falls back to direct Metal allocations (a perf
+    /// trade-off, never a correctness one). Idempotent; both factory entry points call it before any
+    /// runtime exists. Tune here, in one place, if profiling ever argues for a different bound.
+    nonisolated(unsafe) private static var gpuCacheConfigured = false
+    static func configureGPUCacheLimit() {
+        guard !gpuCacheConfigured else { return }
+        gpuCacheConfigured = true
+        MLX.GPU.set(cacheLimit: 2 * 1024 * 1024 * 1024)
     }
 
     /// The model store must live under a **non-purgeable** root. The vendored `Gemma4ModelCache` defaults

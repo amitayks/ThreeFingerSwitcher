@@ -346,9 +346,10 @@ final class AppSettings: ObservableObject {
     /// a one-line resume). Seconds. RETIRED by design D1 (no live consumer) — kept only so an existing
     /// stored value migrates cleanly; the live aging behavior is now `agentParkAutoDismissCountdown`.
     @Published var agentParkIdleTimeout: TimeInterval { didSet { defaults.set(agentParkIdleTimeout, forKey: Keys.agentParkIdleTimeout) } }
-    /// The single user-configurable AUTO-DISMISS countdown (design D1): a parked/idle session untouched for
-    /// this long — and any session whose task COMPLETED — is dismissed FOREVER through the same
-    /// authoritative discard path as a manual dismiss (no summarize-and-sleep). Seconds; default 300 (5 min).
+    /// The OPT-IN auto-dismiss countdown (`refactor-park-and-background-agents`): an idle, fully-seen
+    /// session untouched for this long is dismissed forever through the authoritative discard path.
+    /// Seconds; **0 = never (the default)** — chats persist until the user deletes them (or the
+    /// max-parked eviction bounds the rail). Unseen results always protect a session from expiry.
     @Published var agentParkAutoDismissCountdown: TimeInterval { didSet { defaults.set(agentParkAutoDismissCountdown, forKey: Keys.agentParkAutoDismissCountdown) } }
     /// The two-finger UP excursion (normalized) past the canvas bottom that parks the conversation. Sits
     /// ABOVE the incidental scroll threshold (`canvasResolveThreshold`) so a normal scroll-to-bottom
@@ -856,7 +857,7 @@ final class AppSettings: ObservableObject {
         static let agentCompactKV = false          // 8-bit KV off by default
         static let agentMaxParkedSessions = 6      // soft cap; evicts the least-recently-updated idle one
         static let agentParkIdleTimeout: TimeInterval = 30 * 60   // RETIRED (D1): legacy summarize-and-sleep
-        static let agentParkAutoDismissCountdown: TimeInterval = 300   // 5 min idle → auto-dismiss forever (D1)
+        static let agentParkAutoDismissCountdown: TimeInterval = 0   // 0 = never — expiry is opt-in
         static let agentOverscrollParkThreshold = 0.22            // above canvasResolveThreshold (0.12)
         static let agentNotchRevealDwell: TimeInterval = 0.3      // dwell behind the notch before the dock reveals
         static let flickVelocityThreshold = 0.8                   // peak normalized vel/sec; below = reading-scroll (D4, run-verify)

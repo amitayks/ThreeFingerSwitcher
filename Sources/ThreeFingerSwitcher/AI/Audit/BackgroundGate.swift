@@ -42,14 +42,13 @@ public enum BackgroundGate {
         case .confirm:
             switch parkState {
             case .active:                          return .foreground
-            case .parked, .idle, .completed:       return .waitParked
+            case .parked, .idle:                   return .waitParked
             case .needsYou:                        return .waitParked   // handled above; exhaustive for the compiler
             }
         case .dangerous:
             switch parkState {
             case .active:                          return .foreground   // already in front; the canvas gate owns it
             case .parked, .idle:                   return .escalate(reason: escalationReason(tool: tool))
-            case .completed:                       return .waitParked   // terminal — no new dangerous step runs
             case .needsYou:                        return .waitParked    // handled above
             }
         }

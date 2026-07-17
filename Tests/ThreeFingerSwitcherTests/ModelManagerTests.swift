@@ -48,8 +48,8 @@ final class ModelManagerTests: XCTestCase {
     /// verifies. Capabilities default to text+vision.
     private func registry(matching payload: Data,
                           capabilities: Set<Modality> = [.text, .vision],
-                          id: String = "test-model") -> ModelRegistry {
-        ModelRegistry(
+                          id: String = "test-model") -> ModelCatalog {
+        ModelCatalog(
             models: [ModelDescriptor(
                 id: id,
                 displayName: "Test Model",
@@ -484,6 +484,88 @@ final class ModelManagerTests: XCTestCase {
         XCTAssertEqual(counter.count, 2, "the warm reload re-runs the provisioner (load), still no byte fetch path")
     }
 
+    // MARK: - Single-flight loading (fix-model-load-coalescing-and-gpu-cache)
+
+    /// A provisioner-backed manager whose provisioner SLEEPS (so racing callers genuinely overlap the
+    /// multi-second load window the real ~17 GB load has) and counts invocations; optionally fails.
+    private func slowProvisionerManager(counter: ProvisionCounter,
+                                        delayNanos: UInt64 = 50_000_000,
+                                        failing: Bool = false) -> ModelManager {
+        let payload = Data("w".utf8)
+        return ModelManager(
+            registry: registry(matching: payload),
+            downloader: FakeDownloader(payload: payload),
+            optedIn: true,
+            storageRoot: tempRoot(),
+            provisioner: { descriptor, progress in
+                counter.bump()
+                try await Task.sleep(nanoseconds: delayNanos)
+                if failing { throw RuntimeError.modelLoadFailed(detail: "scripted load failure") }
+                progress(1.0)
+                return StubLLMRuntime(capabilities: descriptor.capabilities)
+            },
+            provisionedOnDisk: { _ in true }
+        )
+    }
+
+    /// THE double-load regression (caught live in the unified log: two overlapping `prepare` runs →
+    /// two full weight sets resident): racing loads must coalesce into ONE provisioner run.
+    func testConcurrentLoadIfNeededRunsProvisionerExactlyOnce() async throws {
+        let counter = ProvisionCounter()
+        let manager = slowProvisionerManager(counter: counter)
+        async let first = manager.loadIfNeeded()
+        async let second = manager.loadIfNeeded()
+        let (a, b) = try await (first, second)
+        XCTAssertEqual(counter.count, 1, "racing loads coalesce into ONE provisioner run")
+        XCTAssertTrue(a as AnyObject === b as AnyObject, "both racers receive the SAME loaded runtime")
+        XCTAssertTrue(manager.isResident)
+        XCTAssertEqual(manager.state, .loaded)
+    }
+
+    /// The real-world racing pair — a capability-resolved turn and a plain load (e.g. a user send and
+    /// a background advance during the load window) — shares one load too.
+    func testRuntimeRequestRacingLoadIfNeededSharesOneLoad() async throws {
+        let counter = ProvisionCounter()
+        let manager = slowProvisionerManager(counter: counter)
+        async let viaCapability = manager.runtime(requiring: [.text])
+        async let viaPlainLoad = manager.loadIfNeeded()
+        _ = try await (viaCapability, viaPlainLoad)
+        XCTAssertEqual(counter.count, 1, "a turn racing an advance pays the cold-load cost exactly once")
+        XCTAssertTrue(manager.isResident)
+    }
+
+    /// A failed shared load fails EVERY joiner (never a hang, never a stub) and clears the in-flight
+    /// task so a later retry starts a fresh load.
+    func testFailedSharedLoadFailsBothJoinersAndRetryStartsFresh() async {
+        let counter = ProvisionCounter()
+        let manager = slowProvisionerManager(counter: counter, failing: true)
+        async let first = manager.loadIfNeeded()
+        async let second = manager.loadIfNeeded()
+        var failures = 0
+        do { _ = try await first; XCTFail("the shared failure must reach the starter") } catch { failures += 1 }
+        do { _ = try await second; XCTFail("the shared failure must reach the joiner") } catch { failures += 1 }
+        XCTAssertEqual(failures, 2)
+        XCTAssertEqual(counter.count, 1, "one failing run — the joiner never triggers a second")
+
+        do { _ = try await manager.loadIfNeeded() } catch { /* fails again; only the count matters */ }
+        XCTAssertEqual(counter.count, 2, "a retry after failure starts FRESH (the in-flight task was cleared)")
+    }
+
+    /// Evicting mid-load (opt-in off, a fleet plan) cancels the in-flight load — a completing load must
+    /// never resurrect a resident model behind the eviction.
+    func testEvictMidLoadCancelsTheInFlightLoad() async {
+        let counter = ProvisionCounter()
+        let manager = slowProvisionerManager(counter: counter, delayNanos: 200_000_000)
+        async let load = manager.loadIfNeeded()
+        try? await Task.sleep(nanoseconds: 20_000_000)   // let the load get in flight
+        manager.evict()
+        do {
+            _ = try await load
+            XCTFail("an evicted in-flight load must cancel, not complete")
+        } catch { /* cancelled — the expected outcome */ }
+        XCTAssertFalse(manager.isResident, "the cancelled load never resurrects a resident model")
+    }
+
     // MARK: - Per-model status + delete
 
     /// A mutable on-disk model set the provisioner-path probe & delete read/write, so a test can assert a
@@ -498,13 +580,13 @@ final class ModelManagerTests: XCTestCase {
     }
 
     /// A two-model registry (default = "model-a") so per-model selection/status is exercisable.
-    private func twoModelRegistry() -> ModelRegistry {
+    private func twoModelRegistry() -> ModelCatalog {
         func descriptor(_ id: String) -> ModelDescriptor {
             ModelDescriptor(id: id, displayName: id, sizeBytes: 1, integritySHA: "sha-\(id)",
                             downloadURL: URL(string: "https://models.invalid/\(id)")!,
                             capabilities: [.text, .vision], quantization: .qat4bit)
         }
-        return ModelRegistry(models: [descriptor("model-a"), descriptor("model-b")], defaultModelID: "model-a")
+        return ModelCatalog(models: [descriptor("model-a"), descriptor("model-b")], defaultModelID: "model-a")
     }
 
     /// A provisioner-backed manager whose disk state is the mutable `disk` (probe + delete go through it).

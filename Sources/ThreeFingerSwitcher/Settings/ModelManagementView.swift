@@ -8,7 +8,7 @@ import AppKit
 /// owns the lifecycle; the view re-renders as `@Published state` advances.
 ///
 /// The view takes the resolved `ModelDescriptor` it represents (the selected model) so the call site
-/// — Settings, with `AppSettings.aiSelectedModelID` resolved against `ModelRegistry` — decides which
+/// — Settings, with `AppSettings.aiSelectedModelID` resolved against `ModelCatalog` — decides which
 /// model is shown; the view just reflects the manager's state for it.
 struct ModelManagementView: View {
     @ObservedObject var manager: ModelManager

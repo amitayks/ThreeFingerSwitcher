@@ -7,30 +7,20 @@ enum AgentStopReason: Equatable, Sendable {
     case cancelled      // the user discarded the canvas (a discard, never a failure)
 }
 
-/// The terminal outcome of the bounded agent loop (design D7). Every outcome except `.cancelled` carries
-/// the best-effort final answer text — the loop NEVER ends with a bare halt.
+/// The terminal outcome of the bounded agent loop (design D7). Every text-carrying outcome holds the
+/// best-effort final answer — the loop NEVER ends with a bare halt. `.pausedAwaitingUser` is the one
+/// deliberate exception (`refactor-park-and-background-agents`): a background approval pause ends the
+/// turn with NO fabricated answer — the pending step is observable state, not a completion. There is no
+/// "task complete" notion here anymore: the old terminal classification let a docked chat's settled
+/// answer auto-dismiss (delete) its session.
 enum AgentLoopOutcome: Equatable, Sendable {
     case answered(text: String)
     case capReached(text: String)
     case stopped(reason: AgentStopReason, text: String)
+    /// A step is pending on the user (background waitParked/escalate): the loop pauses honestly — the
+    /// step is neither run nor skipped, and no final answer is synthesized.
+    case pausedAwaitingUser
     case failed(headline: String)
-
-    /// Whether this outcome represents the TASK having FINISHED (design D1 / Bug 3 terminal detection):
-    /// a plain answer, the bounded cap, or a `.stopped` with nothing pending all mean the work is done
-    /// and the parked row may auto-dismiss forever. `.cancelled` (a discard, not a completion) and
-    /// `.failed` (an observable failure the user may want to retry) are EXCLUDED — neither marks terminal.
-    /// A `.stopped(reason: .cancelled)` is a discard, never a completion.
-    var isTaskComplete: Bool {
-        switch self {
-        case .answered, .capReached:
-            return true
-        case let .stopped(reason, _):
-            // A stop-with-no-pending (spinning / no-progress) is a completed task; a cancellation is not.
-            return reason != .cancelled
-        case .failed:
-            return false
-        }
-    }
 }
 
 /// The loop's full result: the outcome plus the ordered tool steps it ran (the canvas binds these as
@@ -149,8 +139,14 @@ struct AgentLoop: Sendable {
                         return await answer(context, steps: steps, terminator: .stopped(.noProgress))
                     }
                     continue   // the model sees the decline and may pivot
-                case .done, .awaitingApproval:
-                    continue   // .awaitingApproval is resolved inside the contributor's gate await
+                case .done:
+                    continue
+                case .awaitingApproval:
+                    // Only the BACKGROUND runner returns this status as a result (the foreground gate
+                    // resolves inside the contributor's await, yielding done/declined): the step is
+                    // pending on the user — pause the turn honestly. Continuing here would neither run
+                    // nor suspend the step and would fabricate a final answer over phantom work.
+                    return AgentLoopResult(outcome: .pausedAwaitingUser, steps: steps)
                 }
             }
         }

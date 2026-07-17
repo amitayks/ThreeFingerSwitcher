@@ -341,15 +341,13 @@ final class ToolRoutingTests: XCTestCase {
         XCTAssertEqual(dispatcher.executed, 0, "cancel fires no side effect")
     }
 
-    /// Bug 3 / D1 terminal detection: `answered`/`capReached`/`stopped`(non-cancel) are TASK-COMPLETE; a
-    /// cancellation (a discard) and a failure are NOT — they never mark a parked row terminal.
-    func testAgentLoopOutcomeIsTaskComplete() {
-        XCTAssertTrue(AgentLoopOutcome.answered(text: "x").isTaskComplete)
-        XCTAssertTrue(AgentLoopOutcome.capReached(text: "x").isTaskComplete)
-        XCTAssertTrue(AgentLoopOutcome.stopped(reason: .repeatedStep, text: "x").isTaskComplete)
-        XCTAssertTrue(AgentLoopOutcome.stopped(reason: .noProgress, text: "x").isTaskComplete)
-        XCTAssertFalse(AgentLoopOutcome.stopped(reason: .cancelled, text: "").isTaskComplete)
-        XCTAssertFalse(AgentLoopOutcome.failed(headline: "Disk full.").isTaskComplete)
+    /// `refactor-park-and-background-agents`: the terminal "task complete" classification was RETIRED —
+    /// a settled outcome never marks a session for removal. The outcome cases remain distinct values
+    /// (the engine maps them to settlements; the paused case never fabricates text).
+    func testAgentLoopOutcomeCasesStayDistinct() {
+        XCTAssertNotEqual(AgentLoopOutcome.answered(text: "x"), .capReached(text: "x"))
+        XCTAssertNotEqual(AgentLoopOutcome.stopped(reason: .cancelled, text: ""), .pausedAwaitingUser)
+        XCTAssertNotEqual(AgentLoopOutcome.pausedAwaitingUser, .failed(headline: "x"))
     }
 
     // MARK: - Test helpers

@@ -27,7 +27,14 @@ let package = Package(
         // the committed Package.resolved pinned a good commit. An exact revision freezes it everywhere.
         // To bump: change the SHA here, re-resolve, and verify with `xcodebuild`.
         .package(url: "https://github.com/VincentGourbin/gemma-4-swift-mlx",
-                 revision: "c6f8ab5820379898b1d437e8e5c463f376672613")
+                 revision: "c6f8ab5820379898b1d437e8e5c463f376672613"),
+        // Flux 2 image-generation runtime (MLX). Pins mlx-swift to the SAME exact 0.31.4 as
+        // gemma-4-swift-mlx, so it resolves with no version change. Linked into GemmaRuntime ONLY
+        // (keeps ThreeFingerSwitcherCore MLX-free). PINNED to an exact revision (same rationale as
+        // gemma above: upstream `main` drifts). To bump: change the SHA here, re-resolve, verify
+        // with `xcodebuild`.
+        .package(url: "https://github.com/VincentGourbin/flux-2-swift-mlx",
+                 revision: "add498c4a30581d4457ef513bbfe8c9c097c504c")
     ],
     targets: [
         // All app logic lives in this library so the test target can `@testable import` it.
@@ -56,7 +63,11 @@ let package = Package(
             name: "GemmaRuntime",
             dependencies: [
                 "ThreeFingerSwitcherCore",
-                .product(name: "Gemma4Swift", package: "gemma-4-swift-mlx")
+                .product(name: "Gemma4Swift", package: "gemma-4-swift-mlx"),
+                // Flux 2 image-generation (MLX). Same exact mlx-swift 0.31.4 as Gemma — no version
+                // change. Kept in GemmaRuntime so Core stays MLX-free.
+                .product(name: "Flux2Core", package: "flux-2-swift-mlx"),
+                .product(name: "FluxTextEncoders", package: "flux-2-swift-mlx")
             ],
             path: "Sources/GemmaRuntime",
             swiftSettings: [

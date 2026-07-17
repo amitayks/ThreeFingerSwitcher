@@ -1,0 +1,27 @@
+## Why
+
+The notch-native pivot (`notch-native-conversations`) made the expanded conversation a cursor-and-keyboard surface — collapse and delete are buttons. But the app's soul is the trackpad, and the fast-vs-soft flick grammar the launcher canvas already speaks (D4: a resolve fires only on a genuine flick-lift; a soft reading-scrub is always just scroll) is exactly the right way to drive the conversation window too: **flick it up and it tucks itself into the dock; flick it right and it's gone — completely**. The classifier, the two tunables (`flickVelocityThreshold` / `flickLiftWindow`), and the modal-routing precedent all exist; this change gives them a second surface.
+
+## What Changes
+
+- **Fast two-finger flick UP (expanded conversation) → minimize to the dock.** The conversation collapses back to its rail card (the existing `collapse()` verb — background scheduling continues, an in-flight turn is never cancelled). Identical classification to the canvas resolve: travel floor + dominant-axis peak velocity ≥ `flickVelocityThreshold` + lift within `flickLiftWindow`.
+- **Soft swipes stay scrolling.** A sub-threshold scrub (or a decelerated hold-then-lift) emits nothing — by the classifier's construction — so native two-finger scrolling of the thread is untouched. No new consumption: flicks are read passively off the multitouch device, exactly like the canvas resolve.
+- **Fast two-finger flick RIGHT → purge-delete, no trace.** The session is dismissed and **everything related is cleared**: pending generation cancelled, durable conversation + rail row removed (the authoritative discard), the bound engine dropped, **and every audit-log record attributed to that session purged** — from the in-memory ring and the durable `audit.jsonl` (atomic rewrite). The purge path itself writes no log line about the session. **BREAKING (spec-level):** the audit ledger is no longer strictly append-only — it gains exactly one carve-out, the user's explicit per-session purge. The existing delete affordances (trash button, card context menu) keep the plain discard with the ledger intact; the flick is the scorched-earth tier.
+- **Fast DOWN / fast LEFT → reserved no-ops** (documented, so the grammar has room to grow without accidental destructive defaults).
+- **The switcher and launcher keep working while a chat is open.** The new notch mode classifies **two-finger** excursions only; 3/4-finger frames fall through to the normal latch (unlike the launcher-canvas mode, which deliberately swallows everything). The launcher-canvas and Files-drill modal states take precedence when active.
+- **Shared classifier extraction.** The D4 flick math moves out of `GestureRecognizer.trackCanvasResolution` into a pure, unit-testable `FlickExcursionClassifier`; the canvas path and the new notch path both consume it (the existing recognizer/canvas-binding tests guard against drift).
+
+## Capabilities
+
+### Modified Capabilities
+
+- `ai-parked-sessions`: ADDED requirement — the expanded-conversation trackpad grammar: fast-flick-up minimizes to the dock, fast-flick-right purge-deletes with no trace, soft scrubs remain native scrolling, fast down/left reserved, 3+/4-finger gestures unaffected while a conversation is expanded.
+- `ai-background-autonomy`: MODIFIED requirement — the audit log stays append-only in operation but SHALL support exactly one removal: an explicit per-session purge (invoked by the purge-delete gesture) that removes that session's records from the ring and the durable file; a plain (non-purge) session delete leaves the ledger intact.
+
+## Impact
+
+- **Code (MLX-free Core, `swift test`):** new `Gesture/FlickExcursionClassifier.swift` (pure per-excursion state machine: feed → classify-on-lift); `Gesture/GestureRecognizer.swift` re-routes `trackCanvasResolution` through it and adds the `notchConversationActive` two-finger mode with 3+/fall-through; `AI/Audit/AuditLog.swift` gains `purge(sessionID:)` on the protocol + all three implementations (ring filter; disk = filter + atomic rewrite off-main); `App/ParkController.swift` gains `purge(_ id:)` (authoritative discard + audit purge) and an `onExpandedChanged` seam; `App/AppCoordinator.swift` wires the flag + maps flick-up → `collapse()` / flick-right → `purge(id)`.
+- **Tests:** new classifier unit tests (flick vs soft-scrub vs decelerated-lift, both axes); recognizer tests for the notch mode (two-finger flick emits, three-finger falls through to the switcher latch, canvas mode still takes precedence); audit purge tests (ring + disk rewrite + relaunch shows nothing); ParkController purge test (store + row + engine + audit all gone; plain discard keeps audit). Existing `GestureRecognizerTests` / `CanvasResolveBindingTests` must stay green (extraction fidelity).
+- **Consumed, not redefined:** the flick tunables (`flickVelocityThreshold`/`flickLiftWindow`, already in `AppSettings` + Hub-independent), `ParkController.collapse()`/`discard(_:)`, `AgentSessionID` on `AuditRecord`.
+- **No new permission, no gesture relocation, no re-login.** Two-finger flicks are read passively from the existing multitouch feed; nothing new is consumed, so soft scrolling and clicks behave exactly as today.
+- **Out of scope:** gestures in rail (non-expanded) mode; a flick grammar for media outputs (the media wave owns its artifacts); remapping/bindings UI for the notch grammar (fixed defaults, like the original canvas grammar before `add-gesture-previews-and-bindings`).

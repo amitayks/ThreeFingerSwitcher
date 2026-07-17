@@ -12,15 +12,26 @@ protocol ToolCandidateSource: Sendable {
 /// `name`/`summary`/`keywords` (token overlap + keyword substring), top-`limit`, always including the
 /// active skill's allowed tools, capped at `additiveCap` total.
 struct KeywordToolCandidateSource: ToolCandidateSource {
-    let all: [ToolDescriptor]
+    /// LIVE provider of the full tool set — re-queried EVERY turn (never frozen). A tool gated behind a
+    /// flag the user toggles mid-session (e.g. Media generation → `generate_image`) appears the instant the
+    /// flag flips. Snapshotting this once (the old `[ToolDescriptor]` field) silently dropped such tools:
+    /// the registry's `descriptors()` are live, but freezing them here defeated that.
+    let all: @Sendable () -> [ToolDescriptor]
     let additiveCap: Int
 
-    init(all: [ToolDescriptor], additiveCap: Int = 8) {
+    /// Live source: `all` is re-evaluated on each `candidates(...)` call.
+    init(all: @escaping @Sendable () -> [ToolDescriptor], additiveCap: Int = 8) {
         self.all = all
         self.additiveCap = additiveCap
     }
 
+    /// Convenience for a STATIC tool set (tests / fixed registries): wraps the array in a constant provider.
+    init(all: [ToolDescriptor], additiveCap: Int = 8) {
+        self.init(all: { all }, additiveCap: additiveCap)
+    }
+
     func candidates(for context: RouteContext, limit: Int) -> [ToolDescriptor] {
+        let all = self.all()   // LIVE snapshot for THIS turn — honors flags toggled since construction
         let queryTokens = Set(Self.tokenize(context.latestUserText))
         let queryLower = context.latestUserText.lowercased()
 

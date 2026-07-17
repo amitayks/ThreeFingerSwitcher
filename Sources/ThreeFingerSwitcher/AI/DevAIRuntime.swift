@@ -4,7 +4,7 @@ import Foundation
 /// wired into the app's `xcodebuild` target. It lets the streaming preview canvas and the whole
 /// command pipeline run in a signed build TODAY without a real multi-gigabyte download:
 ///
-/// - The standard `ModelRegistry` ships **placeholder** download URLs (`models.invalid`) and dummy
+/// - The standard `ModelCatalog` ships **placeholder** download URLs (`models.invalid`) and dummy
 ///   integrity SHAs, so a real download can't succeed and `downloadAndVerify` would always fail the
 ///   SHA check. This builds a **dev registry** whose `integritySHA` is the SHA of a small fabricated
 ///   payload, paired with a `ModelDownloading` that returns exactly that payload — so download +
@@ -19,12 +19,12 @@ enum DevAIRuntime {
     /// The fabricated dev "weights" payload. Tiny and deterministic; its SHA pins the dev descriptor.
     private static let payload = Data("three-finger-switcher-dev-gemma-stub".utf8)
 
-    /// A dev registry mirroring `ModelRegistry.standard`'s ids/display names/capabilities, but with an
+    /// A dev registry mirroring `ModelCatalog.standard`'s ids/display names/capabilities, but with an
     /// integrity SHA that matches `payload` so verification passes. Keeps the real registry's selection
     /// behavior (default-first, capability subset) intact for the band/executor.
     @MainActor
-    static var devRegistry: ModelRegistry {
-        let standard = ModelRegistry.standard
+    static var devRegistry: ModelCatalog {
+        let standard = ModelCatalog.standard
         let models = standard.models.map { d in
             ModelDescriptor(
                 id: d.id,
@@ -36,7 +36,7 @@ enum DevAIRuntime {
                 quantization: d.quantization
             )
         }
-        return ModelRegistry(models: models, defaultModelID: standard.defaultModelID)
+        return ModelCatalog(models: models, defaultModelID: standard.defaultModelID)
     }
 
     /// Build a `ModelManager` wired to the dev stub: the dev registry, a downloader that returns the

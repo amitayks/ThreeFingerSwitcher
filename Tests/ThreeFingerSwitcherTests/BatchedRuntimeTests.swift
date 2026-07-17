@@ -61,9 +61,9 @@ final class BatchedRuntimeTests: XCTestCase {
     // MARK: - ModelDescriptor.maxContextTokens
 
     func testRegistryCarriesMaxContextTokens() {
-        let d = ModelRegistry.standard.descriptor(id: "gemma-4-31b")
+        let d = ModelCatalog.standard.descriptor(id: "gemma-4-31b")
         XCTAssertEqual(d?.maxContextTokens, 131_072)
-        XCTAssertEqual(ModelRegistry.standard.descriptor(id: "gemma-4-12b")?.maxContextTokens, 32_768)
+        XCTAssertEqual(ModelCatalog.standard.descriptor(id: "gemma-4-12b")?.maxContextTokens, 32_768)
     }
 
     // MARK: - Context preset + concrete budget provider (C3 tie-in)

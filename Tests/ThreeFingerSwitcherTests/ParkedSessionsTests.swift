@@ -37,9 +37,18 @@ final class ParkedSessionsTests: XCTestCase {
         XCTAssertTrue(ParkState.needsYou.isProtectedFromAging)
         XCTAssertFalse(ParkState.parked.isProtectedFromAging)
         XCTAssertFalse(ParkState.idle.isProtectedFromAging)
-        XCTAssertFalse(ParkState.completed.isProtectedFromAging)   // terminal → eligible for auto-dismiss
-        XCTAssertTrue(ParkState.completed.isTerminal)
-        XCTAssertFalse(ParkState.idle.isTerminal)
+    }
+
+    /// `refactor-park-and-background-agents`: the terminal state was RETIRED — a row persisted by an
+    /// older build under "completed" (or any unknown raw value) decodes as `.idle`, never dropped.
+    func testRetiredCompletedStateDecodesAsIdle() throws {
+        let session = ParkedSession(id: sid(), title: "old", state: .parked, badgeCount: 0)
+        let encoded = String(data: try JSONEncoder().encode(session), encoding: .utf8)!
+        for legacyRaw in ["completed", "someFutureState"] {
+            let mutated = encoded.replacingOccurrences(of: "\"parked\"", with: "\"\(legacyRaw)\"")
+            let back = try JSONDecoder().decode(ParkedSession.self, from: Data(mutated.utf8))
+            XCTAssertEqual(back.state, .idle, "a '\(legacyRaw)' row migrates to idle, never fails to load")
+        }
     }
 
     func testParkErrorYieldsCleanHeadlineNeverRawText() {
@@ -60,8 +69,10 @@ final class ParkedSessionsTests: XCTestCase {
 
     func testSerialSchedulerReturnsAtMostOneRegardlessOfSlots() {
         let now = Date(timeIntervalSince1970: 10_000)
-        let a = ParkedSession(id: sid(), title: "a", state: .parked, updatedAt: now.addingTimeInterval(-30))
-        let b = ParkedSession(id: sid(), title: "b", state: .parked, updatedAt: now.addingTimeInterval(-10))
+        let a = ParkedSession(id: sid(), title: "a", state: .parked,
+                              nextRunAt: now.addingTimeInterval(-30), updatedAt: now.addingTimeInterval(-30))
+        let b = ParkedSession(id: sid(), title: "b", state: .parked,
+                              nextRunAt: now.addingTimeInterval(-10), updatedAt: now.addingTimeInterval(-10))
         let sched = SerialParkScheduler(sessions: [b, a])
         // Oldest-waiting first → a, regardless of maxSlots.
         XCTAssertEqual(sched.runnableSessions(now: now, maxSlots: 1), [a.id])
@@ -69,15 +80,19 @@ final class ParkedSessionsTests: XCTestCase {
         XCTAssertEqual(sched.runnableSessions(now: now, maxSlots: 0), [])
     }
 
-    func testSchedulerExcludesNeedsYouAndFutureNextRunAt() {
+    func testSchedulerExcludesNeedsYouFutureNextRunAtAndDormant() {
         let now = Date(timeIntervalSince1970: 10_000)
         let needs = ParkedSession(id: sid(), title: "n", state: .needsYou, updatedAt: now)
         let future = ParkedSession(id: sid(), title: "f", state: .parked,
                                    nextRunAt: now.addingTimeInterval(60), updatedAt: now)
         let active = ParkedSession(id: sid(), title: "act", state: .active, updatedAt: now)
+        // DORMANT (`refactor-park-and-background-agents`): parked with NO next-run time = blocked on
+        // the user (a confirm-tier pause) — never runnable.
+        let dormant = ParkedSession(id: sid(), title: "d", state: .parked,
+                                    nextRunAt: nil, updatedAt: now)
         let runnable = ParkedSession(id: sid(), title: "r", state: .parked,
                                      nextRunAt: now.addingTimeInterval(-1), updatedAt: now)
-        let sched = SerialParkScheduler(sessions: [needs, future, active, runnable])
+        let sched = SerialParkScheduler(sessions: [needs, future, active, dormant, runnable])
         XCTAssertEqual(sched.runnableSessions(now: now, maxSlots: 4), [runnable.id])
     }
 
@@ -86,13 +101,22 @@ final class ParkedSessionsTests: XCTestCase {
         let sched = SerialParkScheduler(sessions: [ParkedSession(id: id, title: "x", state: .parked)])
         sched.didAdvance(id, result: ToolStepResult(tool: "t", status: .done, summary: "ok"))
         let afterDone = sched.snapshot().first { $0.id == id }!
-        XCTAssertEqual(afterDone.state, .idle)
+        XCTAssertEqual(afterDone.state, .idle, "a settled result idles with an unseen badge — NEVER a terminal state")
         XCTAssertEqual(afterDone.badgeCount, 1)
 
         sched.didAdvance(id, result: ToolStepResult(tool: "t", status: .failed(headline: "Clean headline"),
                                                     summary: "x"))
-        XCTAssertEqual(sched.snapshot().first { $0.id == id }!.state, .parked)
+        let afterFailure = sched.snapshot().first { $0.id == id }!
+        XCTAssertEqual(afterFailure.state, .parked)
+        XCTAssertNotNil(afterFailure.nextRunAt, "a failed advance re-parks with a SCHEDULED retry, never silence")
 
+        sched.didAdvance(id, result: ToolStepResult(tool: "t", status: .awaitingApproval, summary: "x"))
+        let afterPause = sched.snapshot().first { $0.id == id }!
+        XCTAssertEqual(afterPause.state, .parked, "a confirm-tier pause waits parked WITHOUT escalating")
+        XCTAssertNil(afterPause.nextRunAt, "…and goes dormant so the driver can't re-serve the paused turn")
+
+        // An escalated (needs-you) session is never downgraded by a subsequent paused advance.
+        sched.escalate(id, reason: "dangerous")
         sched.didAdvance(id, result: ToolStepResult(tool: "t", status: .awaitingApproval, summary: "x"))
         XCTAssertEqual(sched.snapshot().first { $0.id == id }!.state, .needsYou)
     }
@@ -108,6 +132,23 @@ final class ParkedSessionsTests: XCTestCase {
         XCTAssertEqual(sched.runnableSessions(now: Date(), maxSlots: 4), [])
     }
 
+    /// The rail lists sessions **most-recently-used first** (`railSnapshot`) so the last-used session sits
+    /// right after the "+ New chat" card; `snapshot` stays oldest-first (the store/lifecycle order).
+    func testRailSnapshotOrdersMostRecentlyUsedFirst() {
+        let base = Date(timeIntervalSince1970: 1_000_000)
+        let old = ParkedSession(id: sid(), title: "old", state: .idle, updatedAt: base)
+        let mid = ParkedSession(id: sid(), title: "mid", state: .idle, updatedAt: base.addingTimeInterval(60))
+        let recent = ParkedSession(id: sid(), title: "recent", state: .idle, updatedAt: base.addingTimeInterval(120))
+        let sched = SerialParkScheduler(sessions: [mid, old, recent])   // insertion order irrelevant
+
+        XCTAssertEqual(sched.railSnapshot().map(\.id), [recent.id, mid.id, old.id])   // newest → oldest
+        XCTAssertEqual(sched.snapshot().map(\.id), [old.id, mid.id, recent.id])       // lifecycle: oldest → newest
+
+        // Touching a session (bumping updatedAt) floats it to the front of the rail.
+        sched.escalate(old.id, reason: "x")   // escalate bumps updatedAt to now (> base+120)
+        XCTAssertEqual(sched.railSnapshot().first?.id, old.id)
+    }
+
     func testKReadyContractWithConcurrentStub() {
         // A drop-in K scheduler reusing the SAME `ParkRunnable.ordered` filter returns up to K with NO
         // protocol change — the batching seam contract.
@@ -117,12 +158,13 @@ final class ParkedSessionsTests: XCTestCase {
             func runnableSessions(now: Date, maxSlots: Int) -> [AgentSessionID] {
                 Array(ParkRunnable.ordered(rows, now: now).prefix(max(maxSlots, 0)))
             }
-            func didAdvance(_ id: AgentSessionID, result: ToolStepResult, taskComplete: Bool) {}
+            func didAdvance(_ id: AgentSessionID, result: ToolStepResult) {}
             func escalate(_ id: AgentSessionID, reason: String) {}
         }
-        let now = Date(timeIntervalSince1970: 1)
+        let now = Date(timeIntervalSince1970: 100)
         let rows = (0..<5).map { i in
-            ParkedSession(id: sid(), title: "\(i)", state: .parked, updatedAt: now.addingTimeInterval(Double(i)))
+            ParkedSession(id: sid(), title: "\(i)", state: .parked,
+                          nextRunAt: now.addingTimeInterval(Double(-i)), updatedAt: now.addingTimeInterval(Double(i)))
         }
         let k: ParkScheduler = ConcurrentParkScheduler(rows)
         XCTAssertEqual(k.runnableSessions(now: now, maxSlots: 3).count, 3)
@@ -216,18 +258,19 @@ final class ParkedSessionsTests: XCTestCase {
         XCTAssertNil(life.evictable(allProtected, now: now))
     }
 
-    func testDismissableTerminalAndStaleNeverProtected() {
+    func testDismissableOnlySeenStaleIdleNeverProtectedOrUnseenOrParked() {
         let now = Date(timeIntervalSince1970: 100_000)
-        // Terminal (completed) → dismissed regardless of age.
-        let completed = ParkedSession(id: sid(), title: "done", state: .completed,
-                                      updatedAt: now)                       // brand new but terminal
-        // Idle past the countdown → dismissed.
+        // Idle, fully seen, past the countdown → dismissed.
         let staleIdle = ParkedSession(id: sid(), title: "stale", state: .idle,
                                       updatedAt: now.addingTimeInterval(-301))
         // Idle under the countdown → kept.
         let freshIdle = ParkedSession(id: sid(), title: "fresh", state: .idle,
                                       updatedAt: now.addingTimeInterval(-10))
-        // Parked past the countdown → dismissed (parked is non-protected too).
+        // Idle with UNSEEN results → protected indefinitely (`refactor-park-and-background-agents`:
+        // a docked chat's answer must never be reaped before the user sees it).
+        let unseenIdle = ParkedSession(id: sid(), title: "unseen", state: .idle, badgeCount: 2,
+                                       updatedAt: now.addingTimeInterval(-9999))
+        // Parked = pending work (streaming, dormant on an approval, or scheduled) → never expired.
         let staleParked = ParkedSession(id: sid(), title: "parked", state: .parked,
                                         updatedAt: now.addingTimeInterval(-9999))
         // Protected: never dismissed even when ancient.
@@ -236,9 +279,21 @@ final class ParkedSessionsTests: XCTestCase {
         let needs = ParkedSession(id: sid(), title: "needs", state: .needsYou,
                                   updatedAt: now.addingTimeInterval(-9999))
         let life = ParkLifecycle(maxParked: 10, autoDismissCountdown: 300)
-        let dismissable = Set(life.dismissable([completed, staleIdle, freshIdle, staleParked, active, needs],
+        let dismissable = Set(life.dismissable([staleIdle, freshIdle, unseenIdle, staleParked, active, needs],
                                                now: now))
-        XCTAssertEqual(dismissable, Set([completed.id, staleIdle.id, staleParked.id]))
+        XCTAssertEqual(dismissable, Set([staleIdle.id]))
+    }
+
+    func testZeroCountdownDisablesExpiryEntirely() {
+        let now = Date(timeIntervalSince1970: 100_000)
+        let ancient = ParkedSession(id: sid(), title: "ancient", state: .idle,
+                                    updatedAt: now.addingTimeInterval(-1_000_000))
+        // The DEFAULT: countdown 0 = never — sessions persist until the user deletes them.
+        let life = ParkLifecycle(maxParked: 10, autoDismissCountdown: 0)
+        XCTAssertTrue(life.dismissable([ancient], now: now).isEmpty,
+                      "the default countdown of 0 dismisses nothing, ever")
+        XCTAssertEqual(AppSettings.Defaults.agentParkAutoDismissCountdown, 0,
+                       "expiry ships OFF — deletion is the user's (or the opt-in countdown / eviction)")
     }
 
     func testAutoDismissCountdownRemovesStaleParked() throws {
@@ -262,8 +317,9 @@ final class ParkedSessionsTests: XCTestCase {
         XCTAssertTrue(life.dismissable([active, needs], now: now).isEmpty)
     }
 
-    func testRunAutoDismissPassUsesDiscardPath() async throws {
-        // The pass routes each dismissable id through the authoritative discard (cancel pending + remove).
+    func testRunAutoDismissPassUsesDiscardPath() throws {
+        // The pass routes each dismissable id through the authoritative discard (remove; the CONTROLLER
+        // owns generation cancellation via the engine — the coordinator's old task table was dead code).
         let store = InMemoryParkedSessionStore()
         let now = Date(timeIntervalSince1970: 100_000)
         let id = sid()
@@ -272,37 +328,23 @@ final class ParkedSessionsTests: XCTestCase {
                          conversation: conversation(id))
         let coord = ParkLifecycleCoordinator(store: store,
                                              lifecycle: ParkLifecycle(maxParked: 10, autoDismissCountdown: 300))
-        let cancelled = expectation(description: "pending task observed cancellation")
-        let task = Task<Void, Never> {
-            while !Task.isCancelled { await Task.yield() }
-            cancelled.fulfill()
-        }
-        coord.registerPending(id, task: task)
         let dismissed = coord.runAutoDismissPass(now: now)
         XCTAssertEqual(dismissed, [id])
-        await fulfillment(of: [cancelled], timeout: 2)
         XCTAssertNil(store.conversation(id))     // removed via discard path
         XCTAssertTrue(store.all().isEmpty)
     }
 
-    func testDiscardCancelsPendingRemovesAndIsNotAFailure() async throws {
+    func testDiscardRemovesDurablyAndIsNotAFailure() throws {
         let store = InMemoryParkedSessionStore()
         let id = sid()
         try store.upsert(ParkedSession(id: id, title: "D", state: .parked), conversation: conversation(id))
         let coord = ParkLifecycleCoordinator(store: store,
                                              lifecycle: ParkLifecycle(maxParked: 10, autoDismissCountdown: 300))
-        let cancelled = expectation(description: "task observed cancellation")
-        let task = Task<Void, Never> {
-            // A long-lived pending generation; discard cancels it (NOT a failure).
-            while !Task.isCancelled { await Task.yield() }
-            cancelled.fulfill()
-        }
-        coord.registerPending(id, task: task)
         try coord.discard(id)
-        await fulfillment(of: [cancelled], timeout: 2)
         XCTAssertNil(store.conversation(id))            // removed
         XCTAssertTrue(store.all().isEmpty)
-        // No `failed` row was created — discard removed it cleanly (cancellation is not a failure).
+        // No `failed` row was created — discard removed it cleanly (cancellation is not a failure; the
+        // live engine's cancellation is asserted at the controller level, the single cancellation owner).
     }
 
     // MARK: - 5. Anchor + reveal models (overscroll-park was removed by `notch-native-conversations`:
@@ -657,6 +699,31 @@ final class ParkedSessionsTests: XCTestCase {
         XCTAssertEqual(instant.feed(cursor: inside, zoneRect: trigger, railFrame: nil, now: 0), .reveal)
     }
 
+    /// `reset()` (the swipe-up straight-close hook): after a direct close the model is forced hidden, so the
+    /// SAME cursor position that was keeping it open no longer reveals — a fresh cross-behind + dwell is
+    /// required, rather than an immediate re-reveal.
+    func testResetForcesHiddenSoDirectCloseNeedsAFreshCross() {
+        let trigger = CGRect(x: 100, y: 800, width: 120, height: 32)
+        let inside = CGPoint(x: trigger.midX, y: trigger.midY)
+        let live = trigger.insetBy(dx: -60, dy: -60)          // a generous live zone around the trigger
+
+        let model = NotchRevealModel(graceInterval: 0.25, dwellInterval: 0.3)
+        // Reveal it (cross + dwell elapses).
+        _ = model.feed(cursor: inside, zoneRect: trigger, railFrame: nil, liveZone: live, now: 0)
+        XCTAssertEqual(model.feed(cursor: inside, zoneRect: trigger, railFrame: nil, liveZone: live, now: 0.31), .reveal)
+        XCTAssertEqual(model.state, .shown)
+
+        // Straight close → reset. The model is hidden and holds no dwell/grace.
+        model.reset()
+        XCTAssertEqual(model.state, .hidden)
+        XCTAssertFalse(model.isDwelling)
+
+        // The very same cursor (still inside the trigger) now only STARTS a fresh dwell — no instant reveal.
+        XCTAssertEqual(model.feed(cursor: inside, zoneRect: trigger, railFrame: nil, liveZone: live, now: 5.0), .idle)
+        XCTAssertTrue(model.isDwelling)
+        XCTAssertEqual(model.feed(cursor: inside, zoneRect: trigger, railFrame: nil, liveZone: live, now: 5.31), .reveal)
+    }
+
     // MARK: - 5.4 AppSettings keys
 
     func testAgentParkSettingsDefaultsAndReset() {
@@ -664,7 +731,7 @@ final class ParkedSessionsTests: XCTestCase {
         let settings = AppSettings(defaults: defaults)
         XCTAssertEqual(settings.agentMaxParkedSessions, 6)
         XCTAssertEqual(settings.agentParkIdleTimeout, 30 * 60, accuracy: 0.5)
-        XCTAssertEqual(settings.agentParkAutoDismissCountdown, 300, accuracy: 0.5)
+        XCTAssertEqual(settings.agentParkAutoDismissCountdown, 0, accuracy: 0.5)   // 0 = never (opt-in expiry)
         XCTAssertEqual(settings.agentOverscrollParkThreshold, 0.22, accuracy: 0.0001)
         XCTAssertEqual(settings.agentNotchRevealDwell, 0.3, accuracy: 0.0001)
         // Flick scroll-vs-flick tuning (D4): defaults + reset round-trip.
@@ -680,7 +747,7 @@ final class ParkedSessionsTests: XCTestCase {
         settings.resetToDefaults()
         XCTAssertEqual(settings.agentMaxParkedSessions, 6)
         XCTAssertEqual(settings.agentParkIdleTimeout, 30 * 60, accuracy: 0.5)
-        XCTAssertEqual(settings.agentParkAutoDismissCountdown, 300, accuracy: 0.5)
+        XCTAssertEqual(settings.agentParkAutoDismissCountdown, 0, accuracy: 0.5)   // 0 = never (opt-in expiry)
         XCTAssertEqual(settings.agentOverscrollParkThreshold, 0.22, accuracy: 0.0001)
         XCTAssertEqual(settings.agentNotchRevealDwell, 0.3, accuracy: 0.0001)
         XCTAssertEqual(settings.flickVelocityThreshold, 0.8, accuracy: 0.0001)
@@ -741,18 +808,35 @@ final class ParkedSessionsTests: XCTestCase {
                           conversation: conversation(id, title))
     }
 
-    func testNewSessionIsDurableAtBirthAndExpanded() {
+    func testNewSessionIsUnsavedUntilFirstMessage() {
         let store = InMemoryParkedSessionStore()
         let ctrl = makeCtrl(store: store)
         let id = ctrl.newSession()
-        // Durable at birth: the conversation + row exist BEFORE any turn ran.
-        XCTAssertNotNil(store.conversation(id))
+        // NOT durable at birth: an empty new chat writes nothing to the store and adds no rail row.
+        XCTAssertNil(store.conversation(id), "an empty new chat is not saved to the dock")
+        XCTAssertTrue(store.all().isEmpty)
+        XCTAssertEqual(ctrl.expandedID, id)
+        XCTAssertNotNil(ctrl.engineForTest(id), "an engine is bound to the newborn (unsaved) session")
+        XCTAssertEqual(ctrl.engineForTest(id)?.conversation?.id, id)
+
+        // The first message makes it durable + docks it as the foreground .active row (persists even with a
+        // cold model — the message is saved before the availability gate, then the turn shows unavailable).
+        ctrl.engineForTest(id)?.send("hello there")
+        XCTAssertNotNil(store.conversation(id), "the first message persists the session")
         XCTAssertEqual(store.all().first?.id, id)
         XCTAssertEqual(store.all().first?.state, .active, "the expanded (foreground) row is .active")
         XCTAssertEqual(store.all().first?.badgeCount, 0)
-        XCTAssertEqual(ctrl.expandedID, id)
-        XCTAssertNotNil(ctrl.engineForTest(id), "an engine is bound to the newborn session")
-        XCTAssertEqual(ctrl.engineForTest(id)?.conversation?.id, id)
+    }
+
+    func testEmptyNewChatIsDiscardedOnCollapseNotDocked() {
+        let store = InMemoryParkedSessionStore()
+        let ctrl = makeCtrl(store: store)
+        let id = ctrl.newSession()          // opened, never messaged
+        ctrl.collapse()                     // closed empty
+        XCTAssertNil(ctrl.expandedID)
+        XCTAssertNil(store.conversation(id), "an empty new chat is discarded, never saved to the dock")
+        XCTAssertTrue(store.all().isEmpty, "no rail row is created for an empty chat")
+        XCTAssertNil(ctrl.engineForTest(id), "its engine is dropped")
     }
 
     func testExpandBindsStoredConversationAndClearsBadge() {
@@ -785,6 +869,7 @@ final class ParkedSessionsTests: XCTestCase {
         let store = InMemoryParkedSessionStore()
         let ctrl = makeCtrl(store: store)
         let id = ctrl.newSession()
+        ctrl.engineForTest(id)?.send("hi")   // a real (non-empty) session — an empty one would be discarded
 
         ctrl.collapse()
         XCTAssertNil(ctrl.expandedID)
@@ -847,23 +932,29 @@ final class ParkedSessionsTests: XCTestCase {
         XCTAssertTrue(ctrl.notch.overlayModelSessionsForTest.isEmpty)   // rail view-model cleared
     }
 
-    /// The relaunch half of durable-at-birth: a session created moments before quit — no completed turn —
-    /// rebuilds from disk; a discarded one does not.
-    func testJustBornSessionSurvivesRelaunchAndDiscardedDoesNot() {
+    /// The relaunch half of durable-at-first-message: a session that SENT a message (no completed turn)
+    /// rebuilds from disk; an empty new chat that was closed — or a discarded one — does not.
+    func testMessagedSessionSurvivesRelaunchButEmptyAndDiscardedDoNot() {
         let dir = tempDir()
         let born: AgentSessionID
         let discarded: AgentSessionID
+        let neverMessaged: AgentSessionID
         do {
             let store = DiskParkedSessionStore(directory: dir)
             let ctrl = makeCtrl(store: store)
             born = ctrl.newSession()
+            ctrl.engineForTest(born)?.send("keep me")   // the first message makes it durable
+            ctrl.collapse()
+            neverMessaged = ctrl.newSession()            // opened but never sent → discarded on collapse
             ctrl.collapse()
             discarded = ctrl.newSession()
+            ctrl.engineForTest(discarded)?.send("bye")
             ctrl.discard(discarded)
         }
         let reopened = DiskParkedSessionStore(directory: dir)
-        XCTAssertNotNil(reopened.conversation(born), "a just-born session survives relaunch")
+        XCTAssertNotNil(reopened.conversation(born), "a session that sent a message survives relaunch")
         XCTAssertEqual(reopened.all().map(\.id), [born])
+        XCTAssertNil(reopened.conversation(neverMessaged), "an empty new chat is never saved to the dock")
         XCTAssertNil(reopened.conversation(discarded), "a deleted session leaves nothing behind")
     }
 
@@ -899,32 +990,18 @@ final class ParkedSessionsTests: XCTestCase {
         XCTAssertTrue(ctrl.notch.overlayModelSessionsForTest.isEmpty)
     }
 
-    /// Bug 3 / D1 (unchanged by the pivot): a TERMINAL background `.done` (`taskComplete: true`)
-    /// auto-dismisses the row FOREVER on the spot — a finished task never lingers on the rail.
-    func testTerminalDoneAutoDismisses() {
-        let store = InMemoryParkedSessionStore()
-        let id = sid()
-        seedStored(store, id, "Finish", state: .parked)
-        let ctrl = makeCtrl(store: store)
-        ctrl.didAdvance(id, result: ToolStepResult(tool: "t", status: .done, summary: "ok"),
-                        taskComplete: true)
-        XCTAssertNil(store.conversation(id))
-        XCTAssertTrue(store.all().isEmpty)
-        XCTAssertTrue(ctrl.notch.overlayModelSessionsForTest.isEmpty)
-    }
-
-    /// Bug 3 / D1: an INTERMEDIATE `.done` (`taskComplete: false`) keeps the row (idle + badge) so the
-    /// session stays available — only a finished task auto-dismisses.
-    func testIntermediateDoneDoesNotDismiss() {
+    /// `refactor-park-and-background-agents`: there is NO terminal advance — a settled `.done` idles
+    /// with an unseen badge and the session ALWAYS stays (the old `taskComplete: true` flow deleted it
+    /// on the spot, which is how docked chats vanished the moment their answer landed).
+    func testDoneAdvanceNeverDismissesTheSession() {
         let store = InMemoryParkedSessionStore()
         let id = sid()
         seedStored(store, id, "Step", state: .parked)
         let ctrl = makeCtrl(store: store)
-        ctrl.didAdvance(id, result: ToolStepResult(tool: "t", status: .done, summary: "ok"),
-                        taskComplete: false)
-        XCTAssertNotNil(store.conversation(id))
+        ctrl.didAdvance(id, result: ToolStepResult(tool: "t", status: .done, summary: "ok"))
+        XCTAssertNotNil(store.conversation(id), "a settled result never removes the session")
         XCTAssertEqual(store.all().first?.state, .idle)
-        XCTAssertGreaterThan(store.all().first?.badgeCount ?? 0, 0)
+        XCTAssertGreaterThan(store.all().first?.badgeCount ?? 0, 0, "the result is an unseen badge")
     }
 
     func testParkControllerEscalateSetsNeedsYouForGlow() {
@@ -938,15 +1015,222 @@ final class ParkedSessionsTests: XCTestCase {
         XCTAssertTrue(ctrl.notch.hasNeedsYouForTest)
     }
 
-    func testParkControllerSchedulerSeamIsKReady() {
+    func testParkControllerSchedulerSeamIsKReady() throws {
         let store = InMemoryParkedSessionStore()
-        seedStored(store, sid(), state: .parked)
-        seedStored(store, sid(), state: .parked)
+        let now = Date()
+        for i in 0..<2 {
+            let id = sid()
+            try store.upsert(ParkedSession(id: id, title: "\(i)", state: .parked,
+                                           nextRunAt: now.addingTimeInterval(-1), updatedAt: now),
+                             conversation: conversation(id))
+        }
         let ctrl = makeCtrl(store: store)
         // The exposed seam is the SerialParkScheduler: one active now regardless of slots, but the protocol
         // shape serves K (the batched runtime fills more) with no change.
-        XCTAssertLessThanOrEqual(ctrl.parkScheduler.runnableSessions(now: Date(), maxSlots: 1).count, 1)
-        XCTAssertLessThanOrEqual(ctrl.parkScheduler.runnableSessions(now: Date(), maxSlots: 8).count, 1)
+        XCTAssertEqual(ctrl.parkScheduler.runnableSessions(now: now, maxSlots: 1).count, 1)
+        XCTAssertEqual(ctrl.parkScheduler.runnableSessions(now: now, maxSlots: 8).count, 1)
+    }
+
+    // MARK: - 10. `refactor-park-and-background-agents`: dock-mid-response survival, docked approvals,
+    // relaunch recovery, and the background driver (the ROUTED production path, previously uncovered)
+
+    /// A scripted routing runtime: `structured()` dequeues route JSON; `generate()` streams the answer.
+    private final class ScriptedRoutingRuntime: LLMRuntime, @unchecked Sendable {
+        let capabilities: Set<Modality> = [.text]
+        private var routes: [String]
+        private let answerTokens: [String]
+        private let delayNanos: UInt64
+        private let lock = NSLock()
+        init(routes: [String], answer: [String], delayNanos: UInt64 = 0) {
+            self.routes = routes; self.answerTokens = answer; self.delayNanos = delayNanos
+        }
+        func generate(_ request: LLMRequest) -> AsyncThrowingStream<Token, Error> {
+            let toks = answerTokens, delay = delayNanos
+            return AsyncThrowingStream { c in
+                let task = Task {
+                    do {
+                        for (i, t) in toks.enumerated() {
+                            try Task.checkCancellation()
+                            if delay > 0 { try await Task.sleep(nanoseconds: delay) }
+                            c.yield(Token(t, isFinal: i == toks.count - 1))
+                        }
+                        c.finish()
+                    } catch {
+                        c.finish(throwing: RuntimeError.cancelled)
+                    }
+                }
+                c.onTermination = { _ in task.cancel() }
+            }
+        }
+        func structured<T: Decodable & Sendable>(_ r: LLMRequest, schema: StructuredSchema,
+                                                 as type: T.Type) async throws -> StructuredOutcome<T> {
+            let json: String = {
+                lock.lock(); defer { lock.unlock() }
+                return routes.isEmpty ? "{\"tool\":\"\"}" : routes.removeFirst()
+            }()
+            return .value(try JSONDecoder().decode(T.self, from: Data(json.utf8)))
+        }
+    }
+
+    /// A confirm-tier tool whose run awaits the injected gate (the foreground approval path).
+    private final class GatedContributor: ToolContributor, @unchecked Sendable {
+        let descriptor: ToolDescriptor
+        private(set) var ran = false
+        init(name: String) {
+            descriptor = ToolDescriptor(name: name, summary: "s",
+                                        argsSchema: StructuredSchema(name: name, json: "{\"type\":\"object\"}"),
+                                        writePolicy: .confirm)
+        }
+        func descriptors() -> [ToolDescriptor] { [descriptor] }
+        func canHandle(_ tool: String) -> Bool { tool == descriptor.name }
+        func run(_ call: RoutedCall, gate: ApprovalGate) async -> ToolStepResult {
+            switch await gate.awaitDecision(for: .unavailable(reason: "approve me")) {
+            case .approve:
+                ran = true
+                return ToolStepResult(tool: descriptor.name, status: .done, summary: "did it")
+            case .skip:
+                return ToolStepResult(tool: descriptor.name, status: .declined(reason: "skipped"), summary: "skipped")
+            case .cancel:
+                return ToolStepResult(tool: descriptor.name,
+                                      status: .declined(reason: TaskKindToolContributor.cancelledReason),
+                                      summary: "cancelled")
+            }
+        }
+    }
+
+    /// A controller whose engines run the ROUTED turn path (registry-wired) — the production shape.
+    private func makeRoutedCtrl(store: ParkedSessionStore, manager: ModelManager,
+                                registry: ToolRegistry = ToolRegistry([])) -> ParkController {
+        ParkController(store: store, maxParked: 6, autoDismissCountdown: 60,
+                       engineFactory: {
+                           NotchSessionEngine(modelManager: manager, selection: NullSelection(),
+                                              registry: registry,
+                                              candidateSource: KeywordToolCandidateSource(
+                                                  all: { registry.allDescriptors() }))
+                       })
+    }
+
+    /// THE regression: docking mid-response of a ROUTED turn (production always routes; every answer
+    /// used to report terminal → `.completed` → instant auto-dismiss) must leave the chat alive as an
+    /// unseen result, and no later dismiss pass may reap it while the result is unseen.
+    func testDockMidRoutedTurnSurvivesSettleAndDismissPass() async throws {
+        let rt = ScriptedRoutingRuntime(routes: ["{\"tool\":\"\"}"],
+                                        answer: Array(repeating: "x", count: 40),
+                                        delayNanos: 5_000_000)
+        let manager = try await loadedManager(rt)
+        let store = InMemoryParkedSessionStore()
+        let ctrl = makeRoutedCtrl(store: store, manager: manager)
+        let id = ctrl.newSession()
+        let engine = try XCTUnwrap(ctrl.engineForTest(id))
+
+        engine.send("U1")
+        await waitUntil { if case .conversing = engine.state { return true }; return false }
+
+        ctrl.collapse()   // dock mid-response
+        await waitUntil({ store.conversation(id)?.messages.count == 2 }, 5)
+
+        XCTAssertNotNil(store.conversation(id), "the docked chat SURVIVES its answer landing")
+        XCTAssertEqual(store.all().first?.state, .idle)
+        XCTAssertEqual(store.all().first?.badgeCount, 1, "the answer is an unseen result")
+        XCTAssertNil(ctrl.engineForTest(id), "the detached engine is dropped once settled")
+
+        _ = ctrl.runAutoDismissPass(now: Date().addingTimeInterval(10_000))
+        XCTAssertNotNil(store.conversation(id),
+                        "no dismiss pass ever reaps a chat with an unseen result")
+    }
+
+    /// Docking while the routing loop is PAUSED at an approval keeps the suspended step alive as
+    /// needs-you; re-expanding re-presents the SAME step and approve resumes it (the old behavior
+    /// dropped the engine — orphaning the continuation — and let the idle countdown delete the chat).
+    func testDockAtApprovalSurfacesNeedsYouAndApproveAfterExpandResumes() async throws {
+        let tool = GatedContributor(name: "confirm_tool")
+        let rt = ScriptedRoutingRuntime(routes: ["{\"tool\":\"confirm_tool\"}", "{\"tool\":\"\"}"],
+                                        answer: ["done"])
+        let manager = try await loadedManager(rt)
+        let store = InMemoryParkedSessionStore()
+        let ctrl = makeRoutedCtrl(store: store, manager: manager, registry: ToolRegistry([tool]))
+        let id = ctrl.newSession()
+        let engine = try XCTUnwrap(ctrl.engineForTest(id))
+
+        engine.send("go")
+        await waitUntil { engine.isPausedAtApproval }
+
+        ctrl.collapse()   // dock while paused at the gate
+        XCTAssertEqual(store.all().first?.state, .needsYou,
+                       "a docked pending approval surfaces needs-you (protected, badged)")
+        XCTAssertNotNil(ctrl.engineForTest(id), "the engine — and its suspended gate — survives the dock")
+
+        _ = ctrl.runAutoDismissPass(now: Date().addingTimeInterval(10_000))
+        XCTAssertNotNil(store.conversation(id), "a needs-you session is never expired")
+
+        ctrl.expand(id)
+        let reused = try XCTUnwrap(ctrl.engineForTest(id))
+        XCTAssertTrue(reused === engine, "expand reuses the paused engine — the turn is never restarted")
+        XCTAssertTrue(reused.isPausedAtApproval, "the SAME approval re-presents")
+        XCTAssertTrue(reused.approve())
+        await waitUntil({ store.conversation(id)?.messages.count == 2 }, 5)
+        XCTAssertTrue(tool.ran, "the approved step fired after the dock/expand round-trip")
+    }
+
+    /// Relaunch normalization + the driver: a row persisted `.active` (quit mid-turn) whose
+    /// conversation awaits a reply becomes parked + scheduled, and the advance pass re-runs the
+    /// interrupted turn to an unseen result (the old behavior stranded it as a protected zombie).
+    func testRelaunchNormalizesStaleActiveAndDriverRecoversTheTurn() async throws {
+        let store = InMemoryParkedSessionStore()
+        let id = sid()
+        try store.upsert(ParkedSession(id: id, title: "Interrupted", state: .active, updatedAt: Date()),
+                         conversation: conversation(id, "Interrupted"))   // ends on a user message
+        let rt = ScriptedRoutingRuntime(routes: ["{\"tool\":\"\"}"], answer: ["recovered"])
+        let manager = try await loadedManager(rt)
+        let ctrl = makeRoutedCtrl(store: store, manager: manager)
+
+        let normalized = try XCTUnwrap(store.all().first { $0.id == id })
+        XCTAssertEqual(normalized.state, .parked, "a stale .active row normalizes to parked at launch")
+        XCTAssertNotNil(normalized.nextRunAt, "…scheduled to run now, so the driver re-runs the turn")
+
+        XCTAssertEqual(ctrl.runAdvancePass(now: Date().addingTimeInterval(1)), [id])
+        await waitUntil({ store.conversation(id)?.messages.count == 2 }, 5)
+        XCTAssertEqual(store.conversation(id)?.messages.last?.text, "recovered")
+        XCTAssertEqual(store.all().first { $0.id == id }?.state, .idle)
+        XCTAssertEqual(store.all().first { $0.id == id }?.badgeCount, 1,
+                       "the recovered answer lands as an unseen result")
+    }
+
+    func testRelaunchNormalizesStaleActiveWithNothingPendingToIdle() throws {
+        let store = InMemoryParkedSessionStore()
+        let id = sid()
+        let now = Date()
+        let answered = AgentConversation(
+            id: id, title: "Done",
+            messages: [AgentMessage(role: .user, text: "U", createdAt: now),
+                       AgentMessage(role: .assistant, text: "A", createdAt: now)])
+        try store.upsert(ParkedSession(id: id, title: "Done", state: .active, updatedAt: now),
+                         conversation: answered)
+        _ = makeCtrl(store: store)
+        XCTAssertEqual(store.all().first?.state, .idle, "nothing pends → plain idle, not a zombie")
+        XCTAssertNil(store.all().first?.nextRunAt)
+    }
+
+    /// The driver serves ONE session and never double-serves: a tick while a turn is generating
+    /// serves nothing (the in-flight engine owns the single slot).
+    func testDriverServesOneAndNeverDoubleServes() async throws {
+        let store = InMemoryParkedSessionStore()
+        let now = Date()
+        for (i, id) in [sid(), sid()].enumerated() {
+            try store.upsert(ParkedSession(id: id, title: "\(i)", state: .parked,
+                                           nextRunAt: now.addingTimeInterval(Double(-10 + i)),
+                                           updatedAt: now.addingTimeInterval(Double(-20 + i))),
+                             conversation: conversation(id))
+        }
+        let rt = ScriptedRoutingRuntime(routes: ["{\"tool\":\"\"}", "{\"tool\":\"\"}"],
+                                        answer: Array(repeating: "x", count: 60),
+                                        delayNanos: 5_000_000)
+        let manager = try await loadedManager(rt)
+        let ctrl = makeRoutedCtrl(store: store, manager: manager)
+
+        XCTAssertEqual(ctrl.runAdvancePass(now: now).count, 1, "one slot — one session")
+        XCTAssertTrue(ctrl.runAdvancePass(now: now).isEmpty,
+                      "a tick while a turn is generating serves nothing (no double-serve)")
     }
 
     // MARK: - 9. Purge-delete + the expanded-state choke point (`notch-conversation-gestures`)

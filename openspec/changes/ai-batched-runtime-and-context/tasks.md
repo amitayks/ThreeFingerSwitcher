@@ -44,7 +44,7 @@
 
 ## 7. Provisioner wiring (GemmaRuntime — `xcodebuild` compile-verify)
 
-- [x] 7.1 Change `GemmaRuntime.makeModelManager`'s `ModelProvisioner` to construct and `prepare` a `BatchedGemmaMLXRuntime` instead of `GemmaMLXRuntime` (D9) — **no `ModelManager` API change**; residency/lifecycle/registry behavior identical. *Verify: `xcodebuild` compile; the full product links Core + GemmaRuntime.*
+- [x] 7.1 Change `GemmaRuntime.makeModelManager`'s `ModelProvisioner` to construct and `prepare` a `BatchedGemmaMLXRuntime` instead of `GemmaMLXRuntime` (D9) — **no `ModelManager` API change**; residency/lifecycle/registry behavior identical. *Verify: `xcodebuild` compile; the full product links Core + GemmaRuntime.* **(wire-full-potential-gates: now GATED — the provisioner constructs `BatchedGemmaMLXRuntime` ONLY when `batchedRuntimeUnlocked` (the already-resolved `FullPotentialGate.isUnlocked(.batchedRuntime)`, threaded via `AIRuntimeInjection.modelManagerFactory(optedIn:cpuLaneUnlocked:batchedRuntimeUnlocked:)` + `main.swift`); LOCKED (default master OFF) → the proven single-session `GemmaMLXRuntime` is resident, so the K-stream / growable-context surface is never constructed and the build behaves exactly as today's single-session one — the calm panic-off, no error. `xcodebuild` GREEN.)**
 - [x] 7.2 The scheduler-driven background advancer downcasts `ModelManager.currentRuntime as? BatchedLLMRuntime` to drive `batchStep`; the foreground `chat()` path uses the base `LLMRuntime`. *Verify: `xcodebuild` compile; `swift test` for the Core-side downcast guard logic with the stub.*
 
 ## 8. Verify

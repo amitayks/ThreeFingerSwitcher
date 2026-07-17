@@ -51,6 +51,12 @@ protocol GestureRecognizerDelegate: AnyObject {
     /// DOWN swipe applies the result ("bring it into the document"). Emitted once per gesture, only
     /// while `launcherCanvasResolutionActive`.
     func launcherCanvasResolve(dx: Int, dy: Int)
+    /// While a notch conversation is EXPANDED, a fresh two-finger FLICK resolves it
+    /// (`notch-conversation-gestures`): `dy == +1` (fast up) minimizes it into the notch dock,
+    /// `dx == +1` (fast right) purge-deletes the session; fast down/left are reserved no-ops at the
+    /// consumer. Soft scrubs never emit (the D4 classifier ignores them). Emitted at most once per
+    /// excursion, only while `notchConversationActive`.
+    func notchConversationResolve(dx: Int, dy: Int)
 
     // MARK: Files-drill intents (emitted only while `filesDrillActive`; the controller drives entry/exit).
     // The recognizer emits pure intents — directory navigation, preview, search-field focus (an up-step
@@ -83,6 +89,7 @@ extension GestureRecognizerDelegate {
     func launcherEdgeChanged(dx: Int, dy: Int) {}
     func launcherFocusIsOnBandList() -> Bool { false }
     func launcherCanvasResolve(dx: Int, dy: Int) {}
+    func notchConversationResolve(dx: Int, dy: Int) {}
     func filesDepth(_ direction: Int) {}
     func filesHighlight(_ direction: Int) {}
     func filesOpen() {}
@@ -130,26 +137,23 @@ final class GestureRecognizer {
     /// as a one-shot canvas RESOLUTION (horizontal = discard, down = apply) via `launcherCanvasResolve`,
     /// bypassing the normal launcher/switcher latch. The coordinator sets it from the canvas state.
     var launcherCanvasResolutionActive = false
-    private var canvasResStarted = false
     private var canvasResResolved = false
-    private var canvasResStart: CGPoint = .zero
-    /// Running PEAK of `abs(centroidVelocity)` per axis across the in-contact frames of the current canvas
-    /// excursion (D4). A resolve fires only if the dominant axis's peak crossed `flickVelocityThreshold` —
-    /// a slow reading-scrub never reaches it. Reset on lift / fresh contact.
-    private var canvasResPeakVelX: CGFloat = 0
-    private var canvasResPeakVelY: CGFloat = 0
-    /// Timestamp of the most recent in-contact frame whose dominant-axis speed exceeded the flick velocity
-    /// threshold, and the most recent in-contact frame's timestamp. The lift is a FLICK only when it arrives
-    /// within `flickLiftWindow` of the last high-velocity frame (D4) — a pause before lifting means the
-    /// fingers decelerated to a hold/scroll. Reset on lift / fresh contact.
-    private var canvasResLastFastTime: CFTimeInterval = 0
-    private var canvasResLastContactTime: CFTimeInterval = 0
-    /// Whether any in-contact frame this excursion crossed the velocity threshold on the dominant axis.
-    private var canvasResSawFastFrame = false
-    /// Signed dominant-axis travel captured from the last in-contact frame, so the lift-frame (which is
-    /// empty / .zero centroid) can still classify the direction and travel floor of the flick.
-    private var canvasResLastDX: CGFloat = 0
-    private var canvasResLastDY: CGFloat = 0
+    /// The per-excursion D4 flick state for the canvas resolve — the shared classifier
+    /// (`FlickExcursionClassifier`), one instance per surface so excursions never cross-talk.
+    private var canvasFlick = FlickExcursionClassifier()
+
+    /// While true (a notch conversation is EXPANDED — `notch-conversation-gestures`), a fresh
+    /// **two-finger** flick resolves the conversation via `notchConversationResolve` (up = minimize to
+    /// the dock, right = purge-delete; soft scrubs classify as nothing and scroll natively). Unlike the
+    /// canvas mode this NEVER swallows the wider grammar: it watches two-finger excursions only, begins
+    /// them only while the normal machine is idle (a switcher relaxed to two fingers keeps its frames),
+    /// and a 2→3+ morph resets the tracker and hands the frame straight to the normal latch — the
+    /// switcher/launcher stay fully usable while a chat is open. The coordinator sets it from
+    /// `ParkController.onExpandedChanged`.
+    var notchConversationActive = false {
+        didSet { if notchConversationActive != oldValue { notchFlick.reset() } }
+    }
+    private var notchFlick = FlickExcursionClassifier()
 
     /// While true (the Files column navigator is open), every frame routes to `trackFilesDrill` and the
     /// normal finger-count latch is bypassed — a fresh contact during the drill never opens the switcher
@@ -255,6 +259,13 @@ final class GestureRecognizer {
             trackFilesDrill(frame)
             return
         }
+        // While a notch conversation is EXPANDED (`notch-conversation-gestures`), watch two-finger flick
+        // excursions — but never at the wider grammar's expense: an excursion may BEGIN only while the
+        // normal machine is idle (a switcher relaxed to two fingers keeps every frame), and any frame the
+        // handler declines (0/1/3/4 fingers, or a 2→3+ morph) falls straight through to the machine below.
+        if notchConversationActive, notchFlick.started || state == .idle {
+            if handleNotchConversationFrame(frame) { return }
+        }
         let switcherTarget = settings.requireExactlyThree ? (frame.fingerCount == 3) : (frame.fingerCount >= 3)
 
         switch state {
@@ -307,81 +318,68 @@ final class GestureRecognizer {
     private func trackCanvasResolution(_ frame: TouchFrame) {
         let count = frame.fingerCount
         if count == 0 {                       // lift → classify the just-ended excursion, then re-arm
-            resolveCanvasFlickOnLift()
-            resetCanvasResolution()
+            if canvasFlick.started, !canvasResResolved,
+               let flick = canvasFlick.classifyOnLift(travelFloor: canvasResolveThreshold,
+                                                      velocityThreshold: flickVelocityThreshold,
+                                                      liftWindow: flickLiftWindow,
+                                                      axisLockRatio: CGFloat(settings.axisLockRatio)) {
+                canvasResResolved = true
+                delegate?.launcherCanvasResolve(dx: flick.dx, dy: flick.dy)
+            }
+            canvasFlick.reset()
+            canvasResResolved = false
             return
         }
-        if !canvasResStarted {
+        if !canvasFlick.started {
             guard count >= 2 else { return }  // require a fresh (≥) two-finger contact to begin
-            resetCanvasResolution()
-            canvasResStarted = true
-            canvasResStart = frame.centroid
-            canvasResLastContactTime = frame.time
+            canvasResResolved = false
+            canvasFlick.begin(at: frame.centroid, time: frame.time)
             return
         }
         guard !canvasResResolved, count >= 2 else { return }
-        let dx = frame.centroid.x - canvasResStart.x
-        let dy = frame.centroid.y - canvasResStart.y
-        let ratio = CGFloat(settings.axisLockRatio)
-        let verticalDominant = abs(dy) >= ratio * abs(dx)
-        // Accumulate the per-axis velocity peak + the dominant-axis travel from the last in-contact frame
-        // (the lift frame is empty, so the lift handler reads these). Treat `canvasResolveThreshold` as a
-        // travel FLOOR only — never fire here.
-        let vx = abs(frame.centroidVelocity.dx)
-        let vy = abs(frame.centroidVelocity.dy)
-        canvasResPeakVelX = max(canvasResPeakVelX, vx)
-        canvasResPeakVelY = max(canvasResPeakVelY, vy)
-        canvasResLastContactTime = frame.time
-        canvasResLastDX = dx
-        canvasResLastDY = dy
-        // Record the timing of any frame whose DOMINANT-axis speed crossed the flick threshold, so the lift
-        // window is measured from the last genuinely-fast frame on the relevant axis.
-        let dominantSpeed = verticalDominant ? vy : vx
-        if dominantSpeed >= flickVelocityThreshold {
-            canvasResSawFastFrame = true
-            canvasResLastFastTime = frame.time
-        }
+        // Accumulate travel + per-axis velocity peaks + last-fast-frame timing in the shared classifier.
+        // `canvasResolveThreshold` stays a travel FLOOR only — nothing ever fires mid-contact.
+        canvasFlick.track(centroid: frame.centroid, velocity: frame.centroidVelocity, time: frame.time,
+                          velocityThreshold: flickVelocityThreshold,
+                          axisLockRatio: CGFloat(settings.axisLockRatio))
     }
 
-    /// Classify the just-ended canvas excursion on lift (`count == 0`). Emits at most one axis-locked
-    /// `launcherCanvasResolve` and only for a genuine FLICK-LIFT (D4). A one-shot guard (`canvasResResolved`)
-    /// keeps a stray re-lift a no-op; the firing lift already raised the fingers.
-    private func resolveCanvasFlickOnLift() {
-        guard canvasResStarted, !canvasResResolved else { return }
-        let dx = canvasResLastDX
-        let dy = canvasResLastDY
-        let ratio = CGFloat(settings.axisLockRatio)
-        let verticalDominant = abs(dy) >= ratio * abs(dx)
-        // (a) Travel floor: the dominant axis must have crossed `canvasResolveThreshold`.
-        let dominantTravel = verticalDominant ? abs(dy) : abs(dx)
-        guard dominantTravel >= canvasResolveThreshold else { return }
-        // (b) Peak velocity: the dominant axis must have flicked fast at some point.
-        let dominantPeak = verticalDominant ? canvasResPeakVelY : canvasResPeakVelX
-        guard dominantPeak >= flickVelocityThreshold else { return }   // slow scrub → SCROLL, no resolve
-        // (c) Prompt lift: the lift must have followed the last fast frame within the flick window (a pause
-        // before lifting means the fingers decelerated to a hold/scroll).
-        guard canvasResSawFastFrame,
-              canvasResLastContactTime - canvasResLastFastTime <= flickLiftWindow else { return }
-        canvasResResolved = true
-        if verticalDominant {
-            delegate?.launcherCanvasResolve(dx: 0, dy: dy > 0 ? 1 : -1)   // dy>0 = up, dy<0 = down
-        } else {
-            delegate?.launcherCanvasResolve(dx: dx > 0 ? 1 : -1, dy: 0)
-        }
-    }
+    // MARK: - Notch conversation flick (two-finger only, falls through — `notch-conversation-gestures`)
 
-    /// Reset all per-excursion canvas-resolution state (on lift and on a fresh contact) so velocity peaks,
-    /// timing, and travel never leak across gestures.
-    private func resetCanvasResolution() {
-        canvasResStarted = false
-        canvasResResolved = false
-        canvasResPeakVelX = 0
-        canvasResPeakVelY = 0
-        canvasResLastFastTime = 0
-        canvasResLastContactTime = 0
-        canvasResSawFastFrame = false
-        canvasResLastDX = 0
-        canvasResLastDY = 0
+    /// Route one frame while a notch conversation is expanded. Returns true when the frame was consumed
+    /// by the flick tracker; false hands the SAME frame to the normal machine (fall-through). Routing:
+    /// a started excursion's lift classifies + emits one-shot `notchConversationResolve`; a 2→3+ morph
+    /// resets and falls through (the user is growing a switcher/launcher gesture out of a scroll — that
+    /// must win); an un-started tracker begins only on exactly two fingers (and only from the machine's
+    /// idle state — the caller gates that), so 0/1/3/4-finger frames always belong to the normal grammar.
+    private func handleNotchConversationFrame(_ frame: TouchFrame) -> Bool {
+        let count = frame.fingerCount
+        if notchFlick.started {
+            if count == 0 {                   // lift → classify, emit at most once, re-arm
+                if let flick = notchFlick.classifyOnLift(travelFloor: canvasResolveThreshold,
+                                                         velocityThreshold: flickVelocityThreshold,
+                                                         liftWindow: flickLiftWindow,
+                                                         axisLockRatio: CGFloat(settings.axisLockRatio)) {
+                    delegate?.notchConversationResolve(dx: flick.dx, dy: flick.dy)
+                }
+                notchFlick.reset()
+                return true
+            }
+            if count >= 3 {                   // growing contact → the wider grammar owns this frame
+                notchFlick.reset()
+                return false
+            }
+            if count == 2 {
+                notchFlick.track(centroid: frame.centroid, velocity: frame.centroidVelocity,
+                                 time: frame.time,
+                                 velocityThreshold: flickVelocityThreshold,
+                                 axisLockRatio: CGFloat(settings.axisLockRatio))
+            }
+            return true                       // a transient 1-finger dip is ignored, state retained
+        }
+        guard count == 2 else { return false }
+        notchFlick.begin(at: frame.centroid, time: frame.time)
+        return true
     }
 
     // MARK: - Switcher (three-finger; relaxes to two after activation)

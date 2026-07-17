@@ -21,9 +21,6 @@ struct LauncherView: View {
     var executor: AICommandExecutor? = nil
     /// Enable/download wiring for the canvas's `.unavailable` state (configuration-hub).
     var availability: AICanvasAvailability? = nil
-    /// Begin the composer's "attach screenshot" region capture (Bug 6) — wired by the launcher overlay to
-    /// the coordinator's region-picker flow. Forwarded to the canvas; nil hides the affordance.
-    var onAttachScreenshot: (() -> Void)? = nil
 
     private var columns: [GridItem] {
         Array(repeating: GridItem(.fixed(LauncherGridLayout.cellWidth), spacing: LauncherGridLayout.spacing),
@@ -70,8 +67,7 @@ struct LauncherView: View {
         if let executor, let command = model.canvasCommand {
             AICommandCanvasView(executor: executor, command: command,
                                 tint: command.tint.map(Color.init) ?? Color(model.currentBandColor),
-                                availability: availability,
-                                onAttachScreenshot: onAttachScreenshot)
+                                availability: availability)
         } else {
             Color.clear
         }

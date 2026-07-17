@@ -291,11 +291,13 @@ final class NotchHomeZoneOverlayController {
         })
     }
 
-    /// Tear down the rail. `animated` SHRINKS it back into the point behind the notch (spring on the scale,
-    /// no fade) then orders out on completion — the gentle grace-dismiss. `animated == false` is the
+    /// Tear down the panel. `animated` SHRINKS whatever is showing (rail OR the expanded conversation)
+    /// straight back into the point behind the notch (spring on the scale, no fade) then orders out on
+    /// completion — the gentle grace-dismiss AND the swipe-up straight-close. `animated == false` is the
     /// **synchronous** `orderOut` (the ghost-on-Space-switch landmine) — restore/disable, teardown immediate.
-    func hide(animated: Bool) {
-        guard let panel else { return }
+    /// `completion` runs AFTER the order-out (used by the straight-close to reset the panel to rail mode).
+    func hide(animated: Bool, completion: (() -> Void)? = nil) {
+        guard let panel else { completion?(); return }
         // Drop key BEFORE any order-out (D5 ordering): a panel holding key through its teardown can
         // strand first-responder state on a Space switch. Harmless when it was never key.
         setKeyCapable(false)
@@ -303,6 +305,7 @@ final class NotchHomeZoneOverlayController {
             pendingHide?.cancel(); pendingHide = nil
             model.isExpanded = false
             panel.orderOut(nil)                    // synchronous — ghost-on-Space-switch landmine
+            completion?()
             return
         }
         if pendingHide != nil { return }           // already receding — don't restart the animation
@@ -310,6 +313,7 @@ final class NotchHomeZoneOverlayController {
         let work = DispatchWorkItem { [weak self] in
             self?.panel?.orderOut(nil)
             self?.pendingHide = nil
+            completion?()
         }
         pendingHide = work
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.spreadDuration, execute: work)
@@ -485,7 +489,8 @@ struct NotchParkedCard: View {
                 Text(session.title.isEmpty ? "Session" : session.title)
                     .font(.system(size: 12, weight: .semibold))
                     .lineLimit(1).truncationMode(.middle)
-                ParkStateBadge(state: session.state, badgeCount: session.badgeCount)
+                ParkStateBadge(state: session.state, badgeCount: session.badgeCount,
+                               isScheduled: session.nextRunAt != nil)
                 Spacer(minLength: 0)
             }
             .frame(width: NotchHomeZoneLayout.cardWidth,
@@ -505,11 +510,17 @@ struct NotchParkedCard: View {
 struct ParkStateBadge: View {
     let state: ParkState
     let badgeCount: Int
+    /// Whether a `.parked` row is scheduled or actively advancing (`nextRunAt` set, or being served
+    /// right now) vs DORMANT awaiting the user (a confirm-tier pause). Irrelevant for other states.
+    var isScheduled: Bool = true
 
     var body: some View {
         switch state {
-        case .parked:
+        case .parked where isScheduled:
             label("Thinking…", system: "ellipsis", tint: .secondary)
+        case .parked:
+            // Dormant: a paused step waits until the user opens the session (no escalation, no glow).
+            label("Waiting for you", system: "hourglass", tint: .secondary)
         case .idle where badgeCount > 0, .active where badgeCount > 0:
             label("\(badgeCount) new", system: "checkmark.circle.fill", tint: .green)
         case .active:
@@ -520,9 +531,6 @@ struct ParkStateBadge: View {
             label("Parked", system: "moon.zzz", tint: .secondary)
         case .needsYou:
             label("Needs you", system: "exclamationmark.circle.fill", tint: .accentColor)
-        case .completed:
-            // Terminal — auto-dismissed forever on the next pass, so this is a brief transient render.
-            label("Done", system: "checkmark.circle.fill", tint: .green)
         }
     }
 
@@ -621,6 +629,10 @@ struct NotchConversationView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.vertical, 2)
             }
+            // Open at the END of the conversation (latest turn), not the top — an existing session with
+            // history lands at its most recent messages; also keeps the thread pinned to the bottom as it
+            // streams. The explicit scroll-to-tail below still animates the jump on each new turn.
+            .defaultScrollAnchor(.bottom)
             .onChange(of: engine.conversation?.messages.count ?? 0) {
                 withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(Self.tailID, anchor: .bottom) }
             }

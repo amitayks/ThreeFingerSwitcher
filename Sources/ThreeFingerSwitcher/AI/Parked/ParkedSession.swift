@@ -9,36 +9,37 @@ import Foundation
 /// durable store keyed by the SAME `id`. `badgeCount` + `state` are the only two fields the badge view
 /// reads. `Codable` because it persists alongside the conversation so the rail rebuilds on relaunch.
 
-/// The observable state of a (possibly parked) session.
+/// The observable state of a (possibly parked) session. There is deliberately NO terminal state: a
+/// conversational turn settling is never "task complete" (`refactor-park-and-background-agents` — the
+/// old `.completed` → instant-auto-dismiss classification deleted chats docked mid-response). A session
+/// is removed ONLY by user deletion/purge, the opt-in idle expiry, or the max-parked eviction.
 public enum ParkState: String, Codable, Equatable, Sendable {
     /// Foreground, in the canvas.
     case active
-    /// Stashed at the notch home zone; may run in the background.
+    /// Stashed at the notch home zone; may run in the background. `nextRunAt == nil` means DORMANT
+    /// (blocked on the user — e.g. a confirm-tier pause — never runnable until reactivated).
     case parked
     /// A dangerous write / required approval escalated to the foreground (badge + ambient glow).
     case needsYou
-    /// Nothing pending — eligible for summarize-and-sleep + eviction.
+    /// Nothing pending — eligible for eviction and (opt-in) expiry.
     case idle
-    /// The session's TASK has FINISHED (design D1 / Bug 3 terminal detection): the background advance
-    /// reached a terminal `AgentLoopOutcome` (answered / cap / stopped-with-no-pending). A completed
-    /// session is no longer runnable and is auto-dismissed FOREVER by the auto-dismiss pass (the same
-    /// authoritative discard path as a manual dismiss). Distinct from `.idle` (which merely has nothing
-    /// pending and could still receive a follow-up turn).
-    case completed
 
-    /// The non-evictable, non-dismissable states whose attention/escalation is protected (the foreground
-    /// active session and an escalation waiting on the user). `parked`/`idle`/`completed` are eligible for
-    /// lifecycle aging; `active`/`needsYou` are NEVER evicted or auto-dismissed (design D1/D7).
-    var isProtectedFromAging: Bool {
-        switch self {
-        case .active, .needsYou:        return true
-        case .parked, .idle, .completed: return false
-        }
+    /// Migration: rows persisted by older builds under the RETIRED terminal state ("completed") — or any
+    /// unknown future raw value — decode as `.idle`, so no stored session ever fails to load or vanishes.
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = ParkState(rawValue: raw) ?? .idle
     }
 
-    /// Whether the session's task has finished (design D1): a `.completed` row is terminal and is
-    /// auto-dismissed forever on the next pass. Kept as a predicate so callers don't switch on the raw case.
-    var isTerminal: Bool { self == .completed }
+    /// The non-evictable, non-dismissable states whose attention/escalation is protected (the foreground
+    /// active session and an escalation waiting on the user). `parked`/`idle` are eligible for lifecycle
+    /// aging; `active`/`needsYou` are NEVER evicted or auto-dismissed (design D1/D7).
+    var isProtectedFromAging: Bool {
+        switch self {
+        case .active, .needsYou: return true
+        case .parked, .idle:     return false
+        }
+    }
 }
 
 /// One lightweight rail/scheduler row for a session. The full transcript lives in the store under `id`.
@@ -50,7 +51,9 @@ public struct ParkedSession: Codable, Equatable, Identifiable, Sendable {
     public var state: ParkState
     /// Unseen results / needs-you items shown on the rail card.
     public var badgeCount: Int
-    /// Scheduler hint for a timed/scheduled continuation (nil = runnable now).
+    /// When the background driver should next advance this session. nil = DORMANT: not scheduled, never
+    /// runnable (a session waiting on the user, or one with nothing pending). The driver clears it when
+    /// it serves the session so a second tick can never double-serve.
     public var nextRunAt: Date?
     public var updatedAt: Date
 

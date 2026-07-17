@@ -80,6 +80,18 @@ public enum AIError {
             return AIPresentedError(headline: handoff.errorDescription ?? unknownHeadline,
                                     details: handoff.copyableDetails)
         }
+        if let fleet = error as? FleetError {
+            // The eviction list rides in `details` (copyable), never the headline (design D7, task 4.2).
+            return AIPresentedError(headline: fleet.errorDescription ?? unknownHeadline,
+                                    details: fleet.copyableDetails)
+        }
+        if let media = error as? MediaError {
+            // Media-specific failures (no-backend, seed required/invalid, generation/write failed, cloud
+            // budget/unavailable). Raw OS/vendor text rode into `copyableDetails` at the boundary; the
+            // headline stays clean (`ai-media-runtime`, design D10).
+            return AIPresentedError(headline: media.errorDescription ?? unknownHeadline,
+                                    details: media.copyableDetails)
+        }
 
         // 2) Cancellation is not a real failure — give a benign, clean headline if asked.
         if error is CancellationError {

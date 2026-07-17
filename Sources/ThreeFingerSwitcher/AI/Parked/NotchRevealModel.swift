@@ -39,6 +39,15 @@ final class NotchRevealModel {
         self.dwellInterval = dwellInterval
     }
 
+    /// Force the model back to hidden — used when the panel was closed **directly** (e.g. swipe-up closes the
+    /// expanded conversation straight to the notch, bypassing the rail + grace-dismiss), so a fresh
+    /// cross-behind-the-notch (and its dwell) is required to reveal again rather than an immediate re-reveal.
+    func reset() {
+        state = .hidden
+        graceDeadline = nil
+        dwellDeadline = nil
+    }
+
     /// Advance the lifecycle for a cursor sample.
     /// - Parameters:
     ///   - cursor: cursor position (Cocoa global).

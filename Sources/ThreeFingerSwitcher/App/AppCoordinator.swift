@@ -65,11 +65,12 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         // The shared ledger, for the purge-delete gesture only (`notch-conversation-gestures`).
         auditLog: auditLog)
 
-    /// Coarse repeating timer that runs the parked-session auto-dismiss pass (design D1): a terminal or
-    /// idle-past-countdown session is dismissed FOREVER. Installed/torn down alongside `parkController`'s
-    /// enable (mirrors `previewRefreshTimer`); the pass itself is the authoritative discard path.
+    /// Coarse repeating timer for park MAINTENANCE: the (opt-in) auto-dismiss pass — an idle, fully-seen
+    /// session past the configured countdown is dismissed forever — plus the background-driver advance
+    /// pass (recovered turns, scheduled retries). Installed/torn down alongside `parkController`'s
+    /// enable (mirrors `previewRefreshTimer`).
     private var parkAutoDismissTimer: Timer?
-    /// How often the auto-dismiss pass runs (a minute is plenty for a 5-minute default countdown).
+    /// How often the maintenance passes run (a minute is a fine grain for expiry and retries).
     private static let parkAutoDismissInterval: TimeInterval = 60
 
     /// The Keep Awake automation's stateful owner (`automations`). Idle until a `.automation(.keepAwake)`
@@ -342,7 +343,12 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         // Long-term memory (`wire-memory-skills`): `memory.read`/`write`/`update`/`forget`/`promote`.
         aiMemoryToolProvider,
         // Skills as tools (`wire-memory-skills`): each built-in/user skill projected as a routable tool.
-        aiSkillToolProvider
+        aiSkillToolProvider,
+        // Subagents (`refactor-park-and-background-agents`): fixed fresh-context templates as routable
+        // tools — context hygiene, not parallelism; only the summary re-enters the orchestrator thread.
+        SubagentToolContributor(
+            templates: Subagent.builtIns,
+            runtimeProvider: { [modelManager] in try await modelManager.runtime(requiring: [.text]) })
         // + future contributors here.
     ])
     /// The v1 candidate retriever: cheap keyword ranking over the registry's descriptors, offering ~5
@@ -367,7 +373,13 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         return BackgroundToolRunner(
             resolver: BackgroundPolicyResolver(whitelist: settings.agentWhitelist),
             audit: auditLog,
-            scheduler: scheduler,
+            // Escalation routes through the CONTROLLER (persist + repaint —
+            // `refactor-park-and-background-agents`), hopping to the main actor from the off-main loop:
+            // a background needs-you survives relaunch and lights the rail, never a silent in-memory
+            // scheduler flag.
+            onEscalate: { [weak self] id, reason in
+                Task { @MainActor in self?.parkController.escalate(id, reason: reason) }
+            },
             parkStateOf: { id in scheduler.parkState(of: id) })
     }()
 
@@ -702,7 +714,10 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         // The notch home zone rail follows the agent feature (here: AI commands enabled). When off, the
         // cursor monitor isn't even installed.
         parkController.setEnabled(settings.aiCommandsEnabled)
-        setParkAutoDismissEnabled(settings.aiCommandsEnabled)
+        setParkMaintenanceEnabled(settings.aiCommandsEnabled)
+        // Recover interrupted turns NOW (a quit mid-response was normalized to parked+scheduled at the
+        // controller's init) instead of waiting for the first coarse maintenance tick.
+        if settings.aiCommandsEnabled { parkController.runAdvancePass(now: Date()) }
         refreshRowSwitchingGate()
         refreshClipboardMonitor()
         applySpacesRearrangeOnLaunchIfManaged()
@@ -1423,7 +1438,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     func notchConversationResolve(dx: Int, dy: Int) {
         guard let id = parkController.expandedID else { return }
         if dy > 0 {
-            parkController.collapse()          // fast up → minimize to the dock
+            parkController.collapse(closingPanel: true)   // fast up → close straight into the notch (no rail dwell)
         } else if dx > 0 {
             parkController.purge(id)           // fast right → gone everywhere, no trace
         }
@@ -1936,7 +1951,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             .sink { [weak self] on in
                 MainActor.assumeIsolated {
                     self?.parkController.setEnabled(on)
-                    self?.setParkAutoDismissEnabled(on)
+                    self?.setParkMaintenanceEnabled(on)
                 }
             }
             .store(in: &cancellables)
@@ -1976,16 +1991,20 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         .store(in: &cancellables)
     }
 
-    /// Install / tear down the coarse auto-dismiss timer alongside the park rail (design D1). Each tick runs
-    /// the authoritative auto-dismiss pass; idempotent (invalidates any prior timer first) and safe to call
-    /// with `false` repeatedly.
-    private func setParkAutoDismissEnabled(_ on: Bool) {
+    /// Install / tear down the coarse park MAINTENANCE timer alongside the park rail. Each tick runs the
+    /// (opt-in) auto-dismiss pass AND the background-driver advance pass (serving runnable sessions —
+    /// recovered turns, scheduled retries — one at a time); idempotent (invalidates any prior timer
+    /// first) and safe to call with `false` repeatedly.
+    private func setParkMaintenanceEnabled(_ on: Bool) {
         parkAutoDismissTimer?.invalidate()
         parkAutoDismissTimer = nil
         guard on else { return }
         parkAutoDismissTimer = Timer.scheduledTimer(withTimeInterval: Self.parkAutoDismissInterval,
                                                     repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { _ = self?.parkController.runAutoDismissPass(now: Date()) }
+            MainActor.assumeIsolated {
+                _ = self?.parkController.runAutoDismissPass(now: Date())
+                _ = self?.parkController.runAdvancePass(now: Date())
+            }
         }
     }
 

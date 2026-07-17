@@ -12,6 +12,12 @@ public protocol AuditLog: Sendable {
     func record(_ r: AuditRecord)
     /// The most-recent records, reverse-chronological, capped at `limit`.
     func recent(limit: Int) -> [AuditRecord]
+    /// The ledger's SINGLE removal operation (`notch-conversation-gestures`): erase every record
+    /// attributed to `sessionID` — the user's explicit purge-delete gesture, and nothing else, invokes
+    /// it (no agent/tool/background path reaches it, so the model can never erase its own tracks).
+    /// Non-blocking like a write; a durable-store rewrite failure surfaces on the same bounded channel
+    /// as a write failure while the in-memory ring stays purged.
+    func purge(sessionID: AgentSessionID)
 }
 
 /// A bounded in-memory ring (`ai-background-autonomy`). The synchronous read seam every viewer hits; the
@@ -36,6 +42,11 @@ public final class InMemoryAuditLog: AuditLog, @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard limit > 0 else { return [] }
         return Array(ring.suffix(limit).reversed())
+    }
+
+    public func purge(sessionID: AgentSessionID) {
+        lock.lock(); defer { lock.unlock() }
+        ring.removeAll { $0.sessionID == sessionID }
     }
 
     /// Seed the ring from a persisted slice (newest-last order, as stored). Used by `DiskAuditLog` at init.
@@ -110,6 +121,19 @@ public final class DiskAuditLog: AuditLog, @unchecked Sendable {
         ring.recent(limit: limit)
     }
 
+    /// Purge one session's records: the ring filters SYNCHRONOUSLY (viewers are instantly consistent),
+    /// then the durable JSON-lines file is rewritten through the existing atomic `persist` on the
+    /// off-main writer queue. A rewrite failure surfaces on `lastPersistError` (bounded, non-blocking)
+    /// exactly like a write failure — and the ring is already purged either way. Deliberately writes
+    /// no log line referencing the purged session.
+    public func purge(sessionID: AgentSessionID) {
+        ring.purge(sessionID: sessionID)
+        let snapshot = ring.snapshot()
+        writeQueue.async { [weak self] in
+            self?.persist(snapshot)
+        }
+    }
+
     // MARK: - IO boundary (maps every throw to AuditError; logged raw)
 
     /// Read the JSON-lines file into the ring at init. A single corrupt line is skipped (logged); the
@@ -181,6 +205,13 @@ public final class FailableInMemoryAuditLog: AuditLog, @unchecked Sendable {
     }
 
     public func recent(limit: Int) -> [AuditRecord] { ring.recent(limit: limit) }
+
+    public func purge(sessionID: AgentSessionID) {
+        ring.purge(sessionID: sessionID)                 // never blocked — the ring is always purged
+        lock.lock()
+        _lastPersistError = failPersist ? .persistFailed(detail: "forced") : nil
+        lock.unlock()
+    }
 
     var lastPersistError: AuditError? {
         lock.lock(); defer { lock.unlock() }

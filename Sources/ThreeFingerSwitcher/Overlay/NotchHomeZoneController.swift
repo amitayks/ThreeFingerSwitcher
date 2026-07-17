@@ -131,6 +131,23 @@ final class NotchHomeZoneController {
         manageRefreshTimer()
     }
 
+    /// Straight-CLOSE the expanded conversation (the swipe-up "minimize" path): shrink the panel from its
+    /// current expanded size DIRECTLY into the point behind the notch — no rail-size intermediate to dwell
+    /// on. The conversation stays BOUND through the shrink (the caller defers its state-collapse to `then`),
+    /// so the real conversation shrinks — never flashing the empty/new-chat state or the rail. Once hidden:
+    /// reset the panel to rail mode (clears the conversation pin, clean rail for the next reveal), force the
+    /// reveal model hidden (a fresh cross-behind is required to re-open), then run `then` (the state-collapse).
+    func collapseAndClose(then finish: (() -> Void)? = nil) {
+        overlay.setKeyCapable(false)
+        reveal.reset()                              // a fresh cross-behind is required to re-reveal
+        overlay.hide(animated: true) { [weak self] in
+            self?.overlay.model.engine = nil
+            self?.overlay.model.mode = .rail         // clean rail for the next reveal; clears the pin
+            finish?()
+        }
+        manageRefreshTimer()
+    }
+
     // MARK: - Cursor handling (edge-gated, mirrors DockPreviewController)
 
     private func handleCursor(_ point: CGPoint) {

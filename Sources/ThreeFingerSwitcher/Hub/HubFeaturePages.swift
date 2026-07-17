@@ -514,28 +514,28 @@ struct AIPage: View {
         }
     }
 
-    // MARK: - Parked sessions (design D1 — the auto-dismiss countdown)
+    // MARK: - Parked sessions (the opt-in auto-dismiss countdown)
 
-    /// The auto-dismiss countdown surfaced in MINUTES (design D1): a parked/idle (or task-completed)
-    /// session untouched this long is dismissed forever. `agentParkAutoDismissCountdown` is persisted in
-    /// SECONDS, so this binding divides on read / multiplies on write, keeping the Hub slider human (minutes,
-    /// default 5). Clamped to whole minutes so the readout is clean.
+    /// The auto-dismiss countdown surfaced in MINUTES: an idle, fully-seen session untouched this long is
+    /// dismissed forever — **0 = never (the default)**. `agentParkAutoDismissCountdown` is persisted in
+    /// SECONDS, so this binding divides on read / multiplies on write, keeping the Hub slider human.
+    /// Clamped to whole minutes so the readout is clean.
     private var autoDismissMinutes: Binding<Double> {
         Binding(get: { (settings.agentParkAutoDismissCountdown / 60).rounded() },
-                set: { settings.agentParkAutoDismissCountdown = max(1, $0.rounded()) * 60 })
+                set: { settings.agentParkAutoDismissCountdown = max(0, $0.rounded()) * 60 })
     }
 
     @ViewBuilder private var parkedSessionsSection: some View {
         HubSection("Parked sessions",
-                   footnote: "A conversation you park to the notch waits for you here. Untouched past this countdown — or once its task finishes — it's dismissed for good (only ongoing work and sessions that need you stay). Raise the cap to keep more parked at once.") {
+                   footnote: "A conversation you park to the notch waits for you here — it keeps its results until you delete it. Set a countdown to auto-dismiss idle, already-seen sessions (0 = never; unseen results and sessions that need you always stay). Raise the cap to keep more parked at once.") {
             LabeledSlider(title: "Reveal dwell (seconds)", value: $settings.agentNotchRevealDwell,
                           range: 0...1, format: "%.2f",
                           help: "How long the cursor must linger behind the notch before the dock opens. Keeps a quick pass through the notch — reaching for the menu bar or another corner — from popping it. Set to 0 to open instantly. Default 0.30s.")
                 .disabled(!settings.aiCommandsEnabled)
 
-            LabeledSlider(title: "Auto-dismiss after (minutes)", value: autoDismissMinutes,
-                          range: 1...30, format: "%.0f",
-                          help: "How long a parked, idle session waits before it's dismissed forever. Default 5 minutes.")
+            LabeledSlider(title: "Auto-dismiss after (minutes, 0 = never)", value: autoDismissMinutes,
+                          range: 0...30, format: "%.0f",
+                          help: "How long an idle, already-seen session waits before it's dismissed forever. 0 (the default) keeps sessions until you delete them; sessions with unseen results never expire.")
                 .disabled(!settings.aiCommandsEnabled)
 
             LabeledIntSlider(title: "Maximum parked sessions", value: $settings.agentMaxParkedSessions,
