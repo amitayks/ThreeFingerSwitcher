@@ -268,6 +268,34 @@ final class ParkController {
     /// batched-runtime slice can drive K slots with NO protocol change (one active now, K-ready).
     var parkScheduler: ParkScheduler { scheduler }
 
+    /// The AI system's business RIGHT NOW, for automatic model eviction
+    /// (`model-idle-ttl-and-memory-pressure` D2): pulled by `ModelManager` at decision time on the
+    /// main actor, so evict-vs-just-scheduled ordering is deterministic. `foregroundSessionActive` is
+    /// an OR over conversational surfaces — the expanded notch session, any `.active` row, and (when
+    /// the voice change lands) an open voice conversation joins through the same flag.
+    func quiescenceSnapshot() -> QuiescenceSnapshot {
+        let rows = scheduler.snapshot()
+        return QuiescenceSnapshot(
+            turnInFlight: engines.values.contains { $0.isTurnInFlight },
+            foregroundSessionActive: expandedID != nil || rows.contains { $0.state == .active },
+            nextScheduledWork: rows.compactMap(\.nextRunAt).min())
+    }
+
+    /// The engine bound to the expanded session, if any (`add-voice-computer-use-agent`: the
+    /// `set_auto_mode` tools land the grant on the conversation the user is looking at).
+    func expandedEngine() -> NotchSessionEngine? {
+        expandedID.flatMap { engines[$0] }
+    }
+
+    /// The any-human-touch kill switch's fan-out (`add-voice-computer-use-agent`): discard every
+    /// in-flight turn — a DISCARD (no partial message appended, not a failure), exactly the verb the
+    /// canvas's own discard uses.
+    func discardInFlightTurns() {
+        for engine in engines.values where engine.isTurnInFlight {
+            engine.discardTurn()
+        }
+    }
+
     // MARK: - Maintenance
 
     /// Relaunch normalization (`refactor-park-and-background-agents`): no engine can exist at launch, so

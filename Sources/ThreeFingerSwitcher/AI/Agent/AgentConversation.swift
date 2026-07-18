@@ -138,6 +138,15 @@ public struct AgentConversation: Codable, Equatable, Identifiable, Sendable {
     public var compactedSummary: String?
     /// The active skill (file id) driving this session, if any (owned by `ai-skills-as-files`).
     public var skillID: String?
+    /// The per-conversation auto-approve grant (`add-voice-computer-use-agent`, design D7): while
+    /// true, `.confirm`-tier acts execute without a per-step pause (narrated). Granted only through
+    /// the gated `enable_auto_mode` / a surface toggle / a parsed initial-command intent; revocation
+    /// is instant. Persisted with the conversation. Optional so rows stored by older builds decode
+    /// cleanly (nil reads as false).
+    public var autoApprove: Bool?
+
+    /// The effective grant (nil-safe read).
+    public var isAutoApproveGranted: Bool { autoApprove ?? false }
 
     public init(id: AgentSessionID = AgentSessionID(),
                 title: String,
@@ -145,7 +154,8 @@ public struct AgentConversation: Codable, Equatable, Identifiable, Sendable {
                 createdAt: Date = Date(),
                 updatedAt: Date = Date(),
                 compactedSummary: String? = nil,
-                skillID: String? = nil) {
+                skillID: String? = nil,
+                autoApprove: Bool? = nil) {
         self.id = id
         self.title = title
         self.messages = messages
@@ -153,6 +163,7 @@ public struct AgentConversation: Codable, Equatable, Identifiable, Sendable {
         self.updatedAt = updatedAt
         self.compactedSummary = compactedSummary
         self.skillID = skillID
+        self.autoApprove = autoApprove
     }
 }
 

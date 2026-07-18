@@ -189,8 +189,17 @@ public final class GemmaMLXRuntime: LLMRuntime, @unchecked Sendable {
         let pipeline = self.pipeline
 
         let images = request.images   // design D2: a turn may carry MULTIPLE images
+        let needsAudio = request.requiresAudio
 
         return AsyncThrowingStream { continuation in
+            // Audio refusal contract (`add-voice-computer-use-agent`): the request seam carries audio
+            // bytes for the future audio-tower path (`Gemma4AudioProcessor`/`pendingAudioFeatures`,
+            // mirroring the vision integration), but THIS conformer does not feed them yet — refuse
+            // loudly rather than silently dropping the user's audio. Remove when the tower is wired.
+            if needsAudio {
+                continuation.finish(throwing: RuntimeError.unsupportedModality(.audio))
+                return
+            }
             // Manual-loop path: any request that needs channel classification — EITHER vision (the text
             // pipeline's `chatStream` is text-only AND has no token-level entry point) OR reasoning ON
             // (channels are delimited by in-band control tokens only visible at the token level). Streams

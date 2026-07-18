@@ -62,6 +62,9 @@ enum SystemAction: String, Codable, Equatable, CaseIterable, Identifiable {
     case missionControl, appExpose, showDesktop, nextSpace, previousSpace
     case lockScreen, screenSaver, sleepDisplay, emptyTrash
     case screenshotSelection, screenshotFullScreen, screenshotTools
+    /// Read the front window's last assistant reply aloud (`add-speak-last-response-launcher-action`
+    /// — the trackpad-native trigger for the menu-bar item; both route to the same coordinator verb).
+    case speakLastResponse
     // Media & display
     case playPause, nextTrack, previousTrack, volumeUp, volumeDown, mute, brightnessUp, brightnessDown
 
@@ -139,6 +142,7 @@ enum SystemAction: String, Codable, Equatable, CaseIterable, Identifiable {
         case .screenshotSelection: return ("Screenshot — Selection", "camera.viewfinder", "Capture a selected area (system shortcut).", .system)
         case .screenshotFullScreen:return ("Screenshot — Full Screen", "camera.fill", "Capture the whole screen (system shortcut).", .system)
         case .screenshotTools:     return ("Screenshot — Tools", "camera.on.rectangle", "Open the screenshot toolbar (system shortcut).", .system)
+        case .speakLastResponse:   return ("Speak Last Response", "speaker.wave.2.bubble", "Read the front window's last assistant reply aloud (great over a Claude terminal).", .system)
         case .playPause:           return ("Play / Pause", "playpause.fill", "Toggle media playback.", .media)
         case .nextTrack:           return ("Next Track", "forward.fill", "Skip to the next track.", .media)
         case .previousTrack:       return ("Previous Track", "backward.fill", "Go to the previous track.", .media)

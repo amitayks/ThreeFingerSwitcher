@@ -51,6 +51,17 @@ final class AICommandExecutor: ObservableObject {
         /// Committed and done (in-place written or task dispatched).
         case committed
 
+        /// Whether a turn is actively being produced (`fix-evict-thrash-and-hot-path`): the
+        /// quiescence input mirroring `NotchSessionEngine.isTurnInFlight` — automatic model
+        /// eviction must never fire while the CANVAS executor is loading or streaming.
+        /// `.reviewingAction` counts as foreground-active (mid-conversation), not turn-in-flight.
+        var isTurnInFlight: Bool {
+            switch self {
+            case .loadingModel, .streaming: return true
+            default: return false
+            }
+        }
+
         /// Whether a DOWN-swipe commit should COMMIT. Only a ready in-place result or a task action
         /// awaiting armed-confirmation is committable; a DOWN swipe in any other state (still
         /// loading/streaming, no input, declined, failed) is IGNORED — the user waits, and only a

@@ -120,6 +120,9 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
                 self?.keepAwakeController.toggle(dimTo: KeepAwakeController.fraction(fromPercent: dimPercent))
             }
         },
+        // Speak-last-response from a launcher band (`add-speak-last-response-launcher-action`) —
+        // same verb as the menu-bar item.
+        onSpeakLastResponse: { [weak self] in self?.speakLastResponse() },
         // The band carries only bounded/light clipboard previews (see `bandWindow`); resolve the FULL
         // entry by id at fire time so paste restores the complete payload, not the truncated preview.
         clipboardResolver: { [weak self] id in self?.clipboardStore.materializedEntry(id: id) }
@@ -348,9 +351,83 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         // tools — context hygiene, not parallelism; only the summary re-enters the orchestrator thread.
         SubagentToolContributor(
             templates: Subagent.builtIns,
-            runtimeProvider: { [modelManager] in try await modelManager.runtime(requiring: [.text]) })
+            runtimeProvider: { [modelManager] in try await modelManager.runtime(requiring: [.text]) }),
+        // Computer use (`add-voice-computer-use-agent`): AX-first read/focus/click/type over the
+        // switcher's own enumeration + commit path. Flag-gated LIVE (off = absent from candidates);
+        // UserDefaults reads are thread-safe (the loop queries descriptors off-main).
+        ComputerUseToolContributor(
+            enabled: { UserDefaults.standard.bool(forKey: "computerUseEnabled") },
+            resolveWindow: { [weak self] app, title in self?.resolveComputerUseWindow(app: app, title: title) },
+            focusWindow: { [weak self] target in self?.focusComputerUseWindow(target) ?? false },
+            performer: aiAXPerformer,
+            arbiter: aiActionArbiter,
+            narrate: { [weak self] text in self?.voiceNarrate(text) }),
+        // Voice tools: `speak` + the gated auto-mode pair.
+        VoiceToolContributor(
+            voiceEnabled: { UserDefaults.standard.bool(forKey: "voiceConversationEnabled") },
+            computerUseEnabled: { UserDefaults.standard.bool(forKey: "computerUseEnabled") },
+            speak: { [weak self] text in self?.voiceSpeak(text) },
+            setAutoMode: { [weak self] on in self?.setConversationAutoMode(on) })
         // + future contributors here.
     ])
+
+    // MARK: - Voice + computer-use composition (`add-voice-computer-use-agent`)
+
+    /// Hot-path arming flags (`fix-evict-thrash-and-hot-path`): the touch stream is the
+    /// latency-critical gesture pipeline, so its abort hook reads ONLY these plain stored Bools.
+    /// They're maintained by state-change sinks installed inside the lazy initializers below — a
+    /// touch frame can never instantiate the agent/voice stack and never reads settings.
+    private var agentActingNow = false
+    private var voicePhaseLive = false
+    /// Whether the lazy voice stack has ever been built (guards the quiescence read the same way).
+    private var voiceStackLive = false
+
+    /// The agent-vs-human input arbitration: tagged synthetic input + the any-touch kill switch.
+    private lazy var aiActionArbiter: AgentActionArbiter = {
+        let arbiter = AgentActionArbiter()
+        arbiter.onAbort = { [weak self] in self?.abortAgentAction() }
+        // Arm/disarm the hot-path flag on acting-state CHANGES (rare), never per frame.
+        arbiter.$isActing
+            .sink { [weak self] acting in
+                MainActor.assumeIsolated { self?.agentActingNow = acting }
+            }
+            .store(in: &cancellables)
+        return arbiter
+    }()
+    /// The AX read/act engine, posting through the arbiter's tagged event source.
+    private lazy var aiAXPerformer = AXActionPerformer(eventSource: aiActionArbiter.eventSource)
+    /// The process-wide synthesizer (sentence chunks + narration + speak-last-response).
+    private lazy var aiSpeechSynthesizer = SystemSpeechSynthesizer()
+    /// The voice conversation's transcript (in-memory v1 — voice sessions aren't parked rows yet).
+    private var voiceConversation = AgentConversation(title: "Voice", messages: [])
+    /// The VOICE conversation's auto-approve grant (per-engine grants live on the engines).
+    private let voiceAutoGrant = LockedBool()
+    /// The push-to-talk hold-key monitor (default Right Option), installed only while voice is on.
+    private lazy var pttMonitor = PTTKeyMonitor()
+    /// The voice session controller: pure turn model + seams; the turn runs the SAME agent loop and
+    /// tool registry as typed chat (voice is an input/output mode, not a second agent).
+    private lazy var voiceController: VoiceSessionController = {
+        let controller = VoiceSessionController(
+            transcriberFactory: {
+                if #available(macOS 26.0, *) { return SpeechAnalyzerTranscriber() }
+                return nil
+            },
+            synthesizer: aiSpeechSynthesizer,
+            micAuthorizer: { await MicrophoneAuthorizer.requestAccess() },
+            turnStarter: { [weak self] text in
+                self?.voiceTurnStream(text) ?? AsyncThrowingStream { $0.finish() }
+            })
+        voiceStackLive = true
+        // Arm the hot-path abort flag only for the phases a touch should interrupt.
+        controller.$phase
+            .sink { [weak self] phase in
+                MainActor.assumeIsolated {
+                    self?.voicePhaseLive = (phase == .thinking || phase == .speaking)
+                }
+            }
+            .store(in: &cancellables)
+        return controller
+    }()
     /// The v1 candidate retriever: cheap keyword ranking over the registry's descriptors, offering ~5
     /// tools per turn (the loop also offers `widen_candidates` so the model can ask for more).
     private lazy var aiToolCandidateSource =
@@ -417,7 +494,18 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
                     ?? SkillStore.builtInManifests().first { $0.id == id })?.toolNames ?? []
             },
             // Background autonomy: nil when `.backgroundAutonomy` is locked (the plain foreground path).
-            backgroundRunner: aiBackgroundRunner)
+            backgroundRunner: aiBackgroundRunner,
+            // The loop's wall-clock bounds (`add-voice-computer-use-agent` D8), settings-fed live.
+            loopBudget: { [weak self] in
+                guard let self else { return .default }
+                return LoopBudget(stepTimeout: TimeInterval(self.settings.agentStepTimeoutSeconds),
+                                  turnDeadline: TimeInterval(self.settings.agentTurnDeadlineSeconds))
+            },
+            // Auto-approved acts are narrated ALOUD when a voice conversation is live (always visible
+            // in the thinking stream regardless) — spec: silence never hides an act.
+            narrator: { [weak self] text in
+                Task { @MainActor in self?.voiceNarrate(text) }
+            })
     }
 
     // Per-app keyboard language (opt-in; remembers and re-selects the input source per app/site). Gated
@@ -492,6 +580,10 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     /// rebuild time (`StatusItemController.menuNeedsUpdate`), so no live observer is needed.
     var showDiagnostics: Bool { settings.showDiagnostics }
 
+    /// Whether the AI opt-in is on — gates the menu-bar "Speak Last Response" line
+    /// (`add-voice-computer-use-agent` v0; TTS + AX only, no mic).
+    var aiCommandsEnabledForMenu: Bool { settings.aiCommandsEnabled }
+
     var onStateChange: (() -> Void)?
 
     /// The wizard's menu-bar moment: pulses the real status-item mark (wired by
@@ -535,6 +627,15 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             // Keep Awake's first-touch-to-stop arming (non-consuming — a no-op unless it's active, and it
             // never swallows the frame; the recognizer still sees it below).
             self.keepAwakeController.noteTouch(fingerCount: frame.fingerCount)
+            // The agent kill switch (`add-voice-computer-use-agent`): ANY human contact aborts an
+            // in-flight agent act / spoken reply. HOT-PATH RULE (`fix-evict-thrash-and-hot-path`):
+            // this is the latency-critical gesture pipeline — the check is two stored Bools, armed
+            // by state-change sinks; the agent/voice stack is NEVER touched (or instantiated) here
+            // unless one of them is genuinely live.
+            if frame.fingerCount > 0, self.agentActingNow || self.voicePhaseLive {
+                if self.agentActingNow { self.aiActionArbiter.humanTouchDetected() }
+                if self.voicePhaseLive { self.voiceController.humanTouch() }
+            }
             self.recognizer.feed(frame)
         }
         scrollTap.consumePredicate = { [weak self] in
@@ -649,6 +750,9 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         observeParkToggle()
         observeAIGatingSnapshot()
         reconcileAIModelAtLaunch()
+        installAutomaticModelEviction()
+        observeVoiceToggle()
+        syncVoicePTTMonitor()
     }
 
     deinit {
@@ -2127,6 +2231,255 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
                         if let d = self.selectedAIModelDescriptor() { self.modelManager.showStatus(for: d) }
                     }
                 }
+            }
+            .store(in: &cancellables)
+    }
+
+    /// Wire the automatic model-weight eviction triggers (`model-idle-ttl-and-memory-pressure`): the
+    /// REAL memory-pressure observer (the previously-aspirational "evict on memory pressure" comment,
+    /// now true) + the quiescence-keyed idle TTL. The quiescence snapshot pulls from the park
+    /// controller on the main actor at decision time; the TTL closure reads the live setting so a Hub
+    /// change applies without re-wiring. Installed unconditionally — `evaluateAutomaticEviction`
+    /// itself no-ops while not opted in / nothing resident. An open VOICE conversation joins through
+    /// `foregroundSessionActive` (the OR-shaped flag) so a live dialogue never pays a mid-chat evict.
+    private func installAutomaticModelEviction() {
+        modelManager.installAutomaticEviction(
+            pressure: SystemMemoryPressureSource(),
+            quiescence: { [weak self] in
+                guard let self else { return QuiescenceSnapshot() }
+                // EVERY conversational surface joins the snapshot (`fix-evict-thrash-and-hot-path`
+                // — the original only saw notch sessions, so canvas conversations were invisible
+                // and eviction fired between canvas turns → the reload storm):
+                var snapshot = self.parkController.quiescenceSnapshot()
+                // The launcher-canvas executor: a loading/streaming turn blocks ALL eviction; an
+                // open canvas (incl. a paused action review) is a foreground conversation.
+                if self.aiCommandExecutor.state.isTurnInFlight {
+                    snapshot.turnInFlight = true
+                }
+                if self.launcherOverlay.canvasActive {
+                    snapshot.foregroundSessionActive = true
+                }
+                // A live voice conversation (checked WITHOUT instantiating the lazy voice stack).
+                if self.voicePhaseLive || (self.settings.voiceConversationEnabled
+                                           && self.voiceStackLive
+                                           && self.voiceController.isConversationActive) {
+                    snapshot.foregroundSessionActive = true
+                }
+                return snapshot
+            },
+            idleTTL: { [weak self] in TimeInterval((self?.settings.aiIdleEvictMinutes ?? 0) * 60) })
+    }
+
+    // MARK: - Voice + computer-use behaviors (`add-voice-computer-use-agent`)
+
+    /// Resolve a computer-use window target against the switcher's OWN enumeration (fuzzy app-name
+    /// contains + optional title hint; nil app = the frontmost app's window).
+    private func resolveComputerUseWindow(app: String?, title: String?) -> ComputerUseWindowTarget? {
+        let windows = windowService.snapshot()
+        let appQuery = app?.lowercased().trimmingCharacters(in: .whitespaces) ?? ""
+        let titleQuery = title?.lowercased() ?? ""
+        var candidates = windows
+        if !appQuery.isEmpty {
+            candidates = candidates.filter { $0.appName.lowercased().contains(appQuery) }
+        } else if let front = NSWorkspace.shared.frontmostApplication {
+            let own = candidates.filter { $0.pid == front.processIdentifier }
+            if !own.isEmpty { candidates = own }
+        }
+        if !titleQuery.isEmpty {
+            let titled = candidates.filter { $0.title.lowercased().contains(titleQuery) }
+            if !titled.isEmpty { candidates = titled }
+        }
+        // Prefer the current Space (the cheap raise path; reading works regardless).
+        let pick = candidates.first(where: { $0.isOnCurrentSpace }) ?? candidates.first
+        return pick.map { ComputerUseWindowTarget(pid: $0.pid, title: $0.title, appName: $0.appName) }
+    }
+
+    /// Focus a resolved target through the EXISTING hardened commit path (`raiseCommitted` — the
+    /// agent is the third caller after trackpad and ⌘-Tab; switcher-as-API).
+    private func focusComputerUseWindow(_ target: ComputerUseWindowTarget) -> Bool {
+        guard let window = windowService.snapshot().first(where: {
+            $0.pid == target.pid && ($0.title == target.title || target.title.isEmpty)
+        }) ?? windowService.snapshot().first(where: { $0.pid == target.pid }) else { return false }
+        raiseCommitted(window)
+        return true
+    }
+
+    /// The one voice turn: run the SAME bounded agent loop over the voice conversation, streaming
+    /// `.response` tokens back for sentence-chunked speech. Failures speak a clean headline and the
+    /// stream throws so the turn model returns to idle.
+    private func voiceTurnStream(_ text: String) -> AsyncThrowingStream<Token, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task { @MainActor [weak self] in
+                guard let self else { continuation.finish(); return }
+                self.applySpokenAutoIntent(text)
+                self.voiceConversation.messages.append(AgentMessage(role: .user, text: text))
+                do {
+                    let runtime = try await self.modelManager.runtime(requiring: [.text])
+                    let speakLine: @Sendable (String) -> Void = { [weak self] line in
+                        Task { @MainActor in self?.voiceSpeak(line) }
+                    }
+                    // Voice approvals (design D7): no canvas → guidance-and-skip base gate; the
+                    // auto-mode grant (spoken explicitly) lifts `.confirm` acts, narrated.
+                    let gate = AutoApprovingGate(base: SpokenGuidanceGate(speak: speakLine),
+                                                 isGranted: { [grant = self.voiceAutoGrant] in grant.value },
+                                                 narrate: speakLine)
+                    let budget = LoopBudget(
+                        stepTimeout: TimeInterval(self.settings.agentStepTimeoutSeconds),
+                        turnDeadline: TimeInterval(self.settings.agentTurnDeadlineSeconds))
+                    let loop = AgentLoop(runtime: runtime, registry: self.aiToolRegistry,
+                                         candidateSource: self.aiToolCandidateSource,
+                                         gate: gate,
+                                         reasoning: false,   // voice favors latency; reasoning is a chat affair
+                                         source: TaskSource(),
+                                         budget: budget,
+                                         isAutoGranted: { [grant = self.voiceAutoGrant] in grant.value },
+                                         onResponseToken: { token in
+                                             continuation.yield(Token(token, isFinal: false))
+                                         })
+                    let result = await loop.run(
+                        context: RouteContext(messages: self.voiceConversation.messages))
+                    switch result.outcome {
+                    case let .answered(answer), let .capReached(answer):
+                        if !answer.isEmpty {
+                            self.voiceConversation.messages.append(AgentMessage(role: .assistant, text: answer))
+                        }
+                        continuation.finish()
+                    case let .stopped(_, answer):
+                        if !answer.isEmpty {
+                            self.voiceConversation.messages.append(AgentMessage(role: .assistant, text: answer))
+                        }
+                        continuation.finish()
+                    case .pausedAwaitingUser:
+                        continuation.finish()
+                    case let .failed(headline):
+                        self.voiceSpeak(headline)
+                        continuation.finish(throwing: RuntimeError.unavailable(reason: headline))
+                    }
+                } catch {
+                    let presented = AIError.message(for: error)
+                    self.voiceSpeak(presented.headline)
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// The USER's explicit spoken auto-mode grant/revoke: the gate protects against MODEL-initiated
+    /// acts; a deliberate, push-to-talk-held spoken grant IS user consent (design D7 — the
+    /// initial-command intent path).
+    private func applySpokenAutoIntent(_ transcript: String) {
+        let lowered = transcript.lowercased()
+        let grants = ["enable auto mode", "auto mode on", "without asking", "don't ask", "dont ask"]
+        let revokes = ["disable auto mode", "auto mode off", "stop auto mode", "ask me again"]
+        if revokes.contains(where: lowered.contains) {
+            voiceAutoGrant.value = false
+            voiceSpeak("Auto mode off.")
+        } else if grants.contains(where: lowered.contains) {
+            voiceAutoGrant.value = true
+            voiceSpeak("Auto mode on for this conversation.")
+        }
+    }
+
+    /// Speak a line through the shared synthesizer (the `speak` tool + failure lines + narration).
+    private func voiceSpeak(_ text: String) {
+        guard settings.voiceConversationEnabled else { return }
+        aiSpeechSynthesizer.speak(text)
+    }
+
+    /// Narrate an auto-executed act: SPOKEN when a voice conversation is live; the visible step list
+    /// carries it regardless (the loop's thinking stream — spec: silence never hides an act).
+    private func voiceNarrate(_ text: String) {
+        guard settings.voiceConversationEnabled, voiceController.isConversationActive else { return }
+        aiSpeechSynthesizer.speak(text)
+    }
+
+    /// The `set_auto_mode` tools land here: an expanded/live engine's conversation takes the grant;
+    /// otherwise the voice conversation does.
+    private func setConversationAutoMode(_ on: Bool) {
+        if let engine = parkController.expandedEngine() {
+            engine.setAutoApprove(on)
+        } else {
+            voiceAutoGrant.value = on
+        }
+    }
+
+    /// The any-human-touch kill switch (spec: "The human always wins the input"): cancel every
+    /// in-flight turn as a DISCARD and acknowledge.
+    private func abortAgentAction() {
+        parkController.discardInFlightTurns()
+        voiceController.humanTouch()
+    }
+
+    /// Speak-last-response (the v0 wedge — no mic, no conversation): resolve the frontmost (or
+    /// terminal-looking) window, read it via AX, extract the tail, speak it. Uses the model for the
+    /// extraction when it's resident; falls back to the last visible lines so the command ALWAYS
+    /// works. Failures surface as one spoken line + a log — bounded, never a modal.
+    func speakLastResponse() {
+        Task { @MainActor in
+            do {
+                guard let target = resolveComputerUseWindow(app: nil, title: nil) else {
+                    aiSpeechSynthesizer.speak("I can't find a window to read.")
+                    return
+                }
+                let snapshot = try await aiAXPerformer.snapshot(pid: target.pid, titleHint: target.title)
+                let text = snapshot.joinedText
+                guard !text.isEmpty else {
+                    aiSpeechSynthesizer.speak("That window has no readable text.")
+                    return
+                }
+                let tail = String(text.suffix(6_000))
+                var toSpeak: String
+                if modelManager.isResident, let runtime = try? await modelManager.runtime(requiring: [.text]) {
+                    let prompt = """
+                    Below is the tail of a window's visible text (likely a terminal transcript). \
+                    Extract the FINAL assistant/agent response verbatim, or if none exists, briefly \
+                    summarize what the window shows. Reply with only that text.
+
+                    \(tail)
+                    """
+                    toSpeak = (try? await runtime.generateText(LLMRequest(prompt: prompt))) ?? ""
+                } else {
+                    toSpeak = ""
+                }
+                if toSpeak.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    // Model not resident / extraction failed → the last visible lines, honestly.
+                    toSpeak = snapshot.textBlocks.suffix(12).joined(separator: "\n")
+                }
+                var chunker = SentenceChunker()
+                for chunk in chunker.consume(toSpeak) { aiSpeechSynthesizer.speak(chunk) }
+                if let rest = chunker.flush() { aiSpeechSynthesizer.speak(rest) }
+            } catch {
+                let presented = AIError.message(for: error)
+                aiSpeechSynthesizer.speak(presented.headline)
+                NSLog("[ThreeFingerSwitcher] speak-last-response failed: \(presented.details ?? presented.headline)")
+            }
+        }
+    }
+
+    /// Install/remove the PTT trigger with the voice opt-in (and at launch).
+    private func syncVoicePTTMonitor() {
+        if settings.voiceConversationEnabled {
+            pttMonitor.setKeyCode(UInt16(clamping: settings.voicePTTKeyCode))
+            pttMonitor.onDown = { [weak self] in self?.voiceController.pttDown() }
+            pttMonitor.onUp = { [weak self] in self?.voiceController.pttUp() }
+            pttMonitor.start()
+        } else {
+            pttMonitor.stop()
+        }
+    }
+
+    private func observeVoiceToggle() {
+        settings.$voiceConversationEnabled
+            .dropFirst()
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated { self?.syncVoicePTTMonitor() }
+            }
+            .store(in: &cancellables)
+        settings.$voicePTTKeyCode
+            .dropFirst()
+            .sink { [weak self] code in
+                MainActor.assumeIsolated { self?.pttMonitor.setKeyCode(UInt16(clamping: code)) }
             }
             .store(in: &cancellables)
     }

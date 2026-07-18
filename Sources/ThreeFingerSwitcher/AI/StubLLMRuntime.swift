@@ -132,6 +132,7 @@ public final class StubLLMRuntime: LLMRuntime, @unchecked Sendable {
         }
         let delay = interTokenDelayNanos
         let needsVision = request.requiresVision
+        let needsAudio = request.requiresAudio
         let caps = capabilities
 
         return AsyncThrowingStream { continuation in
@@ -139,6 +140,14 @@ public final class StubLLMRuntime: LLMRuntime, @unchecked Sendable {
                 // A vision request against a text-only stub is a hard error, never a silent degrade.
                 if needsVision && !caps.contains(.vision) {
                     continuation.finish(throwing: RuntimeError.unsupportedModality(.vision))
+                    return
+                }
+                // The audio seam's refusal contract (`add-voice-computer-use-agent`): NO runtime serves
+                // audio yet — non-empty audio is ALWAYS refused (even if `capabilities` claims `.audio`,
+                // which only marks a descriptor for selection), never silently dropped. Remove this
+                // unconditional refusal only when a conformer actually feeds the audio tower.
+                if needsAudio {
+                    continuation.finish(throwing: RuntimeError.unsupportedModality(.audio))
                     return
                 }
                 do {

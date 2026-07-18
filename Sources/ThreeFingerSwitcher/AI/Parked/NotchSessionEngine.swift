@@ -129,7 +129,9 @@ final class NotchSessionEngine: ObservableObject {
          registry: ToolRegistry? = nil,
          candidateSource: ToolCandidateSource? = nil,
          skillTools: @escaping @MainActor (String) -> [String] = { _ in [] },
-         backgroundRunner: BackgroundToolRunner? = nil) {
+         backgroundRunner: BackgroundToolRunner? = nil,
+         loopBudget: @escaping @MainActor () -> LoopBudget = { .default },
+         narrator: (@Sendable (String) -> Void)? = nil) {
         self.modelManager = modelManager
         self.selection = selection
         self.contextProvider = contextProvider
@@ -139,6 +141,23 @@ final class NotchSessionEngine: ObservableObject {
         self.candidateSource = candidateSource
         self.skillTools = skillTools
         self.backgroundRunner = backgroundRunner
+        self.loopBudget = loopBudget
+        self.narrator = narrator
+    }
+
+    /// The wall-clock loop bounds (settings-fed at composition; `add-voice-computer-use-agent` D8).
+    private let loopBudget: @MainActor () -> LoopBudget
+    /// Spoken narration sink for auto-approved acts (nil = visible-only narration).
+    private let narrator: (@Sendable (String) -> Void)?
+    /// The conversation's live auto-approve grant (design D7): lock-guarded because the route loop
+    /// reads it OFF the main actor; synced from the bound conversation and by `setAutoApprove`.
+    let autoGrant = LockedBool()
+
+    /// Flip THIS conversation's auto-approve grant (the `enable_auto_mode`/`disable_auto_mode` tools
+    /// and the surface toggle land here). Persisted with the conversation on the next settle.
+    func setAutoApprove(_ on: Bool) {
+        autoGrant.value = on
+        conversation?.autoApprove = on
     }
 
     /// Whether a turn is currently being produced (loading, streaming, OR paused at the approval gate) —
@@ -181,6 +200,7 @@ final class NotchSessionEngine: ObservableObject {
         let now = Date()
         let fresh = AgentConversation(title: title, messages: [], createdAt: now, updatedAt: now)
         conversation = fresh
+        autoGrant.value = false   // a fresh conversation never inherits a grant
         sessionReasoning = reasoningDefault()
         sessionParameters = .default
         thinking = ""
@@ -196,6 +216,7 @@ final class NotchSessionEngine: ObservableObject {
     func bind(_ stored: AgentConversation) {
         cancelTurnMachinery()
         conversation = stored
+        autoGrant.value = stored.isAutoApproveGranted   // the persisted grant follows the session
         sessionReasoning = reasoningDefault()
         sessionParameters = .default
         thinking = ""
@@ -487,11 +508,23 @@ final class NotchSessionEngine: ObservableObject {
         let fireContext = contextProvider()
         let source = TaskSource(appName: fireContext.capturedAppName, url: fireContext.url,
                                 timestamp: fireContext.date)
+        // Auto mode (design D7): the wrapper resolves `.confirm` pauses instantly under the live
+        // grant, narrating each auto-approved act into the visible thinking stream AND the spoken
+        // narrator — silence never hides an act. Without the grant it is a pass-through.
+        let narrator = self.narrator
+        let autoGate = AutoApprovingGate(base: gate,
+                                         isGranted: { [autoGrant] in autoGrant.value },
+                                         narrate: { text in
+                                             continuation.yield(text + "\n")
+                                             narrator?(text)
+                                         })
         let loop = AgentLoop(runtime: runtime, registry: registry, candidateSource: candidateSource,
-                             gate: gate, reasoning: sessionReasoning, source: source,
+                             gate: autoGate, reasoning: sessionReasoning, source: source,
                              onThinking: { continuation.yield($0) },
                              sessionID: current.id,
-                             backgroundRunner: backgroundRunner)
+                             backgroundRunner: backgroundRunner,
+                             budget: loopBudget(),
+                             isAutoGranted: { [autoGrant] in autoGrant.value })
         let result = await loop.run(context: context)
         continuation.finish()
         await consumer.value

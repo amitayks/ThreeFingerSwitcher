@@ -85,6 +85,17 @@ public enum AIError {
             return AIPresentedError(headline: fleet.errorDescription ?? unknownHeadline,
                                     details: fleet.copyableDetails)
         }
+        if let voice = error as? VoiceError {
+            // Voice failures (`add-voice-computer-use-agent`): mic/speech/OS-floor issues with clean
+            // per-case headlines; raw AVFoundation/Speech text rides only in the copyable details.
+            return AIPresentedError(headline: voice.errorDescription ?? unknownHeadline,
+                                    details: voice.copyableDetails)
+        }
+        if let ax = error as? AXActionError {
+            // Computer-use failures: AX read/act problems mapped at the AXUIElement boundary.
+            return AIPresentedError(headline: ax.errorDescription ?? unknownHeadline,
+                                    details: ax.copyableDetails)
+        }
         if let media = error as? MediaError {
             // Media-specific failures (no-backend, seed required/invalid, generation/write failed, cloud
             // budget/unavailable). Raw OS/vendor text rode into `copyableDetails` at the boundary; the

@@ -63,6 +63,12 @@ The system SHALL manage model weights via a lifecycle: weights are downloaded on
 
 **The runtime's GPU buffer cache SHALL be bounded:** the MLX-backed runtime SHALL set an explicit buffer-cache limit at composition so freed generation buffers return to the OS — the resident footprint tracks the model's size instead of growing without bound across turns.
 
+**Eviction SHALL be automatic, not only manual.** Memory-pressure eviction SHALL be genuinely wired (a real OS pressure observer, not an aspiration): on **critical** pressure the resident runtime SHALL be evicted whenever no generation turn and no load is in flight; on **warning** pressure it SHALL be evicted only when the AI system is **fully quiescent** (no turn in flight, no foreground-active session — an open chat *or voice* conversation — no parked work scheduled within the horizon). Additionally, an **idle-TTL backstop** SHALL evict the resident runtime after the AI system has been continuously quiescent for a user-configurable window (default generous; `0` SHALL disable the TTL trigger only — pressure triggers remain live). The CPU ternary lane's small resident footprint SHALL be exempt from both triggers.
+
+**The eviction decision SHALL be a pure policy** — evaluated with time, last-activity, pressure level, and a quiescence snapshot as explicit inputs — so every rule is deterministically testable without real weights or real OS pressure. All automatic triggers SHALL route through the same single eviction path as the manual control, and an eviction SHALL transition the lifecycle `loaded → ready` (weights remain on disk).
+
+**Eviction SHALL be invisible-correct:** the next request after an automatic eviction SHALL transparently lazy-load again through the single-flight load path — identical to first use after relaunch — surfacing the existing observable loading state and never a failure state, a lost turn, or a stranded scheduled advance.
+
 #### Scenario: No download until opt-in
 - **WHEN** the AI commands opt-in is off
 - **THEN** no model weights are downloaded
@@ -99,6 +105,34 @@ The system SHALL manage model weights via a lifecycle: weights are downloaded on
 #### Scenario: The GPU buffer cache does not grow without bound
 - **WHEN** many generation turns run on the loaded model
 - **THEN** the runtime's buffer cache stays within its configured limit and the app's resident footprint tracks the model size rather than creeping upward with use
+
+#### Scenario: Idle TTL evicts a quiescent system
+- **WHEN** no turn is in flight, no session is foreground-active, no parked work is scheduled, and the state has held continuously for the configured TTL
+- **THEN** the resident runtime is evicted via the single eviction path and the lifecycle reads `ready` (weights still on disk)
+
+#### Scenario: TTL of zero restores keep-forever
+- **WHEN** the TTL setting is `0` and the system stays quiescent indefinitely
+- **THEN** the TTL trigger never fires, while memory-pressure eviction remains armed
+
+#### Scenario: Warning pressure respects an open conversation
+- **WHEN** warning-level memory pressure is reported while a session is foreground-active (but no turn is in flight)
+- **THEN** the resident runtime is NOT evicted
+
+#### Scenario: Critical pressure evicts between turns
+- **WHEN** critical memory pressure is reported with no turn and no load in flight (even if a session is foreground-active)
+- **THEN** the resident runtime is evicted, and the session's next message transparently triggers a fresh single-flight load with the observable loading state
+
+#### Scenario: Never evict mid-turn or mid-load
+- **WHEN** any automatic trigger fires while a generation turn or a load is in flight
+- **THEN** the eviction is not executed, and the policy is re-evaluated on the next tick
+
+#### Scenario: Eviction never strands scheduled work
+- **WHEN** a parked advance is scheduled within the quiescence horizon
+- **THEN** the TTL and warning-pressure triggers treat the system as not quiescent, and an advance that lands after an eviction lazy-loads transparently rather than failing
+
+#### Scenario: The pure policy is testable without real pressure
+- **WHEN** the eviction policy is evaluated in tests with faked time, activity, pressure level, and quiescence inputs
+- **THEN** it returns deterministic keep/evict verdicts for every rule above, with no OS observer or resident model involved
 
 ### Requirement: Model registry and capability-based selection
 The system SHALL maintain a registry describing each known model (identifier, size, integrity hash, download source, and capability set), and SHALL select the model for a given command by its required capabilities — e.g. a vision command requires a vision-capable model. The registry SHALL make it possible to route a future audio command to an audio-capable Gemma 4 model without changing feature code.
@@ -237,4 +271,49 @@ The runtime SHALL support an optional **reasoning** mode carried on the request,
 #### Scenario: A per-command override beats the global default
 - **WHEN** a command carries an explicit reasoning override (on or off) that differs from the global default
 - **THEN** the request's reasoning follows the command's override (and a command with no override follows the global default), for in-place and task commands alike
+
+### Requirement: Audio input is carried on the request seam and honestly refused until served
+`LLMRequest` and `LLMChatRequest` SHALL carry an `audio` input (encoded audio byte payloads, defaulting to empty) alongside `images`, with a `requiresAudio` derivation, and capability selection SHALL treat a non-empty `audio` as requiring the `.audio` modality through the SAME `selectModel(requiring:)` path as vision. Until a conformer actually serves audio, every runtime — including the stub — SHALL REJECT a non-empty `audio` request with `unsupportedModality(.audio)`: the seam is statically typed and carried end-to-end, and its unimplemented half is an explicit, tested refusal, never a silently-ignored field. (This is the v4+ foundation for direct audio-in Gemma via the vendored audio tower; wiring the tower is a separate change.)
+
+#### Scenario: Audio requests select for the audio capability
+- **WHEN** a request carries non-empty audio and model selection runs
+- **THEN** only descriptors advertising `.audio` satisfy it, and `RuntimeError.unavailable` is reported when none does
+
+#### Scenario: A non-audio runtime refuses rather than ignores
+- **WHEN** a request with non-empty audio reaches a runtime that does not serve audio (including the test stub)
+- **THEN** it fails with `unsupportedModality(.audio)` — the audio bytes are never silently dropped
+
+#### Scenario: Empty audio changes nothing
+- **WHEN** requests carry the default empty audio
+- **THEN** behavior is byte-for-byte identical to before the field existed (text and vision paths unaffected)
+
+### Requirement: Automatic eviction never thrashes under chronic pressure
+Warning-level eviction SHALL additionally require sustained idleness — no AI activity stamp for at
+least the warning idle floor (5 minutes) — because a resident large model keeps the system at
+sustained warning-level memory pressure as its NORMAL operating state. Critical-level eviction SHALL remain
+immediate (guarded only by in-flight turn/load). The quiescence snapshot SHALL cover EVERY
+conversational surface — the launcher canvas and the executor's in-flight/reviewing states, the notch
+sessions, and a live voice conversation — so no surface's activity is invisible to the eviction
+policy. A reload after eviction SHALL re-stamp activity, giving every reload an automatic grace
+window. The net invariant: automatic eviction SHALL NOT produce an evict→reload cycle during an
+active conversation on ANY surface.
+
+#### Scenario: Chronic warning pressure between canvas turns does not evict
+- **WHEN** warning pressure is sustained, a canvas conversation is in use, and less than the idle
+  floor has passed since the last AI activity
+- **THEN** the resident model is NOT evicted between turns
+
+#### Scenario: Warning pressure with genuine idleness still reclaims
+- **WHEN** warning pressure is reported and no AI activity has been stamped for at least the idle
+  floor with every surface quiescent
+- **THEN** the resident model is evicted
+
+#### Scenario: An executor turn is a turn in flight
+- **WHEN** the launcher-canvas executor is loading or streaming a turn
+- **THEN** the quiescence snapshot reports a turn in flight and no automatic trigger evicts
+
+#### Scenario: The gesture hot path pays one flag read
+- **WHEN** touch frames stream during ordinary gestures with no agent act and no live voice phase
+- **THEN** the agent-abort hook's per-frame cost is a stored-flag check — it never instantiates the
+  agent/voice stack and never reads settings per frame
 

@@ -45,6 +45,11 @@ public struct LLMRequest: Sendable {
     /// Encoded images for a `.vision` request (empty for text-only). A SINGLE turn may carry MULTIPLE
     /// images (design D2); the runtime feeds each to the model input.
     public var images: [Data]
+    /// Encoded audio payloads for an `.audio` request (`add-voice-computer-use-agent`): the statically
+    /// typed v4+ seam for direct audio-in Gemma (the vendored audio tower mirrors the vision path).
+    /// Until a conformer serves audio, every runtime — including the stub — REJECTS a non-empty value
+    /// with `unsupportedModality(.audio)`; the bytes are never silently dropped. Default `[]`.
+    public var audio: [Data]
     public var parameters: GenerationParameters
     /// When true, the runtime should let the model think (reasoning) but stream/return only the final
     /// response — never the thinking.
@@ -53,11 +58,13 @@ public struct LLMRequest: Sendable {
     /// The FIRST image, or nil — the single-image convenience (design D2: `images` is the source of truth).
     public var image: Data? { images.first }
 
-    /// Designated init (multi-image). `images` defaults to `[]`.
-    public init(prompt: String, images: [Data] = [], parameters: GenerationParameters = .default,
+    /// Designated init (multi-image). `images`/`audio` default to `[]`.
+    public init(prompt: String, images: [Data] = [], audio: [Data] = [],
+                parameters: GenerationParameters = .default,
                 reasoning: Bool = false) {
         self.prompt = prompt
         self.images = images
+        self.audio = audio
         self.parameters = parameters
         self.reasoning = reasoning
     }
@@ -72,6 +79,9 @@ public struct LLMRequest: Sendable {
 
     /// Whether this request needs a `.vision`-capable runtime (it carries at least one image).
     public var requiresVision: Bool { !images.isEmpty }
+
+    /// Whether this request needs an `.audio`-capable runtime (it carries at least one audio payload).
+    public var requiresAudio: Bool { !audio.isEmpty }
 }
 
 /// A multi-turn conversation request: a role-tagged message list (already compacted upstream by the
@@ -86,6 +96,10 @@ public struct LLMChatRequest: Sendable {
     /// The turn's images (design D2 — ALL of the latest turn's images, not just one); a `.vision`-capable
     /// runtime is required when non-empty. Empty = a text turn.
     public var images: [Data]
+    /// The turn's audio payloads (`add-voice-computer-use-agent` — the v4+ seam, mirroring `images`).
+    /// An `.audio`-capable runtime is required when non-empty; every current runtime rejects it with
+    /// `unsupportedModality(.audio)` until the audio-tower conformer lands. Default `[]`.
+    public var audio: [Data]
     public var parameters: GenerationParameters
     /// When true, the runtime lets the model think but streams/returns only the final response.
     public var reasoning: Bool
@@ -95,14 +109,16 @@ public struct LLMChatRequest: Sendable {
     /// The FIRST request-level image, or nil — the single-image convenience (design D2).
     public var image: Data? { images.first }
 
-    /// Designated init (multi-image). `images` defaults to `[]`.
+    /// Designated init (multi-image). `images`/`audio` default to `[]`.
     public init(messages: [AgentMessage],
                 images: [Data] = [],
+                audio: [Data] = [],
                 parameters: GenerationParameters = .default,
                 reasoning: Bool = false,
                 tools: [ToolDescriptor]? = nil) {
         self.messages = messages
         self.images = images
+        self.audio = audio
         self.parameters = parameters
         self.reasoning = reasoning
         self.tools = tools
@@ -128,6 +144,9 @@ public struct LLMChatRequest: Sendable {
 
     /// The latest effective image (first of `effectiveImages`), for single-image consumers/tests.
     public var effectiveImage: Data? { effectiveImages.first }
+
+    /// Whether this chat turn needs an `.audio`-capable runtime.
+    public var requiresAudio: Bool { !audio.isEmpty }
 }
 
 // MARK: - Streaming token
@@ -318,6 +337,7 @@ extension LLMRuntime {
         let prompt = ChatTemplate.flatten(request.messages)
         return generate(LLMRequest(prompt: prompt,
                                    images: request.effectiveImages,   // ALL of the turn's images (design D2)
+                                   audio: request.audio,              // carried so the refusal contract holds
                                    parameters: request.parameters,
                                    reasoning: request.reasoning))
     }
@@ -352,6 +372,9 @@ public protocol BatchedLLMRuntime: LLMRuntime {
         -> AsyncThrowingStream<(AgentSessionID, Token), Error>
 
     /// K — how many streams fit RIGHT NOW, derived from free RAM at the current context length and
-    /// KV-quant bits (recomputed when the context setting changes or memory pressure is reported).
+    /// KV-quant bits. The real conformer recomputes this ON EACH READ from the live free-memory probe,
+    /// so a context-setting change or a memory-pressure event is reflected at the next batch admission
+    /// (there is no push-based recompute; `ModelManager`'s wired pressure observer handles eviction,
+    /// and admission simply reads the smaller K afterwards).
     var maxConcurrentStreams: Int { get }
 }

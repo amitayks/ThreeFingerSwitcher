@@ -136,6 +136,22 @@ public final class ModelManager: ObservableObject {
     /// Unused on the provisioner path (the pipeline owns the weights on disk).
     private var verifiedBytes: Data?
 
+    // MARK: Automatic eviction (model-idle-ttl-and-memory-pressure)
+
+    /// When any AI request last resolved a runtime (stamped on every successful resolve/load). The
+    /// idle-TTL trigger measures from here.
+    private var lastAIActivity: Date = .distantPast
+    /// The injected pressure observer (real `DispatchSource` wrapper in the app; fake in tests).
+    private var pressureSource: MemoryPressureObserving?
+    /// Pull-based scheduler snapshot, read at decision time on the main actor (design D2).
+    private var quiescence: (@MainActor () -> QuiescenceSnapshot) = { QuiescenceSnapshot() }
+    /// Live TTL setting in seconds (`aiIdleEvictMinutes * 60`); `0` disables the TTL trigger only.
+    private var idleEvictTTL: (@MainActor () -> TimeInterval) = { 0 }
+    /// Injected clock so tests drive time deterministically.
+    private var now: (@MainActor () -> Date) = { Date() }
+    /// The coarse evaluation tick (D4). ~60s; pressure events also evaluate immediately.
+    private var evictionTimer: Timer?
+
     public init(registry: ModelCatalog = .standard,
                 downloader: ModelDownloading,
                 optedIn: Bool = false,
@@ -456,6 +472,7 @@ public final class ModelManager: ObservableObject {
         // gate so the streaming-turn hot path never pays a task hop.
         if let runtime = residentRuntime {
             state = .loaded
+            stampActivity()
             return runtime
         }
         let target = activeDescriptor ?? registry.defaultDescriptor ?? registry.models.first
@@ -467,6 +484,7 @@ public final class ModelManager: ObservableObject {
     /// The actual load body behind the single-flight gate. Begins with the warm re-check (a drained
     /// in-flight load may already have made the runtime resident).
     private func loadIfNeededBody() async throws -> LLMRuntime {
+        defer { if residentRuntime != nil { stampActivity() } }
         if let runtime = residentRuntime {
             state = .loaded
             return runtime
@@ -618,6 +636,7 @@ public final class ModelManager: ObservableObject {
         // Warm hit: already the resident runtime → no cold load.
         if let runtime = residentRuntime, residentDescriptor?.id == descriptor.id {
             state = .loaded
+            stampActivity()
             return runtime
         }
         return try await coalescedLoad(descriptor.id) { [self] in
@@ -628,6 +647,7 @@ public final class ModelManager: ObservableObject {
     /// The actual per-descriptor load body behind the single-flight gate (warm re-check first — a
     /// drained in-flight load may already have made this descriptor resident).
     private func loadDescriptorBody(_ descriptor: ModelDescriptor) async throws -> LLMRuntime {
+        defer { if residentRuntime != nil { stampActivity() } }
         if let runtime = residentRuntime, residentDescriptor?.id == descriptor.id {
             state = .loaded
             return runtime
@@ -664,12 +684,14 @@ public final class ModelManager: ObservableObject {
     /// The currently resident runtime, if loaded (nil otherwise). Exposed for tests / introspection.
     public var currentRuntime: LLMRuntime? { residentRuntime }
 
-    /// Evict the resident runtime (memory pressure, or opt-in off). The weights stay on disk, so the
-    /// state falls back to `.ready` (a warm re-load, never a re-download) whenever they're still
-    /// present — on the byte path via `verifiedBytes`, and on the provisioner path via the on-disk
-    /// probe (where `verifiedBytes` is always nil because the pipeline owns the weights). Without the
-    /// provisioner branch, "Evict from memory" would leave the row stuck showing "Loaded" while nothing
-    /// is resident.
+    /// Evict the resident runtime. Callers: opt-in off, a fleet residency plan, the manual Settings
+    /// button, and — via `evaluateAutomaticEviction` — the WIRED memory-pressure observer and the
+    /// idle-TTL tick (`model-idle-ttl-and-memory-pressure`; previously "memory pressure" here was an
+    /// unwired aspiration). The weights stay on disk, so the state falls back to `.ready` (a warm
+    /// re-load, never a re-download) whenever they're still present — on the byte path via
+    /// `verifiedBytes`, and on the provisioner path via the on-disk probe (where `verifiedBytes` is
+    /// always nil because the pipeline owns the weights). Without the provisioner branch, "Evict from
+    /// memory" would leave the row stuck showing "Loaded" while nothing is resident.
     public func evict() {
         // An eviction (opt-in off, memory pressure, a fleet plan) also CANCELS any in-flight load —
         // otherwise the load would complete after this and silently resurrect a resident model. The
@@ -691,6 +713,67 @@ public final class ModelManager: ObservableObject {
 
     /// Whether a model is currently resident in memory.
     public var isResident: Bool { residentRuntime != nil }
+
+    // MARK: - Automatic eviction (model-idle-ttl-and-memory-pressure)
+
+    /// Install the automatic-eviction triggers post-init (the factories in `GemmaRuntime`/`DevAIRuntime`
+    /// build the manager without scheduler knowledge; `AppCoordinator` calls this once it has both).
+    /// Injected-probe idiom (`fleetFreeBytes`/`hardwareSupports`): everything is fakeable in Core tests.
+    ///
+    /// - `pressure`: level source; a change evaluates the policy immediately (pressure is the fast path).
+    /// - `quiescence`: pull-based scheduler snapshot, read on the main actor at decision time (D2).
+    /// - `idleTTL`: live TTL in seconds (`0` disables the TTL trigger only).
+    /// - `now`: injected clock for deterministic tests.
+    /// - `tickInterval`: the coarse re-evaluation cadence (D4). `nil` = no timer (tests drive
+    ///   `evaluateAutomaticEviction` directly).
+    public func installAutomaticEviction(pressure: MemoryPressureObserving?,
+                                         quiescence: @escaping @MainActor () -> QuiescenceSnapshot,
+                                         idleTTL: @escaping @MainActor () -> TimeInterval,
+                                         now: @escaping @MainActor () -> Date = { Date() },
+                                         tickInterval: TimeInterval? = 60) {
+        self.pressureSource = pressure
+        self.quiescence = quiescence
+        self.idleEvictTTL = idleTTL
+        self.now = now
+        pressure?.onChange = { [weak self] _ in
+            self?.evaluateAutomaticEviction()
+        }
+        evictionTimer?.invalidate()
+        if let tickInterval {
+            let timer = Timer(timeInterval: tickInterval, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.evaluateAutomaticEviction() }
+            }
+            // Generous tolerance: the tick is a coarse backstop; exact-fire wakeups buy nothing.
+            timer.tolerance = tickInterval * 0.1
+            // `.common` so an open modal/menu run-loop mode doesn't starve the tick.
+            RunLoop.main.add(timer, forMode: .common)
+            evictionTimer = timer
+        }
+    }
+
+    /// Evaluate the pure policy and execute its verdict. Called by the coarse tick and on every
+    /// pressure change; exposed so tests drive it deterministically. Execution-time guards (D5) live
+    /// here — the policy also sees them, but the resident/lane/opt-in checks are the manager's own.
+    public func evaluateAutomaticEviction() {
+        guard optedIn, residentRuntime != nil else { return }
+        // The CPU ternary lane's small footprint is exempt: evicting ~32×-smaller weights buys almost
+        // nothing and costs re-warm latency on every structured burst.
+        if residentDescriptor?.lane == .cpuTernary { return }
+        let verdict = EvictionPolicy.verdict(now: now(),
+                                             lastActivity: lastAIActivity,
+                                             pressure: pressureSource?.level ?? .nominal,
+                                             quiescence: quiescence(),
+                                             ttl: idleEvictTTL(),
+                                             loadInFlight: loadTask != nil)
+        guard case .evict = verdict else { return }
+        evict()
+    }
+
+    /// Stamp "an AI request just used the runtime" — the idle-TTL trigger measures from the newest
+    /// stamp. Called on every successful resolve/load so a busy system never reads as idle.
+    private func stampActivity() {
+        lastAIActivity = now()
+    }
 
     // MARK: - Paths + hashing
 

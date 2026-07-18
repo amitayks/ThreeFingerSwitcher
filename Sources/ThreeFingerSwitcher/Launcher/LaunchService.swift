@@ -45,6 +45,9 @@ final class LaunchService {
     /// `LaunchService` stays decoupled from the automation's state; no-op by default / in tests. Unlike
     /// every other kind, firing an automation is a toggle, not a one-shot completion.
     private let onAutomation: (AutomationKind, Double?) -> Void
+    /// Speak-last-response dispatch (`add-speak-last-response-launcher-action`): injected like
+    /// `onAICommand` so the launcher never references the AI stack; no-op by default / in tests.
+    private let onSpeakLastResponse: () -> Void
     /// Resolves a clipboard entry id to its **fully-materialized** entry at fire time. The band carries
     /// only bounded/light preview entries (image bytes dropped, large text truncated — see
     /// `ClipboardStore.bandWindow`), so paste must fetch the complete representations by id to restore the
@@ -60,6 +63,7 @@ final class LaunchService {
          onAICommand: @escaping (AICommand) -> Void = { _ in },
          onPromptedFolderChosen: @escaping (UUID, UUID, URL) -> Void = { _, _, _ in },
          onAutomation: @escaping (AutomationKind, Double?) -> Void = { _, _ in },
+         onSpeakLastResponse: @escaping () -> Void = {},
          clipboardResolver: @escaping (UUID) -> ClipboardEntry? = { _ in nil }) {
         self.favoritesProvider = favoritesProvider
         self.mover = mover ?? NullWindowMover()
@@ -69,6 +73,7 @@ final class LaunchService {
         self.onAICommand = onAICommand
         self.onPromptedFolderChosen = onPromptedFolderChosen
         self.onAutomation = onAutomation
+        self.onSpeakLastResponse = onSpeakLastResponse
         self.clipboardResolver = clipboardResolver
     }
 
@@ -380,6 +385,7 @@ final class LaunchService {
         case .mute:                postMediaKey(7)
         case .brightnessUp:        adjustBrightness(up: true, adjustment)
         case .brightnessDown:      adjustBrightness(up: false, adjustment)
+        case .speakLastResponse:   onSpeakLastResponse()
         }
     }
 

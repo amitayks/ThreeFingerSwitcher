@@ -37,6 +37,13 @@
     <!-- Shown when a "new contact" AI command first creates a contact card (Contacts, lazy first-use). -->
     <key>NSContactsUsageDescription</key>
     <string>Creates a contact card from text when you run a "new contact" AI command.</string>
+    <!-- Shown on the FIRST actual push-to-talk press (voice conversation, `add-voice-computer-use-agent`).
+         The mic is open ONLY while push-to-talk is held — no wake word, no always-listening. -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Hears you only while you hold the push-to-talk key, to talk with the on-device assistant.</string>
+    <!-- Shown if SpeechAnalyzer additionally requires speech-recognition authorization (on-device only). -->
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Transcribes your push-to-talk speech on this Mac. Audio never leaves the device.</string>
     <!-- Shown when the device link first advertises/connects on the local network (Bonjour). -->
     <key>NSLocalNetworkUsageDescription</key>
     <string>Connects directly to your paired iPhone on your local network to move clipboard items and files between your devices.</string>

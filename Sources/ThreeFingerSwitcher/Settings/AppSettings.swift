@@ -339,6 +339,27 @@ final class AppSettings: ObservableObject {
     /// cost (design D6). Default OFF.
     @Published var agentCompactKV: Bool { didSet { defaults.set(agentCompactKV, forKey: Keys.agentCompactKV) } }
 
+    /// Idle-TTL for the RESIDENT MODEL WEIGHTS (`model-idle-ttl-and-memory-pressure`): after the AI
+    /// system has been fully quiescent this many minutes, the ~17 GB resident model is evicted from
+    /// memory (weights stay on disk; the next request transparently lazy-reloads). `0` = never — the
+    /// pre-change keep-forever behavior. Memory-pressure eviction is NOT a setting (always armed).
+    @Published var aiIdleEvictMinutes: Int { didSet { defaults.set(aiIdleEvictMinutes, forKey: Keys.aiIdleEvictMinutes) } }
+
+    /// Voice conversation opt-in (`add-voice-computer-use-agent`): push-to-talk with the agent.
+    /// Default OFF; requires macOS 26 (SpeechAnalyzer) and — on first actual press — the microphone
+    /// permission (the app's first new TCC grant; the mic opens ONLY while push-to-talk is held).
+    @Published var voiceConversationEnabled: Bool { didSet { defaults.set(voiceConversationEnabled, forKey: Keys.voiceConversationEnabled) } }
+    /// The push-to-talk hold key (default 61 = Right Option — a bare modifier, no typing collision).
+    @Published var voicePTTKeyCode: Int { didSet { defaults.set(voicePTTKeyCode, forKey: Keys.voicePTTKeyCode) } }
+    /// Computer-use opt-in (`add-voice-computer-use-agent`): the agent may read windows and — behind
+    /// the approval gate — click and type in them. Default OFF; reuses the existing Accessibility
+    /// grant (no new permission). A human trackpad touch always aborts an in-flight act.
+    @Published var computerUseEnabled: Bool { didSet { defaults.set(computerUseEnabled, forKey: Keys.computerUseEnabled) } }
+    /// Per-step wall-clock timeout for non-gated agent tool steps, seconds (design D8).
+    @Published var agentStepTimeoutSeconds: Int { didSet { defaults.set(agentStepTimeoutSeconds, forKey: Keys.agentStepTimeoutSeconds) } }
+    /// Per-turn active wall-clock deadline for the agent loop, seconds (human approval time exempt).
+    @Published var agentTurnDeadlineSeconds: Int { didSet { defaults.set(agentTurnDeadlineSeconds, forKey: Keys.agentTurnDeadlineSeconds) } }
+
     /// Soft target for the parked-session set (`ai-parked-sessions`, design §7). When exceeded, the
     /// least-recently-updated IDLE session is evicted (never an active/needs-you/thinking one).
     @Published var agentMaxParkedSessions: Int { didSet { defaults.set(agentMaxParkedSessions, forKey: Keys.agentMaxParkedSessions) } }
@@ -653,6 +674,12 @@ final class AppSettings: ObservableObject {
         agentContextTokens = defaults.object(forKey: Keys.agentContextTokens) as? Int ?? Defaults.agentContextTokens
         agentCompactKV = defaults.object(forKey: Keys.agentCompactKV) as? Bool ?? Defaults.agentCompactKV
         agentMaxParkedSessions = defaults.object(forKey: Keys.agentMaxParkedSessions) as? Int ?? Defaults.agentMaxParkedSessions
+        aiIdleEvictMinutes = defaults.object(forKey: Keys.aiIdleEvictMinutes) as? Int ?? Defaults.aiIdleEvictMinutes
+        voiceConversationEnabled = defaults.object(forKey: Keys.voiceConversationEnabled) as? Bool ?? Defaults.voiceConversationEnabled
+        voicePTTKeyCode = defaults.object(forKey: Keys.voicePTTKeyCode) as? Int ?? Defaults.voicePTTKeyCode
+        computerUseEnabled = defaults.object(forKey: Keys.computerUseEnabled) as? Bool ?? Defaults.computerUseEnabled
+        agentStepTimeoutSeconds = defaults.object(forKey: Keys.agentStepTimeoutSeconds) as? Int ?? Defaults.agentStepTimeoutSeconds
+        agentTurnDeadlineSeconds = defaults.object(forKey: Keys.agentTurnDeadlineSeconds) as? Int ?? Defaults.agentTurnDeadlineSeconds
         agentParkIdleTimeout = defaults.object(forKey: Keys.agentParkIdleTimeout) as? TimeInterval ?? Defaults.agentParkIdleTimeout
         agentParkAutoDismissCountdown = defaults.object(forKey: Keys.agentParkAutoDismissCountdown) as? TimeInterval ?? Defaults.agentParkAutoDismissCountdown
         agentOverscrollParkThreshold = defaults.object(forKey: Keys.agentOverscrollParkThreshold) as? Double ?? Defaults.agentOverscrollParkThreshold
@@ -743,6 +770,14 @@ final class AppSettings: ObservableObject {
         agentContextTokens = Defaults.agentContextTokens
         agentCompactKV = Defaults.agentCompactKV
         agentMaxParkedSessions = Defaults.agentMaxParkedSessions
+        aiIdleEvictMinutes = Defaults.aiIdleEvictMinutes
+        // Voice/computer-use are OPT-INS (like the AI master), so resetToDefaults returns them to
+        // off; the budget tunables reset like other behavior tunables.
+        voiceConversationEnabled = Defaults.voiceConversationEnabled
+        voicePTTKeyCode = Defaults.voicePTTKeyCode
+        computerUseEnabled = Defaults.computerUseEnabled
+        agentStepTimeoutSeconds = Defaults.agentStepTimeoutSeconds
+        agentTurnDeadlineSeconds = Defaults.agentTurnDeadlineSeconds
         agentParkIdleTimeout = Defaults.agentParkIdleTimeout
         agentParkAutoDismissCountdown = Defaults.agentParkAutoDismissCountdown
         agentOverscrollParkThreshold = Defaults.agentOverscrollParkThreshold
@@ -856,6 +891,12 @@ final class AppSettings: ObservableObject {
         static let agentContextTokens = 8_192      // Balanced; clamped to the model max at use
         static let agentCompactKV = false          // 8-bit KV off by default
         static let agentMaxParkedSessions = 6      // soft cap; evicts the least-recently-updated idle one
+        static let aiIdleEvictMinutes = 60         // model-weight idle TTL; 0 = never (keep-forever)
+        static let voiceConversationEnabled = false // push-to-talk voice; opt-in, macOS 26 + mic grant
+        static let voicePTTKeyCode = 61            // Right Option
+        static let computerUseEnabled = false      // AX read/act tools; opt-in, existing grants only
+        static let agentStepTimeoutSeconds = 30    // non-gated tool step wall clock (design D8)
+        static let agentTurnDeadlineSeconds = 180  // per-turn active wall clock (approval time exempt)
         static let agentParkIdleTimeout: TimeInterval = 30 * 60   // RETIRED (D1): legacy summarize-and-sleep
         static let agentParkAutoDismissCountdown: TimeInterval = 0   // 0 = never — expiry is opt-in
         static let agentOverscrollParkThreshold = 0.22            // above canvasResolveThreshold (0.12)
@@ -948,6 +989,12 @@ final class AppSettings: ObservableObject {
         static let agentContextTokens = "agentContextTokens"
         static let agentCompactKV = "agentCompactKV"
         static let agentMaxParkedSessions = "agentMaxParkedSessions"
+        static let aiIdleEvictMinutes = "aiIdleEvictMinutes"
+        static let voiceConversationEnabled = "voiceConversationEnabled"
+        static let voicePTTKeyCode = "voicePTTKeyCode"
+        static let computerUseEnabled = "computerUseEnabled"
+        static let agentStepTimeoutSeconds = "agentStepTimeoutSeconds"
+        static let agentTurnDeadlineSeconds = "agentTurnDeadlineSeconds"
         static let agentParkIdleTimeout = "agentParkIdleTimeout"
         static let agentParkAutoDismissCountdown = "agentParkAutoDismissCountdown"
         static let agentOverscrollParkThreshold = "agentOverscrollParkThreshold"

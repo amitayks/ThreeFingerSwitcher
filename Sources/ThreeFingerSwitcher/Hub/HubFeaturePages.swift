@@ -421,6 +421,20 @@ struct AIPage: View {
     }
 
     /// The fleet roster's ACTIVE CHAT radio binding (`aiSelectedChatModelID`; nil = chat default).
+    /// Whether this OS can run the on-device transcriber (`SpeechAnalyzer`, macOS 26).
+    private var voiceOSSupported: Bool {
+        if #available(macOS 26.0, *) { return true }
+        return false
+    }
+
+    /// The voice section's cost disclosure — includes the OS-floor message when it applies.
+    private var voiceFootnote: String {
+        if !voiceOSSupported {
+            return "Requires macOS 26 (on-device speech recognition)."
+        }
+        return "Push-to-talk with the on-device assistant. The microphone opens ONLY while the key is held (asked for on first press) — no wake word, never always-listening. Speech is transcribed on this Mac; audio never leaves the device."
+    }
+
     private var chatModelSelection: Binding<String?> {
         Binding(get: { settings.aiSelectedChatModelID },
                 set: { settings.aiSelectedChatModelID = $0 })
@@ -686,6 +700,21 @@ struct AIPage: View {
                                     descriptor: selectedModelDescriptor,
                                     onDownload: context.onDownloadModel)
                     .disabled(!settings.aiCommandsEnabled)
+
+                // Idle-TTL for the resident weights (`model-idle-ttl-and-memory-pressure`): after this
+                // long fully idle (no turn, no open chat, nothing scheduled) the loaded model is freed
+                // from memory; the next command reloads it on demand. Memory-pressure eviction is
+                // always armed and not a setting. "Never" = the pre-change keep-forever behavior.
+                Picker("Free model memory after", selection: $settings.aiIdleEvictMinutes) {
+                    Text("Never").tag(0)
+                    Text("15 minutes").tag(15)
+                    Text("30 minutes").tag(30)
+                    Text("1 hour").tag(60)
+                    Text("2 hours").tag(120)
+                    Text("4 hours").tag(240)
+                }
+                .disabled(!settings.aiCommandsEnabled)
+                .help("When the AI has been idle this long, the loaded model is freed from memory. The next command reloads it automatically.")
             }
             // Release Full Potential: the master gate + five cost-disclosing sub-toggles for the heavy
             // fleet capabilities (`ai-full-potential-toggle`, addendum §D1).
@@ -693,6 +722,21 @@ struct AIPage: View {
             HubSection("Reasoning",
                        footnote: "Let the model think before answering for higher-quality results (a bit slower). Thinking is never shown or pasted — only the final result.") {
                 Toggle("Reasoning", isOn: $settings.aiReasoningEnabled)
+                    .disabled(!settings.aiCommandsEnabled)
+            }
+            // Voice + computer use (`add-voice-computer-use-agent`): two separate opt-ins with honest
+            // cost disclosure. Voice needs macOS 26 (SpeechAnalyzer) + the microphone permission on
+            // first press; computer use reuses the existing Accessibility grant — no new permission.
+            HubSection("Voice conversation",
+                       footnote: voiceFootnote) {
+                Toggle("Talk with the assistant (push-to-talk)", isOn: $settings.voiceConversationEnabled)
+                    .disabled(!settings.aiCommandsEnabled || !voiceOSSupported)
+                Text("Double-tap Right Option and hold the second press to talk; release to send. The same double-tap-and-hold interrupts it mid-reply. Any trackpad touch stops it. Single presses and shortcuts like ⌥⌫ are never affected.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            HubSection("Computer use",
+                       footnote: "The assistant can read windows, focus them, and — with your approval — click and type in them. Uses the Accessibility permission you already granted; no new permission. Every action needs approval unless you turn on auto mode for a conversation, and any trackpad touch instantly stops it.") {
+                Toggle("Let the assistant use windows", isOn: $settings.computerUseEnabled)
                     .disabled(!settings.aiCommandsEnabled)
             }
             contextSection
