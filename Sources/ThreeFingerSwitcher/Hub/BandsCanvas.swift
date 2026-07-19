@@ -991,8 +991,9 @@ private struct ItemInspector: View {
                     screenshotClipboardControl(action: action, adjustment: adjustment, toClipboard: toClipboard ?? false)
                 }
             }
-            if case let .automation(kind, dimPercent) = item.kind {
-                automationEditor(kind: kind, dimPercent: dimPercent)
+            if case let .automation(kind, dimPercent, dimKeyboard, lockOnStop) = item.kind {
+                automationEditor(kind: kind, dimPercent: dimPercent,
+                                 dimKeyboard: dimKeyboard ?? false, lockOnStop: lockOnStop ?? false)
             }
             if case let .claudeProject(folder, _, claudePath) = item.kind {
                 claudeProjectEditor(folder, claudePath: claudePath)
@@ -1324,7 +1325,7 @@ private struct ItemInspector: View {
         case .script: return 360
         case .path:   return 250
         case .claudeProject, .terminalCommand, .claudeProjectPrompt, .terminalCommandPrompt: return 400
-        case .automation: return 340
+        case .automation: return 500
         default:      break
         }
         if case let .action(action, _, _) = item.kind {
@@ -1367,11 +1368,21 @@ private struct ItemInspector: View {
     private enum ValueChoice: Hashable { case step, set, change }
 
     /// Inspector for an automation item: a plain-language description of what it does, plus (for Keep
-    /// Awake) a "Dim to N%" control. `dimPercent` nil = minimum (0%). Restore-on-stop is automatic and
-    /// independent of this level, so the caption explains it.
+    /// Awake) a "Dim to N%" control and the two session options (`keep-awake-guard-effects`): also
+    /// dimming the keyboard backlight, and the any-input guard lock. `dimPercent` nil = minimum (0%);
+    /// the options nil = off. Restore-on-stop is automatic and independent of the level, so the
+    /// captions explain it.
     @ViewBuilder
-    private func automationEditor(kind: AutomationKind, dimPercent: Double?) -> some View {
+    private func automationEditor(kind: AutomationKind, dimPercent: Double?,
+                                  dimKeyboard: Bool, lockOnStop: Bool) -> some View {
         let pct = dimPercent ?? 0
+        // Every write preserves the other authored values (a slider drag must not reset the toggles).
+        let update: (Double?, Bool, Bool) -> Void = { pct, kbd, lock in
+            store.updateItem(item.id, inBand: bandID) {
+                $0.kind = .automation(kind, dimPercent: pct,
+                                      dimKeyboard: kbd ? true : nil, lockOnStop: lock ? true : nil)
+            }
+        }
         VStack(alignment: .leading, spacing: 8) {
             Text(kind.detail)
                 .font(.callout).foregroundStyle(.secondary)
@@ -1380,11 +1391,22 @@ private struct ItemInspector: View {
             Text("Dim to \(Int(pct))%")
             Slider(value: Binding(
                 get: { pct },
-                set: { p in
-                    let clamped = max(0, min(100, p.rounded()))
-                    store.updateItem(item.id, inBand: bandID) { $0.kind = .automation(kind, dimPercent: clamped) }
-                }), in: 0...100, step: 5)
+                set: { p in update(max(0, min(100, p.rounded())), dimKeyboard, lockOnStop) }),
+                in: 0...100, step: 5)
             Text("How dark every display goes while active (0% = darkest). Your original brightness is restored when you stop it — the first trackpad touch after you walk away.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Divider()
+            Toggle("Turn off the keyboard backlight too", isOn: Binding(
+                get: { dimKeyboard },
+                set: { update(dimPercent, $0, lockOnStop) }))
+            Text("The backlight is restored together with the displays when it stops.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Toggle("Lock the screen when input ends it", isOn: Binding(
+                get: { lockOnStop },
+                set: { update(dimPercent, dimKeyboard, $0) }))
+            Text("Guards the Mac while it works in the dark: the first trackpad touch, mouse move, or key press jumps straight to the lock screen — unlock with Touch ID or your password. Stopping from the menu bar or quitting never locks.")
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }

@@ -179,6 +179,18 @@ enum AutomationKind: String, Codable, Equatable, CaseIterable, Identifiable {
     }
 }
 
+/// An automation item's authored configuration, resolved from the `.automation` case's optional
+/// persisted values (nil → default) at fire time — the payload of `LaunchService.onAutomation`, so the
+/// seam carries one struct instead of accreting positional optionals (`keep-awake-guard-effects` D5).
+struct AutomationSettings: Equatable {
+    /// Keep Awake's dim level 0…100 (nil = minimum).
+    var dimPercent: Double?
+    /// Also zero the keyboard backlight for the session.
+    var dimKeyboard: Bool = false
+    /// The guard: any input while armed stops the session and locks the screen.
+    var lockOnStop: Bool = false
+}
+
 /// How firing an `.app` item should produce a usable window. Resolution order is: an item's own
 /// override (if set) → its band's `defaultAppStrategy`. `.newInstance` is never chosen by `.smart`.
 enum AppStrategy: String, Codable, Equatable, CaseIterable {
@@ -225,7 +237,11 @@ enum LaunchItemKind: Codable, Equatable {
     /// `dimPercent` (0…100) is Keep Awake's configurable dim level — how dark the displays go while
     /// active; **Optional** so the synthesized decoder uses `decodeIfPresent` and an item saved before
     /// the setting existed decodes to `nil` (interpreted as minimum), exactly like `.action`'s later values.
-    case automation(AutomationKind, dimPercent: Double? = nil)
+    /// `dimKeyboard` and `lockOnStop` (`keep-awake-guard-effects`) are the two per-item session options —
+    /// also-zero-the-keyboard-backlight and the any-input guard lock — **Optional** for the same
+    /// decode-safety (nil = off, no schema bump).
+    case automation(AutomationKind, dimPercent: Double? = nil,
+                    dimKeyboard: Bool? = nil, lockOnStop: Bool? = nil)
     /// A clipboard-history entry shown in the synthetic Clipboard band. **Synthetic and ephemeral**:
     /// built at launcher-open from `ClipboardStore`, never created in the editor and never written
     /// into the persisted `Favorites` record. Firing it pastes the entry into the captured front app.

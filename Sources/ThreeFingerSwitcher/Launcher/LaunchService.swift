@@ -39,12 +39,13 @@ final class LaunchService {
     /// the folder back onto the item (its remembered last folder). Injected like `onAICommand` so
     /// `LaunchService` stays decoupled/testable; no-op by default / in tests.
     private let onPromptedFolderChosen: (UUID, UUID, URL) -> Void
-    /// Called when an `.automation` item is fired — `(kind, dimPercent)`. Wired by the coordinator to
+    /// Called when an `.automation` item is fired — `(kind, settings)`. Wired by the coordinator to
     /// TOGGLE the automation's stateful owner (`KeepAwakeController`) — start if inactive, stop if
-    /// active — passing the item's configured dim level (nil = minimum). Injected like `onAICommand` so
-    /// `LaunchService` stays decoupled from the automation's state; no-op by default / in tests. Unlike
-    /// every other kind, firing an automation is a toggle, not a one-shot completion.
-    private let onAutomation: (AutomationKind, Double?) -> Void
+    /// active — passing the item's resolved `AutomationSettings` (dim level, keyboard dim, guard lock).
+    /// Injected like `onAICommand` so `LaunchService` stays decoupled from the automation's state;
+    /// no-op by default / in tests. Unlike every other kind, firing an automation is a toggle, not a
+    /// one-shot completion.
+    private let onAutomation: (AutomationKind, AutomationSettings) -> Void
     /// Speak-last-response dispatch (`add-speak-last-response-launcher-action`): injected like
     /// `onAICommand` so the launcher never references the AI stack; no-op by default / in tests.
     private let onSpeakLastResponse: () -> Void
@@ -62,7 +63,7 @@ final class LaunchService {
          onSpaceSwitch: @escaping () -> Void = {},
          onAICommand: @escaping (AICommand) -> Void = { _ in },
          onPromptedFolderChosen: @escaping (UUID, UUID, URL) -> Void = { _, _, _ in },
-         onAutomation: @escaping (AutomationKind, Double?) -> Void = { _, _ in },
+         onAutomation: @escaping (AutomationKind, AutomationSettings) -> Void = { _, _ in },
          onSpeakLastResponse: @escaping () -> Void = {},
          clipboardResolver: @escaping (UUID) -> ClipboardEntry? = { _ in nil }) {
         self.favoritesProvider = favoritesProvider
@@ -96,12 +97,14 @@ final class LaunchService {
             perform(action, adjustment: adjustment, toClipboard: toClipboard ?? false)
         case .preset:
             firePreset(item, inBand: band)
-        case .automation(let kind, let dimPercent):
+        case .automation(let kind, let dimPercent, let dimKeyboard, let lockOnStop):
             // Toggle the automation's stateful owner (start if inactive, stop if active). Like
             // `.aiCommand`, this is NOT a one-shot that completes on the lift — it enters/leaves a
-            // persistent mode owned outside the launcher (see `onAutomation`). `dimPercent` carries the
-            // item's configured dim level (nil = minimum) through to the owner.
-            onAutomation(kind, dimPercent)
+            // persistent mode owned outside the launcher (see `onAutomation`). The item's authored
+            // optionals resolve here (nil = default) into one `AutomationSettings` for the owner.
+            onAutomation(kind, AutomationSettings(dimPercent: dimPercent,
+                                                  dimKeyboard: dimKeyboard ?? false,
+                                                  lockOnStop: lockOnStop ?? false))
         case .clipboardEntry(let entry):
             pasteEntry(entry)
         case .fileEntry:
