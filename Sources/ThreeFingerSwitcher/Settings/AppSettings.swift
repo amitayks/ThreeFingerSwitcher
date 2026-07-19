@@ -550,6 +550,14 @@ final class AppSettings: ObservableObject {
     /// down. Default OFF. Older settings have no key and decode with the opt-in OFF.
     @Published var showDockPreviews: Bool { didSet { defaults.set(showDockPreviews, forKey: Keys.showDockPreviews) } }
 
+    /// Opt-in to snap-to-bind window groups: a window drag ending edge-flush against another window
+    /// binds the two into a group that the switcher renders as a fused cluster and raises together
+    /// (selected member focused). Like `showDockPreviews` this relocates NO native gesture, needs NO
+    /// re-login, and requests NO new permission (passive left-mouse monitors + the existing window
+    /// enumeration). Flipping it ON installs the snap monitor, OFF tears it down AND clears the
+    /// runtime groups. Default OFF; older settings have no key and decode with the opt-in OFF.
+    @Published var enableWindowGroups: Bool { didSet { defaults.set(enableWindowGroups, forKey: Keys.enableWindowGroups) } }
+
     /// Opt-in: drive the window switcher from ⌘-Tab (intercept it, suppress the native application
     /// switcher). Like `showDockPreviews` it needs NO re-login and requests NO new permission — it
     /// reuses the already-granted Accessibility (active consuming event tap + raise) and the tracked
@@ -716,6 +724,7 @@ final class AppSettings: ObservableObject {
         keyboardLanguagePerSiteEnabled = defaults.object(forKey: Keys.keyboardLanguagePerSiteEnabled) as? Bool ?? Defaults.keyboardLanguagePerSiteEnabled
         keyboardLanguageAllowBrowserControl = defaults.object(forKey: Keys.keyboardLanguageAllowBrowserControl) as? Bool ?? Defaults.keyboardLanguageAllowBrowserControl
         showDockPreviews = defaults.object(forKey: Keys.showDockPreviews) as? Bool ?? Defaults.showDockPreviews
+        enableWindowGroups = defaults.object(forKey: Keys.enableWindowGroups) as? Bool ?? Defaults.enableWindowGroups
         commandTabSwitcher = defaults.object(forKey: Keys.commandTabSwitcher) as? Bool ?? Defaults.commandTabSwitcher
         includeMinimizedWindows = defaults.object(forKey: Keys.includeMinimizedWindows) as? Bool ?? Defaults.includeMinimizedWindows
         swipeDownMinimizesAll = defaults.object(forKey: Keys.swipeDownMinimizesAll) as? Bool ?? Defaults.swipeDownMinimizesAll
@@ -939,6 +948,7 @@ final class AppSettings: ObservableObject {
         static let keyboardLanguagePerSiteEnabled = true
         static let keyboardLanguageAllowBrowserControl = false   // opt-in; Apple Events host reader (per-browser permission)
         static let showDockPreviews = false        // opt-in; Dock-hover window previews (no re-login, no new permission)
+        static let enableWindowGroups = false      // opt-in; snap-to-bind window groups (no re-login, no new permission)
         static let commandTabSwitcher = false      // opt-in; drive the switcher from ⌘-Tab (no re-login, no new permission)
         static let includeMinimizedWindows = false // opt-in; show minimized windows in the switcher + ⌘-Tab (de-minimize on select)
         static let swipeDownMinimizesAll = false   // opt-in; three-finger down minimizes all current-Space windows (reveal desktop)
@@ -1034,6 +1044,7 @@ final class AppSettings: ObservableObject {
         static let keyboardLanguagePerSiteEnabled = "keyboardLanguagePerSiteEnabled"
         static let keyboardLanguageAllowBrowserControl = "keyboardLanguageAllowBrowserControl"
         static let showDockPreviews = "showDockPreviews"
+        static let enableWindowGroups = "enableWindowGroups"
         static let commandTabSwitcher = "commandTabSwitcher"
         static let includeMinimizedWindows = "includeMinimizedWindows"
         static let swipeDownMinimizesAll = "swipeDownMinimizesAll"

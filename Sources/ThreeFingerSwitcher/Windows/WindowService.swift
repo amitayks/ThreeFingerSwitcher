@@ -633,6 +633,21 @@ final class WindowService {
         return true
     }
 
+    /// Group commit (window-groups): raise a whole snapped-together group with the SELECTED member
+    /// focused. Every mate is fronted first via the light front-without-commit mechanics of
+    /// `peekRaise` — SkyLight handshake + AX raise + the focus singletons, NO focus-history promotion,
+    /// NO watchdog (a second hardened raise would fight the selected member's), with the documented
+    /// Stage-Manager fallback inside `peekRaise` — then the selected member goes through the ONE
+    /// hardened `raise`, LAST, so topmost z-order, focus promotion, and the watchdog all land on it.
+    /// Group members are same-Space by construction (edge adjacency implies one Space; a Space move
+    /// dissolves membership), so no cross-Space machinery is engaged for the mates.
+    func raiseGroup(mates: [WindowInfo], selected: WindowInfo) {
+        for mate in mates {
+            peekRaise(mate)
+        }
+        raise(selected)
+    }
+
     /// The current frontmost window as a `WindowInfo`, captured BEFORE a peek begins so it can be
     /// re-fronted (restored) when the cursor leaves without committing. Resolves the frontmost app's
     /// focused window via Accessibility; nil when none resolves. Our overlay is non-activating, so the

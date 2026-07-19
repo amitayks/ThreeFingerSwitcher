@@ -85,11 +85,15 @@ The overlay SHALL group windows by Space, showing one Space's window grid at a t
 - **THEN** the overlay shows an indicator of the current Space position and the total number of Spaces
 
 ### Requirement: Animated row switching keeps the strip behavior
-When the shown Space changes, the overlay SHALL swap to the new Space's window grid with a vertical animation, reset the highlighted card to the first card (bottom-left) of the new Space's grid, and preserve the solved uniform-scale layout, thumbnails, and moving highlight within the new grid. During that animation all cards SHALL translate together as a single group; a window thumbnail that becomes available WHILE the animation is in progress SHALL NOT alter a card mid-animation (which would interrupt the motion), but SHALL be applied once the animation settles. Within a single Space, horizontal and vertical scrubbing SHALL navigate the grid (per the grid-navigation requirement) rather than swapping Spaces.
+When the shown Space changes, the overlay SHALL swap to the new Space's window grid with a vertical animation and preserve the solved uniform-scale layout, thumbnails, and moving highlight within the new grid. Where the highlight lands SHALL depend on how the Space was entered: a **vertical scrub (or arrow) crossing the grid edge** SHALL land positionally — entering upward (to the next Space) lands in the new grid's **bottom** visual row and entering downward (to the previous Space) lands in the new grid's **top** visual row, in both cases on the card nearest the selection's anchor x-position (spatially continuous with the reel's vertical stacking); a **linear (reel-order) flow** into a Space keeps its own defined landing (next Space's first window forward, previous Space's last window backward); any other entry (including a fresh presentation) SHALL land on the first card (bottom-left). During the animation all cards SHALL translate together as a single group; a window thumbnail that becomes available WHILE the animation is in progress SHALL NOT alter a card mid-animation (which would interrupt the motion), but SHALL be applied once the animation settles. Within a single Space, horizontal and vertical scrubbing SHALL navigate the grid (per the grid-navigation requirement) rather than swapping Spaces.
 
 #### Scenario: Space swap shows the new Space's grid
 - **WHEN** the selection moves to an adjacent Space
-- **THEN** the grid updates to that Space's windows with a vertical animation and the highlight starts at the bottom-left card (the first window)
+- **THEN** the grid updates to that Space's windows with a vertical animation and the highlight lands per the entry mode (positional for a vertical edge crossing, reel-defined for a linear flow, first card otherwise)
+
+#### Scenario: Vertical edge crossing lands positionally in the adjacent Space
+- **WHEN** the selection is on the current grid's top visual row and the user scrubs up (or the bottom visual row and scrubs down)
+- **THEN** the overlay switches to the adjacent Space and the highlight lands in that grid's bottom (respectively top) visual row on the card nearest the anchor x-position, not on a hardcoded first card
 
 #### Scenario: All cards move together; late thumbnails fill in after
 - **WHEN** a Space switch is animating and a window's thumbnail finishes capturing partway through the animation
@@ -184,6 +188,8 @@ The Hub window SHALL remain on the Space it was opened on (it SHALL NOT be made 
 
 The overlay SHALL render the current Space's windows as a wrapped grid of cards, one card per window in snapshot order, filling each visual row left-to-right and stacking the rows bottom-to-top — so the first window (in snapshot order) occupies the BOTTOM visual row and later windows wrap UPWARD. (A single row is unaffected: its first window is leftmost.) Each card SHALL render at its window's true proportion (from the window's real Accessibility frame), not a fixed shape, so a portrait window is a tall-narrow card and a landscape window a wide card. Each card SHALL show the window's thumbnail (or the app-icon placeholder when no thumbnail is available). Within a visual row, cards of differing height SHALL be vertically centered to the row's band height (the tallest card in that row).
 
+Windows belonging to one **group** (the window-groups capability) SHALL render as a **fused cluster**: one flow-wrap unit whose member cards are placed at their windows' real relative arrangement — each member at the shared uniform scale times its real frame, offset within the cluster by the scaled offset of its real frame within the group's union rectangle — so snapped windows visibly sit snapped in the grid. The cluster takes the flow position of its earliest member (in snapshot order); its members are consecutive items of the visual row, ordered by their real position (left-to-right, then top-to-bottom). Member cards SHALL keep individual thumbnails, individual highlight, and individual selection — the cluster is a layout unit, not a selection unit. Cluster members SHALL be exempt from the per-card minimum-size floor (flooring one member would break the mirrored adjacency); when no groups exist the layout SHALL be identical to the ungrouped layout.
+
 #### Scenario: One card per window in order
 
 - **WHEN** the overlay is shown for a Space of N windows
@@ -209,6 +215,21 @@ The overlay SHALL render the current Space's windows as a wrapped grid of cards,
 
 - **WHEN** a visual row contains cards of differing heights
 - **THEN** each card is vertically centered within the row's band (height of the tallest card in that row)
+
+#### Scenario: Grouped windows render fused, mirroring the real arrangement
+
+- **WHEN** two windows are grouped (snapped side by side on screen) and their Space is shown
+- **THEN** their cards render adjacent as one cluster whose internal arrangement matches the real windows' relative positions at the shared uniform scale (side-by-side windows are side-by-side cards, a stacked pair is stacked), visually distinct from the normal inter-card spacing
+
+#### Scenario: Individual highlight within a cluster
+
+- **WHEN** the selection moves onto a grouped window
+- **THEN** only that member card shows the selection highlight, and horizontal scrubbing steps between the cluster's members like any neighboring cards
+
+#### Scenario: No groups means the layout is unchanged
+
+- **WHEN** no window groups exist
+- **THEN** the wrapped grid is identical to the layout before this capability existed
 
 ### Requirement: Uniform-scale layout solve
 
@@ -237,17 +258,27 @@ The overlay SHALL size all visible cards by a single shared scale factor applied
 
 ### Requirement: Grid navigation within a Space
 
-Within a Space, horizontal scrubbing SHALL move the selection among the cards of the current visual row, and vertical scrubbing SHALL move the selection between visual rows. Horizontal movement SHALL stay within the current visual row (it SHALL NOT jump to another row). Moving to an adjacent visual row SHALL land the selection on the first (leftmost) card of that row.
+Within a Space, horizontal scrubbing SHALL move the selection among the cards of the current visual row, and vertical scrubbing SHALL move the selection between visual rows. Horizontal movement SHALL stay within the current visual row (it SHALL NOT jump to another row). Moving to an adjacent visual row SHALL land the selection **positionally**: on the card of that row whose horizontal span is nearest the selection's preferred x-position (the anchor), NOT unconditionally on the row's first card. The anchor SHALL be the x-center of the card selected when a run of vertical steps begins, expressed relative to the grid's horizontal center; it SHALL be reused unchanged by every subsequent vertical step in the run (so travelling several rows holds a straight vertical line rather than drifting through narrow cards), and SHALL be cleared by any horizontal step, any linear (reel-order) selection change, and a fresh presentation of the overlay. The landing card SHALL be the one minimizing the horizontal distance from the anchor to the card's span (zero when the anchor falls within the span), with ties broken toward the nearer card center.
 
 #### Scenario: Horizontal moves within the current row
 
 - **WHEN** the selection is in a visual row and the user scrubs horizontally
 - **THEN** the selection moves among the cards of that same visual row and does not jump to another row
 
-#### Scenario: Vertical moves between visual rows
+#### Scenario: Vertical moves between visual rows lands positionally
 
 - **WHEN** the user scrubs vertically and an adjacent visual row exists within the Space
-- **THEN** the selection moves to that row, landing on its first (leftmost) card
+- **THEN** the selection moves to that row, landing on the card whose horizontal span is nearest the selection's anchor x-position — the card directly above/below when one overlaps the anchor
+
+#### Scenario: A run of vertical steps holds a straight line
+
+- **WHEN** the user steps vertically through several rows in succession (no horizontal step in between)
+- **THEN** every landing uses the anchor captured at the first vertical step (the x-center of the card the run started on), so an intermediate narrow card does not bend the path
+
+#### Scenario: A horizontal step re-anchors
+
+- **WHEN** the user steps horizontally after vertical travel and then steps vertically again
+- **THEN** the new vertical landing is computed from the newly selected card's x-center (the previous anchor is discarded)
 
 #### Scenario: Selection kept visible when the grid overflows
 

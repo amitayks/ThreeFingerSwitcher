@@ -77,24 +77,52 @@ struct SwitcherView: View {
         return -above
     }
 
-    /// One Space's grid, centered within its reel cell: balanced rows of variable-size cards.
+    /// One Space's grid, centered within its reel cell: balanced rows of variable-size flow units — a
+    /// unit is one card, or a fused CLUSTER of grouped windows (window-groups) rendered snapped
+    /// together at their real relative arrangement.
     @ViewBuilder
     private func spaceGrid(_ space: Int) -> some View {
         let layout = model.spaceGrids.indices.contains(space) ? model.spaceGrids[space] : .empty
         let windows = model.rows.indices.contains(space) ? model.rows[space] : []
         VStack(spacing: SwitcherLayout.gridRowSpacing) {
-            ForEach(Array(layout.rows.enumerated()), id: \.offset) { _, row in
+            ForEach(Array(layout.unitRows.enumerated()), id: \.offset) { _, row in
                 HStack(alignment: .center, spacing: SwitcherLayout.gridCardSpacing) {
-                    ForEach(row, id: \.self) { index in
-                        if windows.indices.contains(index), layout.sizes.indices.contains(index) {
-                            card(window: windows[index], size: layout.sizes[index],
-                                 selected: space == model.currentRow && index == model.selectedIndex)
+                    ForEach(row, id: \.self) { unitIndex in
+                        if layout.units.indices.contains(unitIndex) {
+                            unitView(layout.units[unitIndex], windows: windows, space: space)
                         }
                     }
                 }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)   // center the grid within its reel cell
+    }
+
+    /// One flow unit: a singleton renders exactly the pre-groups card; a cluster is a fixed-size
+    /// container with the SAME card views placed at their scaled member frames — the real snapped
+    /// arrangement in miniature (the hairline gap between members is the scaled real gap, visibly
+    /// tighter than the grid's inter-card spacing). Highlight, thumbnails, and the minimized badge are
+    /// per-member exactly as for lone cards.
+    @ViewBuilder
+    private func unitView(_ unit: SwitcherGridUnit, windows: [WindowInfo], space: Int) -> some View {
+        if !unit.isCluster {
+            if let index = unit.members.first, windows.indices.contains(index),
+               let size = unit.frames.first?.size {
+                card(window: windows[index], size: size,
+                     selected: space == model.currentRow && index == model.selectedIndex)
+            }
+        } else {
+            ZStack(alignment: .topLeading) {
+                ForEach(Array(zip(unit.members, unit.frames)), id: \.0) { index, frame in
+                    if windows.indices.contains(index) {
+                        card(window: windows[index], size: frame.size,
+                             selected: space == model.currentRow && index == model.selectedIndex)
+                            .offset(x: frame.minX, y: frame.minY)
+                    }
+                }
+            }
+            .frame(width: unit.size.width, height: unit.size.height, alignment: .topLeading)
+        }
     }
 
     /// Vertical dots on the left showing which Space is active and how many exist. The first Space is

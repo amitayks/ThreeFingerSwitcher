@@ -3,6 +3,9 @@ import Combine
 import ServiceManagement
 import SwiftUI
 import DeviceLinkProtocol
+import os
+
+private let windowGroupsLog = Logger(subsystem: "ThreeFingerSwitcher", category: "WindowGroups")
 
 /// Owns and wires the whole pipeline: touch → recognizer → overlay highlight → commit raise.
 /// Also drives onboarding, settings, and the native-gesture consent flow.
@@ -50,6 +53,12 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         windowService: windowService,
         switcherThumbnails: thumbnails
     )
+
+    // Window groups (opt-in; snap-to-bind): the runtime group store plus the passive drag-end snap
+    // monitor that populates it. Groups are validated lazily against live snapshots at consumption
+    // (switcher open + commit) — see `WindowGroupStore`.
+    private let windowGroups = WindowGroupStore()
+    private lazy var snapMonitor = WindowSnapMonitor(store: windowGroups)
 
     /// The notch home zone + notch-native sessions (`ai-parked-sessions` + `notch-native-conversations`):
     /// the durable store, the one-active-now scheduler (K-ready for the batched runtime), the lifecycle
@@ -747,6 +756,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         observeKeyboardLanguagePerSiteToggle()
         observeKeyboardLanguageBrowserControlToggle()
         observeDockPreviewsToggle()
+        observeWindowGroupsToggle()
         observeParkToggle()
         observeAIGatingSnapshot()
         reconcileAIModelAtLaunch()
@@ -815,6 +825,9 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         // Dock-hover previews are gated ONLY on their own opt-in (independent of the switcher master
         // enable, like per-app keyboard language): a cursor-driven surface, no gesture involved.
         dockPreviewController.setEnabled(settings.showDockPreviews)
+        // Snap-to-bind window groups: same standalone opt-in shape — when off, the left-mouse
+        // monitors aren't even installed.
+        snapMonitor.setEnabled(settings.enableWindowGroups)
         // The notch home zone rail follows the agent feature (here: AI commands enabled). When off, the
         // cursor monitor isn't even installed.
         parkController.setEnabled(settings.aiCommandsEnabled)
@@ -1077,7 +1090,8 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
                      // Opted in but the relocation hasn't survived its re-login yet: the row dots
                      // dim with a pending glyph so the gated vertical axis explains itself.
                      rowSwitchingPending: settings.manageVerticalGesture && !isSpaceRowSwitchingEffective,
-                     windowScale: CGFloat(settings.switcherWindowScale))
+                     windowScale: CGFloat(settings.switcherWindowScale),
+                     groups: validatedWindowGroups(against: windows))
         switcherOwner = owner
         seedAllRows()         // every Space's cached previews present up front (no first-visit rebuild)
         prefetchCurrentRow()  // immediate capture of the whole visible row (no highlight needed)
@@ -1127,7 +1141,12 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
 
     func gestureDidStepRow(_ direction: Int) {
         guard overlay.isVisible else { return }
-        // Vertical scrub navigates the grid's visual rows; only a top/bottom-edge crossing switches Space.
+        stepGridRow(direction)
+    }
+
+    /// Shared vertical grid step (trackpad scrub + ⌘-Tab Up/Down): move between the grid's visual
+    /// rows with positional (sticky-anchor) landing; only a top/bottom-edge crossing switches Space.
+    private func stepGridRow(_ direction: Int) {
         switch overlay.moveVertical(direction) {
         case .moved:
             break   // highlight only; the periodic sweep keeps the visible row's previews fresh
@@ -1137,7 +1156,9 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     }
 
     /// Switch to an adjacent Space-row (from a grid-edge vertical scrub), clamping or wrapping per the
-    /// setting, and refresh thumbnails/live preview for the new Space exactly as before.
+    /// setting, landing positionally — up enters the new grid's bottom visual row, down its top row,
+    /// on the card nearest the vertical run's anchor — and refresh thumbnails/live preview for the new
+    /// Space exactly as before.
     private func switchSpace(by delta: Int) {
         let count = overlay.rowCount
         guard count > 1 else { return }
@@ -1148,7 +1169,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             row = min(max(row, 0), count - 1)
         }
         guard row != overlay.currentRow else { return }
-        overlay.updateRow(row)
+        overlay.updateRowPositional(row, upward: delta > 0)
         prefetchCurrentRow()   // seed the new Space's cached thumbnails now + immediately re-capture the row
         // …then freeze: async captures landing during the slide are buffered (so they can't snap it) and
         // cut in once it settles. Must follow the seed (done inside prefetchCurrentRow) and precede the
@@ -1279,13 +1300,48 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     /// Raise a committed switcher/⌘-Tab selection, un-minimizing it first when it is a minimized window
     /// (present only with the include-minimized-windows opt-in). `raiseDeminimizing` clears `kAXMinimized` —
     /// which restores the window's prior position/size — then runs the same hardened `raise`; a non-minimized
-    /// selection raises exactly as before.
+    /// selection raises exactly as before. When the selection belongs to a validated window GROUP
+    /// (window-groups opt-in), the whole group raises — mates fronted lightly first, the selected member
+    /// last with focus — and because this is the ONE shared commit point, trackpad and ⌘-Tab inherit it
+    /// identically. (A minimized window is never in a validated group — validation drops minimized
+    /// members — so the branches cannot overlap.)
     private func raiseCommitted(_ window: WindowInfo) {
-        if window.isMinimized {
+        if let mates = windowGroupMates(of: window), !mates.isEmpty {
+            windowService.raiseGroup(mates: mates, selected: window)
+        } else if window.isMinimized {
             windowService.raiseDeminimizing(window)
         } else {
             windowService.raise(window)
         }
+    }
+
+    /// The validated group-mates of a committed window (window-groups opt-in), resolved from the
+    /// overlay's current snapshot rows — the same `WindowInfo`s (with AX elements) the switcher shows.
+    /// Nil when the feature is off or the window is ungrouped; validation happens at this consumption
+    /// point too, so a member closed/minimized mid-session can never be raised.
+    private func windowGroupMates(of window: WindowInfo) -> [WindowInfo]? {
+        guard settings.enableWindowGroups else { return nil }
+        let shown = overlay.model.rows.flatMap { $0 }
+        let validated = validatedWindowGroups(against: shown)
+        guard let group = validated.first(where: { $0.contains(window.id) }) else { return nil }
+        return shown.filter { group.contains($0.id) && $0.id != window.id }
+    }
+
+    /// Validate the group store against a live snapshot (dropping closed/minimized/off-Space members —
+    /// the lazy-lifecycle consumption point) and return the surviving groups. Empty when the opt-in
+    /// is off, so the layout and commit paths degrade to exactly the pre-groups behavior.
+    private func validatedWindowGroups(against windows: [WindowInfo]) -> [Set<CGWindowID>] {
+        guard settings.enableWindowGroups else { return [] }
+        let stored = windowGroups.groups
+        // `realFrame` (AX, top-left global — same handedness as the monitor's CG frames) feeds the
+        // geometric validation: members that no longer touch have detached, even when the resize/move
+        // that separated them was never seen by the mouse monitor (keyboard/AX-driven).
+        let validated = windowGroups.validatedGroups(against: windows.map {
+            WindowGroupStore.Candidate(id: $0.id, isMinimized: $0.isMinimized,
+                                       spaceID: $0.spaceID, frame: $0.realFrame)
+        })
+        windowGroupsLog.log("validate: stored \(stored.map { $0.sorted() }, privacy: .public) vs snapshot \(windows.count) windows -> \(validated.map { $0.sorted() }, privacy: .public)")
+        return validated
     }
 
     func gestureDidCancel() {
@@ -1331,16 +1387,18 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         }
     }
 
-    /// Up/Down arrow: jump directly to the adjacent Space (its first window), reusing the trackpad's
-    /// `switchSpace`. The direction mirrors the trackpad's vertical scrub exactly — `up ? +1 : -1`,
-    /// flipped by `reverseVerticalDirection` (same computation as `GestureRecognizer.emitRowStep`) — so
-    /// the Up arrow and an up-scrub move the reel the same way.
+    /// Up/Down arrow: navigate the grid's visual rows through the SAME path as the trackpad's vertical
+    /// scrub (`stepGridRow` — positional landing, Space switch only at the grid's top/bottom edge, wrap
+    /// per the setting). The arrow is literal — Up always moves the highlight visually up — so
+    /// `reverseVerticalDirection` does NOT flip it: that setting expresses a finger-vs-content *scrub*
+    /// preference, which has no meaning for a directional keypress. (When it flipped the old
+    /// jump-a-whole-Space arrows, "Up" could move the reel down — with grid-row movement that would
+    /// read as the highlight moving against the arrow.)
     func keyboardSwitcherStepSpace(up: Bool) {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.switcherOwner == .keyboard, self.overlay.isVisible else { return }
-            var delta = up ? 1 : -1
-            if self.settings.reverseVerticalDirection { delta = -delta }
-            self.switchSpace(by: delta)
+            // An edge crossing runs `switchSpace`, which already refreshes + freezes the new row.
+            self.stepGridRow(up ? 1 : -1)
         }
     }
 
@@ -2044,6 +2102,16 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         settings.$showDockPreviews
             .dropFirst()
             .sink { [weak self] on in MainActor.assumeIsolated { self?.dockPreviewController.setEnabled(on) } }
+            .store(in: &cancellables)
+    }
+
+    /// React to the `enableWindowGroups` toggle (mirrors `observeDockPreviewsToggle`): ON installs the
+    /// passive left-mouse snap monitor; OFF removes it AND clears the store, so re-enabling never
+    /// resurrects stale groups.
+    private func observeWindowGroupsToggle() {
+        settings.$enableWindowGroups
+            .dropFirst()
+            .sink { [weak self] on in MainActor.assumeIsolated { self?.snapMonitor.setEnabled(on) } }
             .store(in: &cancellables)
     }
 

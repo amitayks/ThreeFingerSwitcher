@@ -1,7 +1,8 @@
 import Foundation
 
 /// Arrow-key direction while the ⌘-Tab switcher is open (Windows-Alt-Tab-style navigation). Left/Right
-/// step through windows (mirroring Shift+Tab / Tab, flowing across Spaces); Up/Down jump between Spaces.
+/// step through windows (mirroring Shift+Tab / Tab, flowing across Spaces); Up/Down navigate the grid's
+/// visual rows with positional landing, switching Space only at the grid's top/bottom edge.
 enum SwitcherArrow { case left, right, up, down }
 
 /// The pure decision surface the keyboard tap drives. `KeyboardSwitcher` is the production
@@ -29,8 +30,9 @@ protocol KeyboardSwitcherDelegate: AnyObject {
     /// A subsequent Tab (forward) or Shift+Tab (backward): step the selection one window along the flat
     /// reel order, flowing across Spaces in that direction.
     func keyboardSwitcherStep(forward: Bool)
-    /// An Up/Down arrow while active: jump the selection to the adjacent Space (its first window),
-    /// matching the trackpad's vertical Space-switch direction.
+    /// An Up/Down arrow while active: step the selection vertically through the grid's visual rows
+    /// exactly as the trackpad's vertical scrub does (positional landing; a Space switch only when the
+    /// step crosses the grid's top/bottom edge).
     func keyboardSwitcherStepSpace(up: Bool)
     /// ⌘ released while active: commit — raise the highlighted window, crossing Space if needed.
     func keyboardSwitcherCommit()
@@ -95,7 +97,8 @@ final class KeyboardSwitcher: KeyboardSwitcherInput {
     }
 
     /// Arrow-key navigation while the switcher is open (⌘ held): Left/Right step backward/forward through
-    /// windows (like Shift+Tab / Tab, flowing across Spaces); Up/Down jump between Spaces. Ignored unless a
+    /// windows (like Shift+Tab / Tab, flowing across Spaces); Up/Down step the grid's visual rows (Space
+    /// switch only at the grid edge). Ignored unless a
     /// session is active — arrows never OPEN the switcher (and the tap only forwards them while active).
     func arrow(_ key: SwitcherArrow) {
         guard phase == .active else { return }

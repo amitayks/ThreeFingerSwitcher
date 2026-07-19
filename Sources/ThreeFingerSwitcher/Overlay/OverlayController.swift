@@ -70,11 +70,11 @@ final class OverlayController {
 
     func show(rows: [[WindowInfo]], labels: [String], startRow: Int, column: Int,
               aboveMissionControl: Bool = false, rowSwitchingPending: Bool = false,
-              windowScale: CGFloat = 1) {
+              windowScale: CGFloat = 1, groups: [Set<CGWindowID>] = []) {
         // The configurable window size scales the uniform-scale cap; set it before the rows so the
         // first grid solve already uses it.
         model.setMaxScale(SwitcherLayout.kMax * windowScale)
-        model.setRows(rows, labels: labels, startRow: startRow, column: column)
+        model.setRows(rows, labels: labels, startRow: startRow, column: column, groups: groups)
         model.rowSwitchingPending = rowSwitchingPending
         let panel = self.panel ?? makePanel()
         self.panel = panel
@@ -109,6 +109,15 @@ final class OverlayController {
     func updateRow(_ row: Int) {
         withAnimation(.easeInOut(duration: Self.slideDuration)) {
             model.setRow(row)
+        }
+    }
+
+    /// Switch the displayed Space from a vertical grid-edge crossing, landing POSITIONALLY (the
+    /// model's sticky anchor picks the nearest card in the entry row) instead of on the first window.
+    /// Same explicit animation transaction as `updateRow` so the reel slides identically.
+    func updateRowPositional(_ row: Int, upward: Bool) {
+        withAnimation(.easeInOut(duration: Self.slideDuration)) {
+            model.setRowEntering(row, upward: upward)
         }
     }
 
