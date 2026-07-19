@@ -150,7 +150,7 @@ final class WindowService {
                 currentByPid[m.pid] = Set(currentSpaceElements(pid: m.pid).keys)
             }
             if !onCurrent, bruteByPid[m.pid] == nil {
-                bruteByPid[m.pid] = Set(bruteForceWindows(pid: m.pid, includeNonStandard: settings.includeNonStandardWindows).map(\.0))
+                bruteByPid[m.pid] = Set(bruteForceWindows(pid: m.pid, includeNonStandard: bruteIncludesNonStandard(pid: m.pid)).map(\.0))
             }
             let live = onCurrent ? (currentByPid[m.pid]?.contains(wid) ?? false)
                                  : (bruteByPid[m.pid]?.contains(wid) ?? false)
@@ -236,7 +236,7 @@ final class WindowService {
                 element = axCurrentByPid[m.pid]?[wid]
             } else {
                 if axBruteByPid[m.pid] == nil {
-                    axBruteByPid[m.pid] = Dictionary(bruteForceWindows(pid: m.pid, includeNonStandard: settings.includeNonStandardWindows), uniquingKeysWith: { a, _ in a })
+                    axBruteByPid[m.pid] = Dictionary(bruteForceWindows(pid: m.pid, includeNonStandard: bruteIncludesNonStandard(pid: m.pid)), uniquingKeysWith: { a, _ in a })
                 }
                 element = axBruteByPid[m.pid]?[wid]
             }
@@ -287,6 +287,16 @@ final class WindowService {
         // `elementCache` is now the sole Bug-A guard, so this prune must stay correct.
         elementCache = elementCache.filter { spaceForWindow[$0.key] != nil }
 
+        // Phantom-duplicate suppression (WindowFilter.dedupe, design D3): exact same-app clones —
+        // identical title, integral real frame, and minimized state (the AirDrop send popup exposes
+        // several per actual window) — collapse to the front-most (lowest z). `include`-rule apps
+        // are exempt.
+        rows = WindowFilter.dedupe(
+            rows, exemptPids: includeRulePids(appsByPid.keys),
+            key: { WindowFilter.DedupeKey(pid: $0.window.pid, title: $0.window.title,
+                                          frame: $0.window.realFrame, isMinimized: $0.window.isMinimized) },
+            rank: { $0.z })
+
         // Order by per-window focus recency (primary), falling back to current-Space → Space index →
         // z-order for never-focused windows. Routed through the pure `WindowOrdering` helper so the
         // sort key is unit-testable without AppKit/AX.
@@ -316,6 +326,14 @@ final class WindowService {
                 }
             }
             extras.sort { $0.wid < $1.wid }   // stable id order so re-lists don't restrobe (mirrors dockPreviewOrder)
+            // Phantom clones can appear among the supplementary minimized windows too — collapse them
+            // by the same identity key (stable id rank, since these have no z).
+            extras = WindowFilter.dedupe(
+                extras, exemptPids: includeRulePids(appsByPid.keys),
+                key: { WindowFilter.DedupeKey(pid: $0.app.processIdentifier,
+                                              title: axString($0.el, kAXTitleAttribute as String),
+                                              frame: axFrame($0.el), isMinimized: true) },
+                rank: { Int($0.wid) })
             if !extras.isEmpty {
                 let extraMeta = metadata(for: extras.map(\.wid))
                 for e in extras {
@@ -366,6 +384,12 @@ final class WindowService {
         // Prune the focus history to the enumerated ids (parity with snapshot()), so closed windows
         // don't linger on the legacy fallback path.
         focus.evict(keepingLive: Set(result.map(\.window.id)))
+        // Phantom-duplicate suppression, parity with snapshot() (frame here is the AX frame).
+        result = WindowFilter.dedupe(
+            result, exemptPids: includeRulePids(apps.map(\.processIdentifier)),
+            key: { WindowFilter.DedupeKey(pid: $0.window.pid, title: $0.window.title,
+                                          frame: $0.window.frame, isMinimized: $0.window.isMinimized) },
+            rank: { $0.z })
         // Same window-rank-first key as snapshot(); here every window is current-Space at spaceIndex 0
         // and `z` is a global running index, so once recency is exhausted the order is the stable
         // enumeration order and the appRank tiebreak is unreachable.
@@ -450,6 +474,13 @@ final class WindowService {
                 isOnCurrentSpace: true, spaceID: nil, spaceIndex: 0, isMinimized: minimized
             ))
         }
+        // Phantom-duplicate suppression, parity with the switcher snapshot (stable id rank — the
+        // clones are visually indistinguishable, so any survivor is the right card).
+        result = WindowFilter.dedupe(
+            result, exemptPids: includeRulePids([pid]),
+            key: { WindowFilter.DedupeKey(pid: $0.pid, title: $0.title,
+                                          frame: $0.realFrame, isMinimized: $0.isMinimized) },
+            rank: { Int($0.id) })
         return Self.dockPreviewOrder(result)
     }
 
@@ -462,15 +493,14 @@ final class WindowService {
         }
     }
 
-    /// Like `isSwitchable` but does NOT exclude minimized windows — the Dock preview wants them. Keeps the
-    /// same role/subrole gate (standard windows + dialogs/sheets) so non-window AX surfaces are dropped.
+    /// Like `isSwitchable` but does NOT exclude minimized windows — the Dock preview wants them. Routes
+    /// through the same `WindowFilter` (with minimized forced included), so the relaxed toggle and the
+    /// per-app rules apply to the Dock popup exactly as they do to the switcher.
     private func isPreviewable(_ axWin: AXUIElement) -> Bool {
-        let role = axString(axWin, kAXRoleAttribute as String)
-        guard role == (kAXWindowRole as String) else { return false }
-        if let subrole = axString(axWin, kAXSubroleAttribute as String) {
-            return subrole == (kAXStandardWindowSubrole as String)
-        }
-        return true
+        var pol = axPid(axWin).map(policy(forPid:))
+            ?? WindowFilterPolicy(relaxed: settings.includeNonStandardWindows, includeMinimized: true)
+        pol.includeMinimized = true
+        return WindowFilter.verdict(candidate(for: axWin), policy: pol) == .listed
     }
 
     /// Dock-preview commit: bring `window` to the front, **un-minimizing it first** if needed, then run
@@ -818,7 +848,7 @@ final class WindowService {
         if window.isOnCurrentSpace {
             if let el = currentSpaceElements(pid: window.pid)[window.id] { return el }
         } else {
-            if let el = bruteForceWindows(pid: window.pid, includeNonStandard: settings.includeNonStandardWindows).first(where: { $0.0 == window.id })?.1 { return el }
+            if let el = bruteForceWindows(pid: window.pid, includeNonStandard: bruteIncludesNonStandard(pid: window.pid)).first(where: { $0.0 == window.id })?.1 { return el }
         }
         // Fall back to an element cached while the window was reachable (off-Space Chromium raise).
         if let cached = elementCache[window.id], axCopy(cached, kAXRoleAttribute as String) != nil {
@@ -892,41 +922,112 @@ final class WindowService {
         return map
     }
 
-    /// Minimum window dimension — the SHORTER side must clear this — admitted by the RELAXED gate. A
-    /// standard document window clears it easily; the thin helper/shadow/toolbar surfaces a foreign
-    /// toolkit exposes as extra windows do not — so the relaxation surfaces the real window without its
-    /// junk companions. Only consulted in relaxed mode; strict mode never admitted these.
-    ///
-    /// Calibrated from the live case that motivated it: the Android emulator (`qemu-system-aarch64`)
-    /// exposes its real device window (short side 372) AND a borderless side-toolbar (61×515, empty
-    /// title, same process — raising it just re-fronts the emulator). 100 sits in the wide gap between
-    /// the toolbar's 61 and the next-narrowest real window (138 in the observed set), so it drops the
-    /// toolbar with margin while keeping every genuine window (a small square/watch emulator, ~320, is
-    /// well clear).
-    private let minRelaxedWindowDimension: CGFloat = 100
+    // MARK: - Switchability (the pure filter's AX boundary)
 
+    /// Gather the observable AX facts for one window element — the boundary read for the pure
+    /// `WindowFilter` (design D1). Size is the AX (real) size, so a Stage-Manager strip proxy —
+    /// small in CGWindowList bounds but really large — is measured by its true size and not
+    /// mistaken for a helper window.
+    private func candidate(for axWin: AXUIElement) -> WindowCandidate {
+        WindowCandidate(
+            role: axString(axWin, kAXRoleAttribute as String),
+            subrole: axString(axWin, kAXSubroleAttribute as String),
+            title: axString(axWin, kAXTitleAttribute as String),
+            size: axFrame(axWin).size,
+            hasCloseButton: axCopy(axWin, kAXCloseButtonAttribute as String) != nil,
+            isMinimized: axBool(axWin, kAXMinimizedAttribute as String)
+        )
+    }
+
+    /// The per-app rule key: bundle ID, falling back to executable name (Qt/CLI-hosted apps like the
+    /// Android emulator can lack a bundle ID). Cached per pid — bounded by the process count over the
+    /// app's lifetime, and pid reuse across launches is rare enough that a stale hit is harmless (the
+    /// key is only a dictionary lookup into the user's rules).
+    private var bundleKeyByPid: [pid_t: String] = [:]
+    func bundleKey(for pid: pid_t) -> String {
+        if let cached = bundleKeyByPid[pid] { return cached }
+        let app = NSRunningApplication(processIdentifier: pid)
+        let key = app?.bundleIdentifier ?? app?.executableURL?.lastPathComponent ?? "pid-\(pid)"
+        bundleKeyByPid[pid] = key
+        return key
+    }
+
+    /// The filter policy for an app: the two global toggles plus the user's per-app rule (if any).
+    private func policy(forPid pid: pid_t) -> WindowFilterPolicy {
+        WindowFilterPolicy(relaxed: settings.includeNonStandardWindows,
+                           includeMinimized: settings.includeMinimizedWindows,
+                           appRule: settings.windowAppRules[bundleKey(for: pid)])
+    }
+
+    /// The pids whose `include` rule exempts them from phantom-duplicate suppression (design D3).
+    private func includeRulePids<S: Sequence>(_ pids: S) -> Set<pid_t> where S.Element == pid_t {
+        guard !settings.windowAppRules.isEmpty else { return [] }
+        return Set(pids.filter { settings.windowAppRules[bundleKey(for: $0)] == .include })
+    }
+
+    private func axPid(_ element: AXUIElement) -> pid_t? {
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success, pid > 0 else { return nil }
+        return pid
+    }
+
+    /// Whether the acquisition pre-filter in `bruteForceWindows` should accept any window-role
+    /// element for this pid: the global relaxed toggle, or the app's `include` rule (else an
+    /// off-Space window of an `include` app could never be acquired under a strict global).
+    private func bruteIncludesNonStandard(pid: pid_t) -> Bool {
+        settings.includeNonStandardWindows || policy(forPid: pid).appRule == .include
+    }
+
+    /// The switchability gate — routed through the pure `WindowFilter` (see its doc for the tiers).
+    /// `minimizeAllWindows()` skips already-minimized windows BEFORE this gate, so admitting
+    /// minimized windows here never re-minimizes one.
     private func isSwitchable(_ axWin: AXUIElement) -> Bool {
-        // Minimized windows are dropped by default; the include-minimized-windows opt-in admits them (the
-        // switcher then badges them and commits via the un-minimize path). `minimizeAllWindows()` skips
-        // already-minimized windows BEFORE this gate, so relaxing here never re-minimizes one.
-        if axBool(axWin, kAXMinimizedAttribute as String), !settings.includeMinimizedWindows { return false }
-        let role = axString(axWin, kAXRoleAttribute as String)
-        guard role == (kAXWindowRole as String) else { return false }
-        // Relaxed gate (`includeNonStandardWindows`): any window-role element is switchable regardless
-        // of subrole — surfacing real windows that report a non-standard/unknown subrole (foreign
-        // toolkits like the Android emulator's Qt window; setup/welcome surfaces like Xcode's start
-        // window). The layer-0 gate in `snapshot()` still filters true floating HUD/utility panels; a
-        // minimum-size gate here filters the tiny helper windows those toolkits also expose. Size is the
-        // AX (real) size, so a Stage-Manager strip proxy — small in CGWindowList bounds but really
-        // large — is measured by its true size and not mistaken for a helper window.
-        if settings.includeNonStandardWindows {
-            let size = axFrame(axWin).size
-            return size.width >= minRelaxedWindowDimension && size.height >= minRelaxedWindowDimension
+        let pol = axPid(axWin).map(policy(forPid:))
+            ?? WindowFilterPolicy(relaxed: settings.includeNonStandardWindows,
+                                  includeMinimized: settings.includeMinimizedWindows)
+        return WindowFilter.verdict(candidate(for: axWin), policy: pol) == .listed
+    }
+
+    // MARK: - Window Inspector
+
+    /// The Hub Window Inspector's data (design D5): every regular app's current-Space window
+    /// candidates with the verdict the switcher's own filter produced, plus dedup marking — the same
+    /// `WindowFilter` drives both, so the inspector and the switcher can never disagree. Current-
+    /// Space-only on purpose: the inspector answers questions about windows the user is looking at
+    /// ("why isn't this listed?", "why four cards?"); off-Space ghost forensics stays with
+    /// `diagnosticReport()`. On-demand only — the Hub refreshes on explicit action, never a timer.
+    func inspectorSnapshot() -> [WindowInspectorEntry] {
+        guard AXIsProcessTrusted() else { return [] }
+        let selfPid = getpid()
+        let apps = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular && $0.processIdentifier != selfPid && !$0.isTerminated }
+            .sorted { ($0.localizedName ?? "").localizedCaseInsensitiveCompare($1.localizedName ?? "") == .orderedAscending }
+        var entries: [WindowInspectorEntry] = []
+        var frames: [CGWindowID: CGRect] = [:]
+        for app in apps {
+            let pid = app.processIdentifier
+            let pol = policy(forPid: pid)
+            for (wid, el) in currentSpaceElements(pid: pid).sorted(by: { $0.key < $1.key }) {
+                let c = candidate(for: el)
+                frames[wid] = axFrame(el)
+                entries.append(WindowInspectorEntry(
+                    id: wid, pid: pid, appKey: bundleKey(for: pid), appName: app.localizedName ?? "",
+                    appIcon: app.icon, title: c.title ?? "", subrole: c.subrole, size: c.size,
+                    isMinimized: c.isMinimized, verdict: WindowFilter.verdict(c, policy: pol)))
+            }
         }
-        if let subrole = axString(axWin, kAXSubroleAttribute as String) {
-            return subrole == (kAXStandardWindowSubrole as String)
+        // Mark the dedup losers among the listed entries — the same suppression the snapshot applies.
+        let listed = entries.filter { $0.verdict == .listed }
+        let survivors = Set(WindowFilter.dedupe(
+            listed, exemptPids: includeRulePids(apps.map(\.processIdentifier)),
+            key: { WindowFilter.DedupeKey(pid: $0.pid, title: $0.title,
+                                          frame: frames[$0.id] ?? .zero, isMinimized: $0.isMinimized) },
+            rank: { Int($0.id) }).map(\.id))
+        return entries.map { entry in
+            var entry = entry
+            entry.dedupedOut = entry.verdict == .listed && !survivors.contains(entry.id)
+            return entry
         }
-        return true
     }
 
     private func axFrame(_ axWin: AXUIElement) -> CGRect {
@@ -940,4 +1041,23 @@ final class WindowService {
         }
         return CGRect(origin: origin, size: size)
     }
+}
+
+/// One row of the Hub Window Inspector (design D5): a current-Space window candidate with the
+/// verdict the switcher's own filter produced for it, and whether phantom-duplicate suppression
+/// would drop it. Built by `WindowService.inspectorSnapshot()`.
+struct WindowInspectorEntry: Identifiable {
+    let id: CGWindowID
+    let pid: pid_t
+    /// The per-app rule key (bundle ID or executable name) — what a rule edit writes under.
+    let appKey: String
+    let appName: String
+    let appIcon: NSImage?
+    let title: String
+    let subrole: String?
+    let size: CGSize
+    let isMinimized: Bool
+    let verdict: WindowFilterVerdict
+    /// Listed by the filter but suppressed as an exact clone of another listed window.
+    var dedupedOut: Bool = false
 }

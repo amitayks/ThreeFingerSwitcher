@@ -3569,6 +3569,11 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             // The snapshot already excludes our own PID, so the Hub never appears as a card.
             return SpaceGrouping.group(self.windowService.snapshot()).rows
         }
+        // Window Inspector (Switcher page): the on-demand candidate/verdict snapshot. Pull-only —
+        // the page refreshes on explicit action, never on a timer (the idle-CPU landmine).
+        ctx.inspectWindows = { [weak self] in
+            self?.windowService.inspectorSnapshot() ?? []
+        }
         ctx.seedThumbnails = { [weak self] model in
             guard let self else { return }
             // PRODUCTION semantics (mirrors `makeWizardContext.seedThumbnails`): live-capture every

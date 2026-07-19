@@ -124,11 +124,15 @@ struct SwitcherPage: View {
                 Toggle("Require exactly three fingers", isOn: $settings.requireExactlyThree)
                 ToggleRow(title: "Include non-standard windows",
                           isOn: $settings.includeNonStandardWindows,
-                          caption: "Also switch to windows that don't report as standard document windows — like the Android emulator, simulators and tools from other UI toolkits, and setup/welcome screens (e.g. Xcode's start window). May also surface some dialog and panel windows.")
+                          caption: "Also switch to windows that don't report as standard document windows — like the Android emulator, simulators and tools from other UI toolkits, setup/welcome screens (e.g. Xcode's start window), and dialogs such as copy-progress windows. Phantom frames and floating palettes are still filtered out; check the Window inspector below to see each decision and override it per app.")
                 ToggleRow(title: "Include minimized windows",
                           isOn: $settings.includeMinimizedWindows,
                           caption: "Show minimized windows in the switcher and ⌘-Tab, badged as “Minimized.” Selecting one restores it to where it was. Locked on while “Minimize all windows on three-finger down” (below) is enabled, so those windows are never stranded.")
                     .disabled(settings.swipeDownMinimizesAll)
+            }
+            HubSection("Window inspector",
+                       footnote: "Every window on the current Space and what the switcher decided about it — including duplicates it collapsed. If the filter gets an app wrong, set a per-app rule here.") {
+                HubWindowInspector(settings: settings, inspect: context.inspectWindows)
             }
             // Space-row switching — a sub-feature of the switcher: slide up/down while it is open to move
             // between Spaces. Re-homed here from the former standalone Spaces page.

@@ -121,6 +121,13 @@ final class AppSettings: ObservableObject {
     /// (preserve today's strict behavior); older settings have no key and decode with it OFF.
     @Published var includeNonStandardWindows: Bool { didSet { defaults.set(includeNonStandardWindows, forKey: Keys.includeNonStandardWindows) } }
 
+    /// Per-app window-listing rules (`WindowAppRule`) keyed by bundle ID (falling back to executable
+    /// name for apps that have none — e.g. the Android emulator): `include` lists every window-role
+    /// element of the app, `strict` applies the standard-subrole gate regardless of the global relaxed
+    /// toggle, `exclude` lists nothing from the app; an absent key follows the global policy. Edited
+    /// from the Hub's Window Inspector. A pure behavior tunable — live-applies on the next gesture.
+    @Published var windowAppRules: [String: WindowAppRule] { didSet { persistCodable(windowAppRules, Keys.windowAppRules) } }
+
     /// Normalized vertical centroid travel that switches one Space-row. Larger than stepDistance
     /// so horizontal scrubbing jitter doesn't flip rows.
     @Published var rowStepDistance: Double { didSet { persist(rowStepDistance, Keys.rowStepDistance) } }
@@ -631,6 +638,7 @@ final class AppSettings: ObservableObject {
         switcherWindowScale = defaults.object(forKey: Keys.switcherWindowScale) as? Double ?? Defaults.switcherWindowScale
         requireExactlyThree = defaults.object(forKey: Keys.requireExactlyThree) as? Bool ?? Defaults.requireExactlyThree
         includeNonStandardWindows = defaults.object(forKey: Keys.includeNonStandardWindows) as? Bool ?? Defaults.includeNonStandardWindows
+        windowAppRules = AppSettings.loadCodable([String: WindowAppRule].self, defaults, Keys.windowAppRules) ?? Defaults.windowAppRules
         rowStepDistance = defaults.object(forKey: Keys.rowStepDistance) as? Double ?? Defaults.rowStepDistance
         focusWatchdogEnabled = defaults.object(forKey: Keys.focusWatchdogEnabled) as? Bool ?? Defaults.focusWatchdogEnabled
         manageSpacesRearrange = defaults.object(forKey: Keys.manageSpacesRearrange) as? Bool ?? Defaults.manageSpacesRearrange
@@ -724,6 +732,7 @@ final class AppSettings: ObservableObject {
         // A pure behavior tunable (no system side effect / permission / download), so — like `wrapAtEnds`
         // and `requireExactlyThree` — it resets back to its strict default.
         includeNonStandardWindows = Defaults.includeNonStandardWindows
+        windowAppRules = Defaults.windowAppRules
         // Pure behavior tunables (no relocation / permission / download), so both reset to OFF. Order
         // matters: clear the minimize-all trigger FIRST so the coupling guard does not re-enable reachability.
         swipeDownMinimizesAll = Defaults.swipeDownMinimizesAll
@@ -851,6 +860,7 @@ final class AppSettings: ObservableObject {
         static let switcherWindowScale = 0.60    // 0.60× of SwitcherLayout.kMax
         static let requireExactlyThree = true
         static let includeNonStandardWindows = false   // strict: only AXStandardWindow (opt-in to widen)
+        static let windowAppRules: [String: WindowAppRule] = [:]   // no per-app overrides — global policy everywhere
         static let rowStepDistance = 0.06       // 2× the horizontal step; deliberate up/down
         static let reverseVerticalDirection = false
         static let focusWatchdogEnabled = true
@@ -949,6 +959,7 @@ final class AppSettings: ObservableObject {
         static let switcherWindowScale = "switcherWindowScale"
         static let requireExactlyThree = "requireExactlyThree"
         static let includeNonStandardWindows = "includeNonStandardWindows"
+        static let windowAppRules = "windowAppRules"
         static let rowStepDistance = "rowStepDistance"
         static let reverseVerticalDirection = "reverseVerticalDirection"
         static let focusWatchdogEnabled = "focusWatchdogEnabled"

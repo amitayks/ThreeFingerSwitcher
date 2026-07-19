@@ -87,6 +87,9 @@ final class HubContext {
     // reuses the granted Screen Recording (degrades to icons when not granted).
     /// The user's real windows (one row per Space-row); empty ⇒ the holder falls back to sample art.
     var realWindowRows: () -> [[WindowInfo]] = { [] }
+    /// Window Inspector (Switcher page): the on-demand candidate/verdict snapshot from
+    /// `WindowService.inspectorSnapshot()`. Called on the page's explicit refresh only.
+    var inspectWindows: () -> [WindowInspectorEntry] = { [] }
     /// Seed/prefetch live thumbnails into the passed demo model (post-Screen-Recording reveal).
     var seedThumbnails: (SwitcherModel) -> Void = { _ in }
     /// The launcher's bands for the current toggles (favorites + AI/Clipboard when on).
