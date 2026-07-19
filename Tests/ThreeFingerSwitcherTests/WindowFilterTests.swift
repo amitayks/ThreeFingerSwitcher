@@ -110,10 +110,32 @@ final class WindowFilterTests: XCTestCase {
         XCTAssertEqual(WindowFilter.verdict(toolbar, policy: relaxedPolicy), .dropped(.phantom))
     }
 
-    func testEmulatorDeviceWindowStillLists() {
-        // Short side 372 clears the legacy threshold even untitled/chromeless.
-        let device = candidate(subrole: unknown, title: "", size: CGSize(width: 372, height: 700))
+    func testAirDropPhantomCloneDrops() {
+        // Live-probed 2026-07-19: one AirDrop share births three Finder-owned untitled chromeless
+        // clones at the host window's exact 316×601 frame, lingering after dismissal. Size must
+        // never admit an identity-less window — this is the regression that killed the size signal.
+        let clone = candidate(subrole: unknown, title: "", size: CGSize(width: 316, height: 601))
+        XCTAssertEqual(WindowFilter.verdict(clone, policy: relaxedPolicy), .dropped(.phantom))
+    }
+
+    func testTitledEmulatorDeviceWindowLists() {
+        // The emulator's real windows carry titles ("Android Emulator - Pixel_10_Pro:5554") — the
+        // title discriminator covers them without any size signal. A truly titleless real window is
+        // recovered via the per-app include rule, not a size guess.
+        let device = candidate(subrole: unknown, title: "Android Emulator - Pixel_10_Pro:5554",
+                               size: CGSize(width: 372, height: 700))
         XCTAssertEqual(WindowFilter.verdict(device, policy: relaxedPolicy), .listed)
+        let untitledBig = candidate(subrole: unknown, title: "", size: CGSize(width: 372, height: 700))
+        XCTAssertEqual(WindowFilter.verdict(untitledBig, policy: relaxedPolicy), .dropped(.phantom),
+                       "untitled + chromeless is phantom regardless of size")
+    }
+
+    func testMissingSubroleListsUntitled() {
+        // Strict lists a no-subrole window unconditionally — relaxed must too (monotonicity), even
+        // untitled and chromeless.
+        let bare = candidate(subrole: nil, title: "", size: CGSize(width: 200, height: 200))
+        XCTAssertEqual(WindowFilter.verdict(bare, policy: strictPolicy), .listed)
+        XCTAssertEqual(WindowFilter.verdict(bare, policy: relaxedPolicy), .listed)
     }
 
     func testTitledSmallUnknownWindowLists() {
@@ -122,7 +144,7 @@ final class WindowFilterTests: XCTestCase {
     }
 
     func testWhitespaceTitleDoesNotCountAsTitled() {
-        let blank = candidate(subrole: unknown, title: "  \n", size: CGSize(width: 90, height: 90))
+        let blank = candidate(subrole: unknown, title: "  \n", size: CGSize(width: 500, height: 500))
         XCTAssertEqual(WindowFilter.verdict(blank, policy: relaxedPolicy), .dropped(.phantom))
     }
 

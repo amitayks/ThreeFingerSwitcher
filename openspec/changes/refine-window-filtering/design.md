@@ -12,11 +12,11 @@ The old relaxed gate **replaced** the subrole check with `both dims ≥ 100`, so
 
 1. **Known-real subroles** — `AXStandardWindow`, `AXDialog`, `AXSystemDialog` — always list (no size/title/chrome test beyond the degenerate floor). This is the allowlist half: a subrole macOS itself uses for real user-facing windows is trusted outright.
 2. **Known-junk subroles** — `AXFloatingWindow`, `AXSystemFloatingWindow` — always drop. True palettes/HUDs; the layer-0 gate already catches most, this catches layer-0 oddballs.
-3. **Unknown/missing subroles** (foreign toolkits: Qt emulators, Xcode's welcome window) — the discriminators decide: **non-empty title OR close-button chrome OR min side ≥ 100** (the legacy scalar, demoted from sole gate to one of three signals). A window failing all three is a phantom frame.
+3. **Unrecognized subroles** (AXUnknown, novel toolkit values) — the identity discriminators decide: **non-empty title OR close-button chrome**. A window with neither is a phantom frame, *regardless of size*. A window reporting **no subrole at all** stays listed (strict lists these — monotonicity). Size was originally kept as a third signal (the legacy 100pt scalar) and then removed on live evidence: one AirDrop share births **three Finder-owned, untitled, chromeless clones at the host window's exact 316×601 frame**, which linger after dismissal and accumulate across attempts (probed 2026-07-19) — any "big enough to be real" bar admits them forever. The emulator's real windows are titled, so the title discriminator covers the case the scalar was calibrated for; a truly titleless real window is recovered via the per-app `include` rule, visibly, in the inspector — not by a size guess.
 
 A **degenerate floor** (min side < 40) drops sliver/zero frames before the tiers. Strict mode takes none of this — its verdicts are byte-identical to today (standard subrole, or missing subrole → listed), so the default-config user sees no listing change except dedup.
 
-Calibration: the emulator toolbar (61×515, untitled, chromeless, unknown subrole) drops at tier 3; the emulator device window (short side 372) lists at tier 3 via size; the Finder progress (~430×90, titled + chrome) lists at tier 1 or 3 regardless of its reported subrole.
+Calibration: the emulator toolbar (61×515, untitled, chromeless, unknown subrole) drops at tier 3; the emulator device window (titled "Android Emulator - …") lists at tier 3 via title; the Finder progress (~430×90, titled + chrome) lists at tier 1 or 3 regardless of its reported subrole; the AirDrop popover clones (316×601, untitled, chromeless) drop at tier 3.
 
 ## D3. Dedup keys on identity, not similarity
 

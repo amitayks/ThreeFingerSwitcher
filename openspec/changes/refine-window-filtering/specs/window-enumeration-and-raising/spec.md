@@ -12,7 +12,7 @@ In **relaxed** mode the filter SHALL be three-tier and SHALL be monotonic over s
 
 1. Known-real subroles (standard window, dialog, system dialog) are always listed.
 2. Known-junk subroles (floating and system-floating palettes) are always dropped.
-3. Unknown or missing subroles are listed when the window looks real — a non-empty title, OR window chrome (a close button), OR a minimum side of at least the legacy helper threshold (100pt) — and dropped as phantom otherwise.
+3. A window reporting NO subrole at all is listed (strict mode lists these — monotonicity). Any other unrecognized subrole (unknown / novel toolkit values) is listed only when the window shows identity — a non-empty title OR window chrome (a close button) — and dropped as phantom otherwise. Size SHALL NOT be a sufficient signal on its own: the AirDrop share popover births untitled, chromeless clones at the host window's exact frame (three per attempt, host-app-owned, lingering after dismissal), which defeat any "big enough to be real" bar.
 
 A degenerate-size floor (minimum side below 40pt) SHALL drop sliver/zero frames in relaxed mode before the tiers apply.
 
@@ -25,15 +25,20 @@ A degenerate-size floor (minimum side below 40pt) SHALL drop sliver/zero frames 
 - **WHEN** relaxed mode is on and a standard-subrole window's height is below the legacy 100pt threshold (a copy-progress window)
 - **THEN** the window is listed — relaxation never drops a window strict mode would list
 
-#### Scenario: Titled or chromed small unknown window is listed
+#### Scenario: Titled or chromed unknown window is listed
 
-- **WHEN** relaxed mode is on and a window with an unknown subrole is smaller than the legacy threshold but has a non-empty title or a close button
-- **THEN** the window is listed
+- **WHEN** relaxed mode is on and a window with an unknown subrole has a non-empty title or a close button (the emulator's titled device window, a small titled progress window)
+- **THEN** the window is listed regardless of its size
 
-#### Scenario: Untitled chromeless helper is dropped as phantom
+#### Scenario: Untitled chromeless unknown window is dropped as phantom regardless of size
 
-- **WHEN** relaxed mode is on and a window-role element has an unknown subrole, an empty title, no close button, and a side below the legacy threshold (the emulator side-toolbar)
+- **WHEN** relaxed mode is on and a window-role element has an unknown subrole, an empty title, and no close button — whether small (the emulator side-toolbar) or host-window-sized (an AirDrop share popover clone)
 - **THEN** the window is dropped with the phantom reason
+
+#### Scenario: Missing subrole stays listed
+
+- **WHEN** relaxed mode is on and a window reports no subrole at all, even untitled and chromeless
+- **THEN** the window is listed (strict mode lists these, and relaxation never drops a window strict lists)
 
 #### Scenario: Phantom duplicates collapse to one card
 

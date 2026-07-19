@@ -80,7 +80,7 @@ struct HubWindowInspector: View {
                 .font(.caption)
                 .foregroundStyle(entry.title.isEmpty ? .secondary : .primary)
                 .lineLimit(1).truncationMode(.middle)
-            Text("\(Int(entry.size.width))×\(Int(entry.size.height))\(entry.isMinimized ? " · minimized" : "")")
+            Text("\(Int(entry.size.width))×\(Int(entry.size.height)) · \(Self.subroleLabel(entry.subrole))\(entry.isMinimized ? " · minimized" : "")")
                 .font(.caption2).foregroundStyle(.tertiary)
                 .layoutPriority(1)
             Spacer(minLength: 8)
@@ -110,6 +110,13 @@ struct HubWindowInspector: View {
         case .dropped(.phantom): return ("Phantom frame", .secondary)
         case .dropped(.nonStandardSubrole): return ("Non-standard window", .secondary)
         }
+    }
+
+    /// Compact subrole readout ("AXStandardWindow" → "standard") — the debugging signal that tells
+    /// which filter tier judged the window, without raw AX constants in the UI.
+    static func subroleLabel(_ subrole: String?) -> String {
+        guard let subrole else { return "no subrole" }
+        return subrole.hasPrefix("AX") ? String(subrole.dropFirst(2)).lowercased() : subrole
     }
 
     static func ruleLabel(_ rule: WindowAppRule) -> String {

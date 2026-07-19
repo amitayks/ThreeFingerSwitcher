@@ -70,12 +70,6 @@ enum WindowFilter {
     /// compact progress windows.
     static let degenerateFloor: CGFloat = 40
 
-    /// The legacy relaxed-gate scalar, demoted from sole gate to one of three real-window signals:
-    /// an unknown-subrole window with no title and no chrome still lists when its shorter side
-    /// clears this (the emulator's device window), and still drops when it doesn't (its 61pt
-    /// side-toolbar).
-    static let helperThreshold: CGFloat = 100
-
     /// Subroles macOS itself uses for real user-facing windows — trusted outright in relaxed mode.
     static let realSubroles: Set<String> = [
         kAXStandardWindowSubrole as String,
@@ -113,11 +107,17 @@ enum WindowFilter {
         if let subrole = c.subrole {
             if realSubroles.contains(subrole) { return .listed }
             if junkSubroles.contains(subrole) { return .dropped(.junkSubrole) }
+            // Known-nothing subrole (AXUnknown, novel toolkit values): a real window shows identity —
+            // a title or chrome. Size proves NOTHING: the AirDrop share popover births untitled,
+            // chromeless clones of the host window at its exact 316×601 frame (three per attempt,
+            // Finder-owned, lingering after dismissal — live-probed 2026-07-19), so any "big enough
+            // to be real" bar admits them forever. A titleless-but-real oddball is recovered via the
+            // per-app `include` rule, visibly, in the inspector — not by a heuristic that guesses.
+            let titled = !(c.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            return titled || c.hasCloseButton ? .listed : .dropped(.phantom)
         }
-        // Unknown/missing subrole: does it look like a real window?
-        let titled = !(c.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        if titled || c.hasCloseButton || minSide >= helperThreshold { return .listed }
-        return .dropped(.phantom)
+        // No subrole reported at all: strict mode lists these, so relaxed must too (monotonicity).
+        return .listed
     }
 
     // MARK: - Phantom-duplicate suppression (design D3)
