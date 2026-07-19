@@ -122,11 +122,15 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             self?.favoritesStore.updateItem(itemID, inBand: bandID) { $0.kind = $0.kind.withLastFolder(folder) }
         },
         // An automation item TOGGLES its stateful owner (start if inactive, stop if active) — not a
-        // one-shot completion. v1 has one automation: Keep Awake, dimming to the item's configured level.
-        onAutomation: { [weak self] kind, dimPercent in
+        // one-shot completion. v1 has one automation: Keep Awake, configured per item (dim level,
+        // keyboard-backlight dim, and the any-input guard lock — `keep-awake-guard-effects`).
+        onAutomation: { [weak self] kind, settings in
             switch kind {
             case .keepAwake:
-                self?.keepAwakeController.toggle(dimTo: KeepAwakeController.fraction(fromPercent: dimPercent))
+                self?.keepAwakeController.toggle(KeepAwakeController.Config(
+                    dimLevel: KeepAwakeController.fraction(fromPercent: settings.dimPercent),
+                    dimKeyboard: settings.dimKeyboard,
+                    lockOnStop: settings.lockOnStop))
             }
         },
         // Speak-last-response from a launcher band (`add-speak-last-response-launcher-action`) —
