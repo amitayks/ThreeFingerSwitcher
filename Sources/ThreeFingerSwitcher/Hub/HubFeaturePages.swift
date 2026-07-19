@@ -12,9 +12,10 @@ struct SwitcherPage: View {
 
     /// §12 — the REAL mini switcher: a `SwitcherView` over the user's open windows grouped into Space-rows
     /// (true proportions + live thumbnails; icon-only fallbacks), owned by a `HubSwitcherDemo` holder and
-    /// seeded once. It is STATIC — the ghost-hand autoplay plays the teaching story over it (three-finger
-    /// open → lift one → up/down Spaces → sideways windows); the model is not driven in sync (the driven form
-    /// was removed to stop the idle main-thread spin — see `docs/postmortem-idle-cpu-spin.md`).
+    /// seeded once. The ghost-hand autoplay plays the teaching story (three-finger open → lift one → up/down
+    /// Spaces → sideways windows) and the preview's `sync` seam steps the model to match — clockless in the
+    /// holder, driven only by the visibility-gated preview clock, so a hidden Hub stays inert (the guardrail
+    /// from `docs/postmortem-idle-cpu-spin.md`; the old free-running driver stays deleted).
     @StateObject private var demo = HubSwitcherDemo()
     @State private var seeded = false
     /// The base autoplay gesture — the teaching story, its open swipe scaled to the activation threshold.
@@ -22,6 +23,8 @@ struct SwitcherPage: View {
     /// The hover-demo override pushed into the preview by the direction pickers: hovering the windows-axis
     /// control demos a sideways window scrub, the Spaces-axis control an up/down Space move. `nil` ⇒ base.
     @State private var hoverGesture: GesturePose.DemoGesture?
+    /// The sync script matching `hoverGesture` (the stroke-index mapping the drive uses); `nil` ⇒ teaching.
+    @State private var hoverScript: HubSwitcherDemo.SyncScript?
 
     init(context: HubContext) {
         self.context = context
@@ -64,7 +67,15 @@ struct SwitcherPage: View {
                 subtitle: "Switch windows with a three-finger horizontal swipe — and Spaces by sliding up/down.") {
             HubSection {
                 HubFeatureHeader(
-                    preview: HubGesturePreview(gesture: gesture, hoverGesture: hoverGesture) {
+                    preview: HubGesturePreview(
+                        gesture: gesture,
+                        hoverGesture: hoverGesture,
+                        // The sync seam: the mini switcher follows the ghost hand (pop in on the open beat,
+                        // Space slides on up/down, highlight steps on the scrub, pop out on the commit lift).
+                        sync: { pose in
+                            demo.drive(pose, script: pose.hovering ? (hoverScript ?? .teaching) : .teaching)
+                        }
+                    ) {
                         SwitcherDemoMiniature(demo: demo)
                     },
                     icon: HubDestination.switcher.systemImage,
@@ -120,7 +131,10 @@ struct SwitcherPage: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .onHover { hoverGesture = $0 ? HubSwitcherDemo.windowsHoverGesture() : nil }
+                .onHover { inside in
+                    hoverGesture = inside ? HubSwitcherDemo.windowsHoverGesture() : nil
+                    hoverScript = inside ? .windowsHover : nil
+                }
                 Toggle("Require exactly three fingers", isOn: $settings.requireExactlyThree)
                 ToggleRow(title: "Include non-standard windows",
                           isOn: $settings.includeNonStandardWindows,
@@ -151,7 +165,10 @@ struct SwitcherPage: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .onHover { hoverGesture = $0 ? HubSwitcherDemo.spacesHoverGesture() : nil }
+                .onHover { inside in
+                    hoverGesture = inside ? HubSwitcherDemo.spacesHoverGesture() : nil
+                    hoverScript = inside ? .spacesHover : nil
+                }
                 .disabled(!settings.manageVerticalGesture)
                 // The three-finger-DOWN action. Only reachable once the vertical gesture is ours (the same
                 // opt-in above), so it's gated on `manageVerticalGesture`. Enabling it also flips on
