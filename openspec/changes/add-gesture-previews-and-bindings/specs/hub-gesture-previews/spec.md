@@ -1,17 +1,17 @@
 ## ADDED Requirements
 
 ### Requirement: Live gesture preview surface in the Hub
-The Hub SHALL provide a reusable **gesture preview** surface that leads each gesture-driven feature page: a stylized trackpad pad (glowing fingertip dots) beneath a **static** miniature of the feature's actual overlay. The preview SHALL play itself — a ghost hand looping the feature's gesture (the macOS System-Settings idiom) — as **pure autoplay**: it reads no input and does **not** manipulate the miniature's model (the miniature is seeded once and rendered static). The preview SHALL reuse the First Touch wizard's pad and motion vocabulary (`FingerDotsPad`, the pose driver, `PulseHalo`) and the real overlay views, so the Hub and the runtime read as one app. The preview SHALL request **no new permission** and SHALL relocate **no gesture**.
+The Hub SHALL provide a reusable **gesture preview** surface that leads each gesture-driven feature page: a stylized trackpad pad (glowing fingertip dots) beneath a miniature of the feature's actual overlay. The preview SHALL play itself — a ghost hand looping the feature's gesture (the macOS System-Settings idiom) — as **pure autoplay**: it reads no input, and the preview component itself manipulates no overlay model. A page MAY additionally observe the preview's **clockless sync seam** (quantized pose frames, emitted only from the visibility-gated clock) to step its **own** miniature's model in time with the ghost hand — the seam owns no timer, so a hidden Hub emits no frames and drives nothing. The preview SHALL reuse the shared pose driver and the real overlay views, so the Hub and the runtime read as one app (the pad itself is a Hub-restyled slab; the wizard keeps `FingerDotsPad`). The preview SHALL request **no new permission** and SHALL relocate **no gesture**.
 
-> This is deliberately autoplay-only: the earlier live-tracking/**rehearse** integration (the user's real fingers replacing the ghost and driving the miniature) and the **driven form** (a per-frame clock stepping the caller's real overlay model in sync) were removed. Both kept a perpetual `TimelineView`/Observation/Auto-Layout loop alive inside the retained, hidden Hub window and pinned the main thread — see `docs/postmortem-idle-cpu-spin.md`.
+> The earlier live-tracking/**rehearse** integration (the user's real fingers replacing the ghost and driving the miniature) and the **driven form** (a free-running per-frame clock stepping the caller's real overlay model) stay removed: both kept a perpetual `TimelineView`/Observation/Auto-Layout loop alive inside the retained, hidden Hub window and pinned the main thread — see `docs/postmortem-idle-cpu-spin.md`. The sync seam is not that form: it introduces **no clock of its own** — frames exist only while the single visibility-gated preview clock ticks, and every driven mutation is state-guarded (idempotent per frame).
 
 #### Scenario: Gesture page opens with a self-looping preview
 - **WHEN** the user opens a gesture-driven feature page in the Hub
-- **THEN** a trackpad pad with a looping ghost hand and a static overlay miniature appears above the page's controls, playing the feature's gesture without any input
+- **THEN** a trackpad pad with a looping ghost hand and an overlay miniature appears above the page's controls, playing the feature's gesture without any input
 
 #### Scenario: Preview is presentation-only
 - **WHEN** the preview is on screen
-- **THEN** it loops the feature's currently-bound gesture over the static miniature and never reads touch, never manipulates the miniature's model, and never fires the feature
+- **THEN** it loops the feature's currently-bound gesture, never reads touch, and never fires the feature — any miniature motion comes solely from the page's sync-seam driver stepping its own demo model
 
 #### Scenario: Band-feature preview demonstrates the full path
 - **WHEN** the user opens a band-based feature page (Clipboard, Files, or AI Commands)
@@ -44,9 +44,9 @@ When a feature page offers configurable gesture bindings, **hovering** a binding
 - **THEN** the preview returns to looping the currently-bound gesture
 
 ### Requirement: Previews render the real overlay, not an abstract stand-in
-A gesture page's preview miniature SHALL be the **actual overlay view**, seeded once with the user's real content — exactly as the First Touch wizard presents it — so the user sees how the feature really looks. The miniature is **static** (the autoplay ghost hand plays over it; its model is not driven):
-- The **Switcher** preview SHALL render a mini `SwitcherView` over the user's **currently open windows** (real `WindowInfo` rows + their live thumbnails when Screen Recording is granted, icons otherwise), at the switcher's true real-proportion sizing — a scaled-down version of the real grid.
-- The **Launcher** preview SHALL render the **real `LauncherView`** seeded with the user's actual bands, resting on the home band.
+A gesture page's preview miniature SHALL be the **actual overlay view**, seeded once with the user's real content — exactly as the First Touch wizard presents it — so the user sees how the feature really looks:
+- The **Switcher** preview SHALL render a mini `SwitcherView` over the user's **currently open windows** (real `WindowInfo` rows + their live thumbnails when Screen Recording is granted, icons otherwise), at the switcher's true real-proportion sizing — a scaled-down version of the real grid — **stepped in sync with the ghost hand** through the clockless sync seam (see "The Switcher preview teaches the full gesture" below).
+- The **Launcher** preview SHALL render the **real `LauncherView`** seeded with the user's actual bands, resting on the home band; it is static (the ghost hand plays over it).
 - The **band** pages (Clipboard / Files / AI) SHALL render the real `LauncherView` seeded **showing their band** (the last band), reusing the same seeded model, so the static miniature already displays the band the autoplay journey traverses to.
 The Hub SHALL obtain this real content through the coordinator (the same `realWindowRows` / `seedThumbnails` / `launcherBands` providers the wizard uses); it SHALL degrade gracefully (icons when no thumbnails, the real bands always) and request no new permission.
 
@@ -63,7 +63,7 @@ The ghost-hand demonstration SHALL **perform the actual gesture as a determinist
 - **open** the platform with **three** fingers (switcher) or **four** fingers (launcher and its bands),
 - **navigate / traverse / move the canvas / scrub the clipboard** with **two** fingers,
 - **four** fingers **dismiss** an open launcher surface.
-The demonstration plays over the **static** miniature (it does not step the miniature's model in sync — that live-driving was removed with the driven form; see `docs/postmortem-idle-cpu-spin.md`).
+The launcher/band demonstrations play over their **static** miniatures; the **Switcher** demonstration steps its miniature through the clockless sync seam (no free-running driver — see `docs/postmortem-idle-cpu-spin.md` for what stays removed).
 
 For the **launcher and its band pages**, the demonstration SHALL portray the *real usage story*, not a generic stroke: (1) the four-finger **open** stroke SHALL travel roughly the **activation distance** (`launcherActivationThreshold`) before the launcher appears; (2) the hand SHALL then **drop from four fingers to two on continuous contact** — two fingers lift while two stay down — rather than fully releasing and re-pressing; (3) the remaining two fingers SHALL continue in the navigate/traverse direction. The demonstration SHALL always play at **preview scale** (it SHALL NOT grow).
 
@@ -94,11 +94,19 @@ Feature pages with **no gesture** (Keyboard Language, Devices, Setup, General) S
 - **THEN** no trackpad/ghost-hand preview is shown for it
 
 ### Requirement: The Switcher preview teaches the full gesture as a deterministic story
-The Window-Switcher preview SHALL demonstrate the complete switcher gesture as a single deterministic story rather than abstract back-and-forth motion: **three fingers slide** to open (a horizontal swipe whose length tracks the configured **activation threshold**, so it reads as "just enough to trigger"), then **one finger lifts** while the other two keep resting (the ghost hand drops from three fingertips to two **without** a full lift between them), and the two resting fingers **navigate** — **up** to the second Space-row, back **down** to the first, then **sideways** across the windows in the row — before lifting. The story plays over the **static** miniature (the highlight / Space-row reel are seeded, not stepped in sync — the in-sync driving was removed; see `docs/postmortem-idle-cpu-spin.md`). The full story SHALL always play regardless of which switcher sub-features are currently enabled. A compact **action map** SHALL accompany the preview, spelling out the same steps in words.
+The Window-Switcher preview SHALL demonstrate the complete switcher gesture as a single deterministic story rather than abstract back-and-forth motion: **three fingers slide** to open (a horizontal swipe whose length tracks the configured **activation threshold**, so it reads as "just enough to trigger"), then **one finger lifts** while the other two keep resting (the ghost hand drops from three fingertips to two **without** a full lift between them), and the two resting fingers **navigate** — **up** to the second Space-row, back **down** to the first, then **sideways** across the windows in the row — before lifting. The miniature SHALL follow the story **in sync**: the mini switcher pops in when the open swipe crosses its activation beat, the up/down strokes slide the real Space-row reel (the overlay's own slide animation), the sideways scrub steps the highlight card by card, and the final lift commits — the panel pops out until the next loop's open swipe. The sync SHALL be driven **only** by the preview's visibility-gated clock through the clockless sync seam (state-guarded, idempotent frames; no timer of its own — the free-running driver of `docs/postmortem-idle-cpu-spin.md` stays removed). The full story SHALL always play regardless of which switcher sub-features are currently enabled. A compact **action map** SHALL accompany the preview, spelling out the same steps in words.
 
 #### Scenario: The switcher demo performs the connected open-then-lift-one story
 - **WHEN** the Window-Switcher preview loops
 - **THEN** the ghost hand opens with three fingers, drops to two fingers without lifting the whole hand, moves up to the second Space-row and back, then scrubs sideways across the windows
+
+#### Scenario: The miniature follows the ghost hand
+- **WHEN** the switcher demo's strokes play
+- **THEN** the mini switcher appears at the open swipe's activation beat, its Space-row reel slides up and back with the vertical strokes, its highlight steps across the windows with the sideways scrub, and it disappears on the committing lift — the same lifecycle the real overlay performs
+
+#### Scenario: A hidden Hub drives nothing
+- **WHEN** the Hub window is closed, miniaturized, or occluded
+- **THEN** no sync frames are emitted and the miniature's model is not touched — the sync inherits the preview clock's visibility gate
 
 #### Scenario: The opening swipe reflects the activation threshold
 - **WHEN** the user changes the "Activation threshold" control

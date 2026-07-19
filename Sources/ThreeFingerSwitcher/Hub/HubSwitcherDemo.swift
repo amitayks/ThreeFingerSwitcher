@@ -3,14 +3,23 @@ import CoreGraphics
 
 /// The §12 holder behind the Window-Switcher preview: it owns the **real** `SwitcherModel` (rendered by a
 /// real `SwitcherView`), seeded once with the user's real windows so the preview shows the actual switcher.
-/// The model is **static** — the ghost-hand autoplay plays the teaching gesture *over* it, but nothing drives
-/// the model in sync (the old `HubDemoDriver`-driven form was removed to stop the idle main-thread spin; see
-/// `docs/postmortem-idle-cpu-spin.md`). The only live behavior kept is the window-size control, which
-/// re-solves the grid so the static preview cards grow/shrink as the user drags the slider.
+/// The model follows the ghost hand through the preview's **sync seam** (`drive(_:script:)`): the open swipe
+/// pops the panel in at the activation beat, the up/down strokes slide the Space reel, the sideways scrub
+/// steps the highlight card by card, and the lift commits — the panel pops out until the next loop. This is
+/// NOT the old free-running `HubDemoDriver` (removed for the idle main-thread spin,
+/// `docs/postmortem-idle-cpu-spin.md`): there is no clock here — frames arrive only from the preview's
+/// visibility-gated `TimelineView`, so a hidden Hub drives nothing and every mutation is state-guarded
+/// (idempotent per frame). The window-size control stays live, re-solving the grid as the slider drags.
 @MainActor
 final class HubSwitcherDemo: ObservableObject {
-    /// The real model the preview renders (seeded once, not driven).
+    /// The real model the preview renders (seeded once; stepped only by the sync drive).
     let model = SwitcherModel()
+
+    /// Whether the mini switcher is "open" in the teaching story: `true` while the ghost hand navigates,
+    /// `false` between loops (after the lift-to-select, until the next open swipe crosses the activation
+    /// beat). The miniature pops in/out on this, mirroring the real overlay's lifecycle. Defaults `true` so
+    /// an undriven preview (hidden Hub's static frame, bare `#Preview`) still shows the switcher.
+    @Published private(set) var overlayShown = true
 
     // MARK: - Seeding
 
@@ -32,13 +41,101 @@ final class HubSwitcherDemo: ObservableObject {
     }
 
     /// The switcher's rendered natural size (grid content + chrome), so the preview can compute a scale that
-    /// fits the idle miniature to the available width.
+    /// fits the idle miniature to the available width. Mirrors `SwitcherView.container` exactly: the reel at
+    /// content height, a 10pt gap swallowed by the title bar's `titleAreaHeight - 10` frame, and the
+    /// container padding (+ the row-indicator gutter when several Spaces show).
     var renderedNaturalSize: CGSize {
         let content = model.maxContentSize
         let gutter = model.rowCount > 1 ? SwitcherLayout.rowIndicatorGutter : 0
         return CGSize(
             width: content.width + 2 * SwitcherLayout.gridContainerPadding + gutter,
-            height: content.height + 2 * SwitcherLayout.gridContainerPadding + 10 + SwitcherLayout.titleAreaHeight)
+            height: content.height + 2 * SwitcherLayout.gridContainerPadding + SwitcherLayout.titleAreaHeight)
+    }
+
+    // MARK: - Sync drive (the miniature follows the ghost hand)
+
+    /// Which autoplay script the incoming sync frames describe — the stroke-index → model-move mapping.
+    /// `.teaching` is the attract loop (open → up → down → scrub); the hover scripts match the
+    /// `windowsHoverGesture()` / `spacesHoverGesture()` stroke lists.
+    enum SyncScript: Equatable {
+        case teaching
+        case windowsHover
+        case spacesHover
+    }
+
+    /// The Space-slide pace — the real switcher's `OverlayController.slideDuration` feel, so the preview's
+    /// reel moves exactly like the overlay it teaches.
+    private static let rowSlide = Animation.easeInOut(duration: 0.34)
+
+    /// The scrub stroke's last emitted highlight step, so each crossed boundary emits exactly ONE
+    /// `moveHorizontal` — the odometer idiom in miniature.
+    private var scrubStep = 0
+    private var lastScript: SyncScript = .teaching
+
+    /// Step the model in time with one quantized ghost-hand frame. Called from the preview's `sync` seam —
+    /// i.e. only while the visibility-gated clock runs (the postmortem guardrail) — and idempotent per
+    /// frame: every mutation is guarded on current model state, so repeated, skipped, or resumed frames
+    /// land safely anywhere in the loop.
+    func drive(_ pose: GhostSyncPose, script: SyncScript) {
+        if script != lastScript {
+            lastScript = script
+            scrubStep = 0
+        }
+        if pose.lifted {
+            // The lift after the final stroke: the selection commits and the switcher goes away.
+            setShown(false)
+            return
+        }
+        switch (script, pose.strokeIndex) {
+        case (_, 0):
+            openStroke(fraction: pose.fraction)
+        case (.teaching, 1), (.spacesHover, 1):
+            if pose.fraction >= 0.5, model.rowCount > 1, model.currentRow == 0 {
+                withAnimation(Self.rowSlide) { model.setRowEntering(1, upward: true) }
+            }
+        case (.teaching, 2), (.spacesHover, 2):
+            if pose.fraction >= 0.5, model.currentRow != 0 {
+                withAnimation(Self.rowSlide) { model.setRowEntering(0, upward: false) }
+            }
+        case (.teaching, 3), (.windowsHover, 1):
+            stepScrub(fraction: pose.fraction)
+        default:
+            break
+        }
+    }
+
+    /// The open swipe: while the stroke is still short of the activation beat the panel stays hidden — and,
+    /// freshly hidden from the previous loop's commit, quietly resets to the home row's first window (an
+    /// instant, off-screen snap) — then crossing the beat pops it in, the moment the real switcher appears.
+    private func openStroke(fraction: Double) {
+        if fraction < 0.45 {
+            if !overlayShown, model.currentRow != 0 || model.selectedIndex != 0 || scrubStep != 0 {
+                scrubStep = 0
+                model.setRowAndColumn(0, column: 0)
+            }
+        } else {
+            setShown(true)
+        }
+    }
+
+    /// The sideways scrub: step the highlight card by card across the current visual row as the stroke
+    /// advances — one step per crossed boundary, clamped at the row's end exactly like the real odometer.
+    private func stepScrub(fraction: Double) {
+        let gridRow = model.currentGridRow
+        guard model.gridLayout.rows.indices.contains(gridRow) else { return }
+        let rowLength = model.gridLayout.rows[gridRow].count
+        guard rowLength > 1 else { return }
+        let steps = min(rowLength - 1, 4)
+        let desired = min(steps, Int(fraction * Double(steps + 1)))
+        while scrubStep < desired {
+            scrubStep += 1
+            model.moveHorizontal(1, wrap: false)
+        }
+    }
+
+    private func setShown(_ shown: Bool) {
+        guard overlayShown != shown else { return }
+        withAnimation(.spring(response: 0.32, dampingFraction: 0.8)) { overlayShown = shown }
     }
 }
 
@@ -152,12 +249,22 @@ struct SwitcherActionMap: View {
     }
 }
 
-// MARK: - The idle teaching miniature (static)
+// MARK: - The teaching miniature
 
-/// The Switcher preview miniature: the real `SwitcherView` scaled to fit the available width, showing the
-/// seeded windows. It is **static** — the ghost-hand autoplay plays over it; the model is not driven.
+/// The Switcher preview miniature: the real `SwitcherView` scaled to fit the available slot, showing the
+/// seeded windows. The sync drive steps the model (highlight scrub, Space slides) and flips `overlayShown`
+/// with the loop's open/commit beats, so the clip reads as the real switcher appearing, being navigated,
+/// and committing. Observes the **model** directly — the holder publishes almost nothing itself, and the
+/// fit scale must recompute the moment the seeded grid lands (observing only the holder left the view at
+/// its pre-seed size: the mini switcher rendered unscaled and overflowed the page).
 struct SwitcherDemoMiniature: View {
     @ObservedObject var demo: HubSwitcherDemo
+    @ObservedObject private var model: SwitcherModel
+
+    init(demo: HubSwitcherDemo) {
+        self.demo = demo
+        _model = ObservedObject(wrappedValue: demo.model)
+    }
 
     private let reservedHeight: CGFloat = 150
 
@@ -167,9 +274,10 @@ struct SwitcherDemoMiniature: View {
             let fit = min(1.0,
                           min((geo.size.width - 16) / max(natural.width, 1),
                               (geo.size.height - 12) / max(natural.height, 1)))
-            SwitcherView(model: demo.model)
+            SwitcherView(model: model)
                 .frame(width: natural.width, height: natural.height)
-                .scaleEffect(fit, anchor: .center)
+                .scaleEffect(fit * (demo.overlayShown ? 1.0 : 0.92), anchor: .center)
+                .opacity(demo.overlayShown ? 1 : 0)
                 .frame(width: geo.size.width, height: geo.size.height, alignment: .center)
         }
         .frame(height: reservedHeight)

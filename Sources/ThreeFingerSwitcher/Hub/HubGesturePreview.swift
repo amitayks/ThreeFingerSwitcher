@@ -11,8 +11,10 @@ import CoreGraphics
 /// ## Autoplay-only (deliberately simple)
 /// This is **pure autoplay**: a `TimelineView(.periodic)` advances a continuous `phase` through the shared,
 /// MLX-free directed-stroke pose driver (`GesturePose.pose(phase:gesture:)`) and renders the resulting ghost
-/// fingertips on the pad. The miniature is whatever the caller draws and is **never manipulated** — the
-/// preview touches no overlay model. Two autoplay states layer over the one driver:
+/// fingertips on the pad. The miniature is whatever the caller draws; the preview itself touches no overlay
+/// model — a page that wants its miniature to follow the hand observes the optional `sync` seam (quantized
+/// pose frames, emitted only while the clock runs) and steps its own model. Two autoplay states layer over
+/// the one driver:
 ///   - **Attract** (default): loops `gesture` — the feature's currently-bound move (a `switcherDemo`,
 ///     `launcherOpen`, a `bandJourney`, or a `canvasResolve`, built by the page from `GesturePose`).
 ///   - **Hover-demo**: when `hoverGesture` is non-nil the loop plays that *candidate* excursion instead, so a
@@ -42,6 +44,12 @@ struct HubGesturePreview<Miniature: View>: View {
     /// The HOVER-DEMO override: when non-nil the loop plays this candidate excursion instead of `gesture`,
     /// so hovering a binding option previews the move. `nil` ⇒ attract.
     var hoverGesture: GesturePose.DemoGesture?
+    /// The optional sync seam: called with each **quantized** pose frame (`GhostSyncPose`), so a page can
+    /// step its miniature's model in time with the ghost hand (highlight scrubs, Space slides). Fired ONLY
+    /// from inside the visibility-gated `TimelineView` (via `.onChange`, i.e. outside the view update), so
+    /// a hidden Hub drives nothing — the same no-idle-spin guarantee as the clock itself
+    /// (`docs/postmortem-idle-cpu-spin.md`). The receiver must be idempotent per frame.
+    var sync: ((GhostSyncPose) -> Void)?
     /// The static overlay miniature the caller supplies (a scaled `SwitcherView` / `LauncherView`, seeded
     /// once and never driven). Rendered above the pad.
     @ViewBuilder var miniature: () -> Miniature
@@ -57,10 +65,12 @@ struct HubGesturePreview<Miniature: View>: View {
     init(
         gesture: GesturePose.DemoGesture,
         hoverGesture: GesturePose.DemoGesture? = nil,
+        sync: ((GhostSyncPose) -> Void)? = nil,
         @ViewBuilder miniature: @escaping () -> Miniature
     ) {
         self.gesture = gesture
         self.hoverGesture = hoverGesture
+        self.sync = sync
         self.miniature = miniature
     }
 
@@ -84,13 +94,23 @@ struct HubGesturePreview<Miniature: View>: View {
     }
 
     /// The self-playing pad. Only mounts a `TimelineView` while the Hub is visible — the whole point of the
-    /// gate. When hidden it draws the resting pose statically (no periodic tick, no invalidation, no spin).
+    /// gate. When hidden it draws the resting pose statically (no periodic tick, no invalidation, no spin —
+    /// and no `sync` frames, so a driven miniature freezes with it).
     @ViewBuilder
     private var pad: some View {
         if isVisible {
             TimelineView(.periodic(from: .now, by: 1.0 / 30.0)) { ctx in
                 let phase = ctx.date.timeIntervalSinceReferenceDate * GesturePose.phaseStep * 30
-                dots(GesturePose.pose(phase: phase, gesture: activeGesture))
+                let frame = GesturePose.pose(phase: phase, gesture: activeGesture)
+                dots(frame)
+                    // The sync seam: publish the QUANTIZED pose to the page's driver. `.onChange` runs the
+                    // action after the view update (never during), and only when the quantized value moves —
+                    // a bounded number of firings per stroke, not one per 30 Hz frame. `initial: true`
+                    // re-seeds the driver whenever the clock (re)mounts on a visibility flip.
+                    .onChange(of: GhostSyncPose(frame: frame, hovering: hoverGesture != nil),
+                              initial: true) { _, pose in
+                        sync?(pose)
+                    }
             }
         } else {
             // Hidden Hub: a single static frame, no clock. (Resting pose of the active gesture.)
@@ -98,21 +118,94 @@ struct HubGesturePreview<Miniature: View>: View {
         }
     }
 
-    /// Render one pose frame (the ghost fingertips) on the pad, under a soft pulse halo.
+    /// Render one pose frame (the ghost fingertips) on the stylized trackpad.
     @ViewBuilder
     private func dots(_ frame: (dots: [CGPoint], fingerCount: Int, centroid: CGPoint,
                                strokeIndex: Int, progress: Double, lifted: Bool)) -> some View {
-        ZStack {
-            // `PulseHalo` carries its OWN internal `TimelineView`, so it must be gated on visibility too —
-            // otherwise it keeps ticking in the hidden/retained Hub window and spins the main thread even
-            // though the pose clock (`pad`) is already gated (docs/postmortem-idle-cpu-spin.md).
-            if isVisible {
-                PulseHalo(size: 150, intensity: 0.7)
-                    .opacity(0.8)
+        HubTrackpadPad(dots: frame.lifted ? [] : frame.dots)
+            .allowsHitTesting(false)
+    }
+}
+
+// MARK: - Sync seam
+
+/// One **quantized** ghost-hand frame — the value a page's miniature driver observes to stay in step with
+/// the autoplay. Progress is bucketed into `ticksPerStroke` sub-steps so the preview's `.onChange` fires a
+/// bounded number of times per stroke (not per 30 Hz frame); `hovering` distinguishes the hover-demo script
+/// from the attract script, so a driver never misreads one script's stroke indices as the other's.
+struct GhostSyncPose: Equatable {
+    /// Sub-steps per stroke — fine enough that a scrub reads smooth, coarse enough to bound the churn.
+    static let ticksPerStroke = 24
+
+    var strokeIndex: Int
+    var tick: Int
+    var lifted: Bool
+    var hovering: Bool
+
+    /// The stroke's progress this frame represents, recovered from the quantized tick (0…1).
+    var fraction: Double { Double(tick) / Double(Self.ticksPerStroke) }
+
+    init(strokeIndex: Int, tick: Int, lifted: Bool, hovering: Bool) {
+        self.strokeIndex = strokeIndex
+        self.tick = tick
+        self.lifted = lifted
+        self.hovering = hovering
+    }
+
+    init(frame: (dots: [CGPoint], fingerCount: Int, centroid: CGPoint,
+                 strokeIndex: Int, progress: Double, lifted: Bool),
+         hovering: Bool) {
+        self.init(strokeIndex: frame.strokeIndex,
+                  tick: min(Self.ticksPerStroke, max(0, Int(frame.progress * Double(Self.ticksPerStroke)))),
+                  lifted: frame.lifted,
+                  hovering: hovering)
+    }
+}
+
+// MARK: - The stylized trackpad
+
+/// The Hub previews' trackpad — the wizard's `FingerDotsPad` idiom restyled for the Hub's darker, denser
+/// pages: a soft top-lit slab with a hairline gradient rim, and crisper fingertip dots so the ghost hand
+/// reads clearly against the page (the former ambient `PulseHalo` blob is gone — the motion itself is the
+/// liveness). Purely presentational; the wizard keeps its own pad untouched.
+private struct HubTrackpadPad: View {
+    let dots: [CGPoint]
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                let slab = RoundedRectangle(cornerRadius: 15, style: .continuous)
+                slab.fill(
+                    LinearGradient(colors: [Color.white.opacity(0.09), Color.white.opacity(0.03)],
+                                   startPoint: .top, endPoint: .bottom))
+                slab.strokeBorder(
+                    LinearGradient(colors: [Color.white.opacity(0.22), Color.white.opacity(0.06)],
+                                   startPoint: .top, endPoint: .bottom),
+                    lineWidth: 1)
+                ForEach(Array(dots.enumerated()), id: \.offset) { _, dot in
+                    ZStack {
+                        Circle()
+                            .fill(Color.accentColor.opacity(0.30))
+                            .frame(width: 24, height: 24)
+                            .blur(radius: 5)
+                        Circle()
+                            .fill(LinearGradient(colors: [Color.accentColor.opacity(0.95),
+                                                          Color.accentColor.opacity(0.55)],
+                                                 startPoint: .topLeading, endPoint: .bottomTrailing))
+                            .frame(width: 14, height: 14)
+                        Circle()
+                            .strokeBorder(Color.white.opacity(0.35), lineWidth: 0.5)
+                            .frame(width: 14, height: 14)
+                    }
+                    .position(x: dot.x * geo.size.width,
+                              y: (1 - dot.y) * geo.size.height)
+                    .animation(.easeOut(duration: 0.06), value: dots)
+                    .transition(.scale.combined(with: .opacity))
+                }
             }
-            FingerDotsPad(dots: frame.lifted ? [] : frame.dots, live: false)
+            .animation(.spring(response: 0.28, dampingFraction: 0.75), value: dots.count)
         }
-        .allowsHitTesting(false)
+        .frame(width: 188, height: 118)
     }
 }
 
