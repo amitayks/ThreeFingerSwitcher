@@ -617,27 +617,91 @@ final class SwitcherModelTests: XCTestCase {
     // MARK: - moveVertical (between rows; edge -> Space switch). First window is in the bottom row, so a
     // swipe UP walks toward the top edge and a swipe DOWN from the bottom crosses to the previous Space.
 
-    func testMoveVerticalUpMovesToRowAboveFirstCard() {
+    func testMoveVerticalUpLandsPositionally() {
         let model = sixSquareGridModel()
-        model.moveHorizontal(1, wrap: false)   // bottom row [0,1], col 1
+        model.moveHorizontal(1, wrap: false)   // bottom row [0,1], col 1 (the RIGHT card)
 
         let result = model.moveVertical(1)     // up -> the row above
 
         XCTAssertEqual(result, .moved)
         XCTAssertEqual(model.currentGridRow, 1)
-        XCTAssertEqual(model.selectedIndex, 2)   // first card of the row above ([2,3])
-        XCTAssertEqual(model.col, 0)
+        XCTAssertEqual(model.selectedIndex, 3)   // the card directly ABOVE ([2,3] col 1), not the first
+        XCTAssertEqual(model.col, 1)
     }
 
-    func testMoveVerticalDownMovesToRowBelowFirstCard() {
+    func testMoveVerticalDownLandsPositionally() {
         let model = sixSquareGridModel()
-        model.setColumn(5)                      // top row [4,5], col 1
+        model.setColumn(5)                      // top row [4,5], col 1 (the RIGHT card)
 
         let result = model.moveVertical(-1)     // down -> the row below
 
         XCTAssertEqual(result, .moved)
         XCTAssertEqual(model.currentGridRow, 1)
-        XCTAssertEqual(model.selectedIndex, 2)   // first card of the row below ([2,3])
+        XCTAssertEqual(model.selectedIndex, 3)   // the card directly BELOW ([2,3] col 1), not the first
+    }
+
+    /// Five squares → visual rows top-to-bottom [[4],[2,3],[0,1]]: a single centered card on top, so a
+    /// vertical run through it distinguishes the STICKY anchor from a naive current-center anchor.
+    private func fiveSquareGridModel() -> SwitcherModel {
+        let model = SwitcherModel()
+        model.setCanvas(CGSize(width: 250, height: 400))
+        let square = CGRect(x: 0, y: 0, width: 300, height: 300)
+        let windows = (0..<5).map { makeWindow(id: CGWindowID(100 + $0), realFrame: square) }
+        model.setRows([windows], labels: ["1"], startRow: 0, column: 0)
+        XCTAssertEqual(model.gridLayout.rows, [[4], [2, 3], [0, 1]])
+        return model
+    }
+
+    func testVerticalRunHoldsStickyAnchorThroughNarrowRow() {
+        let model = fiveSquareGridModel()
+        model.moveHorizontal(1, wrap: false)     // bottom row col 1 (the right card) -> anchor is HERE
+
+        XCTAssertEqual(model.moveVertical(1), .moved)   // up -> middle [2,3], right card
+        XCTAssertEqual(model.selectedIndex, 3)
+        XCTAssertEqual(model.moveVertical(1), .moved)   // up -> top [4], the lone centered card
+        XCTAssertEqual(model.selectedIndex, 4)
+
+        // Back DOWN through the lone card: the run's anchor (right column) must still hold — a naive
+        // current-center anchor would re-anchor at the centered card and tie-break LEFT (index 2).
+        XCTAssertEqual(model.moveVertical(-1), .moved)
+        XCTAssertEqual(model.selectedIndex, 3)
+    }
+
+    func testHorizontalStepReanchorsTheVerticalRun() {
+        let model = fiveSquareGridModel()
+        model.moveHorizontal(1, wrap: false)            // bottom right
+        _ = model.moveVertical(1)                        // middle right (anchor = right column)
+        model.moveHorizontal(-1, wrap: false)            // middle LEFT — ends the run
+
+        _ = model.moveVertical(1)                        // top lone card
+        XCTAssertEqual(model.selectedIndex, 4)
+        _ = model.moveVertical(-1)                       // back down: new anchor is the LEFT column
+        XCTAssertEqual(model.selectedIndex, 2)
+    }
+
+    func testSetRowsClearsTheAnchor() {
+        let model = fiveSquareGridModel()
+        model.moveHorizontal(1, wrap: false)
+        _ = model.moveVertical(1)                        // run in progress, anchor = right column
+        let square = CGRect(x: 0, y: 0, width: 300, height: 300)
+        let windows = (0..<5).map { makeWindow(id: CGWindowID(100 + $0), realFrame: square) }
+        model.setRows([windows], labels: ["1"], startRow: 0, column: 0)   // fresh show, bottom-left
+
+        _ = model.moveVertical(1)                        // anchor re-captures from the LEFT card
+
+        XCTAssertEqual(model.selectedIndex, 2)           // middle row, left card — not the stale right
+    }
+
+    func testSingleRowVerticalStepIsImmediatelyEdge() {
+        let model = SwitcherModel()
+        model.setCanvas(CGSize(width: 250, height: 400))
+        let square = CGRect(x: 0, y: 0, width: 300, height: 300)
+        let windows = (0..<2).map { makeWindow(id: CGWindowID(100 + $0), realFrame: square) }
+        model.setRows([windows], labels: ["1"], startRow: 0, column: 0)
+        XCTAssertEqual(model.gridLayout.rows.count, 1)
+
+        XCTAssertEqual(model.moveVertical(1), .atEdge(spaceDelta: 1))
+        XCTAssertEqual(model.moveVertical(-1), .atEdge(spaceDelta: -1))
     }
 
     func testMoveVerticalUpAtTopRowReportsEdge() {
@@ -680,6 +744,81 @@ final class SwitcherModelTests: XCTestCase {
         XCTAssertEqual(model.currentGridRow, 2)   // first window sits in the bottom row
         XCTAssertEqual(model.col, 0)
         XCTAssertEqual(model.windows.map(\.id).first, 200)
+    }
+
+    // MARK: - Positional Space entry (vertical grid-edge crossing)
+
+    /// Two five-square Spaces so both grids are [[top lone],[mid pair],[bottom pair]].
+    private func twoFiveSquareSpaces() -> SwitcherModel {
+        let model = SwitcherModel()
+        model.setCanvas(CGSize(width: 250, height: 400))
+        let square = CGRect(x: 0, y: 0, width: 300, height: 300)
+        let spaceA = (0..<5).map { makeWindow(id: CGWindowID(100 + $0), spaceID: 1, realFrame: square) }
+        let spaceB = (0..<5).map { makeWindow(id: CGWindowID(200 + $0), spaceID: 2, realFrame: square) }
+        model.setRows([spaceA, spaceB], labels: ["1", "2"], startRow: 0, column: 0)
+        return model
+    }
+
+    func testSetRowEnteringUpwardLandsBottomRowNearestAnchor() {
+        let model = twoFiveSquareSpaces()
+        model.moveHorizontal(1, wrap: false)     // Space 0 bottom row col 1 (right column)
+        _ = model.moveVertical(1)                // middle right (run in progress, anchor = right)
+        _ = model.moveVertical(1)                // top lone card
+        XCTAssertEqual(model.moveVertical(1), .atEdge(spaceDelta: 1))
+
+        model.setRowEntering(1, upward: true)    // cross up into Space 1
+
+        XCTAssertEqual(model.currentRow, 1)
+        XCTAssertEqual(model.currentGridRow, 2)             // entered at the new grid's BOTTOM row
+        XCTAssertEqual(model.selectedWindow?.id, 201)       // right column held across the Space edge
+    }
+
+    func testSetRowEnteringDownwardLandsTopRowNearestAnchor() {
+        let model = twoFiveSquareSpaces()
+        model.setRowAndColumn(1, column: 1)      // Space 1 bottom row col 1
+        _ = model.moveVertical(1)                // anchor = right column, run started
+        _ = model.moveVertical(-1)               // back down (still Space 1)
+        XCTAssertEqual(model.moveVertical(-1), .atEdge(spaceDelta: -1))
+
+        model.setRowEntering(0, upward: false)   // cross down into Space 0
+
+        XCTAssertEqual(model.currentRow, 0)
+        XCTAssertEqual(model.currentGridRow, 0)             // entered at the new grid's TOP row
+        XCTAssertEqual(model.selectedWindow?.id, 104)       // the lone top card
+    }
+
+    // MARK: - SwitcherLayout positional geometry helpers
+
+    func testRowIntervalsAreCenterRelative() {
+        let sizes = [CGSize(width: 100, height: 80), CGSize(width: 50, height: 80)]
+        let intervals = SwitcherLayout.rowIntervals(row: [0, 1], sizes: sizes)
+        // Row width = 100 + 16 + 50 = 166, centered: starts at -83.
+        XCTAssertEqual(intervals.count, 2)
+        XCTAssertEqual(intervals[0].lowerBound, -83, accuracy: 0.01)
+        XCTAssertEqual(intervals[0].upperBound, 17, accuracy: 0.01)
+        XCTAssertEqual(intervals[1].lowerBound, 33, accuracy: 0.01)
+        XCTAssertEqual(intervals[1].upperBound, 83, accuracy: 0.01)
+        XCTAssertEqual(SwitcherLayout.cardCenterX(row: [0, 1], sizes: sizes, position: 0), -33, accuracy: 0.01)
+        XCTAssertEqual(SwitcherLayout.cardCenterX(row: [0, 1], sizes: sizes, position: 1), 58, accuracy: 0.01)
+    }
+
+    func testNearestPositionPrefersTheOverlappingCard() {
+        let sizes = [CGSize(width: 100, height: 80), CGSize(width: 50, height: 80)]
+        // Anchor 40 sits INSIDE card 1's span [33, 83]; card 0's edge (17) is nearer than card 1's
+        // center (58) — overlap must still win.
+        XCTAssertEqual(SwitcherLayout.nearestPosition(toAnchorX: 40, row: [0, 1], sizes: sizes), 1)
+        XCTAssertEqual(SwitcherLayout.nearestPosition(toAnchorX: -50, row: [0, 1], sizes: sizes), 0)
+    }
+
+    func testNearestPositionTieBreaksTowardCenterThenLeft() {
+        let sizes = [CGSize(width: 100, height: 80), CGSize(width: 100, height: 80)]
+        // Cards span [-108,-8] and [8,108]: anchor 0 gaps are equal (8) and centers equidistant (58)
+        // -> leftmost wins.
+        XCTAssertEqual(SwitcherLayout.nearestPosition(toAnchorX: 0, row: [0, 1], sizes: sizes), 0)
+        // Anchor +20 overlaps card 1 only.
+        XCTAssertEqual(SwitcherLayout.nearestPosition(toAnchorX: 20, row: [0, 1], sizes: sizes), 1)
+        // A single-card row always lands on it.
+        XCTAssertEqual(SwitcherLayout.nearestPosition(toAnchorX: 500, row: [0], sizes: sizes), 0)
     }
 
     // MARK: - Linear traversal (⌘-Tab keyboard driver)

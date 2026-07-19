@@ -167,6 +167,10 @@ struct SwitcherPage: View {
                        footnote: "Hover an app's Dock icon to fan out its windows on the current Space (including minimized). Hover a thumbnail to peek its live content — the real window isn't disturbed — and click to bring it forward. Reuses the permissions you've already granted: no new permission, no logout. Off by default.") {
                 ToggleRow(title: "Show window previews when hovering the Dock", isOn: $settings.showDockPreviews)
             }
+            HubSection("Window groups",
+                       footnote: "Drag a window until it snaps against another window's edge to link them: the switcher shows the pair snapped together (each window still highlighted on its own), and selecting one brings the whole group forward with the selected window focused. Drag a window away to unlink it; closing, minimizing, or moving it to another Space unlinks it too. No new permission, no logout. Off by default.") {
+                ToggleRow(title: "Group windows snapped together by their edges", isOn: $settings.enableWindowGroups)
+            }
         }
     }
 }
