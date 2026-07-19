@@ -15,7 +15,7 @@ final class AutomationItemCodableTests: XCTestCase {
         let data = try JSONEncoder().encode(item)
         let decoded = try JSONDecoder().decode(LaunchItem.self, from: data)
         XCTAssertEqual(decoded, item)
-        guard case let .automation(kind, dimPercent) = decoded.kind else {
+        guard case let .automation(kind, dimPercent, _, _) = decoded.kind else {
             return XCTFail("expected .automation, got \(decoded.kind)")
         }
         XCTAssertEqual(kind, .keepAwake)
@@ -29,11 +29,44 @@ final class AutomationItemCodableTests: XCTestCase {
         let data = try JSONEncoder().encode(item)
         let decoded = try JSONDecoder().decode(LaunchItem.self, from: data)
         XCTAssertEqual(decoded, item)
-        guard case let .automation(kind, dimPercent) = decoded.kind else {
+        guard case let .automation(kind, dimPercent, _, _) = decoded.kind else {
             return XCTFail("expected .automation, got \(decoded.kind)")
         }
         XCTAssertEqual(kind, .keepAwake)
         XCTAssertEqual(dimPercent, 30)
+    }
+
+    /// The `keep-awake-guard-effects` options ride the same decode-safe optional pattern.
+    func testAutomationItemWithOptionsRoundTrips() throws {
+        let item = LaunchItem(title: "Keep Awake",
+                              icon: .sfSymbol("cup.and.saucer.fill"),
+                              kind: .automation(.keepAwake, dimPercent: 30,
+                                                dimKeyboard: true, lockOnStop: true))
+        let data = try JSONEncoder().encode(item)
+        let decoded = try JSONDecoder().decode(LaunchItem.self, from: data)
+        XCTAssertEqual(decoded, item)
+        guard case let .automation(_, dimPercent, dimKeyboard, lockOnStop) = decoded.kind else {
+            return XCTFail("expected .automation, got \(decoded.kind)")
+        }
+        XCTAssertEqual(dimPercent, 30)
+        XCTAssertEqual(dimKeyboard, true)
+        XCTAssertEqual(lockOnStop, true)
+    }
+
+    /// An item encoded WITHOUT the options (nil → key omitted) is byte-identical to a pre-option
+    /// record, so this doubles as the legacy-decode proof: absent keys decode to nil (= off).
+    func testAutomationItemWithoutOptionsDecodesToNilOptions() throws {
+        let item = LaunchItem(title: "Keep Awake",
+                              icon: .sfSymbol("cup.and.saucer.fill"),
+                              kind: .automation(.keepAwake, dimPercent: 30))
+        let data = try JSONEncoder().encode(item)
+        let decoded = try JSONDecoder().decode(LaunchItem.self, from: data)
+        guard case let .automation(_, dimPercent, dimKeyboard, lockOnStop) = decoded.kind else {
+            return XCTFail("expected .automation, got \(decoded.kind)")
+        }
+        XCTAssertEqual(dimPercent, 30)
+        XCTAssertNil(dimKeyboard, "absent option decodes to nil (off)")
+        XCTAssertNil(lockOnStop, "absent option decodes to nil (off)")
     }
 
     func testAutomationKindRoundTrips() throws {

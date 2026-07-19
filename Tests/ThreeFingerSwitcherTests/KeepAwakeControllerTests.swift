@@ -3,17 +3,21 @@ import CoreGraphics
 @testable import ThreeFingerSwitcherCore
 
 /// Tests for the Keep Awake automation's stateful lifecycle (spec: `automations`) against a recording
-/// fake `Effects` — NO real displays/power. Proves: start dims every display + begins the assertion; the
-/// triggering gesture can't self-cancel (arms only after the trackpad empties); the return-touch stops
-/// it and restores the exact captured brightness + ends the assertion once; stop is idempotent; the
-/// heartbeat re-pins brightness + re-declares user activity; an unreadable display is skipped.
+/// fake `Effects` — NO real displays/power/monitors. Proves: start dims every display + begins the
+/// assertion; the triggering gesture can't self-cancel (arms only after the trackpad empties); the
+/// return-touch stops it and restores the exact captured brightness + ends the assertion once; stop is
+/// idempotent; the heartbeat re-pins brightness + re-declares user activity; an unreadable display is
+/// skipped. The `keep-awake-guard-effects` additions: the keyboard-backlight session effect (snapshot →
+/// zero → re-pin → restore, skip-unreadable, off-by-default) and the guard (monitor installed only at
+/// ARM, any input stops + locks BEFORE restore, explicit stops never lock).
 @MainActor
 final class KeepAwakeControllerTests: XCTestCase {
 
     // MARK: - Recording fake
 
     /// Records every effect the controller performs, and models a mutable "current brightness" per
-    /// display so restore/heartbeat can be asserted against real state transitions.
+    /// display (and keyboard) so restore/heartbeat can be asserted against real state transitions.
+    /// `sequence` interleaves ordered effect names so stop ordering (monitor→lock→restore) is provable.
     private final class Recorder {
         var displays: [CGDirectDisplayID] = [1, 2]
         var current: [CGDirectDisplayID: Float] = [1: 0.8, 2: 0.5]
@@ -22,16 +26,40 @@ final class KeepAwakeControllerTests: XCTestCase {
         var beginCount = 0
         var endCount = 0
         var declareCount = 0
+        var keyboards: [UInt64] = [10]
+        var kbCurrent: [UInt64: Float] = [10: 0.6]
+        var kbUnreadable: Set<UInt64> = []
+        var kbSetLog: [(UInt64, Float)] = []
+        var lockCount = 0
+        var monitorBeginCount = 0
+        var monitorEndCount = 0
+        /// The guard callback captured at install — a test fires it to simulate mouse/key input.
+        var monitorInput: (() -> Void)?
+        var sequence: [String] = []
     }
 
     private func makeEffects(_ r: Recorder) -> KeepAwakeController.Effects {
         KeepAwakeController.Effects(
             activeDisplays: { r.displays },
             getBrightness: { r.unreadable.contains($0) ? nil : r.current[$0] },
-            setBrightness: { id, v in r.setLog.append((id, v)); r.current[id] = v },
+            setBrightness: { id, v in
+                r.setLog.append((id, v)); r.current[id] = v; r.sequence.append("display(\(id))")
+            },
             beginActivity: { r.beginCount += 1; return NSObject() },
-            endActivity: { _ in r.endCount += 1 },
-            declareUserActive: { r.declareCount += 1 })
+            endActivity: { _ in r.endCount += 1; r.sequence.append("endActivity") },
+            declareUserActive: { r.declareCount += 1 },
+            keyboardBacklightIDs: { r.keyboards },
+            getKeyboardBrightness: { r.kbUnreadable.contains($0) ? nil : r.kbCurrent[$0] },
+            setKeyboardBrightness: { id, v in
+                r.kbSetLog.append((id, v)); r.kbCurrent[id] = v; r.sequence.append("keyboard(\(id))")
+            },
+            lockScreen: { r.lockCount += 1; r.sequence.append("lock") },
+            beginInputMonitoring: { onInput in
+                r.monitorBeginCount += 1; r.monitorInput = onInput; return NSObject()
+            },
+            endInputMonitoring: { _ in
+                r.monitorEndCount += 1; r.monitorInput = nil; r.sequence.append("endMonitor")
+            })
     }
 
     private func makeController(_ r: Recorder) -> KeepAwakeController {
@@ -208,5 +236,162 @@ final class KeepAwakeControllerTests: XCTestCase {
         c.start()
         c.stop()
         XCTAssertEqual(flips, [true, false])
+    }
+
+    // MARK: - Keyboard backlight session effect (keep-awake-guard-effects)
+
+    func testKeyboardDimsOnStartAndRestoresOnStop() {
+        let r = Recorder()
+        let c = makeController(r)
+        c.start(KeepAwakeController.Config(dimKeyboard: true))
+
+        XCTAssertEqual(r.kbCurrent[10], 0, "backlight zeroed on start")
+
+        c.stop()
+        XCTAssertEqual(r.kbCurrent[10], 0.6, "backlight restored to the captured level")
+    }
+
+    func testKeyboardOptionOffLeavesKeyboardUntouched() {
+        let r = Recorder()
+        let c = makeController(r)
+        c.start()                              // default config: dimKeyboard = false
+        c.noteTouch(fingerCount: 0)
+        c.noteTouch(fingerCount: 1)            // input stop
+        XCTAssertTrue(r.kbSetLog.isEmpty, "keyboard never read or written when the option is off")
+        XCTAssertEqual(r.kbCurrent[10], 0.6)
+    }
+
+    func testUnreadableKeyboardIsSkippedNeverFails() {
+        let r = Recorder()
+        r.kbUnreadable = [10]
+        let c = makeController(r)
+        c.start(KeepAwakeController.Config(dimKeyboard: true))
+
+        XCTAssertTrue(c.isActive, "still starts")
+        XCTAssertTrue(r.kbSetLog.isEmpty, "unreadable keyboard untouched")
+
+        c.stop()
+        XCTAssertEqual(r.kbCurrent[10], 0.6, "never restored (never dimmed)")
+    }
+
+    func testHeartbeatRepinsKeyboardToZero() {
+        let r = Recorder()
+        let c = makeController(r)
+        c.start(KeepAwakeController.Config(dimKeyboard: true))
+        r.kbCurrent[10] = 0.4                  // auto-illumination raises it
+
+        c.heartbeatTick()
+
+        XCTAssertEqual(r.kbCurrent[10], 0, "re-pinned to zero")
+        c.stop()
+        XCTAssertEqual(r.kbCurrent[10], 0.6, "restore unaffected by re-pins")
+    }
+
+    // MARK: - Guard: any-input stop + lock (keep-awake-guard-effects)
+
+    private func startGuarded(_ r: Recorder) -> KeepAwakeController {
+        let c = makeController(r)
+        c.start(KeepAwakeController.Config(dimKeyboard: true, lockOnStop: true))
+        return c
+    }
+
+    func testGuardInstallsMonitorOnlyAtArm() {
+        let r = Recorder()
+        let c = startGuarded(r)
+        XCTAssertEqual(r.monitorBeginCount, 0, "no monitor before the trigger lifts")
+
+        c.noteTouch(fingerCount: 2)            // residual trigger contacts
+        XCTAssertEqual(r.monitorBeginCount, 0)
+
+        c.noteTouch(fingerCount: 0)            // trackpad empties → ARM
+        XCTAssertEqual(r.monitorBeginCount, 1, "monitor installed exactly at ARM")
+        XCTAssertEqual(r.lockCount, 0)
+        c.stop()
+    }
+
+    func testGuardOffInstallsNoMonitorAndNeverLocks() {
+        let r = Recorder()
+        let c = makeController(r)
+        c.start()                              // lockOnStop = false
+        c.noteTouch(fingerCount: 0)
+        XCTAssertEqual(r.monitorBeginCount, 0, "no monitor without the guard option")
+
+        c.noteTouch(fingerCount: 1)            // touch stop
+        XCTAssertFalse(c.isActive)
+        XCTAssertEqual(r.lockCount, 0, "base behavior: stop without lock")
+    }
+
+    func testGuardMonitorInputStopsAndLocksBeforeRestore() {
+        let r = Recorder()
+        let c = startGuarded(r)
+        c.noteTouch(fingerCount: 0)            // ARM (installs monitor)
+        r.sequence.removeAll()
+
+        r.monitorInput?()                       // simulated mouse move / key press
+
+        XCTAssertFalse(c.isActive)
+        XCTAssertEqual(r.lockCount, 1, "locked exactly once")
+        XCTAssertEqual(r.monitorEndCount, 1, "monitor removed")
+        XCTAssertEqual(r.current[1], 0.8, "brightness restored behind the lock")
+        XCTAssertEqual(r.kbCurrent[10], 0.6, "backlight restored behind the lock")
+        // Ordering: monitor off → lock → keyboard restore → display restore → assertion end.
+        let order = ["endMonitor", "lock", "keyboard(10)"]
+        let indices = order.compactMap { r.sequence.firstIndex(of: $0) }
+        XCTAssertEqual(indices.count, order.count, "all stop effects ran: \(r.sequence)")
+        XCTAssertEqual(indices, indices.sorted(), "lock precedes every restore: \(r.sequence)")
+        if let lock = r.sequence.firstIndex(of: "lock"),
+           let display = r.sequence.firstIndex(of: "display(1)") {
+            XCTAssertLessThan(lock, display, "no unlocked-desktop flash")
+        } else {
+            XCTFail("missing lock/display entries in \(r.sequence)")
+        }
+    }
+
+    func testGuardTouchStopAlsoLocks() {
+        let r = Recorder()
+        let c = startGuarded(r)
+        c.noteTouch(fingerCount: 0)            // ARM
+        c.noteTouch(fingerCount: 1)            // a finger lands — input-path stop
+
+        XCTAssertFalse(c.isActive)
+        XCTAssertEqual(r.lockCount, 1, "trackpad input locks too")
+        XCTAssertEqual(r.monitorEndCount, 1)
+    }
+
+    func testGuardExplicitStopNeverLocksButRemovesMonitor() {
+        let r = Recorder()
+        let c = startGuarded(r)
+        c.noteTouch(fingerCount: 0)            // ARM (monitor live)
+
+        c.stop()                               // menu bar / quit / will-sleep / re-fire toggle
+
+        XCTAssertFalse(c.isActive)
+        XCTAssertEqual(r.lockCount, 0, "explicit and teardown stops never lock")
+        XCTAssertEqual(r.monitorEndCount, 1, "monitor still torn down")
+        XCTAssertEqual(r.current[1], 0.8)
+        XCTAssertEqual(r.kbCurrent[10], 0.6)
+    }
+
+    func testGuardDoubleStopEndsMonitorAndLockOnce() {
+        let r = Recorder()
+        let c = startGuarded(r)
+        c.noteTouch(fingerCount: 0)
+        r.monitorInput?()
+        c.stop(reason: .input)                 // stray second stop
+        c.stop()
+        XCTAssertEqual(r.lockCount, 1)
+        XCTAssertEqual(r.monitorEndCount, 1)
+        XCTAssertEqual(r.endCount, 1)
+    }
+
+    func testGuardedToggleOffIsExplicitNoLock() {
+        let r = Recorder()
+        let c = makeController(r)
+        let config = KeepAwakeController.Config(lockOnStop: true)
+        c.toggle(config)
+        XCTAssertTrue(c.isActive)
+        c.toggle(config)                       // re-fire while active
+        XCTAssertFalse(c.isActive)
+        XCTAssertEqual(r.lockCount, 0, "a re-fire toggle is an explicit stop")
     }
 }

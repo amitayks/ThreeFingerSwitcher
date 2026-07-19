@@ -47,60 +47,81 @@ final class SnapAdjacencyTests: XCTestCase {
         let a = CGRect(x: 0, y: 0, width: 400, height: 300)
         XCTAssertFalse(SnapAdjacency.adjacent(a, a))
     }
+
+    // MARK: - attached (the stay-bound test: touching OR overlapping)
+
+    func testOverlapIsAttachedButNotAdjacent() {
+        let a = CGRect(x: 0, y: 0, width: 400, height: 300)
+        let b = CGRect(x: 250, y: 0, width: 400, height: 300)     // 150pt overlap
+        XCTAssertFalse(SnapAdjacency.adjacent(a, b))              // never a BIND trigger
+        XCTAssertTrue(SnapAdjacency.attached(a, b))               // but the bond persists
+    }
+
+    func testContainedWindowIsAttached() {
+        let a = CGRect(x: 0, y: 0, width: 800, height: 600)
+        let b = CGRect(x: 100, y: 100, width: 200, height: 200)   // fully inside
+        XCTAssertTrue(SnapAdjacency.attached(a, b))
+    }
+
+    func testHairlineCornerOverlapIsNotAttached() {
+        let a = CGRect(x: 0, y: 0, width: 400, height: 300)
+        let b = CGRect(x: 395, y: 295, width: 400, height: 300)   // 5×5 corner brush ≤ ε
+        XCTAssertFalse(SnapAdjacency.attached(a, b))
+    }
 }
 
 /// WindowGroupStore: the physical-attachment group lifecycle.
 final class WindowGroupStoreTests: XCTestCase {
     func testSnapBindsTwoWindows() {
         let store = WindowGroupStore()
-        store.dragSettled(window: 1, adjacent: [2])
+        store.dragSettled(window: 1, snapped: [2])
         XCTAssertEqual(store.group(for: 1), [1, 2])
         XCTAssertEqual(store.group(for: 2), [1, 2])
     }
 
     func testBindingMergesTransitively() {
         let store = WindowGroupStore()
-        store.dragSettled(window: 2, adjacent: [3])       // {2,3}
-        store.dragSettled(window: 1, adjacent: [2])       // A onto B while B grouped with C
+        store.dragSettled(window: 2, snapped: [3])       // {2,3}
+        store.dragSettled(window: 1, snapped: [2])       // A onto B while B grouped with C
         XCTAssertEqual(store.group(for: 1), [1, 2, 3])
         XCTAssertEqual(store.groups.count, 1)
     }
 
     func testDragApartRemovesMemberAndDissolvesPairs() {
         let store = WindowGroupStore()
-        store.dragSettled(window: 1, adjacent: [2])
-        store.dragSettled(window: 1, adjacent: [])        // dragged away from every mate
+        store.dragSettled(window: 1, snapped: [2])
+        store.dragSettled(window: 1, snapped: [])        // dragged away from every mate
         XCTAssertNil(store.group(for: 1))
         XCTAssertNil(store.group(for: 2))                 // a group below two members dissolves
     }
 
     func testDragApartFromTrioKeepsTheRemainingPair() {
         let store = WindowGroupStore()
-        store.dragSettled(window: 1, adjacent: [2, 3])
-        store.dragSettled(window: 3, adjacent: [])
+        store.dragSettled(window: 1, snapped: [2, 3])
+        store.dragSettled(window: 3, snapped: [])
         XCTAssertNil(store.group(for: 3))
         XCTAssertEqual(store.group(for: 1), [1, 2])
     }
 
     func testRebindOntoNewContactLeavesOldGroup() {
         let store = WindowGroupStore()
-        store.dragSettled(window: 1, adjacent: [2])       // {1,2}
-        store.dragSettled(window: 1, adjacent: [5])       // dragged from 2 onto 5
+        store.dragSettled(window: 1, snapped: [2])       // {1,2}
+        store.dragSettled(window: 1, snapped: [5])       // dragged from 2 onto 5
         XCTAssertEqual(store.group(for: 1), [1, 5])
         XCTAssertNil(store.group(for: 2))
     }
 
     func testStayingAdjacentToAMateWhileTouchingANewWindowMergesAll() {
         let store = WindowGroupStore()
-        store.dragSettled(window: 1, adjacent: [2])       // {1,2}
-        store.dragSettled(window: 1, adjacent: [2, 5])    // still on 2, now also flush against 5
+        store.dragSettled(window: 1, snapped: [2])       // {1,2}
+        store.dragSettled(window: 1, snapped: [2, 5])    // still on 2, now also flush against 5
         XCTAssertEqual(store.group(for: 1), [1, 2, 5])
     }
 
     func testValidationDropsClosedMinimizedAndOffSpaceMembers() {
         let store = WindowGroupStore()
-        store.dragSettled(window: 1, adjacent: [2, 3])
-        store.dragSettled(window: 5, adjacent: [6])
+        store.dragSettled(window: 1, snapped: [2, 3])
+        store.dragSettled(window: 5, snapped: [6])
         // 3 is gone (closed), 6 is minimized, everyone else lives on Space 10.
         let live: [WindowGroupStore.Candidate] = [
             .init(id: 1, spaceID: 10), .init(id: 2, spaceID: 10),
@@ -113,7 +134,7 @@ final class WindowGroupStoreTests: XCTestCase {
 
     func testValidationKeepsTheLargestSameSpaceSubset() {
         let store = WindowGroupStore()
-        store.dragSettled(window: 1, adjacent: [2, 3])
+        store.dragSettled(window: 1, snapped: [2, 3])
         let live: [WindowGroupStore.Candidate] = [
             .init(id: 1, spaceID: 10), .init(id: 2, spaceID: 10),
             .init(id: 3, spaceID: 20),                    // moved to another Space: detached
@@ -123,7 +144,7 @@ final class WindowGroupStoreTests: XCTestCase {
 
     func testClearDropsEverything() {
         let store = WindowGroupStore()
-        store.dragSettled(window: 1, adjacent: [2])
+        store.dragSettled(window: 1, snapped: [2])
         store.clear()
         XCTAssertNil(store.group(for: 1))
         XCTAssertTrue(store.groups.isEmpty)
@@ -133,7 +154,7 @@ final class WindowGroupStoreTests: XCTestCase {
 
     func testPruneDetachedDissolvesAResizedApartPair() {
         let store = WindowGroupStore()
-        store.dragSettled(window: 1, adjacent: [2])
+        store.dragSettled(window: 1, snapped: [2])
         // Window 1's border was resized inward: a 100pt gap now separates the pair.
         let changed = store.pruneDetached(frames: [
             1: CGRect(x: 0, y: 0, width: 300, height: 900),
@@ -145,7 +166,7 @@ final class WindowGroupStoreTests: XCTestCase {
 
     func testPruneDetachedKeepsATouchingPairAndSplitsAChain() {
         let store = WindowGroupStore()
-        store.dragSettled(window: 1, adjacent: [2, 3])       // chain {1,2,3}
+        store.dragSettled(window: 1, snapped: [2, 3])       // chain {1,2,3}
         // 3 moved away; 1 and 2 still flush -> {1,2} survives, 3 drops.
         store.pruneDetached(frames: [
             1: CGRect(x: 0, y: 0, width: 400, height: 900),
@@ -157,7 +178,7 @@ final class WindowGroupStoreTests: XCTestCase {
 
     func testPruneDetachedLeavesGroupsWithUnknownFramesAlone() {
         let store = WindowGroupStore()
-        store.dragSettled(window: 1, adjacent: [2])
+        store.dragSettled(window: 1, snapped: [2])
         let changed = store.pruneDetached(frames: [1: CGRect(x: 0, y: 0, width: 400, height: 900)])
         XCTAssertFalse(changed)                              // member 2 un-enumerable: conservative keep
         XCTAssertEqual(store.group(for: 1), [1, 2])
@@ -165,7 +186,7 @@ final class WindowGroupStoreTests: XCTestCase {
 
     func testValidationDropsGeometricallyDetachedMembers() {
         let store = WindowGroupStore()
-        store.dragSettled(window: 1, adjacent: [2])
+        store.dragSettled(window: 1, snapped: [2])
         // Both alive, same Space — but a keyboard resize opened a gap the monitor never saw.
         let live: [WindowGroupStore.Candidate] = [
             .init(id: 1, spaceID: 10, frame: CGRect(x: 0, y: 0, width: 300, height: 900)),
@@ -176,10 +197,42 @@ final class WindowGroupStoreTests: XCTestCase {
 
     func testValidationKeepsTouchingMembersWithFrames() {
         let store = WindowGroupStore()
-        store.dragSettled(window: 1, adjacent: [2])
+        store.dragSettled(window: 1, snapped: [2])
         let live: [WindowGroupStore.Candidate] = [
             .init(id: 1, spaceID: 10, frame: CGRect(x: 0, y: 0, width: 400, height: 900)),
             .init(id: 2, spaceID: 10, frame: CGRect(x: 400, y: 0, width: 400, height: 900)),
+        ]
+        XCTAssertEqual(store.validatedGroups(against: live), [[1, 2]])
+    }
+
+    // MARK: - Overlap keeps the bond (only a gap detaches)
+
+    func testPruneKeepsAnOverlappingPair() {
+        let store = WindowGroupStore()
+        store.dragSettled(window: 1, snapped: [2])
+        // 2 was pushed INTO 1: heavy overlap, no flush edge — still physically attached.
+        let changed = store.pruneDetached(frames: [
+            1: CGRect(x: 0, y: 0, width: 400, height: 900),
+            2: CGRect(x: 250, y: 0, width: 400, height: 900),
+        ])
+        XCTAssertFalse(changed)
+        XCTAssertEqual(store.group(for: 1), [1, 2])
+    }
+
+    func testDragIntoOverlapStaysBound() {
+        let store = WindowGroupStore()
+        store.dragSettled(window: 1, snapped: [2])
+        // The next drag ends OVERLAPPING the mate: no fresh snap, but attachment persists.
+        store.dragSettled(window: 1, snapped: [], attached: [2])
+        XCTAssertEqual(store.group(for: 1), [1, 2])
+    }
+
+    func testValidationKeepsOverlappingMembersWithFrames() {
+        let store = WindowGroupStore()
+        store.dragSettled(window: 1, snapped: [2])
+        let live: [WindowGroupStore.Candidate] = [
+            .init(id: 1, spaceID: 10, frame: CGRect(x: 0, y: 0, width: 400, height: 900)),
+            .init(id: 2, spaceID: 10, frame: CGRect(x: 250, y: 0, width: 400, height: 900)),
         ]
         XCTAssertEqual(store.validatedGroups(against: live), [[1, 2]])
     }
@@ -217,6 +270,43 @@ final class WindowGroupLayoutTests: XCTestCase {
         // Expanded per-window views stay index-aligned.
         XCTAssertEqual(layout.rows, [[0, 1]])
         XCTAssertEqual(layout.sizes[0], CGSize(width: 96, height: 72))
+    }
+
+    func testClusterDeoverlapsOverlappingMembersToFlushContact() {
+        // B overlaps A by 100pt: the preview pushes B right to flush contact (no covered cards),
+        // growing the union accordingly.
+        let unit = SwitcherLayoutUnit.cluster(members: [
+            (index: 0, natural: CGRect(x: 0, y: 0, width: 400, height: 300)),
+            (index: 1, natural: CGRect(x: 300, y: 0, width: 400, height: 300)),
+        ])
+        XCTAssertEqual(unit.memberFrames[0], CGRect(x: 0, y: 0, width: 400, height: 300))
+        XCTAssertEqual(unit.memberFrames[1], CGRect(x: 400, y: 0, width: 400, height: 300))
+        XCTAssertEqual(unit.naturalSize, CGSize(width: 800, height: 300))
+    }
+
+    func testClusterDeoverlapPushesAContainedWindowOut() {
+        // A small window laid ON TOP of a big one (bound via overlap) must still render beside/below
+        // it, never covering it. The push axis is whichever clears with less travel.
+        let unit = SwitcherLayoutUnit.cluster(members: [
+            (index: 0, natural: CGRect(x: 0, y: 0, width: 800, height: 600)),
+            (index: 1, natural: CGRect(x: 550, y: 100, width: 200, height: 200)),
+        ])
+        let big = unit.memberFrames[0]
+        let small = unit.memberFrames[1]
+        XCTAssertTrue(big.intersection(small).isEmpty || big.intersection(small).width <= 0.5
+                        || big.intersection(small).height <= 0.5, "cards must not cover each other")
+        // pushRight = 800−550 = 250, pushDown = 600−100 = 500 → pushed RIGHT to flush at x = 800.
+        XCTAssertEqual(small.minX, 800, accuracy: 0.5)
+    }
+
+    func testClusterFlushArrangementPassesThroughUntouched() {
+        // The common case — a real flush snap — must still mirror reality exactly.
+        let unit = SwitcherLayoutUnit.cluster(members: [
+            (index: 0, natural: CGRect(x: 0, y: 0, width: 400, height: 300)),
+            (index: 1, natural: CGRect(x: 400, y: 0, width: 400, height: 300)),
+        ])
+        XCTAssertEqual(unit.memberFrames[1].minX, 400)
+        XCTAssertEqual(unit.naturalSize, CGSize(width: 800, height: 300))
     }
 
     func testClusterMembersOrderVisuallyAndMirrorTheMarginGap() {
