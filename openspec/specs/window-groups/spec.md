@@ -44,12 +44,17 @@ When a window drag (or resize) ends with the window's edge flush against another
 
 ### Requirement: Groups mean physical attachment and dissolve when it ends
 
-Group membership SHALL end for a member that is dragged (or resized) away from all of its group-mates, and for a member that is closed, minimized, or moved to another Space — validated against live window state at every consumption point (switcher snapshot assembly and commit) so a stale member can neither render nor be raised. A group reduced below two members SHALL dissolve. Groups SHALL be runtime-only (never persisted across app restarts).
+Group membership SHALL end for a member that is dragged (or resized) away from all of its group-mates, and for a member that is closed, minimized, or moved to another Space — validated against live window state at every consumption point (switcher snapshot assembly and commit) so a stale member can neither render nor be raised. Attachment SHALL be judged by the *stay-bound* contact test, which is looser than the *bind* trigger: a bond is created only by a flush snap, but it PERSISTS while the windows touch **or overlap** (more than a corner brush) — pushing a member into its mate, or laying a small member on top of one, keeps the bond; only a real gap detaches. A group reduced below two members SHALL dissolve. Groups SHALL be runtime-only (never persisted across app restarts).
 
 #### Scenario: Dragging apart unbinds
 
 - **WHEN** a member of a group is dragged away so it is no longer edge-adjacent to any group-mate
 - **THEN** that member leaves the group (and the group dissolves if fewer than two members remain)
+
+#### Scenario: Overlapping members stay bound
+
+- **WHEN** a group member ends up overlapping a group-mate (dragged into it, resized over it, or a small member sitting on top of a larger one)
+- **THEN** the bond persists — overlap is physical contact, not detachment — and the group survives every geometry re-check and consumption-point validation; overlap alone SHALL NOT create a new bond (binding still requires the flush snap)
 
 #### Scenario: Closing or minimizing a member removes it
 

@@ -24,17 +24,47 @@ struct SwitcherLayoutUnit: Equatable {
     /// window frames): the unit is their union rect; each member keeps its offset within it. Members
     /// are ordered visually — left-to-right, then top-to-bottom — which is also the order they occupy
     /// in the expanded navigation row.
+    ///
+    /// The PREVIEW never overlaps: real windows may overlap on screen and stay bound (attachment
+    /// persists through overlap — only a gap detaches), but every card must remain fully visible and
+    /// individually highlightable. Overlaps are therefore resolved by DE-OVERLAPPING in visual order:
+    /// each member that intersects an already-placed member takes the minimal rightward-or-downward
+    /// push to flush contact (whichever is smaller), repeated until clear. Non-overlapping
+    /// arrangements — the flush snap itself — pass through untouched, so the common case still
+    /// mirrors reality exactly.
     static func cluster(members: [(index: Int, natural: CGRect)]) -> SwitcherLayoutUnit {
         let ordered = members.sorted { a, b in
             if abs(a.natural.minX - b.natural.minX) > 0.5 { return a.natural.minX < b.natural.minX }
             return a.natural.minY < b.natural.minY
         }
-        let union = ordered.reduce(CGRect.null) { $0.union($1.natural) }
-        let frames = ordered.map {
-            CGRect(x: $0.natural.minX - union.minX, y: $0.natural.minY - union.minY,
-                   width: $0.natural.width, height: $0.natural.height)
+        // De-overlap pass: earlier (leftmost) members anchor; later ones are pushed right/down until
+        // no placed member is covered. Every push is > 0.5pt, so the loop strictly progresses; the
+        // guard bounds pathological configurations.
+        var placed: [CGRect] = []
+        for m in ordered {
+            var f = m.natural
+            var iterations = 0
+            while iterations < 64,
+                  let hit = placed.first(where: { overlapArea($0, f) }) {
+                let pushRight = hit.maxX - f.minX
+                let pushDown = hit.maxY - f.minY
+                if pushRight <= pushDown { f.origin.x += pushRight } else { f.origin.y += pushDown }
+                iterations += 1
+            }
+            placed.append(f)
+        }
+        let union = placed.reduce(CGRect.null) { $0.union($1) }
+        let frames = placed.map {
+            CGRect(x: $0.minX - union.minX, y: $0.minY - union.minY,
+                   width: $0.width, height: $0.height)
         }
         return SwitcherLayoutUnit(members: ordered.map(\.index), memberFrames: frames, naturalSize: union.size)
+    }
+
+    /// True when two rects genuinely share area (more than a hairline) — flush contact is NOT overlap.
+    private static func overlapArea(_ a: CGRect, _ b: CGRect) -> Bool {
+        let i = a.intersection(b)
+        return i.width > 0.5 && i.height > 0.5
     }
 }
 

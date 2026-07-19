@@ -31,25 +31,28 @@ final class WindowGroupStore {
         groups.first { $0.contains(id) }
     }
 
-    /// A window's drag has settled. `adjacent` is the set of windows its edges now sit flush against.
-    /// Intent-driven: only the DRAGGED window's contacts bind — two windows that merely happen to rest
-    /// adjacent are never bound by a third window's drag.
-    ///   1. If the window was grouped and no group-mate remains adjacent, it leaves that group
-    ///      (a group below two members dissolves).
-    ///   2. Every adjacent window's group (or the lone window) is merged with the dragged window's
-    ///      into ONE group — transitive: A onto B while B is grouped with C yields {A, B, C}.
-    func dragSettled(window id: CGWindowID, adjacent: Set<CGWindowID>) {
+    /// A window's drag has settled. `snapped` is the set of windows its edges now sit FLUSH against
+    /// (the strict bind test); `attached` is the looser stay-bound contact set (flush OR overlapping —
+    /// always a superset of `snapped`). Intent-driven: only the DRAGGED window's contacts bind — two
+    /// windows that merely happen to rest adjacent are never bound by a third window's drag.
+    ///   1. If the window was grouped and no group-mate remains ATTACHED (not even overlapping), it
+    ///      leaves that group (a group below two members dissolves). Pushing a member INTO its mate
+    ///      keeps the bond — only a real gap detaches.
+    ///   2. Every freshly SNAPPED window's group (or the lone window) is merged with the dragged
+    ///      window's into ONE group — transitive: A onto B while B is grouped with C yields {A, B, C}.
+    func dragSettled(window id: CGWindowID, snapped: Set<CGWindowID>, attached: Set<CGWindowID>? = nil) {
+        let contact = (attached ?? snapped).union(snapped)
         // 1. Detached from all mates: leave the old group.
         if let idx = groups.firstIndex(where: { $0.contains(id) }) {
-            if adjacent.isDisjoint(with: groups[idx].subtracting([id])) {
+            if contact.isDisjoint(with: groups[idx].subtracting([id])) {
                 groups[idx].remove(id)
                 if groups[idx].count < 2 { groups.remove(at: idx) }
             }
         }
-        // 2. Merge with every contact's group.
-        guard !adjacent.isEmpty else { return }
+        // 2. Merge with every fresh snap's group.
+        guard !snapped.isEmpty else { return }
         var merged: Set<CGWindowID> = [id]
-        merged.formUnion(adjacent)
+        merged.formUnion(snapped)
         for member in merged {
             if let idx = groups.firstIndex(where: { $0.contains(member) }) {
                 merged.formUnion(groups[idx])
@@ -121,7 +124,8 @@ final class WindowGroupStore {
         return changed
     }
 
-    /// Connected components of the members under `SnapAdjacency` (touching = same component).
+    /// Connected components of the members under the STAY-BOUND contact test (`SnapAdjacency.attached`:
+    /// flush-touching OR overlapping = same component) — bonds persist through overlap; only a gap splits.
     static func adjacencyComponents(of members: [(id: CGWindowID, frame: CGRect)]) -> [Set<CGWindowID>] {
         var unvisited = Array(members.indices)
         var components: [Set<CGWindowID>] = []
@@ -130,7 +134,7 @@ final class WindowGroupStore {
             var frontier = [seed]
             while let current = frontier.popLast() {
                 let neighbors = unvisited.filter {
-                    SnapAdjacency.adjacent(members[current].frame, members[$0].frame)
+                    SnapAdjacency.attached(members[current].frame, members[$0].frame)
                 }
                 for n in neighbors {
                     component.insert(n)
