@@ -50,4 +50,19 @@ enum SnapAdjacency {
         }
         return false
     }
+
+    /// Whether two frames are physically ATTACHED — the *stay-bound* test, deliberately looser than
+    /// the *bind* test (`adjacent`): a bond is created only by a flush snap, but it persists while
+    /// the windows touch OR OVERLAP. Pushing a member INTO its mate (or laying a small window on top
+    /// of it) is still physical contact; only pulling them APART — a real gap — detaches. The overlap
+    /// must be more than a corner brush (`epsilon` in both dimensions).
+    static func attached(
+        _ a: CGRect, _ b: CGRect,
+        epsilon: CGFloat = SnapAdjacency.epsilon,
+        minSharedExtent: CGFloat = SnapAdjacency.minSharedExtent
+    ) -> Bool {
+        if adjacent(a, b, epsilon: epsilon, minSharedExtent: minSharedExtent) { return true }
+        let overlap = a.intersection(b)
+        return overlap.width > epsilon && overlap.height > epsilon
+    }
 }
