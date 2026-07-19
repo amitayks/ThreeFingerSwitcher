@@ -73,6 +73,12 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         engineFactory: { [unowned self] in self.makeNotchSessionEngine() },
         // The shared ledger, for the purge-delete gesture only (`notch-conversation-gestures`).
         auditLog: auditLog)
+        .configuredForTuning(
+            // The in-notch settings zone (`notch-timeline-and-tuning`): the slider reads/writes the
+            // notch's own dial; the model max caps the "Max" stop's token caption + snapshot.
+            provider: { [weak self] in self?.settings.notchTuning ?? .balanced },
+            modelMax: { [weak self] in self?.selectedAIModelDescriptor()?.maxContextTokens ?? 8_192 },
+            onChange: { [weak self] tuning in self?.settings.notchTuning = tuning })
 
     /// Coarse repeating timer for park MAINTENANCE: the (opt-in) auto-dismiss pass — an idle, fully-seen
     /// session past the configured countdown is dismissed forever — plus the background-driver advance
@@ -497,6 +503,17 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
                 FireContext(capturedAppName: self?.capturedFrontApp?.localizedName)
             },
             reasoning: { [weak self] in self?.settings.aiReasoningEnabled ?? false },
+            // BORN-WITH tuning (`notch-timeline-and-tuning`): a NEW notch conversation snapshots the
+            // notch dial (reasoning + context tokens, clamped to the model max) at birth and carries it
+            // for life; the legacy `reasoning:` closure above remains the fallback for pre-change
+            // conversations with no stored tuning.
+            tuningDefault: { [weak self] in
+                guard let self else { return nil }
+                let tuning = self.settings.notchTuning
+                let modelMax = self.selectedAIModelDescriptor()?.maxContextTokens ?? 8_192
+                return (reasoning: tuning.reasoning,
+                        contextTokens: tuning.contextTokens(modelMax: modelMax))
+            },
             registry: aiToolRegistry,
             candidateSource: aiToolCandidateSource,
             // Active-skill allow-list (`wire-memory-skills`): the bound skill's `toolNames` are always

@@ -143,4 +143,53 @@ final class AgentConversationTests: XCTestCase {
         let single = LLMChatRequest(messages: [], image: a)
         XCTAssertEqual(single.images, [a])
     }
+
+    // MARK: - The display timeline + born-with tuning (`notch-timeline-and-tuning`)
+
+    func testSegmentsAndBornWithTuningRoundTripThroughCodable() throws {
+        let segments = [TurnSegment(kind: .thinking, text: "T1"),
+                        TurnSegment(kind: .answer, text: "R1"),
+                        TurnSegment(kind: .thinking, text: "T2")]
+        let message = AgentMessage(role: .assistant, text: "R1", thinking: "T1T2", segments: segments,
+                                   createdAt: Date(timeIntervalSince1970: 1))
+        let convo = AgentConversation(title: "t", messages: [message],
+                                      createdAt: Date(timeIntervalSince1970: 0),
+                                      updatedAt: Date(timeIntervalSince1970: 2),
+                                      reasoningOverride: false, contextTokens: 32_768)
+        let decoded = try JSONDecoder().decode(AgentConversation.self, from: JSONEncoder().encode(convo))
+        XCTAssertEqual(decoded, convo, "the segment timeline + born-with tuning round-trip")
+        XCTAssertEqual(decoded.messages[0].segments, segments,
+                       "segments keep their cross-channel arrival order")
+        XCTAssertEqual(decoded.reasoningOverride, false)
+        XCTAssertEqual(decoded.contextTokens, 32_768)
+    }
+
+    func testPreChangeJSONDecodesWithNilSegmentsAndTuning() throws {
+        // A row persisted BEFORE this change carries none of the new keys — everything decodes nil
+        // (the decode-safe optional contract; nothing throws, nothing is dropped).
+        let legacy = """
+        {"id":"\(UUID().uuidString)","role":"assistant","text":"answer","thinking":"old","createdAt":1}
+        """
+        let message = try JSONDecoder().decode(AgentMessage.self, from: Data(legacy.utf8))
+        XCTAssertNil(message.segments, "a pre-change message has no stored timeline")
+        let convo = AgentConversation(title: "t", messages: [message])
+        let decoded = try JSONDecoder().decode(AgentConversation.self, from: JSONEncoder().encode(convo))
+        XCTAssertNil(decoded.reasoningOverride)
+        XCTAssertNil(decoded.contextTokens)
+    }
+
+    func testDisplaySegmentsFallsBackForPreChangeMessages() {
+        // Legacy flat thinking → ONE leading thinking block, then the answer (the spec's fallback).
+        let legacy = AgentMessage(role: .assistant, text: "answer", thinking: "old reasoning")
+        XCTAssertEqual(legacy.displaySegments,
+                       [TurnSegment(kind: .thinking, text: "old reasoning"),
+                        TurnSegment(kind: .answer, text: "answer")])
+        // No thinking at all → just the answer block.
+        let bare = AgentMessage(role: .assistant, text: "answer")
+        XCTAssertEqual(bare.displaySegments, [TurnSegment(kind: .answer, text: "answer")])
+        // A stored timeline wins over the flat fields.
+        let timeline = [TurnSegment(kind: .answer, text: "a"), TurnSegment(kind: .thinking, text: "t")]
+        let modern = AgentMessage(role: .assistant, text: "a", thinking: "t", segments: timeline)
+        XCTAssertEqual(modern.displaySegments, timeline)
+    }
 }

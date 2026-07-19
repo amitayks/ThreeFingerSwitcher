@@ -28,6 +28,13 @@ final class NotchHomeZoneController {
     var onDiscard: ((AgentSessionID) -> Void)?
     /// Resolve the engine driving a session's expanded conversation (owned by `ParkController`).
     var engineProvider: (AgentSessionID) -> NotchSessionEngine? = { _ in nil }
+    /// The notch tuning dial's read seam (`notch-timeline-and-tuning`): the persisted stop the settings
+    /// zone opens on.
+    var tuningProvider: () -> NotchTuning = { .balanced }
+    /// The active model's architectural context maximum (caps the "Max" stop's token caption).
+    var modelMaxProvider: () -> Int = { 131_072 }
+    /// The slider landed on a stop — persist it (applies to each FOLLOWING new chat).
+    var onTuningChanged: ((NotchTuning) -> Void)?
 
     private var enabled = false
     private var refreshTimer: Timer?
@@ -51,6 +58,9 @@ final class NotchHomeZoneController {
         overlay.onNewSession = { [weak self] in self?.onNewSession?() }
         overlay.onCollapse = { [weak self] in self?.onCollapse?() }
         overlay.onDiscard = { [weak self] id in self?.onDiscard?(id) }
+        overlay.onOpenSettings = { [weak self] in self?.openSettings() }
+        overlay.onCloseSettings = { [weak self] in self?.closeSettings() }
+        overlay.onTuningChanged = { [weak self] tuning in self?.onTuningChanged?(tuning) }
     }
 
     /// Set the reveal DWELL — how long the cursor must stay crossed behind the notch before the rail reveals
@@ -131,6 +141,49 @@ final class NotchHomeZoneController {
         manageRefreshTimer()
     }
 
+    // MARK: - The in-notch settings zone (`notch-timeline-and-tuning` D5)
+
+    /// Morph the panel into the SETTINGS zone (the gear above the "+ New chat" card): seed the dial from
+    /// the persisted stop, flip the mode, and stretch the same panel to the settings solve — the
+    /// `expandSession` recipe without an engine. The panel never takes key status in this mode (the
+    /// slider is mouse-only), and the rail's grace-dismiss keeps applying (see `handleCursor`).
+    func openSettings() {
+        let point = NSEvent.mouseLocation
+        guard let m = metrics(for: point) ?? NSScreen.main.flatMap(metricsFor) else { return }
+        overlay.model.tuning = tuningProvider()
+        overlay.model.modelMaxContextTokens = modelMaxProvider()
+        overlay.model.mode = .settings
+        overlay.model.attachment = attachmentFor(m)
+        overlay.reveal(at: settingsRectFor(m), animateResize: true)
+        manageRefreshTimer()
+    }
+
+    /// The settings zone's back affordance: return the panel to RAIL mode (the border stretches back
+    /// down to the rail solve). A no-op unless settings mode is showing.
+    func closeSettings() {
+        guard case .settings = overlay.model.mode else { return }
+        overlay.model.mode = .rail
+        guard overlay.isVisible else { return }
+        let point = NSEvent.mouseLocation
+        guard let m = metrics(for: point) ?? NSScreen.main.flatMap(metricsFor) else { return }
+        overlay.model.sessions = sessionsProvider()
+        overlay.model.attachment = attachmentFor(m)
+        overlay.reveal(at: railRectFor(m, zone: zoneRectFor(m)), animateResize: true)
+        manageRefreshTimer()
+    }
+
+    /// The settings zone's panel rect: the compact settings solve through the same attach-or-tab anchor
+    /// the rail/expanded solves use.
+    private func settingsRectFor(_ m: ScreenMetrics) -> CGRect {
+        let size = NotchHomeZoneLayout.solveSettings(visibleFrame: m.visibleFrame)
+        if let notch = m.notch {
+            return NotchHomeZoneAnchor.attachedPanelRect(contentSize: size, notch: notch,
+                                                         screenFrame: m.screenFrame)
+        }
+        return NotchHomeZoneAnchor.railRect(zone: zoneRectFor(m), size: size,
+                                            visibleFrame: m.visibleFrame)
+    }
+
     /// Straight-CLOSE the expanded conversation (the swipe-up "minimize" path): shrink the panel from its
     /// current expanded size DIRECTLY into the point behind the notch — no rail-size intermediate to dwell
     /// on. The conversation stays BOUND through the shrink (the caller defers its state-collapse to `then`),
@@ -180,21 +233,33 @@ final class NotchHomeZoneController {
         case .dismiss:
             dismiss()
         case .reveal:
-            overlay.model.sessions = sessionsProvider()
-            // Set the attachment BEFORE showing so the view carves the notch / insets content correctly on
-            // the very first frame (no flash of an un-carved rounded rect).
-            overlay.model.attachment = attachmentFor(m)
-            let rail = railRectFor(m, zone: zone)
-            overlay.reveal(at: rail)            // spreads out of the notch on first show; repositions after
+            if case .settings = overlay.model.mode, overlay.isVisible {
+                // Keep-open tick while the SETTINGS zone is showing: reposition at the settings solve —
+                // never the rail rect, which would snap the morphed panel back to rail size. Grace
+                // still applies through the same feed (settings dismisses like the rail).
+                overlay.reveal(at: settingsRectFor(m))
+            } else {
+                overlay.model.sessions = sessionsProvider()
+                // Set the attachment BEFORE showing so the view carves the notch / insets content correctly on
+                // the very first frame (no flash of an un-carved rounded rect).
+                overlay.model.attachment = attachmentFor(m)
+                let rail = railRectFor(m, zone: zone)
+                overlay.reveal(at: rail)        // spreads out of the notch on first show; repositions after
+            }
         }
         manageRefreshTimer()
     }
 
-    /// Dismiss the rail. `animated` (the default, used for the cursor-left grace-dismiss) recedes it back
-    /// into the notch on the ease-in-out spread; `animated == false` (restore / feature-off) tears it down
-    /// synchronously so focus/teardown are immediate (the ghost-on-Space-switch landmine path).
+    /// Dismiss the rail (or the settings zone — it grace-dismisses like the rail). `animated` (the
+    /// default, used for the cursor-left grace-dismiss) recedes it back into the notch on the ease-in-out
+    /// spread; `animated == false` (restore / feature-off) tears it down synchronously so focus/teardown
+    /// are immediate (the ghost-on-Space-switch landmine path). A dismissed settings zone resets to rail
+    /// mode once hidden, so the NEXT reveal always opens the rail.
     private func dismiss(animated: Bool = true) {
-        overlay.hide(animated: animated)
+        let wasSettings: Bool = { if case .settings = overlay.model.mode { return true }; return false }()
+        overlay.hide(animated: animated) { [weak self] in
+            if wasSettings { self?.overlay.model.mode = .rail }
+        }
         manageRefreshTimer()
     }
 

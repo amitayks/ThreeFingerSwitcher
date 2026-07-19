@@ -61,9 +61,14 @@ final class NotchSessionEngine: ObservableObject {
     }
 
     @Published private(set) var state: State = .idle
-    /// The model's streamed REASONING for the in-flight turn — live into the expanded view's collapsible
-    /// Thinking section; retained on the appended assistant message for DISPLAY only, NEVER re-fed.
+    /// The model's streamed REASONING for the in-flight turn — the flat accumulation (kept as the badge /
+    /// test seam); retained on the appended assistant message for DISPLAY only, NEVER re-fed.
     @Published private(set) var thinking: String = ""
+    /// The in-flight turn's ordered TIMELINE (`notch-timeline-and-tuning`): thinking and answer segments
+    /// appended in token-arrival order (append-or-coalesce — a token whose channel matches the last
+    /// segment's kind extends it; a channel flip starts a new segment). The expanded view streams this
+    /// live; `appendAssistantTurn` persists it onto the settled message. Display-only, never re-fed.
+    @Published private(set) var liveSegments: [TurnSegment] = []
     /// The ordered tool steps the route loop has run for the current turn (the expanded view renders a
     /// compact list of `ToolStepResult.summary`). Reset per turn.
     @Published private(set) var toolSteps: [ToolStepResult] = []
@@ -106,17 +111,26 @@ final class NotchSessionEngine: ObservableObject {
     /// controller's upsert is idempotent). Does NOT fire for an empty/whitespace send.
     var onTurnStarted: (@MainActor (AgentConversation) -> Void)?
 
+    /// The born-with tuning snapshot the notch settings slider yields for a NEW conversation (design D7):
+    /// nil = no dial wired (the legacy behavior — `reasoningDefault` + the injected budget), so existing
+    /// call sites and tests are unchanged.
+    typealias TuningSnapshot = (reasoning: Bool, contextTokens: Int)
+
     private let modelManager: ModelManager
     private let selection: SelectionProviding
     private let contextProvider: @MainActor () -> FireContext
     private let reasoningDefault: @MainActor () -> Bool
     private let budgetProvider: ContextBudgetProviding
+    private let tuningDefault: @MainActor () -> TuningSnapshot?
     private let registry: ToolRegistry?
     private let candidateSource: ToolCandidateSource?
     private let skillTools: @MainActor (String) -> [String]
     private let backgroundRunner: BackgroundToolRunner?
 
     private var sessionReasoning = false
+    /// The BOUND conversation's born-with context budget (stamped at birth / restored at bind); nil =
+    /// the legacy injected `budgetProvider`.
+    private var sessionContextTokens: Int?
     private var sessionParameters: GenerationParameters = .default
     private var generationTask: Task<Void, Never>?
     private var approvalGate: CanvasApprovalGate?
@@ -126,6 +140,7 @@ final class NotchSessionEngine: ObservableObject {
          contextProvider: @escaping @MainActor () -> FireContext = { FireContext() },
          reasoning: @escaping @MainActor () -> Bool = { false },
          budgetProvider: ContextBudgetProviding = DefaultContextBudget(),
+         tuningDefault: @escaping @MainActor () -> TuningSnapshot? = { nil },
          registry: ToolRegistry? = nil,
          candidateSource: ToolCandidateSource? = nil,
          skillTools: @escaping @MainActor (String) -> [String] = { _ in [] },
@@ -137,6 +152,7 @@ final class NotchSessionEngine: ObservableObject {
         self.contextProvider = contextProvider
         self.reasoningDefault = reasoning
         self.budgetProvider = budgetProvider
+        self.tuningDefault = tuningDefault
         self.registry = registry
         self.candidateSource = candidateSource
         self.skillTools = skillTools
@@ -198,12 +214,24 @@ final class NotchSessionEngine: ObservableObject {
     func startNew(title: String = "New chat") -> AgentConversation {
         cancelTurnMachinery()
         let now = Date()
-        let fresh = AgentConversation(title: title, messages: [], createdAt: now, updatedAt: now)
+        var fresh = AgentConversation(title: title, messages: [], createdAt: now, updatedAt: now)
+        // BORN-WITH tuning (design D7): a new conversation snapshots the notch dial at birth and carries
+        // it for life (persisted on the conversation) — a later slider change never retunes this session.
+        // No dial wired (nil) keeps the legacy snapshot-only reasoning default.
+        if let tuning = tuningDefault() {
+            fresh.reasoningOverride = tuning.reasoning
+            fresh.contextTokens = tuning.contextTokens
+            sessionReasoning = tuning.reasoning
+            sessionContextTokens = tuning.contextTokens
+        } else {
+            sessionReasoning = reasoningDefault()
+            sessionContextTokens = nil
+        }
         conversation = fresh
         autoGrant.value = false   // a fresh conversation never inherits a grant
-        sessionReasoning = reasoningDefault()
         sessionParameters = .default
         thinking = ""
+        liveSegments = []
         toolSteps = []
         clearPendingAttachments()
         state = .awaitingTurn
@@ -217,9 +245,14 @@ final class NotchSessionEngine: ObservableObject {
         cancelTurnMachinery()
         conversation = stored
         autoGrant.value = stored.isAutoApproveGranted   // the persisted grant follows the session
-        sessionReasoning = reasoningDefault()
+        // BORN-WITH tuning: a conversation stamped at birth keeps its own reasoning + budget for life; a
+        // pre-change conversation (nil fields) keeps the exact legacy behavior (the global reasoning
+        // default re-read at bind, the injected budget).
+        sessionReasoning = stored.reasoningOverride ?? reasoningDefault()
+        sessionContextTokens = stored.contextTokens
         sessionParameters = .default
         thinking = ""
+        liveSegments = []
         toolSteps = []
         clearPendingAttachments()
         state = .awaitingTurn
@@ -236,6 +269,7 @@ final class NotchSessionEngine: ObservableObject {
         if !isTurnInFlight {
             conversation = nil
             thinking = ""
+            liveSegments = []
             toolSteps = []
             state = .idle
         }
@@ -248,6 +282,7 @@ final class NotchSessionEngine: ObservableObject {
         cancelTurnMachinery()
         conversation = nil
         thinking = ""
+        liveSegments = []
         toolSteps = []
         clearPendingAttachments()
         state = .idle
@@ -328,6 +363,7 @@ final class NotchSessionEngine: ObservableObject {
         approvalGate?.resolve(.cancel)
         approvalGate = nil
         thinking = ""
+        liveSegments = []
         state = .awaitingTurn
     }
 
@@ -416,10 +452,11 @@ final class NotchSessionEngine: ObservableObject {
         }
         if Task.isCancelled { return }
 
-        // Compaction: when the assembled estimate approaches the injected budget, collapse older turns
-        // into a summary BEFORE assembling. A failed summarization is a turn `.failed` and does NOT drop
-        // history (the plan applies only on a successful summary, so a retry sees it all).
-        if ConversationCompactor.needsCompaction(current, budget: budgetProvider) {
+        // Compaction: when the assembled estimate approaches the session's budget (born-with when the
+        // conversation carries one, else the injected default), collapse older turns into a summary
+        // BEFORE assembling. A failed summarization is a turn `.failed` and does NOT drop history (the
+        // plan applies only on a successful summary, so a retry sees it all).
+        if ConversationCompactor.needsCompaction(current, budget: effectiveBudget) {
             let plan = ConversationCompactor.plan(current)
             if !plan.isEmpty {
                 do {
@@ -450,7 +487,9 @@ final class NotchSessionEngine: ObservableObject {
         guard let request = assembleRequest() else { return }
 
         // Stream the turn: `.thinking` → live `thinking` (reset per turn); `.response` → `.conversing`.
+        // BOTH channels also append to `liveSegments` in arrival order — the transcript's timeline.
         thinking = ""
+        liveSegments = []
         state = .conversing(partial: "")
         var accumulated = ""
         do {
@@ -459,8 +498,10 @@ final class NotchSessionEngine: ObservableObject {
                 switch token.channel {
                 case .thinking:
                     thinking += token.text
+                    appendLive(.thinking, token.text)
                 case .response:
                     accumulated += token.text
+                    appendLive(.answer, token.text)
                     state = .conversing(partial: accumulated)
                 }
             }
@@ -492,17 +533,32 @@ final class NotchSessionEngine: ObservableObject {
         let gate = makeApprovalGate()
 
         thinking = ""
+        liveSegments = []
         toolSteps = []
         state = .conversing(partial: "")
 
-        // Ordered, turn-owned reasoning stream: the loop yields tokens (off-main) into the stream and
-        // ONE consumer appends them in order on the main actor, drained before the turn settles. The
-        // old per-token detached `Task`s were unordered and could land after settlement or discard.
-        var streamContinuation: AsyncStream<String>.Continuation!
-        let tokens = AsyncStream<String> { streamContinuation = $0 }
+        // Ordered, turn-owned CHANNEL stream (`notch-timeline-and-tuning`): the loop yields tagged
+        // (channel, text) events (off-main) into ONE stream and ONE consumer appends them in order on
+        // the main actor, drained before the turn settles — so cross-channel arrival order is serialized
+        // exactly as emitted (the timeline's interleaving is decided here, once). The old per-token
+        // detached `Task`s were unordered and could land after settlement or discard.
+        var streamContinuation: AsyncStream<(TokenChannel, String)>.Continuation!
+        let tokens = AsyncStream<(TokenChannel, String)> { streamContinuation = $0 }
         let continuation = streamContinuation!
         let consumer = Task { [weak self] in
-            for await text in tokens { self?.thinking += text }
+            var partial = ""
+            for await (channel, text) in tokens {
+                guard let self else { continue }
+                switch channel {
+                case .thinking:
+                    self.thinking += text
+                    self.appendLive(.thinking, text)
+                case .response:
+                    partial += text
+                    self.appendLive(.answer, text)
+                    self.state = .conversing(partial: partial)
+                }
+            }
         }
 
         let fireContext = contextProvider()
@@ -515,16 +571,20 @@ final class NotchSessionEngine: ObservableObject {
         let autoGate = AutoApprovingGate(base: gate,
                                          isGranted: { [autoGrant] in autoGrant.value },
                                          narrate: { text in
-                                             continuation.yield(text + "\n")
+                                             continuation.yield((.thinking, text + "\n"))
                                              narrator?(text)
                                          })
+        // `onResponseToken` is WIRED (`notch-timeline-and-tuning`): the routed turn's final answer
+        // streams token-by-token into the timeline + `.conversing(partial:)` exactly like the
+        // plain-chat path — it no longer appears whole at settle.
         let loop = AgentLoop(runtime: runtime, registry: registry, candidateSource: candidateSource,
                              gate: autoGate, reasoning: sessionReasoning, source: source,
-                             onThinking: { continuation.yield($0) },
+                             onThinking: { continuation.yield((.thinking, $0)) },
                              sessionID: current.id,
                              backgroundRunner: backgroundRunner,
                              budget: loopBudget(),
-                             isAutoGranted: { [autoGrant] in autoGrant.value })
+                             isAutoGranted: { [autoGrant] in autoGrant.value },
+                             onResponseToken: { continuation.yield((.response, $0)) })
         let result = await loop.run(context: context)
         continuation.finish()
         await consumer.value
@@ -552,16 +612,54 @@ final class NotchSessionEngine: ObservableObject {
         }
     }
 
-    /// Append the assistant turn (response only as `text`; thinking retained for DISPLAY only and NEVER
-    /// re-fed), return to `.awaitingTurn`, and report the settled snapshot to the controller.
+    /// Append the assistant turn (response only as `text`; thinking + the ordered segment timeline
+    /// retained for DISPLAY only and NEVER re-fed), return to `.awaitingTurn`, and report the settled
+    /// snapshot to the controller.
     private func appendAssistantTurn(_ text: String) {
         let now = Date()
         conversation?.messages.append(AgentMessage(role: .assistant, text: text,
                                                    thinking: thinking.isEmpty ? nil : thinking,
+                                                   segments: settledSegments(finalText: text),
                                                    createdAt: now))
         conversation?.updatedAt = now
+        // The live timeline hands off to the persisted message (no double-render); the flat `thinking`
+        // deliberately KEEPS its accumulation until the next turn resets it (the existing seam).
+        liveSegments = []
         state = .awaitingTurn
         if let settled = conversation { onTurnSettled?(settled, .answered) }
+    }
+
+    /// The timeline persisted onto the settled message. The settled `text` is AUTHORITATIVE: normally it
+    /// equals the streamed answer segments and the live timeline persists as-is; when a routed stop path
+    /// settles text that never streamed (or streamed differently), the answer segments are rebuilt from
+    /// the settled text (thinking blocks keep their places) so the stored timeline never contradicts the
+    /// committed answer. An empty timeline persists as nil (the legacy fallback renders `thinking`/`text`).
+    private func settledSegments(finalText: String) -> [TurnSegment]? {
+        var segments = liveSegments
+        let streamedAnswer = segments.filter { $0.kind == .answer }.map(\.text).joined()
+        if streamedAnswer != finalText {
+            segments.removeAll { $0.kind == .answer }
+            if !finalText.isEmpty { segments.append(TurnSegment(kind: .answer, text: finalText)) }
+        }
+        return segments.isEmpty ? nil : segments
+    }
+
+    /// Append-or-coalesce one streamed chunk onto the live timeline: a chunk whose channel matches the
+    /// last segment's kind extends it (one string mutation per token — the array's shape changes only at
+    /// channel flips); a flip starts a new segment.
+    private func appendLive(_ kind: TurnSegment.Kind, _ text: String) {
+        guard !text.isEmpty else { return }
+        if liveSegments.last?.kind == kind {
+            liveSegments[liveSegments.count - 1].text += text
+        } else {
+            liveSegments.append(TurnSegment(kind: kind, text: text))
+        }
+    }
+
+    /// The compaction budget for the BOUND conversation: its born-with token budget when stamped
+    /// (`notch-timeline-and-tuning` D7), else the injected provider (the legacy behavior).
+    private var effectiveBudget: ContextBudgetProviding {
+        sessionContextTokens.map { DefaultContextBudget(maxContextTokens: $0) } ?? budgetProvider
     }
 
     /// Assemble the conversation into an `LLMChatRequest`: each message's committed `text` ONLY
