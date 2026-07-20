@@ -13,6 +13,10 @@ protocol CursorMonitor: AnyObject {
     /// A right-click (anywhere) reported in Cocoa global coordinates. Observed passively — used to yield
     /// the preview to the Dock's native action menu when the click lands on a tile.
     var onRightClick: ((CGPoint) -> Void)? { get set }
+    /// A left-mouse-down (anywhere) reported in Cocoa global coordinates. Observed passively (never
+    /// consumed, so the native Dock click is unaffected) — used to commit the highlighted preview when the
+    /// click lands on the shown app's Dock tile.
+    var onLeftDown: ((CGPoint) -> Void)? { get set }
     func start()
     func stop()
 }
@@ -21,6 +25,7 @@ protocol CursorMonitor: AnyObject {
 final class ManualCursorMonitor: CursorMonitor {
     var onMove: ((CGPoint) -> Void)?
     var onRightClick: ((CGPoint) -> Void)?
+    var onLeftDown: ((CGPoint) -> Void)?
     private(set) var running = false
     func start() { running = true }
     func stop() { running = false }
@@ -33,5 +38,10 @@ final class ManualCursorMonitor: CursorMonitor {
     func emitRightClick(_ point: CGPoint) {
         guard running else { return }
         onRightClick?(point)
+    }
+    /// Simulate a left-mouse-down (no-op while stopped, matching the real monitor).
+    func emitLeftDown(_ point: CGPoint) {
+        guard running else { return }
+        onLeftDown?(point)
     }
 }
