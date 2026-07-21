@@ -10,7 +10,26 @@ import Foundation
 /// NEVER re-fed as ground truth. Thinking lives in a separate field so the exclusion is *structural* —
 /// the assembler (`ChatTemplate.flatten`) reads `text` only and never touches `thinking`. A bug that
 /// re-fed reasoning would both bloat the context window and violate the contract; keeping the two fields
-/// apart makes that bug impossible by construction rather than by a fragile strip step.
+/// apart makes that bug impossible by construction rather than by a fragile strip step. The ordered
+/// `segments` timeline (`notch-timeline-and-tuning`) sits in the same DISPLAY-only tier as `thinking`:
+/// assembly never reads it.
+
+/// One display-only block of an assistant turn's TIMELINE (`notch-timeline-and-tuning`): the turn's
+/// thinking and answer in token-arrival order, a new segment starting wherever the channel flips — so the
+/// transcript can re-render the interleaved thinking/answer sequence exactly as it streamed. Display-only
+/// like `thinking` (never re-fed; assembly reads `text` only).
+public struct TurnSegment: Codable, Equatable, Sendable {
+    public enum Kind: String, Codable, Sendable {
+        case thinking, answer
+    }
+    public var kind: Kind
+    public var text: String
+
+    public init(kind: Kind, text: String) {
+        self.kind = kind
+        self.text = text
+    }
+}
 
 /// The role of a message in a conversation. Mirrors the standard chat roles; `.tool` carries a tool
 /// step's outcome back into the thread.
@@ -30,6 +49,10 @@ public struct AgentMessage: Codable, Equatable, Identifiable, Sendable {
     public var text: String
     /// The model's reasoning, retained for DISPLAY only; never re-fed verbatim as ground truth.
     public var thinking: String?
+    /// The turn's ordered thinking/answer TIMELINE (`notch-timeline-and-tuning`), retained for DISPLAY
+    /// only like `thinking` — never re-fed, structurally excluded from assembly. Optional and decode-safe:
+    /// a message persisted before this field renders via the `displaySegments` legacy fallback.
+    public var segments: [TurnSegment]?
     /// The turn's images (each PNG); a SINGLE turn may carry MULTIPLE images (design D2 — a multi-image
     /// turn). Empty for a text-only turn. `LLMChatRequest.images` forwards the latest turn's full array.
     public var images: [Data]
@@ -43,11 +66,24 @@ public struct AgentMessage: Codable, Equatable, Identifiable, Sendable {
     /// and assembly that only need one image (design D2: `images` is the source of truth; this is derived).
     public var image: Data? { images.first }
 
+    /// The message's display TIMELINE: the persisted `segments` when present, else the legacy fallback —
+    /// the flat `thinking` (a message stored before segments existed) as one leading thinking block,
+    /// followed by the committed `text` as one answer block. The single read every transcript renderer
+    /// uses, so old and new messages draw through the same path.
+    public var displaySegments: [TurnSegment] {
+        if let segments, !segments.isEmpty { return segments }
+        var out: [TurnSegment] = []
+        if let thinking, !thinking.isEmpty { out.append(TurnSegment(kind: .thinking, text: thinking)) }
+        out.append(TurnSegment(kind: .answer, text: text))
+        return out
+    }
+
     /// Designated init. `images` defaults to `[]`; the `image:` convenience init folds a single image in.
     public init(id: UUID = UUID(),
                 role: AgentRole,
                 text: String,
                 thinking: String? = nil,
+                segments: [TurnSegment]? = nil,
                 images: [Data] = [],
                 toolCalls: [ToolRoute]? = nil,
                 toolResult: ToolStepResult? = nil,
@@ -56,6 +92,7 @@ public struct AgentMessage: Codable, Equatable, Identifiable, Sendable {
         self.role = role
         self.text = text
         self.thinking = thinking
+        self.segments = segments
         self.images = images
         self.toolCalls = toolCalls
         self.toolResult = toolResult
@@ -72,7 +109,7 @@ public struct AgentMessage: Codable, Equatable, Identifiable, Sendable {
                 toolCalls: [ToolRoute]? = nil,
                 toolResult: ToolStepResult? = nil,
                 createdAt: Date = Date()) {
-        self.init(id: id, role: role, text: text, thinking: thinking,
+        self.init(id: id, role: role, text: text, thinking: thinking, segments: nil,
                   images: image.map { [$0] } ?? [],
                   toolCalls: toolCalls, toolResult: toolResult, createdAt: createdAt)
     }
@@ -84,7 +121,7 @@ public struct AgentMessage: Codable, Equatable, Identifiable, Sendable {
     // array), defaulting to `[]` — so a conversation persisted under the old shape still decodes. Encode
     // always writes the new `images` array (the singular key is decode-only legacy tolerance).
     private enum CodingKeys: String, CodingKey {
-        case id, role, text, thinking, images, image, toolCalls, toolResult, createdAt
+        case id, role, text, thinking, segments, images, image, toolCalls, toolResult, createdAt
     }
 
     public init(from decoder: Decoder) throws {
@@ -93,6 +130,7 @@ public struct AgentMessage: Codable, Equatable, Identifiable, Sendable {
         self.role = try c.decode(AgentRole.self, forKey: .role)
         self.text = try c.decode(String.self, forKey: .text)
         self.thinking = try c.decodeIfPresent(String.self, forKey: .thinking)
+        self.segments = try c.decodeIfPresent([TurnSegment].self, forKey: .segments)
         if let arr = try c.decodeIfPresent([Data].self, forKey: .images) {
             self.images = arr
         } else if let single = try c.decodeIfPresent(Data.self, forKey: .image) {
@@ -111,6 +149,7 @@ public struct AgentMessage: Codable, Equatable, Identifiable, Sendable {
         try c.encode(role, forKey: .role)
         try c.encode(text, forKey: .text)
         try c.encodeIfPresent(thinking, forKey: .thinking)
+        try c.encodeIfPresent(segments, forKey: .segments)
         try c.encode(images, forKey: .images)
         try c.encodeIfPresent(toolCalls, forKey: .toolCalls)
         try c.encodeIfPresent(toolResult, forKey: .toolResult)
@@ -144,6 +183,15 @@ public struct AgentConversation: Codable, Equatable, Identifiable, Sendable {
     /// is instant. Persisted with the conversation. Optional so rows stored by older builds decode
     /// cleanly (nil reads as false).
     public var autoApprove: Bool?
+    /// BORN-WITH tuning (`notch-timeline-and-tuning`): the reasoning flag this conversation was created
+    /// under. Stamped at birth from the notch tuning slider and carried for the conversation's whole
+    /// life — a later slider change never retunes an existing session. Optional and decode-safe: nil
+    /// (a pre-change conversation) falls back to the surface's global reasoning default at bind time.
+    public var reasoningOverride: Bool?
+    /// BORN-WITH tuning: the context-token budget this conversation was created under (already clamped
+    /// to the model max at birth). Feeds compaction for this conversation only. Optional and
+    /// decode-safe: nil falls back to the engine's injected budget.
+    public var contextTokens: Int?
 
     /// The effective grant (nil-safe read).
     public var isAutoApproveGranted: Bool { autoApprove ?? false }
@@ -155,7 +203,9 @@ public struct AgentConversation: Codable, Equatable, Identifiable, Sendable {
                 updatedAt: Date = Date(),
                 compactedSummary: String? = nil,
                 skillID: String? = nil,
-                autoApprove: Bool? = nil) {
+                autoApprove: Bool? = nil,
+                reasoningOverride: Bool? = nil,
+                contextTokens: Int? = nil) {
         self.id = id
         self.title = title
         self.messages = messages
@@ -164,6 +214,8 @@ public struct AgentConversation: Codable, Equatable, Identifiable, Sendable {
         self.compactedSummary = compactedSummary
         self.skillID = skillID
         self.autoApprove = autoApprove
+        self.reasoningOverride = reasoningOverride
+        self.contextTokens = contextTokens
     }
 }
 

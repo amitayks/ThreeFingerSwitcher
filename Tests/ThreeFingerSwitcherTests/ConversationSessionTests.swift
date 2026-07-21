@@ -361,6 +361,141 @@ final class ConversationSessionTests: XCTestCase {
 
     // MARK: - advance() (the background driver's verb)
 
+    // MARK: - The timeline (`notch-timeline-and-tuning`): interleaved segments, streamed + persisted
+
+    /// A runtime whose `generate` yields an arbitrary CHANNEL SCRIPT — interleaved thinking/response
+    /// chunks in exact order (the stub emits thinking-then-response only, which can't exercise a flip
+    /// back). `structured()` dequeues route JSON so the same type drives routed turns.
+    private final class ChannelScriptRuntime: LLMRuntime, @unchecked Sendable {
+        let capabilities: Set<Modality> = [.text]
+        private var routes: [String]
+        private let script: [(TokenChannel, String)]
+        private let lock = NSLock()
+        init(script: [(TokenChannel, String)], routes: [String] = []) {
+            self.script = script; self.routes = routes
+        }
+        func generate(_ request: LLMRequest) -> AsyncThrowingStream<Token, Error> {
+            let script = self.script
+            return AsyncThrowingStream { c in
+                for (i, entry) in script.enumerated() {
+                    c.yield(Token(entry.1, isFinal: i == script.count - 1, channel: entry.0))
+                }
+                c.finish()
+            }
+        }
+        func structured<T: Decodable & Sendable>(_ r: LLMRequest, schema: StructuredSchema,
+                                                 as type: T.Type) async throws -> StructuredOutcome<T> {
+            let json: String = {
+                lock.lock(); defer { lock.unlock() }
+                return routes.isEmpty ? "{\"tool\":\"\"}" : routes.removeFirst()
+            }()
+            return .value(try JSONDecoder().decode(T.self, from: Data(json.utf8)))
+        }
+    }
+
+    func testTimelineInterleavesChannelsInArrivalOrderAndPersistsOnSettle() async throws {
+        let rt = ChannelScriptRuntime(script: [(.thinking, "T1"), (.response, "R1"),
+                                               (.thinking, "T2"), (.response, "R2")])
+        let engine = makeEngine(try await loadedManager(runtime: rt), reasoning: true)
+
+        engine.startNew()
+        engine.send("U1")
+        await waitUntil { engine.state == .awaitingTurn && engine.conversation?.messages.count == 2 }
+
+        let message = try XCTUnwrap(engine.conversation?.messages.last)
+        XCTAssertEqual(message.text, "R1R2", "the committed text is the response channel only")
+        XCTAssertEqual(message.thinking, "T1T2", "the flat thinking accumulation is unchanged")
+        XCTAssertEqual(message.segments,
+                       [TurnSegment(kind: .thinking, text: "T1"),
+                        TurnSegment(kind: .answer, text: "R1"),
+                        TurnSegment(kind: .thinking, text: "T2"),
+                        TurnSegment(kind: .answer, text: "R2")],
+                       "the persisted timeline preserves cross-channel ARRIVAL order — a segment per flip")
+        XCTAssertTrue(engine.liveSegments.isEmpty,
+                      "the live timeline hands off to the persisted message at settle")
+    }
+
+    func testTimelineCoalescesSameChannelChunksIntoOneSegment() async throws {
+        let rt = ChannelScriptRuntime(script: [(.thinking, "Ta"), (.thinking, "Tb"), (.response, "R")])
+        let engine = makeEngine(try await loadedManager(runtime: rt), reasoning: true)
+
+        engine.startNew()
+        engine.send("U1")
+        await waitUntil { engine.state == .awaitingTurn && engine.conversation?.messages.count == 2 }
+
+        XCTAssertEqual(engine.conversation?.messages.last?.segments,
+                       [TurnSegment(kind: .thinking, text: "TaTb"),
+                        TurnSegment(kind: .answer, text: "R")],
+                       "consecutive same-channel chunks coalesce — the array grows only at channel flips")
+    }
+
+    func testRoutedAnswerStreamsLiveInterleavedIntoTheTimeline() async throws {
+        // Thinking AFTER the answer chunk can only appear mid-timeline if the answer streamed LIVE
+        // (the wired `onResponseToken`); an at-settle append would leave [thinking, answer] instead.
+        let rt = ChannelScriptRuntime(script: [(.thinking, "Ta"), (.response, "R1"), (.thinking, "Tb")],
+                                      routes: ["{\"tool\":\"\"}"])
+        let engine = makeRoutedEngine(try await loadedManager(runtime: rt), registry: ToolRegistry([]))
+
+        engine.startNew()
+        engine.send("U1")
+        await waitUntil { engine.state == .awaitingTurn && engine.conversation?.messages.count == 2 }
+
+        let message = try XCTUnwrap(engine.conversation?.messages.last)
+        XCTAssertEqual(message.text, "R1")
+        XCTAssertEqual(message.segments,
+                       [TurnSegment(kind: .thinking, text: "Ta"),
+                        TurnSegment(kind: .answer, text: "R1"),
+                        TurnSegment(kind: .thinking, text: "Tb")],
+                       "the routed answer streamed live BETWEEN the thinking chunks — not whole at settle")
+    }
+
+    // MARK: - Born-with tuning (`notch-timeline-and-tuning` D7)
+
+    private func makeTunedEngine(_ manager: ModelManager,
+                                 reasoning: Bool,
+                                 tuning: @escaping @MainActor () -> NotchSessionEngine.TuningSnapshot?)
+        -> NotchSessionEngine {
+        NotchSessionEngine(modelManager: manager, selection: FakeSelectionProvider(),
+                           reasoning: { reasoning }, tuningDefault: tuning)
+    }
+
+    func testTuningIsStampedAtBirthAndKeptAcrossRebind() async throws {
+        let stub = StubLLMRuntime(scriptedTokens: ["A1"], interTokenDelayNanos: 0)
+        var dial: NotchSessionEngine.TuningSnapshot? = (reasoning: false, contextTokens: 4_096)
+        let engine = makeTunedEngine(try await loadedManager(runtime: stub), reasoning: true,
+                                     tuning: { dial })
+
+        let born = engine.startNew()
+        XCTAssertEqual(born.reasoningOverride, false, "the dial's reasoning is stamped at birth")
+        XCTAssertEqual(born.contextTokens, 4_096, "the dial's context budget is stamped at birth")
+        XCTAssertEqual(engine.assembleRequest()?.reasoning, false,
+                       "the turn runs with the born-with reasoning, not the global default")
+
+        // The dial moves AFTER birth: a stored conversation keeps the tuning it was born under.
+        dial = (reasoning: true, contextTokens: 32_768)
+        var stored = born
+        stored.messages = [AgentMessage(role: .user, text: "U1")]
+        engine.bind(stored)
+        XCTAssertEqual(engine.assembleRequest()?.reasoning, false,
+                       "re-binding keeps the born-with reasoning — a later slider change never retunes it")
+    }
+
+    func testPreChangeConversationFallsBackToTheGlobalReasoningDefault() async throws {
+        let stub = StubLLMRuntime(scriptedTokens: ["A1"], interTokenDelayNanos: 0)
+        let engine = makeTunedEngine(try await loadedManager(runtime: stub), reasoning: true,
+                                     tuning: { (reasoning: false, contextTokens: 4_096) })
+
+        // A conversation stored BEFORE the dial existed (no born-with fields) keeps the exact legacy
+        // behavior: the global reasoning default re-read at bind.
+        let legacy = AgentConversation(title: "old",
+                                       messages: [AgentMessage(role: .user, text: "U1")])
+        engine.bind(legacy)
+        XCTAssertEqual(engine.assembleRequest()?.reasoning, true,
+                       "nil born-with tuning falls back to the global reasoning default")
+    }
+
+    // MARK: - advance() (the background driver's verb)
+
     func testAdvanceRunsThePendingTurnAndNoOpsWhenNothingPends() async throws {
         let stub = StubLLMRuntime(scriptedTokens: ["A1"], interTokenDelayNanos: 0)
         let engine = makeEngine(try await loadedManager(runtime: stub))

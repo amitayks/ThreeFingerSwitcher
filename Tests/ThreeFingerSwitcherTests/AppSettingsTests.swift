@@ -602,6 +602,26 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertEqual(settings.stepDistance, 0.0777, accuracy: eps, "pre-existing settings untouched")
     }
 
+    // MARK: - Notch tuning (`notch-timeline-and-tuning`)
+
+    /// The notch chat's thinking+context dial: defaults Balanced, round-trips its raw value, and resets
+    /// with the other behavior tunables.
+    func testNotchTuningDefaultsBalancedRoundTripsAndResets() {
+        let settings = makeSettings()
+        XCTAssertEqual(settings.notchTuning, .balanced, "default: thinking on · base context")
+
+        settings.notchTuning = .max
+        let reloaded = AppSettings(defaults: defaults)
+        XCTAssertEqual(reloaded.notchTuning, .max, "the selected stop persists across relaunch")
+
+        settings.resetToDefaults()
+        XCTAssertEqual(settings.notchTuning, .balanced, "reset returns the dial to Balanced")
+
+        // A corrupt/unknown stored value falls back to the default rather than crashing.
+        defaults.set("garbage", forKey: "notchTuning")
+        XCTAssertEqual(AppSettings(defaults: defaults).notchTuning, .balanced)
+    }
+
     // MARK: - Isolation
 
     /// Two instances on different suites must not share state, proving suite isolation.

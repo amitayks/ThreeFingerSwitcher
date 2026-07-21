@@ -50,6 +50,18 @@ enum NotchHomeZoneLayout {
     }
     static let expandedWidth: CGFloat = 560
     static let expandedHeight: CGFloat = 520
+
+    /// The in-notch SETTINGS zone's content-fit solve (`notch-timeline-and-tuning` D5): a compact fixed
+    /// card clamped to fractions of the visible frame — the expanded-conversation idiom, smaller (one
+    /// slider plus captions, no thread).
+    static func solveSettings(visibleFrame: CGRect) -> CGSize {
+        let maxW = visibleFrame.width > 1 ? visibleFrame.width * 0.40 : settingsWidth
+        let maxH = visibleFrame.height > 1 ? visibleFrame.height * 0.42 : settingsHeight
+        return CGSize(width: min(settingsWidth, maxW), height: min(settingsHeight, maxH))
+    }
+    static let settingsWidth: CGFloat = 440
+    static let settingsHeight: CGFloat = 252
+
     /// The resting zone (the reveal target + the ambient-glow host) — a slim top-center tab.
     static let zoneWidth: CGFloat = 120
     static let zoneHeight: CGFloat = 10
@@ -121,12 +133,13 @@ enum NotchAttachment: Equatable {
 /// the view-model the overlay renders. `@MainActor` — UI state.
 @MainActor
 final class NotchHomeZoneViewModel: ObservableObject {
-    /// What the panel is showing (`notch-native-conversations` D4): the card RAIL, or ONE session
-    /// EXPANDED in place into its conversation view. The same panel and chrome serve both — never a
-    /// second panel.
+    /// What the panel is showing (`notch-native-conversations` D4): the card RAIL, ONE session EXPANDED
+    /// in place into its conversation view, or the in-notch SETTINGS zone (`notch-timeline-and-tuning`).
+    /// The same panel and chrome serve all three — never a second panel.
     enum Mode: Equatable {
         case rail
         case expanded(AgentSessionID)
+        case settings
     }
 
     @Published var sessions: [ParkedSession] = []
@@ -142,6 +155,11 @@ final class NotchHomeZoneViewModel: ObservableObject {
     /// The engine driving the currently-expanded session's conversation (set by the controller on
     /// expand, cleared on collapse). The expanded view observes it directly.
     @Published var engine: NotchSessionEngine?
+    /// The notch tuning dial the settings zone renders (seeded from settings by the controller on
+    /// open; written back through `onTuningChanged` on every slider move).
+    @Published var tuning: NotchTuning = .balanced
+    /// The active model's architectural context maximum — caps the "Max" stop's token caption.
+    @Published var modelMaxContextTokens: Int = 131_072
     /// True iff at least one parked session is in `.needsYou` — drives the ambient glow.
     var hasNeedsYou: Bool { sessions.contains { $0.state == .needsYou } }
 }
@@ -166,6 +184,12 @@ final class NotchHomeZoneOverlayController {
     var onCollapse: (() -> Void)?
     /// A card was discarded (deletion — from the card's context menu or the expanded header).
     var onDiscard: ((AgentSessionID) -> Void)?
+    /// The gear above the "+ New chat" card was clicked — morph the panel into the settings zone.
+    var onOpenSettings: (() -> Void)?
+    /// The settings zone's back affordance — return the panel to rail mode.
+    var onCloseSettings: (() -> Void)?
+    /// The settings zone's slider landed on a stop — persist it (applies to following NEW chats).
+    var onTuningChanged: ((NotchTuning) -> Void)?
 
     /// Flip the panel's key-capability while the expanded composer is focused (`notch-native-conversations`
     /// D5): the panel stays `.nonactivatingPanel` (becoming key never activates the app; the front app
@@ -212,7 +236,10 @@ final class NotchHomeZoneOverlayController {
             onNewSession: { [weak self] in self?.onNewSession?() },
             onCollapse: { [weak self] in self?.onCollapse?() },
             onDiscard: { [weak self] id in self?.onDiscard?(id) },
-            onComposerFocusChanged: { [weak self] focused in self?.setKeyCapable(focused) }
+            onComposerFocusChanged: { [weak self] focused in self?.setKeyCapable(focused) },
+            onOpenSettings: { [weak self] in self?.onOpenSettings?() },
+            onCloseSettings: { [weak self] in self?.onCloseSettings?() },
+            onTuningChanged: { [weak self] tuning in self?.onTuningChanged?(tuning) }
         ))
         return panel
     }
@@ -336,6 +363,11 @@ struct NotchHomeZoneRailView: View {
     /// The composer focus seam (`notch-native-conversations` D5): the controller flips the panel's
     /// key-capability so keystrokes reach the field only while it is focused.
     let onComposerFocusChanged: (Bool) -> Void
+    /// The settings-zone seams (`notch-timeline-and-tuning`): gear → settings mode, back → rail,
+    /// slider → persisted stop.
+    let onOpenSettings: () -> Void
+    let onCloseSettings: () -> Void
+    let onTuningChanged: (NotchTuning) -> Void
 
     private var isAttached: Bool {
         if case .notch = model.attachment { return true }
@@ -360,6 +392,12 @@ struct NotchHomeZoneRailView: View {
                     // Defensive: an expanded id with no engine (discarded underneath) renders the rail.
                     railBody
                 }
+            case .settings:
+                NotchTuningSettingsView(
+                    model: model,
+                    isAttached: isAttached,
+                    onBack: onCloseSettings,
+                    onTuningChanged: onTuningChanged)
             }
         }
         .background(chromeFill)
@@ -382,7 +420,7 @@ struct NotchHomeZoneRailView: View {
     /// notch and sit balanced), or a fixed gap in tab mode.
     private var railBody: some View {
         HStack(spacing: NotchHomeZoneLayout.cardSpacing) {
-            NotchNewChatCard(action: onNewSession)
+            NotchNewChatCard(action: onNewSession, onOpenSettings: onOpenSettings)
             ForEach(model.sessions) { session in
                 NotchParkedCard(session: session,
                                 onExpand: { onExpand(session.id) },
@@ -450,30 +488,46 @@ private struct NotchPanelBorderShape: Shape {
 }
 
 /// The persistent "+ New chat" card (`notch-native-conversations`): the notch is the ONLY birthplace of
-/// conversational sessions, so the rail always offers one — including on an empty dock.
+/// conversational sessions, so the rail always offers one — including on an empty dock. The settings
+/// GEAR sits above the plus icon (`notch-timeline-and-tuning`): clicking it morphs the panel into the
+/// in-notch settings zone (the thinking+context dial for following new chats).
 struct NotchNewChatCard: View {
     let action: () -> Void
+    let onOpenSettings: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            VStack(spacing: 8) {
-                Image(systemName: "plus.bubble")
-                    .font(.system(size: 20, weight: .medium))
-                    .foregroundStyle(Color.accentColor)
-                Text("New chat")
-                    .font(.system(size: 12, weight: .semibold))
+        VStack(spacing: 4) {
+            Button(action: onOpenSettings) {
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 18)
+                    .contentShape(Rectangle())
             }
-            .frame(width: NotchHomeZoneLayout.cardWidth,
-                   height: NotchHomeZoneLayout.cardHeight)
-            .padding(10)
-            .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [5, 4]))
-                .foregroundStyle(.white.opacity(0.18)))
+            .buttonStyle(.plain)
+            .help("Tune thinking + context for new chats")
+            Button(action: action) {
+                VStack(spacing: 6) {
+                    Image(systemName: "plus.bubble")
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundStyle(Color.accentColor)
+                    Text("New chat")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Start a new conversation")
         }
-        .buttonStyle(.plain)
-        .help("Start a new conversation")
+        .frame(width: NotchHomeZoneLayout.cardWidth,
+               height: NotchHomeZoneLayout.cardHeight)
+        .padding(10)
+        .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12)
+            .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [5, 4]))
+            .foregroundStyle(.white.opacity(0.18)))
     }
 }
 
@@ -557,7 +611,9 @@ struct NotchConversationView: View {
     let onComposerFocusChanged: (Bool) -> Void
 
     @State private var composerText = ""
-    @State private var thinkingExpanded = false
+    /// The user-toggled OPEN thinking blocks, keyed `messageID-segmentIndex` (`live-N` for the in-flight
+    /// turn). Settled blocks default collapsed; the live streaming tail is forced open while it streams.
+    @State private var expandedThinking: Set<String> = []
     @FocusState private var composerFocused: Bool
 
     var body: some View {
@@ -619,9 +675,7 @@ struct NotchConversationView: View {
                     ForEach(engine.conversation?.messages ?? []) { message in
                         turnBubble(message)
                     }
-                    if !engine.thinking.isEmpty {
-                        thinkingSection
-                    }
+                    liveTurnBubble
                     toolStepsList
                     stateExtras
                     Color.clear.frame(height: 1).id(Self.tailID)
@@ -636,7 +690,9 @@ struct NotchConversationView: View {
             .onChange(of: engine.conversation?.messages.count ?? 0) {
                 withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(Self.tailID, anchor: .bottom) }
             }
-            .onChange(of: streamingPartial) {
+            // Pin to the tail as the timeline streams — a superset of the old partial/thinking triggers
+            // (both channels append here in arrival order).
+            .onChange(of: engine.liveSegments) {
                 proxy.scrollTo(Self.tailID, anchor: .bottom)
             }
         }
@@ -644,9 +700,11 @@ struct NotchConversationView: View {
 
     private static let tailID = "notch-conversation-tail"
 
-    private var streamingPartial: String {
-        if case let .conversing(partial) = engine.state { return partial }
-        return ""
+    /// Whether an assistant turn is actively streaming (`.conversing`) — the live timeline entry's
+    /// forced-open thinking tail and "Thinking…" label key off this.
+    private var isTurnStreaming: Bool {
+        if case .conversing = engine.state { return true }
+        return false
     }
 
     private var emptyHint: some View {
@@ -684,13 +742,104 @@ struct NotchConversationView: View {
                     .help("Copy this answer")
                 }
             }
-            BidiText(text: message.text.isEmpty ? "…" : message.text, fontSize: 13)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            if message.role == .assistant {
+                // The TIMELINE (`notch-timeline-and-tuning`): the turn's persisted thinking/answer
+                // segments in original arrival order (or the legacy flat-thinking fallback), thinking
+                // blocks collapsed to compact expandable rows.
+                segmentTimeline(message.displaySegments,
+                                keyPrefix: message.id.uuidString,
+                                liveTail: false)
+            } else {
+                BidiText(text: message.text.isEmpty ? "…" : message.text, fontSize: 13)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 10)
             .fill(message.role == .user ? Color.accentColor.opacity(0.12) : Color.white.opacity(0.05)))
+    }
+
+    /// The IN-FLIGHT assistant turn as a live timeline entry: `engine.liveSegments` streaming in arrival
+    /// order through the SAME segment renderer the persisted messages use, so the settle handoff (live
+    /// entry → appended message) is seamless. Also shown while a turn is paused at an approval or has
+    /// failed mid-stream (the segments so far stay visible), matching the old always-visible thinking.
+    @ViewBuilder
+    private var liveTurnBubble: some View {
+        if isTurnStreaming || !engine.liveSegments.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("AI")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary).textCase(.uppercase)
+                if engine.liveSegments.isEmpty {
+                    BidiText(text: "…", fontSize: 13)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    segmentTimeline(engine.liveSegments, keyPrefix: "live", liveTail: isTurnStreaming)
+                }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.05)))
+        }
+    }
+
+    /// Render one turn's ordered segments: answer segments as normal turn text, thinking segments as
+    /// muted per-block collapsibles. `liveTail` marks the streaming turn — its LAST thinking segment
+    /// (the one still growing) renders forced-open so you watch the model think, collapsing to the
+    /// compact row when the turn settles.
+    @ViewBuilder
+    private func segmentTimeline(_ segments: [TurnSegment], keyPrefix: String, liveTail: Bool) -> some View {
+        ForEach(Array(segments.enumerated()), id: \.offset) { index, segment in
+            switch segment.kind {
+            case .thinking:
+                thinkingBlock(segment.text,
+                              key: "\(keyPrefix)-\(index)",
+                              isStreaming: liveTail && index == segments.count - 1)
+            case .answer:
+                BidiText(text: segment.text.isEmpty ? "…" : segment.text, fontSize: 13)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    /// One collapsible thinking block in a turn's timeline (the per-block successor of the old single
+    /// bottom "Thinking" section). No repeating animation — streaming text itself is the motion (the
+    /// idle-CPU-spin rule).
+    private func thinkingBlock(_ text: String, key: String, isStreaming: Bool) -> some View {
+        let isExpanded = isStreaming || expandedThinking.contains(key)
+        return VStack(alignment: .leading, spacing: 6) {
+            Button {
+                if expandedThinking.contains(key) {
+                    expandedThinking.remove(key)
+                } else {
+                    expandedThinking.insert(key)
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 11, weight: .semibold)).foregroundStyle(Color.accentColor)
+                    Text(isStreaming ? "Thinking…" : "Thinking")
+                        .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+                    Spacer()
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(isStreaming)   // the live tail stays open while it streams
+            if isExpanded {
+                ScrollView {
+                    BidiText(text: text, fontSize: 11, color: .secondaryLabelColor)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                }
+                .frame(maxHeight: 110)
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.04)))
     }
 
     /// The in-flight assistant turn + per-state extras: the streaming bubble, the approval card with
@@ -704,16 +853,10 @@ struct NotchConversationView: View {
                 Text("Loading the model…").font(.system(size: 12)).foregroundStyle(.secondary)
             }
             .padding(.vertical, 4)
-        case let .conversing(partial):
-            VStack(alignment: .leading, spacing: 3) {
-                Text("AI").font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.secondary).textCase(.uppercase)
-                BidiText(text: partial.isEmpty ? "…" : partial, fontSize: 13)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.05)))
+        case .conversing:
+            // The live timeline entry (`liveTurnBubble`, above the tool steps) renders the streaming
+            // turn — thinking and answer interleaved in arrival order — so nothing renders here.
+            EmptyView()
         case let .awaitingApproval(review):
             approvalCard(review)
         case let .failed(message):
@@ -787,34 +930,6 @@ struct NotchConversationView: View {
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.red.opacity(0.06)))
     }
 
-    /// The assistant's live reasoning, collapsed to one tappable row (the canvas's collapsible-thinking
-    /// idea, compacted for the notch surface).
-    private var thinkingSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Button { thinkingExpanded.toggle() } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "sparkles")
-                        .font(.system(size: 11, weight: .semibold)).foregroundStyle(Color.accentColor)
-                    Text("Thinking").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
-                    Spacer()
-                    Image(systemName: thinkingExpanded ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            if thinkingExpanded {
-                ScrollView {
-                    BidiText(text: engine.thinking, fontSize: 11, color: .secondaryLabelColor)
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
-                }
-                .frame(maxHeight: 110)
-            }
-        }
-        .padding(8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.04)))
-    }
-
     /// The route loop's ran tool steps — a compact status list (summary + glyph per step).
     @ViewBuilder
     private var toolStepsList: some View {
@@ -884,5 +999,102 @@ struct NotchConversationView: View {
         guard !text.isEmpty else { return }
         composerText = ""
         engine.send(text)
+    }
+}
+
+/// The in-notch SETTINGS zone (`notch-timeline-and-tuning` D5/D6): the same merged-notch panel,
+/// mode-switched from the rail, hosting the ONE thinking+context slider over `NotchTuning`'s ordered
+/// stops. Mouse-only on the non-activating panel (no text field lives here, so the panel never takes
+/// key status in this mode); the back chevron returns to the rail. The chosen stop persists via
+/// `onTuningChanged` and shapes each FOLLOWING new chat (born-with — current chats keep theirs).
+struct NotchTuningSettingsView: View {
+    @ObservedObject var model: NotchHomeZoneViewModel
+    /// Attached (merged-notch, over the physical top) vs tab mode — drives the top headroom.
+    let isAttached: Bool
+    let onBack: () -> Void
+    let onTuningChanged: (NotchTuning) -> Void
+
+    /// The discrete slider ↔ stop mapping: positions 0…3 in `NotchTuning` declaration order; a write
+    /// rounds to the nearest stop, updates the view-model, and persists through the seam.
+    private var sliderBinding: Binding<Double> {
+        Binding(get: { Double(model.tuning.sliderIndex) },
+                set: { raw in
+                    let stop = NotchTuning.fromSliderIndex(Int(raw.rounded()))
+                    guard stop != model.tuning else { return }
+                    model.tuning = stop
+                    onTuningChanged(stop)
+                })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+                // Attached mode: the panel's top band sits behind the physical notch — keep the header
+                // clear of it (the expanded conversation's headroom idea).
+                .padding(.top, isAttached ? 34 : 10)
+                .padding(.horizontal, 14)
+            Divider().opacity(0.25).padding(.vertical, 8)
+            VStack(alignment: .leading, spacing: 12) {
+                Text("How hard new chats think — and how much they remember.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Slider(value: sliderBinding, in: 0...Double(NotchTuning.allCases.count - 1), step: 1)
+                stopLabels
+                effectDetail
+                Text("Applies to each new chat you start, until you change it. Current chats keep the tuning they were born with.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, 14)
+            Spacer(minLength: 10)
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Button(action: onBack) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Back to the dock")
+            Image(systemName: "gearshape.fill")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
+            Text("New chat tuning")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.white)
+            Spacer()
+        }
+    }
+
+    /// The four stop titles under the slider, the selected one accented.
+    private var stopLabels: some View {
+        HStack(spacing: 0) {
+            ForEach(Array(NotchTuning.allCases.enumerated()), id: \.offset) { index, stop in
+                Text(stop.title)
+                    .font(.system(size: 10, weight: stop == model.tuning ? .semibold : .regular))
+                    .foregroundStyle(stop == model.tuning ? Color.accentColor : .secondary)
+                if index < NotchTuning.allCases.count - 1 { Spacer() }
+            }
+        }
+    }
+
+    /// What the selected stop MEANS: the thinking state + the effective context-token count (the "Max"
+    /// stop capped by the active model's architectural maximum).
+    private var effectDetail: some View {
+        let tuning = model.tuning
+        let tokens = tuning.contextTokens(modelMax: model.modelMaxContextTokens)
+        return HStack(spacing: 14) {
+            Label(tuning.reasoning ? "Thinking on" : "Thinking off",
+                  systemImage: tuning.reasoning ? "sparkles" : "bolt.fill")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(tuning.reasoning ? Color.accentColor : .orange)
+            Label("\(tokens.formatted()) token context", systemImage: "square.stack.3d.up")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+        }
     }
 }

@@ -118,8 +118,7 @@ final class WindowSnapMonitor {
             snapLog.log("settle: dragged window \(id) gone (closed mid-settle)")
             return
         }
-        var snapped: Set<CGWindowID> = []       // flush edges: the BIND trigger
-        var attached: Set<CGWindowID> = []      // flush OR overlapping: the STAY-BOUND contact
+        var snapped: Set<CGWindowID> = []       // flush edges: the strict bind/keep test for a DRAG
         for other in windows where other.id != id {
             let d = SnapAdjacency.diagnostic(dragged.frame, other.frame)
             // Log every near-miss so tolerance tuning has real numbers from real machines.
@@ -127,20 +126,23 @@ final class WindowSnapMonitor {
                 snapLog.debug("settle: candidate \(other.id) hGap \(Int(d.horizontalGap)) (vShared \(Int(d.verticalShared))) vGap \(Int(d.verticalGap)) (hShared \(Int(d.horizontalShared)))")
             }
             if SnapAdjacency.adjacent(dragged.frame, other.frame) { snapped.insert(other.id) }
-            if SnapAdjacency.attached(dragged.frame, other.frame) { attached.insert(other.id) }
         }
-        if snapped.isEmpty, attached.isEmpty, retryOnEmpty {
-            snapLog.log("settle: window \(id) no contact yet; late re-check in \(self.lateSettleDelay)s")
+        // Apply IMMEDIATELY — a break must never sit pending where a stray click could cancel it.
+        store.dragSettled(window: id, snapped: snapped)
+        // A drag can detach OTHER members than the dragged one (shoving a window through a cluster,
+        // pulling the middle out of a chain) — the passive geometry check (loose, overlap-preserving)
+        // is the arbiter for everyone else.
+        store.pruneDetached(frames: Dictionary(windows.map { ($0.id, $0.frame) }) { first, _ in first })
+        snapLog.log("settle: window \(id) snapped \(snapped.sorted(), privacy: .public) -> groups \(self.store.groups.map { $0.sorted() }, privacy: .public)")
+        if snapped.isEmpty, retryOnEmpty {
+            // The magnetic snap ANIMATES into place after release, so a flush landing may not read
+            // flush at the first read. Any unbind is already applied above; this re-check can only
+            // catch a late-settling BIND — a cancelled re-check never loses a break.
+            snapLog.log("settle: window \(id) not flush yet; late bind re-check in \(self.lateSettleDelay)s")
             schedule(after: lateSettleDelay) { [weak self] in
                 self?.evaluateSettled(window: id, retryOnEmpty: false)
             }
-            return
         }
-        store.dragSettled(window: id, snapped: snapped, attached: attached)
-        // A drag can detach OTHER members than the dragged one (shoving a window through a cluster,
-        // or a resize mis-attributed to a window that DID move) — geometry is the arbiter for all.
-        store.pruneDetached(frames: Dictionary(windows.map { ($0.id, $0.frame) }) { first, _ in first })
-        snapLog.log("settle: window \(id) snapped \(snapped.sorted(), privacy: .public) attached \(attached.sorted(), privacy: .public) -> groups \(self.store.groups.map { $0.sorted() }, privacy: .public)")
     }
 
     // MARK: - CGWindowList reads (one coordinate space: CG top-left global)

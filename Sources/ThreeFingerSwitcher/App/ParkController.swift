@@ -83,6 +83,19 @@ final class ParkController {
         notch.setRevealDwell(interval)
     }
 
+    /// Wire the in-notch settings zone's tuning dial (`notch-timeline-and-tuning`): the slider's
+    /// read/write seams and the model max that caps the "Max" stop. Returns self so the owner's lazy
+    /// construction can chain it.
+    @discardableResult
+    func configuredForTuning(provider: @escaping () -> NotchTuning,
+                             modelMax: @escaping () -> Int,
+                             onChange: @escaping (NotchTuning) -> Void) -> ParkController {
+        notch.tuningProvider = provider
+        notch.modelMaxProvider = modelMax
+        notch.onTuningChanged = onChange
+        return self
+    }
+
     /// The current park state for `id`, delegating to the scheduler's thread-safe (lock-guarded) read — the
     /// same any-thread seam the background-autonomy runner's `parkStateOf` uses. The expanded session's row
     /// is kept `.active` so the runner takes the foreground path — its engine's approval gate owns it.

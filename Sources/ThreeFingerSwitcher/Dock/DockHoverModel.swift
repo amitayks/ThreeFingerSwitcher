@@ -90,6 +90,18 @@ final class DockHoverModel {
         return .dismiss
     }
 
+    /// A left-click at `cursor`: if the preview is active and the click landed on the *shown* app's own
+    /// Dock tile, return that app's pid so the controller can commit the highlighted window (matching a
+    /// click on the card, so the icon click isn't undone by the leave-restore). A click off the active
+    /// tile — another app's tile, the popup, or the desktop — returns nil, leaving the normal live-zone /
+    /// grace (and native Dock) behavior in charge. Pure: the controller performs the commit and decides
+    /// whether a card is actually highlighted. State is left untouched (a commit tears down via `reset`).
+    func leftClick(at cursor: CGPoint, tiles: [DockTile]) -> pid_t? {
+        guard case let .active(pid) = state,
+              Self.tile(at: cursor, in: tiles)?.pid == pid else { return nil }
+        return pid
+    }
+
     /// Force back to idle (e.g. the feature was disabled, or the user committed a window).
     func reset() {
         state = .idle

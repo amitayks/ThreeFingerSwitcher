@@ -219,12 +219,17 @@ final class WindowGroupStoreTests: XCTestCase {
         XCTAssertEqual(store.group(for: 1), [1, 2])
     }
 
-    func testDragIntoOverlapStaysBound() {
+    func testDragOntoAMateBreaksTheBond() {
+        // A drag is explicit intent about the DRAGGED window: ending on top of the mate (no flush
+        // edge → empty snapped set) breaks the bond just like ending with a gap — otherwise, on a
+        // crowded screen where a dragged-out window almost always lands overlapping some member,
+        // breaking a group by dragging would be nearly impossible. Overlap preserves bonds only
+        // against PASSIVE geometry changes (see the prune/validation tests below).
         let store = WindowGroupStore()
         store.dragSettled(window: 1, snapped: [2])
-        // The next drag ends OVERLAPPING the mate: no fresh snap, but attachment persists.
-        store.dragSettled(window: 1, snapped: [], attached: [2])
-        XCTAssertEqual(store.group(for: 1), [1, 2])
+        store.dragSettled(window: 1, snapped: [])   // drag ended overlapping 2: not flush → leave
+        XCTAssertNil(store.group(for: 1))
+        XCTAssertNil(store.group(for: 2))
     }
 
     func testValidationKeepsOverlappingMembersWithFrames() {

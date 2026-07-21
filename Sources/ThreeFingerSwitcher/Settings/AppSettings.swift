@@ -346,6 +346,12 @@ final class AppSettings: ObservableObject {
     /// cost (design D6). Default OFF.
     @Published var agentCompactKV: Bool { didSet { defaults.set(agentCompactKV, forKey: Keys.agentCompactKV) } }
 
+    /// The NOTCH chat's own thinking+context dial (`notch-timeline-and-tuning`): the in-notch settings
+    /// zone's slider stop, applied to each conversation BORN at the notch after the change (snapshot at
+    /// birth, carried for life). Deliberately separate from the global `aiReasoningEnabled` /
+    /// `agentContextPreset`, which keep steering the launcher band and other agent surfaces.
+    @Published var notchTuning: NotchTuning { didSet { defaults.set(notchTuning.rawValue, forKey: Keys.notchTuning) } }
+
     /// Idle-TTL for the RESIDENT MODEL WEIGHTS (`model-idle-ttl-and-memory-pressure`): after the AI
     /// system has been fully quiescent this many minutes, the ~17 GB resident model is evicted from
     /// memory (weights stay on disk; the next request transparently lazy-reloads). `0` = never — the
@@ -689,6 +695,7 @@ final class AppSettings: ObservableObject {
         agentContextPreset = AgentContextPreset(rawValue: defaults.string(forKey: Keys.agentContextPreset) ?? "") ?? Defaults.agentContextPreset
         agentContextTokens = defaults.object(forKey: Keys.agentContextTokens) as? Int ?? Defaults.agentContextTokens
         agentCompactKV = defaults.object(forKey: Keys.agentCompactKV) as? Bool ?? Defaults.agentCompactKV
+        notchTuning = NotchTuning(rawValue: defaults.string(forKey: Keys.notchTuning) ?? "") ?? Defaults.notchTuning
         agentMaxParkedSessions = defaults.object(forKey: Keys.agentMaxParkedSessions) as? Int ?? Defaults.agentMaxParkedSessions
         aiIdleEvictMinutes = defaults.object(forKey: Keys.aiIdleEvictMinutes) as? Int ?? Defaults.aiIdleEvictMinutes
         voiceConversationEnabled = defaults.object(forKey: Keys.voiceConversationEnabled) as? Bool ?? Defaults.voiceConversationEnabled
@@ -787,6 +794,7 @@ final class AppSettings: ObservableObject {
         agentContextPreset = Defaults.agentContextPreset
         agentContextTokens = Defaults.agentContextTokens
         agentCompactKV = Defaults.agentCompactKV
+        notchTuning = Defaults.notchTuning
         agentMaxParkedSessions = Defaults.agentMaxParkedSessions
         aiIdleEvictMinutes = Defaults.aiIdleEvictMinutes
         // Voice/computer-use are OPT-INS (like the AI master), so resetToDefaults returns them to
@@ -909,6 +917,7 @@ final class AppSettings: ObservableObject {
         static let agentContextPreset: AgentContextPreset = .balanced   // comfortable mid context, the default
         static let agentContextTokens = 8_192      // Balanced; clamped to the model max at use
         static let agentCompactKV = false          // 8-bit KV off by default
+        static let notchTuning: NotchTuning = .balanced   // notch chat dial: thinking on · base context
         static let agentMaxParkedSessions = 6      // soft cap; evicts the least-recently-updated idle one
         static let aiIdleEvictMinutes = 60         // model-weight idle TTL; 0 = never (keep-forever)
         static let voiceConversationEnabled = false // push-to-talk voice; opt-in, macOS 26 + mic grant
@@ -1009,6 +1018,7 @@ final class AppSettings: ObservableObject {
         static let agentContextPreset = "agentContextPreset"
         static let agentContextTokens = "agentContextTokens"
         static let agentCompactKV = "agentCompactKV"
+        static let notchTuning = "notchTuning"
         static let agentMaxParkedSessions = "agentMaxParkedSessions"
         static let aiIdleEvictMinutes = "aiIdleEvictMinutes"
         static let voiceConversationEnabled = "voiceConversationEnabled"
