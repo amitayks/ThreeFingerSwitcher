@@ -13,12 +13,12 @@ struct FilesPage: View {
     @ObservedObject private var settings: AppSettings
 
     /// §11.5 — the REAL launcher showing its FILES band: a `LauncherView` over the user's actual bands with a
-    /// synthetic Files band appended (the last band, like Clipboard / AI), seeded once and landed on it so the
-    /// static preview shows the Files band. The ghost-hand autoplay plays `filesJourney`
-    /// (`bandJourney(bandFraction: 0.66, inSurface: .lift)`) over it — 4-finger open → 2-finger traverse to
-    /// the Files band → land/lift; the model is not driven and does not grow (see
-    /// `docs/postmortem-idle-cpu-spin.md`). The Files band is a STATIC seeded band (the user's configured
-    /// roots, no live `FilesColumnController` / drill controller).
+    /// synthetic Files band appended (the last band, like Clipboard / AI), seeded once and landed on it (the
+    /// resting frame shows the Files band). The ghost-hand autoplay plays `filesJourney` — 4-finger open →
+    /// 2-finger traverse down the band list → land/lift — and the preview's `sync` seam replays it on the
+    /// model (pop in, band walk to the Files band, pop out); clockless, visibility-gated, never grows (see
+    /// `docs/postmortem-idle-cpu-spin.md`). The Files band itself stays a STATIC seeded band (the user's
+    /// configured roots, no live `FilesColumnController` / drill controller).
     @StateObject private var demo = HubLauncherDemo()
     @State private var seeded = false
     /// The hover-demo override pushed into the preview by the drill-resolution binding rows: hovering a row
@@ -36,9 +36,10 @@ struct FilesPage: View {
         _settings = ObservedObject(wrappedValue: context.settings)
     }
 
-    /// The preview's attract journey: open the four-finger launcher → traverse to the Files band → land
+    /// The preview's attract journey: open the four-finger launcher → traverse DOWN the band list to the
+    /// Files band (the real band-rail grammar, so the driven miniature can follow stroke for stroke) → land
     /// and lift to open. The hover-demo override (`hoverGesture`) plays a candidate drill excursion instead.
-    private static let filesJourney = GesturePose.bandJourney(bandFraction: 0.66, inSurface: .lift)
+    private static let filesJourney = HubLauncherDemo.bandJourneyGesture(openLength: 0.30)
 
     /// The coarse axis a Files-drill excursion sweeps along — the `GesturePose.Axis` the shared
     /// `HubBindingPicker` component expects from `demoAxis`. The two lift excursions land-and-open (the
@@ -133,7 +134,13 @@ struct FilesPage: View {
                 subtitle: "A four-finger Files band — pilot your local folders, preview, and open by trackpad.") {
             HubSection(footnote: "Adds a local-only column navigator as a band in the four-finger launcher: drill into your folders horizontally, highlight vertically, lift to deliver the item to the app you came from — or open it (your choice) — and add a finger for the action menu. Reads the local filesystem on demand — no new permission, no logout, nothing copied off this Mac. Off by default.") {
                 HubFeatureHeader(
-                    preview: HubGesturePreview(gesture: Self.filesJourney, hoverGesture: hoverGesture) {
+                    preview: HubGesturePreview(
+                        gesture: Self.filesJourney,
+                        hoverGesture: hoverGesture,
+                        // The sync seam: the miniature replays the journey — pop in on the open beat,
+                        // traverse the band list to the Files band, pop out on the lift-to-open.
+                        sync: { demo.drive($0, script: .bandJourney) }
+                    ) {
                         FilesDemoMiniature(demo: demo)
                     },
                     icon: HubDestination.files.systemImage,
@@ -601,9 +608,11 @@ struct FilesPage: View {
 /// + a synthetic Files band appended last), shown small (preview scale) — the preview "playing its part." It
 /// is **static** (the ghost-hand autoplay plays over it; the model is not driven) and takes no hits.
 private struct FilesDemoMiniature: View {
-    @ObservedObject var model: LauncherModel
+    @ObservedObject var demo: HubLauncherDemo
+    @ObservedObject private var model: LauncherModel
 
     init(demo: HubLauncherDemo) {
+        self.demo = demo
         _model = ObservedObject(wrappedValue: demo.model)
     }
 
@@ -614,7 +623,8 @@ private struct FilesDemoMiniature: View {
         let h = min(n.height, 320)
         LauncherView(model: model, executor: nil, availability: nil)
             .frame(width: n.width, height: h)
-            .scaleEffect(scale)
+            .scaleEffect(scale * (demo.overlayShown ? 1.0 : 0.92))
+            .opacity(demo.overlayShown ? 1 : 0)
             .frame(width: n.width * scale, height: h * scale)
             .allowsHitTesting(false)
     }

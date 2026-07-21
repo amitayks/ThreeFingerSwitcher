@@ -202,11 +202,12 @@ struct LauncherPage: View {
     let context: HubContext
     @ObservedObject private var settings: AppSettings
 
-    /// §13 — the user's REAL launcher, seeded once into a `HubLauncherDemo` holder and rendered STATIC. The
-    /// ghost-hand autoplay plays the deterministic teaching story over it (4-finger open → lift two → up/down
-    /// bands → left/right items); the model is not driven in sync and the launcher does not grow (the driven /
-    /// grow-on-rehearse forms were removed to stop the idle main-thread spin — see
-    /// `docs/postmortem-idle-cpu-spin.md`). The open swipe length tracks the activation threshold.
+    /// §13 — the user's REAL launcher, seeded once into a `HubLauncherDemo` holder. The ghost-hand autoplay
+    /// plays the deterministic teaching story (4-finger open → lift two → one band down → across the items)
+    /// and the preview's `sync` seam steps the model to match — clockless in the holder, driven only by the
+    /// visibility-gated preview clock, so a hidden Hub stays inert (the guardrail from
+    /// `docs/postmortem-idle-cpu-spin.md`; the launcher still never grows). The open swipe length tracks the
+    /// activation threshold.
     @StateObject private var demo = HubLauncherDemo()
     @State private var seeded = false
     /// The autoplay teaching gesture; its open swipe scales with the activation threshold.
@@ -235,7 +236,12 @@ struct LauncherPage: View {
                 subtitle: "A four-finger launcher of your apps, scripts, and commands.") {
             HubSection(footnote: "Slide four fingers horizontally to open a launcher of your favorite apps, scripts, and presets; dwell on an item and lift to fire it. Frees the native four-finger swipe gestures (Mission Control / App Exposé stay on three-finger up/down). Changes a system setting that needs a logout/restart to take effect and stays applied until you turn it off.") {
                 HubFeatureHeader(
-                    preview: HubGesturePreview(gesture: gesture) {
+                    preview: HubGesturePreview(
+                        gesture: gesture,
+                        // The sync seam: the mini launcher follows the ghost hand (pop in on the open
+                        // beat, band step, item scrub + arm, pop out on the closing lift).
+                        sync: { demo.drive($0, script: .teaching) }
+                    ) {
                         LauncherDemoMiniature(demo: demo)
                     },
                     icon: HubDestination.launcher.systemImage,
@@ -281,9 +287,10 @@ struct ClipboardPage: View {
     @ObservedObject private var settings: AppSettings
 
     /// §13 — the REAL launcher showing its CLIPBOARD band: a `LauncherView` seeded once with the clipboard
-    /// band on (it is the last band) and landed on it, so the static preview shows the Clipboard band. The
-    /// ghost-hand autoplay plays the full path over it — 4-finger open → 2-finger traverse down to the
-    /// Clipboard band → land; the model is not driven and does not grow (see `docs/postmortem-idle-cpu-spin.md`).
+    /// band on (it is the last band) and landed on it (the resting frame shows the band). The ghost-hand
+    /// autoplay plays the full path — 4-finger open → 2-finger traverse down the band list → lift — and the
+    /// preview's `sync` seam replays it on the model (pop in, band walk to the Clipboard band, pop out);
+    /// clockless, visibility-gated, never grows (see `docs/postmortem-idle-cpu-spin.md`).
     @StateObject private var demo = HubLauncherDemo()
     @State private var seeded = false
     /// The autoplay band-journey gesture; its open swipe scales with the activation threshold.
@@ -317,7 +324,12 @@ struct ClipboardPage: View {
                 subtitle: "Keep a history of what you copy, in the launcher's Clipboard band.") {
             HubSection(footnote: "Records what you copy — text, images, files, colors, links — into a Clipboard band shown as the last band in the four-finger launcher. Scrub to an entry and lift to paste it where you were. Stored only on this Mac; password-manager copies and excluded apps are never recorded. No new permission or logout needed. Off by default.") {
                 HubFeatureHeader(
-                    preview: HubGesturePreview(gesture: gesture) {
+                    preview: HubGesturePreview(
+                        gesture: gesture,
+                        // The sync seam: the miniature replays the journey — pop in on the open beat,
+                        // traverse the band list to the Clipboard band, pop out on the lift.
+                        sync: { demo.drive($0, script: .bandJourney) }
+                    ) {
                         LauncherDemoMiniature(demo: demo)
                     },
                     icon: HubDestination.clipboard.systemImage,
@@ -384,9 +396,11 @@ struct AIPage: View {
     @ObservedObject private var models: ModelManager
 
     /// §11.5 — the REAL launcher showing its AI band (the hero): a `LauncherView` seeded once with the AI
-    /// band on (the last band) and landed on it, rendered STATIC. The ghost-hand autoplay plays the full path
-    /// over it — 4-finger open → 2-finger traverse to the AI band → a directed two-finger downward commit
-    /// swipe; the model is not driven and does not grow (see `docs/postmortem-idle-cpu-spin.md`).
+    /// band on (the last band) and landed on it (the resting frame shows the band). The ghost-hand autoplay
+    /// plays the full path — 4-finger open → 2-finger traverse down to the AI band → the firing lift → a
+    /// directed two-finger commit swipe — and the preview's `sync` seam replays the journey on the model
+    /// (the resolve tail plays over it; the canvas isn't miniature); clockless, visibility-gated, never
+    /// grows (see `docs/postmortem-idle-cpu-spin.md`).
     @StateObject private var demo = HubLauncherDemo()
     @State private var seeded = false
     /// The base autoplay journey, and the hover-demo override the canvas-resolve binding rows push in:
@@ -404,9 +418,11 @@ struct AIPage: View {
         _models = ObservedObject(wrappedValue: context.models)
     }
 
-    /// The preview's attract journey: open the four-finger launcher → traverse to the AI band → a directed
-    /// downward canvas-commit swipe. The hover-demo override (`hoverGesture`) plays a candidate resolve.
-    private static let aiJourney = GesturePose.bandJourney(bandFraction: 0.5, inSurface: .swipeDown)
+    /// The preview's attract journey: open the four-finger launcher → traverse DOWN the band list to the
+    /// AI band (the real band-rail grammar, so the driven miniature can follow stroke for stroke) → the
+    /// firing lift → a fresh directed downward canvas-commit swipe. The hover-demo override
+    /// (`hoverGesture`) plays a candidate resolve instead.
+    private static let aiJourney = HubLauncherDemo.bandJourneyGesture(openLength: 0.30, resolve: .swipeDown)
 
     /// The coarse axis a canvas excursion sweeps along (up/down ⇒ vertical, left/right ⇒ horizontal) —
     /// the `GesturePose.Axis` the shared `HubBindingPicker` component expects from `demoAxis`.
@@ -671,7 +687,13 @@ struct AIPage: View {
                 subtitle: "Run on-device AI commands. Author the commands themselves on the Bands page.") {
             HubSection(footnote: "Runs an on-device Gemma 4 model — turning this on starts a one-time multi-gigabyte download. No new permission or logout needed (a calendar task asks for Calendar access the first time it runs). Add AI commands to any band on the Bands page. Off by default.") {
                 HubFeatureHeader(
-                    preview: HubGesturePreview(gesture: Self.aiJourney, hoverGesture: hoverGesture) {
+                    preview: HubGesturePreview(
+                        gesture: Self.aiJourney,
+                        hoverGesture: hoverGesture,
+                        // The sync seam: the miniature replays the journey to the AI band; the resolve
+                        // tail and any hovered candidate swipe play over it (the canvas isn't miniature).
+                        sync: { demo.drive($0, script: .bandJourneyResolve) }
+                    ) {
                         LauncherDemoMiniature(demo: demo)
                     },
                     icon: HubDestination.ai.systemImage,
@@ -958,31 +980,69 @@ struct GeneralPage: View {
     }
 }
 
-// MARK: - §13 Launcher demo holder (the user's REAL launcher, seeded once and rendered static)
+// MARK: - §13 Launcher demo holder (the user's REAL launcher, stepped by the sync drive)
 
 /// The §13 holder behind the Launcher / Clipboard / Files / AI previews: it owns the **real** `LauncherModel`
 /// (rendered by a real `LauncherView`), seeded once with the user's real bands so the preview shows the actual
-/// launcher. The model is **static** — the ghost-hand autoplay plays the teaching gesture *over* it; nothing
-/// drives the model in sync (the old `HubDemoDriver`-driven form + the grow-on-rehearse morph were removed to
-/// stop the idle main-thread spin; see `docs/postmortem-idle-cpu-spin.md`).
+/// launcher. Like `HubSwitcherDemo`, the model follows the ghost hand through the preview's **sync seam**
+/// (`drive(_:script:)`): the four-finger open pops the panel in at the activation beat, the two-finger
+/// vertical strokes step the band list, the teaching scrub crosses into the grid and steps the items (arming
+/// the last one), and the final lift pops the panel out until the next loop. NOT the old free-running
+/// `HubDemoDriver` (removed for the idle main-thread spin, `docs/postmortem-idle-cpu-spin.md`): the holder
+/// owns no clock — frames arrive only from the preview's visibility-gated `TimelineView`, and every mutation
+/// is state-guarded (idempotent per frame).
 ///
-/// Band pages (Clipboard / Files / AI) seed with `landOnLastBand: true` so the static preview *shows* their
-/// band (the last band, appended by `WizardTourBands.compose`) — the autoplay journey traverses toward it, and
-/// the seeded model already displays it.
+/// Band pages (Clipboard / Files / AI) seed with `landOnLastBand: true` so the preview's resting/static frame
+/// *shows* their band (the last band) — the driven loop then replays the journey from the home band toward it.
 @MainActor
 final class HubLauncherDemo: ObservableObject {
-    /// The real launcher model the preview renders (seeded once, not driven).
+    /// The real launcher model the preview renders (seeded once; stepped only by the sync drive).
     let model = LauncherModel()
 
+    /// Whether the mini launcher is "open" in the teaching story: `true` while the ghost hand navigates,
+    /// `false` between loops (after the closing lift, until the next open swipe crosses the activation
+    /// beat). Defaults `true` so an undriven preview (hidden Hub's static frame, bare `#Preview`) shows it.
+    @Published private(set) var overlayShown = true
+
+    /// The seeded band content, retained so the drive can quietly re-seed the model between loops (the
+    /// off-screen reset to the journey's start) and re-land it on the page's band for a hover-demo.
+    private struct SeedState {
+        var bands: [[LaunchItem]]
+        var names: [String]
+        var colors: [ItemColor]
+        var icons: [ItemIcon]
+        var clipboardBandIndex: Int?
+        /// The band the page rests/presents on: the last band for the band pages, the home band otherwise.
+        var restBand: Int
+    }
+    private var seedState: SeedState?
+
+    // Sync-drive state (see the drive extension below): the item-scrub odometer's emitted steps, the last
+    // script driven (a script change resets the odometer), and the hover presentation's one-shot latch.
+    private var scrubStep = 0
+    private var lastScript: SyncScript?
+    private var hoverPresented = false
+
     /// Seed the model from a `HubPreviewModels`-built launcher (the user's real bands). `landOnLastBand`
-    /// lands the selection on the last band (the Clipboard / Files / AI band) so a band page's static preview
-    /// shows that band; otherwise it rests on the home band, exactly as the real launcher opens.
+    /// lands the selection on the last band (the Clipboard / Files / AI band) so a band page's resting
+    /// preview shows that band; otherwise it rests on the home band, exactly as the real launcher opens.
     func seed(from source: LauncherModel, landOnLastBand: Bool = false) {
         model.dwell = source.dwell
         let startBand = landOnLastBand ? max(0, source.bandCount - 1) : 0
-        model.setBands(source.bands, names: source.bandNames, colors: source.bandColors,
-                       icons: source.bandIcons, startBand: startBand, column: 0,
-                       clipboardBandIndex: source.clipboardBandIndex)
+        seedState = SeedState(bands: source.bands, names: source.bandNames, colors: source.bandColors,
+                              icons: source.bandIcons, clipboardBandIndex: source.clipboardBandIndex,
+                              restBand: startBand)
+        applySeed(startBand: startBand)
+    }
+
+    /// (Re)apply the stored seed at `startBand` — the drive's quiet reset (off-screen between loops) and
+    /// the hover presentation both route through here. `setBands` re-lands focus and disarms, exactly as a
+    /// fresh launcher open does.
+    private func applySeed(startBand: Int) {
+        guard let seed = seedState else { return }
+        model.setBands(seed.bands, names: seed.names, colors: seed.colors,
+                       icons: seed.icons, startBand: startBand, column: 0,
+                       clipboardBandIndex: seed.clipboardBandIndex)
     }
 }
 
@@ -993,11 +1053,11 @@ extension HubLauncherDemo {
     /// `HubSwitcherDemo.teachingGesture`. A **four-finger** open swipe whose length tracks the activation
     /// distance, then — CONNECTED, no lift (`gapAfter: 0`, so two fingers lift while two stay down) — a
     /// two-finger DOWN step to switch a band, then a two-finger RIGHT scrub into the grid and across the
-    /// items, then a lift and loop. The coordinates match the engine's centroid math so the highlight tracks
-    /// the hand.
+    /// items, then a lift and loop. Coordinates are y-UP (trackpad bottom-left origin — the pad renderer
+    /// flips), so the "down one band" stroke travels to a SMALLER y.
     static func teachingGesture(openLength: CGFloat) -> GesturePose.DemoGesture {
         let openL = max(0.10, min(0.46, openLength))
-        let xL: CGFloat = 0.30, xR: CGFloat = 0.74, homeY: CGFloat = 0.50, downY: CGFloat = 0.66
+        let xL: CGFloat = 0.30, xR: CGFloat = 0.74, homeY: CGFloat = 0.50, downY: CGFloat = 0.34
         // Four-finger open: a rightward swipe of `openL`, ending at `xL` so the two-finger nav has room to
         // travel right. `gapAfter: 0` keeps the hand DOWN — the next stroke drops to two fingers.
         let open = GesturePose.Stroke(fingers: 4,
@@ -1015,16 +1075,25 @@ extension HubLauncherDemo {
     /// The band-journey teaching gesture (Clipboard / Files / AI): a **four-finger** open, then — CONNECTED —
     /// a long two-finger DOWN stroke that traverses the band list toward the last band, then a settle + lift.
     /// The traverse is target-based in the holder, so the exact stroke extent need only read as "down the
-    /// bands"; the open length still tracks the activation distance.
-    static func bandJourneyGesture(openLength: CGFloat) -> GesturePose.DemoGesture {
+    /// bands"; the open length still tracks the activation distance. Coordinates are y-UP, so "down the band
+    /// list" descends from `topY` to the smaller `botY`. An optional `resolve` appends the AI canvas's
+    /// resolve tail: the traverse's lift *fires* the armed command, then a FRESH two-finger directed swipe
+    /// (the real canvas grammar — a stray re-lift is a no-op; resolution is a new excursion) commits it.
+    static func bandJourneyGesture(openLength: CGFloat,
+                                   resolve: GesturePose.BandInSurfaceGesture? = nil) -> GesturePose.DemoGesture {
         let openL = max(0.10, min(0.46, openLength))
-        let xL: CGFloat = 0.34, topY: CGFloat = 0.34, botY: CGFloat = 0.80
+        let xL: CGFloat = 0.34, topY: CGFloat = 0.66, botY: CGFloat = 0.20
         let open = GesturePose.Stroke(fingers: 4,
                                       from: CGPoint(x: max(GesturePose.lowerBound, xL - openL), y: topY),
                                       to: CGPoint(x: xL, y: topY), gapAfter: 0)
         let traverse = GesturePose.Stroke(fingers: 2, from: CGPoint(x: xL, y: topY), to: CGPoint(x: xL, y: botY),
                                           hold: 0.22)
-        return GesturePose.DemoGesture(strokes: [open, traverse], liftGap: 0.6)
+        var strokes = [open, traverse]
+        if let resolve, resolve != .lift {
+            // A fresh, centered two-finger resolve after the firing lift (the canvas-resolve vocabulary).
+            strokes.append(contentsOf: GesturePose.canvasResolve(resolve).strokes)
+        }
+        return GesturePose.DemoGesture(strokes: strokes, liftGap: 0.6)
     }
 
     /// Map the configurable activation threshold (`0.01…0.15`, the real trigger distance) to the demo's
@@ -1035,6 +1104,130 @@ extension HubLauncherDemo {
         let clamped = min(0.15, max(0.01, threshold))
         let f = (clamped - 0.01) / (0.15 - 0.01)
         return CGFloat(0.18 + f * (0.44 - 0.18))
+    }
+}
+
+// MARK: - §13 Sync drive (the launcher miniature follows the ghost hand)
+
+extension HubLauncherDemo {
+    /// Which autoplay script the incoming sync frames describe — the stroke-index → model-move mapping.
+    enum SyncScript: Equatable {
+        /// The Launcher page's attract loop: open → one band down → scrub into the grid and across the
+        /// items (arming the last one) → lift.
+        case teaching
+        /// A band page's journey (Clipboard / Files): open → traverse the band list to the LAST band → lift.
+        case bandJourney
+        /// The AI page's journey: open → traverse to the AI band → the firing lift → a fresh two-finger
+        /// canvas-resolve swipe (the tail drives nothing — the miniature never shows the canvas).
+        case bandJourneyResolve
+    }
+
+    /// The band-step / grid-step pace, matching the real launcher's snappy selection moves.
+    private static var stepAnimation: Animation { .easeInOut(duration: 0.22) }
+
+    /// The final stroke of each script — the only lift that CLOSES the demo launcher. Earlier lifts within
+    /// a loop (the AI journey's firing lift between traverse and resolve) keep the panel up, exactly as the
+    /// real launcher stays up to show the canvas.
+    private static func finalStrokeIndex(_ script: SyncScript) -> Int {
+        switch script {
+        case .teaching, .bandJourneyResolve: return 2
+        case .bandJourney: return 1
+        }
+    }
+
+    /// Step the model in time with one quantized ghost-hand frame. Called from the preview's `sync` seam —
+    /// only while the visibility-gated clock runs (the postmortem guardrail) — and idempotent per frame:
+    /// every mutation is guarded on current model state, so repeated, skipped, or resumed frames land
+    /// safely anywhere in the loop.
+    func drive(_ pose: GhostSyncPose, script: SyncScript) {
+        guard seedState != nil else { return }
+        if script != lastScript {
+            lastScript = script
+            scrubStep = 0
+        }
+        // A hover-demo plays a *candidate* excursion (a standalone resolve/discard swipe) whose stroke
+        // indices mean nothing to the journey mapping: present the page's band statically underneath it
+        // and drive nothing. Leaving the hover resumes the loop wherever the attract script is.
+        if pose.hovering {
+            presentForHover()
+            return
+        }
+        hoverPresented = false
+        if pose.lifted {
+            if pose.strokeIndex >= Self.finalStrokeIndex(script) { setShown(false) }
+            return
+        }
+        switch (script, pose.strokeIndex) {
+        case (_, 0):
+            openStroke(fraction: pose.fraction)
+        case (.teaching, 1):
+            if pose.fraction >= 0.5 { walkBands(to: min(1, model.bandCount - 1)) }
+        case (.teaching, 2):
+            scrubItems(fraction: pose.fraction)
+        case (.bandJourney, 1), (.bandJourneyResolve, 1):
+            walkBands(to: model.bandCount - 1, fraction: pose.fraction)
+        default:
+            // The AI resolve tail: the canvas isn't rendered in the miniature — nothing to drive.
+            break
+        }
+    }
+
+    /// The open swipe: short of the activation beat the panel stays hidden — and, freshly hidden from the
+    /// previous loop's closing lift, quietly resets to the journey's start (home band, an instant
+    /// off-screen re-seed) — then crossing the beat pops it in, the moment the real launcher appears.
+    private func openStroke(fraction: Double) {
+        if fraction < 0.45 {
+            if !overlayShown, model.currentBand != 0 || scrubStep != 0 || model.arming || model.armed {
+                scrubStep = 0
+                applySeed(startBand: 0)
+            }
+        } else {
+            setShown(true)
+        }
+    }
+
+    /// Walk the band-list highlight DOWN toward `target`, one step per crossed odometer boundary (or all
+    /// the way when `fraction` is omitted). Steps only while focus is on the band rail, so replayed frames
+    /// can never leak steps into a grid.
+    private func walkBands(to target: Int, fraction: Double = 1) {
+        guard model.bandCount > 1, model.focus == .bands, target > 0 else { return }
+        let desired = min(target, Int(fraction * Double(target + 1)))
+        while model.currentBand < desired {
+            withAnimation(Self.stepAnimation) { model.stepVertical(-1) }
+        }
+    }
+
+    /// The teaching scrub: cross from the band rail into the grid, then step the highlight across the
+    /// first row as the stroke advances — one step per crossed boundary, clamped like the real odometer.
+    /// The stroke's settling hold dwells on the last item and ARMS it (the real dwell-to-arm), so the
+    /// closing lift reads as firing the armed item.
+    private func scrubItems(fraction: Double) {
+        guard !model.items.isEmpty else { return }
+        let itemsInRow = min(LauncherGridLayout.columns, model.items.count)
+        let total = min(itemsInRow, 4)          // enter the grid + up to 3 item steps
+        let desired = min(total, Int(fraction * Double(total + 1)))
+        while scrubStep < desired {
+            scrubStep += 1
+            withAnimation(Self.stepAnimation) { model.stepHorizontal(1) }
+        }
+        if fraction >= 0.9, scrubStep >= total, model.focus == .grid, !model.arming, !model.armed {
+            model.beginArming()
+        }
+    }
+
+    /// Present the resting state under a hover-demo: the panel shown, landed on the page's band (the band
+    /// pages' own band; the launcher page's home band), nothing mid-scrub. One-shot per hover entry.
+    private func presentForHover() {
+        guard !hoverPresented, let seed = seedState else { return }
+        hoverPresented = true
+        scrubStep = 0
+        applySeed(startBand: seed.restBand)
+        setShown(true)
+    }
+
+    private func setShown(_ shown: Bool) {
+        guard overlayShown != shown else { return }
+        withAnimation(.spring(response: 0.32, dampingFraction: 0.8)) { overlayShown = shown }
     }
 }
 
@@ -1050,12 +1243,15 @@ func launcherNaturalSize(_ model: LauncherModel) -> CGSize {
 }
 
 /// The §14 launcher-demo miniature: the **real** `LauncherView` over the holder's seeded model, shown small
-/// (preview scale) — the preview "playing its part." It is **static** (the ghost-hand autoplay plays over it;
-/// the model is not driven) and takes no hits (the preview disables hit-testing).
+/// (preview scale) — the preview "playing its part." The sync drive steps the model (band walk, item scrub,
+/// arming) and flips `overlayShown` with the loop's open/close beats, so the clip reads as the real launcher
+/// appearing, being navigated, and firing. Takes no hits (the preview disables hit-testing).
 private struct LauncherDemoMiniature: View {
-    @ObservedObject var model: LauncherModel
+    @ObservedObject var demo: HubLauncherDemo
+    @ObservedObject private var model: LauncherModel
 
     init(demo: HubLauncherDemo) {
+        self.demo = demo
         _model = ObservedObject(wrappedValue: demo.model)
     }
 
@@ -1066,7 +1262,8 @@ private struct LauncherDemoMiniature: View {
         let h = min(n.height, 320)               // a compact preview slot
         LauncherView(model: model, executor: nil, availability: nil)
             .frame(width: n.width, height: h)
-            .scaleEffect(scale)
+            .scaleEffect(scale * (demo.overlayShown ? 1.0 : 0.92))
+            .opacity(demo.overlayShown ? 1 : 0)
             .frame(width: n.width * scale, height: h * scale)   // the slot is the SCALED size (no overflow)
             .allowsHitTesting(false)
     }

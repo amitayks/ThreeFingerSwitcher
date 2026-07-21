@@ -245,7 +245,9 @@ final class GesturePoseTests: XCTestCase {
         XCTAssertEqual(g.strokes.count, 1)
         let s = g.strokes[0]
         XCTAssertEqual(s.fingers, 2, "the canvas resolve is a two-finger excursion")
-        XCTAssertLessThan(s.from.y, s.to.y, "swipeDown strokes from a higher point downward (top → center)")
+        // Pose coordinates are y-UP (the trackpad's bottom-left origin, matching the pad renderer's
+        // `(1 - y)` flip): a DOWNWARD stroke therefore starts at the HIGHER y and descends.
+        XCTAssertGreaterThan(s.from.y, s.to.y, "swipeDown strokes from the pad's top downward (top → center)")
         XCTAssertEqual(s.from.x, s.to.x, accuracy: 1e-9, "a vertical resolve keeps X fixed")
     }
 

@@ -373,6 +373,9 @@ enum GesturePose {
     /// The directed two-finger stroke for an in-surface excursion, anchored at the landing column `land`
     /// (X) and resting row `mid` (Y). `.lift` has no directional stroke (returns nil — the journey simply
     /// rests on the band). Directions stroke from one edge of the safe pad toward the centre/landing.
+    /// Coordinates are **y-up** (bottom-left origin, the real trackpad's convention, which the pad renderer's
+    /// `(1 - y)` flip assumes): the pad's top is `upperBound`, its bottom `lowerBound` — so a *downward*
+    /// stroke travels from a HIGH y toward a lower one.
     nonisolated private static func inSurfaceStroke(_ g: BandInSurfaceGesture, at land: CGFloat, mid: CGFloat) -> Stroke? {
         let lo = lowerBound
         let hi = upperBound
@@ -380,10 +383,11 @@ enum GesturePose {
         case .lift:
             return nil
         case .swipeDown:
-            // Top-middle → center: a downward commit.
-            return Stroke(fingers: 2, from: CGPoint(x: land, y: lo), to: CGPoint(x: land, y: mid))
-        case .swipeUp:
+            // Top-middle → center: a downward commit (y-up: from the pad's top, hi, descending).
             return Stroke(fingers: 2, from: CGPoint(x: land, y: hi), to: CGPoint(x: land, y: mid))
+        case .swipeUp:
+            // Bottom-middle → center: an upward stroke (y-up: from the pad's bottom, lo, rising).
+            return Stroke(fingers: 2, from: CGPoint(x: land, y: lo), to: CGPoint(x: land, y: mid))
         case .swipeLeft, .swipeHorizontal:
             let from = min(hi, land + 0.30)
             return Stroke(fingers: 2, from: CGPoint(x: from, y: mid), to: CGPoint(x: max(lo, land - 0.10), y: mid))

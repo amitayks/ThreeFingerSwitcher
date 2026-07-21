@@ -143,9 +143,11 @@ final class HubSwitcherDemo: ObservableObject {
 
 extension HubSwitcherDemo {
     /// The resting (home-row) band: the 2-finger nav begins here and the sideways scrub stays here.
-    static let homeY: CGFloat = 0.58
-    /// The "second row" band the up-stroke reaches.
-    static let upY: CGFloat = 0.26
+    /// Pose coordinates are y-UP (trackpad bottom-left origin — the pad renderer flips), so the home
+    /// band sits BELOW `upY`.
+    static let homeY: CGFloat = 0.42
+    /// The "second row" band the up-stroke reaches (higher on the pad = larger y).
+    static let upY: CGFloat = 0.74
     /// The sideways scrub travels x across this range.
     static let scrubLeft: CGFloat = 0.28
     static let scrubRight: CGFloat = 0.80
