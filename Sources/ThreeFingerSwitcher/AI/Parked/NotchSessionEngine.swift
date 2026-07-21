@@ -1,5 +1,12 @@
 import Foundation
 import Combine
+import os
+
+/// Per-turn streaming diagnostics (`notch-timeline-and-tuning`): turn start (path + effective
+/// reasoning), first token per channel (arrival latency), and the settled channel totals — so
+/// "thinking isn't streaming" is diagnosable from `log stream` without a debug build. No per-token
+/// spam: first-arrival lines are one-shot per turn.
+private let notchTurnLog = Logger(subsystem: "ThreeFingerSwitcher", category: "NotchSession")
 
 /// The transient set of images staged on a notch composer before the next send. Pure value — the engine
 /// owns it; the expanded conversation view renders/edits it via the engine's attach/remove seams. `text`
@@ -131,6 +138,10 @@ final class NotchSessionEngine: ObservableObject {
     /// The BOUND conversation's born-with context budget (stamped at birth / restored at bind); nil =
     /// the legacy injected `budgetProvider`.
     private var sessionContextTokens: Int?
+    /// One-shot first-arrival log flags (see `notchTurnLog`), reset at each turn start.
+    private var loggedFirstThinking = false
+    private var loggedFirstAnswer = false
+    private var turnStartedAt = Date()
     private var sessionParameters: GenerationParameters = .default
     private var generationTask: Task<Void, Never>?
     private var approvalGate: CanvasApprovalGate?
@@ -490,6 +501,7 @@ final class NotchSessionEngine: ObservableObject {
         // BOTH channels also append to `liveSegments` in arrival order — the transcript's timeline.
         thinking = ""
         liveSegments = []
+        beginTurnDiagnostics(path: "plain")
         state = .conversing(partial: "")
         var accumulated = ""
         do {
@@ -535,6 +547,7 @@ final class NotchSessionEngine: ObservableObject {
         thinking = ""
         liveSegments = []
         toolSteps = []
+        beginTurnDiagnostics(path: "routed")
         state = .conversing(partial: "")
 
         // Ordered, turn-owned CHANNEL stream (`notch-timeline-and-tuning`): the loop yields tagged
@@ -617,6 +630,7 @@ final class NotchSessionEngine: ObservableObject {
     /// snapshot to the controller.
     private func appendAssistantTurn(_ text: String) {
         let now = Date()
+        notchTurnLog.notice("turn settled: thinkingChars=\(self.thinking.count, privacy: .public) answerChars=\(text.count, privacy: .public) segments=\(self.liveSegments.count, privacy: .public)")
         conversation?.messages.append(AgentMessage(role: .assistant, text: text,
                                                    thinking: thinking.isEmpty ? nil : thinking,
                                                    segments: settledSegments(finalText: text),
@@ -649,10 +663,38 @@ final class NotchSessionEngine: ObservableObject {
     /// channel flips); a flip starts a new segment.
     private func appendLive(_ kind: TurnSegment.Kind, _ text: String) {
         guard !text.isEmpty else { return }
+        logFirstArrival(kind)
         if liveSegments.last?.kind == kind {
             liveSegments[liveSegments.count - 1].text += text
         } else {
             liveSegments.append(TurnSegment(kind: kind, text: text))
+        }
+    }
+
+    /// Reset + emit the turn-start diagnostic line (see `notchTurnLog`). The `reasoning` value here is
+    /// the single discriminator for "thinking isn't streaming": false means the request never asked the
+    /// model to think (a tuning/session-birth question), true with no later thinking-first-token line
+    /// means the model produced none (a runtime/model question).
+    private func beginTurnDiagnostics(path: String) {
+        loggedFirstThinking = false
+        loggedFirstAnswer = false
+        turnStartedAt = Date()
+        notchTurnLog.notice("turn start: path=\(path, privacy: .public) reasoning=\(self.sessionReasoning, privacy: .public) contextTokens=\(self.sessionContextTokens ?? -1, privacy: .public)")
+    }
+
+    /// One-shot per-channel first-arrival lines — proves each channel actually STREAMED (arrival
+    /// latency from turn start) rather than landing in a settle-time burst.
+    private func logFirstArrival(_ kind: TurnSegment.Kind) {
+        let elapsed = Date().timeIntervalSince(turnStartedAt)
+        switch kind {
+        case .thinking:
+            guard !loggedFirstThinking else { return }
+            loggedFirstThinking = true
+            notchTurnLog.notice("first THINKING token after \(String(format: "%.2f", elapsed), privacy: .public)s")
+        case .answer:
+            guard !loggedFirstAnswer else { return }
+            loggedFirstAnswer = true
+            notchTurnLog.notice("first ANSWER token after \(String(format: "%.2f", elapsed), privacy: .public)s")
         }
     }
 
