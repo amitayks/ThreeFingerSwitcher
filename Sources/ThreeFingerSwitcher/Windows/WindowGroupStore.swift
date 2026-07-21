@@ -32,19 +32,23 @@ final class WindowGroupStore {
     }
 
     /// A window's drag has settled. `snapped` is the set of windows its edges now sit FLUSH against
-    /// (the strict bind test); `attached` is the looser stay-bound contact set (flush OR overlapping —
-    /// always a superset of `snapped`). Intent-driven: only the DRAGGED window's contacts bind — two
-    /// windows that merely happen to rest adjacent are never bound by a third window's drag.
-    ///   1. If the window was grouped and no group-mate remains ATTACHED (not even overlapping), it
-    ///      leaves that group (a group below two members dissolves). Pushing a member INTO its mate
-    ///      keeps the bond — only a real gap detaches.
+    /// (the strict bind test). A drag is an EXPLICIT re-arrangement of the dragged window, so its
+    /// bonds re-evaluate STRICTLY: it keeps/creates bonds only to what it ends flush against —
+    /// landing with a gap OR on TOP of a mate both break the old bond (on a laptop screen a
+    /// dragged-out window almost always lands overlapping some group member; if overlap kept the
+    /// bond here, breaking a group by dragging would be nearly impossible). The looser
+    /// overlap-preserving contact rule applies only to PASSIVE geometry checks (`pruneDetached` /
+    /// `validatedGroups`), where nobody expressed intent about the member. Intent-driven: only the
+    /// DRAGGED window's contacts bind — two windows that merely happen to rest adjacent are never
+    /// bound by a third window's drag.
+    ///   1. If the window was grouped and no group-mate is among its flush contacts, it leaves that
+    ///      group (a group below two members dissolves).
     ///   2. Every freshly SNAPPED window's group (or the lone window) is merged with the dragged
     ///      window's into ONE group — transitive: A onto B while B is grouped with C yields {A, B, C}.
-    func dragSettled(window id: CGWindowID, snapped: Set<CGWindowID>, attached: Set<CGWindowID>? = nil) {
-        let contact = (attached ?? snapped).union(snapped)
-        // 1. Detached from all mates: leave the old group.
+    func dragSettled(window id: CGWindowID, snapped: Set<CGWindowID>) {
+        // 1. Not flush against any mate: leave the old group.
         if let idx = groups.firstIndex(where: { $0.contains(id) }) {
-            if contact.isDisjoint(with: groups[idx].subtracting([id])) {
+            if snapped.isDisjoint(with: groups[idx].subtracting([id])) {
                 groups[idx].remove(id)
                 if groups[idx].count < 2 { groups.remove(at: idx) }
             }

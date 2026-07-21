@@ -13,8 +13,9 @@ import CoreGraphics
 final class GlobalCursorMonitor: CursorMonitor {
     var onMove: ((CGPoint) -> Void)?
     var onRightClick: ((CGPoint) -> Void)?
-    /// Passive left-button observation (the window-groups snap monitor): report-only, never consumed —
-    /// the click/drag reaches its app unmodified, exactly like the right-click pair.
+    /// Passive left-button observation: report-only, never consumed — the click/drag reaches its app
+    /// unmodified, exactly like the right-click pair. Consumers: window-groups snap (drag-end detection,
+    /// down+up) and the Dock preview (commit-on-icon-click, down only).
     var onLeftDown: ((CGPoint) -> Void)?
     var onLeftUp: ((CGPoint) -> Void)?
 

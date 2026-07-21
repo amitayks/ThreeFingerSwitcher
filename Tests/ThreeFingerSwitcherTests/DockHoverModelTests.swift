@@ -166,4 +166,34 @@ final class DockHoverModelTests: XCTestCase {
         XCTAssertEqual(m.rightClick(at: CGPoint(x: 25, y: 25), tiles: tilesFixture), .dismiss)
         XCTAssertEqual(m.state, .idle)
     }
+
+    // MARK: - Left-click commits the highlighted preview
+
+    func test_leftClick_onShownAppTile_returnsThatPid() {
+        // Popup open for app 1; a left-click on app 1's own tile is a commit signal for pid 1.
+        let m = DockHoverModel()
+        _ = m.feed(cursor: CGPoint(x: 25, y: 25), tiles: tilesFixture, popupFrame: nil, now: 0)  // open on tile 1
+        XCTAssertEqual(m.leftClick(at: CGPoint(x: 25, y: 25), tiles: tilesFixture), 1)
+        XCTAssertEqual(m.state, .active(pid: 1))   // state untouched — the controller tears down via reset
+    }
+
+    func test_leftClick_onAnotherAppTile_returnsNil() {
+        // A click on a DIFFERENT app's tile is not a commit of the shown app (it swaps via hover instead).
+        let m = DockHoverModel()
+        _ = m.feed(cursor: CGPoint(x: 25, y: 25), tiles: tilesFixture, popupFrame: nil, now: 0)  // open on tile 1
+        XCTAssertNil(m.leftClick(at: CGPoint(x: 85, y: 25), tiles: tilesFixture))                 // tile 2
+    }
+
+    func test_leftClick_offAnyTile_returnsNil() {
+        // A click on the popup / empty space is not an icon click → nil (the card's own commit handles it).
+        let m = DockHoverModel()
+        _ = m.feed(cursor: CGPoint(x: 25, y: 25), tiles: tilesFixture, popupFrame: nil, now: 0)
+        XCTAssertNil(m.leftClick(at: CGPoint(x: 500, y: 500), tiles: tilesFixture))
+    }
+
+    func test_leftClick_whenNothingActive_returnsNil() {
+        // No popup open → a left-click on a tile is not a commit (nothing to commit).
+        let m = DockHoverModel()
+        XCTAssertNil(m.leftClick(at: CGPoint(x: 25, y: 25), tiles: tilesFixture))
+    }
 }

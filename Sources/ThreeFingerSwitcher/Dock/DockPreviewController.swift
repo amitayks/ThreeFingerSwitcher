@@ -84,11 +84,13 @@ final class DockPreviewController {
         if on {
             cursor.onMove = { [weak self] point in self?.handleCursor(point) }
             cursor.onRightClick = { [weak self] point in self?.handleRightClick(point) }
+            cursor.onLeftDown = { [weak self] point in self?.handleLeftClick(point) }
             cursor.start()
         } else {
             cursor.stop()
             cursor.onMove = nil
             cursor.onRightClick = nil
+            cursor.onLeftDown = nil
             dismiss()
         }
     }
@@ -146,6 +148,21 @@ final class DockPreviewController {
         // The tile's native action menu is now opening; keep the popup closed for this tile until the
         // cursor leaves it, so a stray move (cursor still on the icon) doesn't re-show it behind the menu.
         menuSuppressedPID = pid
+    }
+
+    /// A left-click landed somewhere. If the preview is open, the click hit the SHOWN app's own Dock tile,
+    /// and a card is currently highlighted (peeked), commit that highlighted window — the same result as
+    /// clicking the card. This is what makes an icon click stick: without it, the click falls through to
+    /// the native Dock but our leave-restore (`dismiss(restore:true)`) would re-front the pre-peek window
+    /// and undo it. When no card is highlighted we do nothing — the native activation stands and, since
+    /// nothing was peeked, there's no restore to undo. The click is observed passively (never consumed),
+    /// so the native Dock still receives it unmodified (and also acts — see design D3).
+    private func handleLeftClick(_ point: CGPoint) {
+        guard enabled, overlay.isVisible else { return }
+        let tiles = reader.read()?.tiles ?? snapshot?.tiles ?? []
+        guard hover.leftClick(at: point, tiles: tiles) != nil,
+              let id = overlay.model.highlightedID else { return }
+        commit(id)
     }
 
     /// Open (or swap to) the preview for `pid`: enumerate its current-Space windows (incl. minimized),
