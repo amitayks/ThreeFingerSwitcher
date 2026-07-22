@@ -207,6 +207,11 @@ final class NotchSessionEngine: ObservableObject {
         return false
     }
 
+    /// Whether the BOUND session runs its turns with reasoning (born-with when stamped, else the global
+    /// default read at bind). The expanded view badges a no-thinking session with this — a session born
+    /// under Quick would otherwise look broken ("why is there no streamed thinking?") instead of tuned.
+    var isSessionReasoningEnabled: Bool { sessionReasoning }
+
     /// Whether the turn is actively PRODUCING (loading or streaming) — as opposed to suspended at the
     /// approval gate, which consumes no generation slot. The background driver counts only these when
     /// deciding whether the single slot is taken (a session paused on the user must never block other

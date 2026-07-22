@@ -645,6 +645,15 @@ struct NotchConversationView: View {
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(.white)
                 .lineLimit(1).truncationMode(.middle)
+            if !engine.isSessionReasoningEnabled {
+                // Born-with visibility (`notch-timeline-and-tuning`): a session running WITHOUT
+                // reasoning is marked, so "no streamed thinking" reads as this chat's tuning — the
+                // only Thinking content it will show is the router's rationale, which arrives whole.
+                Label("Thinking off", systemImage: "bolt.fill")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.orange.opacity(0.85))
+                    .help("This chat was created with thinking off (the Quick stop). Move the notch settings slider and start a new chat to stream the model's reasoning.")
+            }
             Spacer()
             Button(action: onDelete) {
                 Image(systemName: "trash")
@@ -772,8 +781,12 @@ struct NotchConversationView: View {
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.secondary).textCase(.uppercase)
                 if engine.liveSegments.isEmpty {
-                    BidiText(text: "…", fontSize: 13)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    // The pre-first-token phase — in the routed path this is the tool-routing pass, a
+                    // full non-streaming generation that can run for seconds. An honest static label
+                    // (no repeating animation — the idle-CPU-spin rule) instead of a bare ellipsis.
+                    Text("Choosing how to answer…")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
                 } else {
                     segmentTimeline(engine.liveSegments, keyPrefix: "live", liveTail: isTurnStreaming)
                 }
