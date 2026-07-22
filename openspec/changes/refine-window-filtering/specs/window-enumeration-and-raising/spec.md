@@ -10,9 +10,9 @@ In **strict** mode (the `includeNonStandardWindows` toggle off, no per-app overr
 
 In **relaxed** mode the filter SHALL be three-tier and SHALL be monotonic over strict — every window strict mode lists, relaxed mode also lists:
 
-1. Known-real subroles (standard window, dialog, system dialog) are always listed.
+1. The standard-window subrole is always listed. Only this subrole is trusted outright: the dialog subroles SHALL NOT be — Qt stamps `AXDialog` on every window it creates, real device windows and chromeless helper frames alike (the Android emulator's untitled 61×515 side-toolbar reports the same `AXDialog` as its titled device window — live-probed 2026-07-22).
 2. Known-junk subroles (floating and system-floating palettes) are always dropped.
-3. A window reporting NO subrole at all is listed (strict mode lists these — monotonicity). Any other unrecognized subrole (unknown / novel toolkit values) is listed only when the window shows identity — a non-empty title OR window chrome (a close button) — and dropped as phantom otherwise. Size SHALL NOT be a sufficient signal on its own: the AirDrop share popover births untitled, chromeless clones at the host window's exact frame (three per attempt, host-app-owned, lingering after dismissal), which defeat any "big enough to be real" bar.
+3. A window reporting NO subrole at all is listed (strict mode lists these — monotonicity). Every other subrole — dialog, system dialog, unknown, novel toolkit values — is listed only when the window shows identity: a non-empty title OR window chrome (a close button); dropped as phantom otherwise. Size SHALL NOT be a sufficient signal on its own: the AirDrop share popover births untitled, chromeless clones at the host window's exact frame (three per attempt, host-app-owned, lingering after dismissal), which defeat any "big enough to be real" bar.
 
 A degenerate-size floor (minimum side below 40pt) SHALL drop sliver/zero frames in relaxed mode before the tiers apply.
 
@@ -34,6 +34,16 @@ A degenerate-size floor (minimum side below 40pt) SHALL drop sliver/zero frames 
 
 - **WHEN** relaxed mode is on and a window-role element has an unknown subrole, an empty title, and no close button — whether small (the emulator side-toolbar) or host-window-sized (an AirDrop share popover clone)
 - **THEN** the window is dropped with the phantom reason
+
+#### Scenario: Untitled chromeless dialog is dropped as phantom
+
+- **WHEN** relaxed mode is on and a window reports a dialog subrole with an empty title and no close button (the Qt-built emulator's side-toolbar, which reports `AXDialog` like its real windows do)
+- **THEN** the window is dropped with the phantom reason — dialog subroles carry no identity of their own
+
+#### Scenario: Titled dialog is listed
+
+- **WHEN** relaxed mode is on and a dialog-subrole window carries a non-empty title or a close button (Finder's copy-progress, the emulator's titled device window, Xcode's welcome window)
+- **THEN** the window is listed
 
 #### Scenario: Missing subrole stays listed
 

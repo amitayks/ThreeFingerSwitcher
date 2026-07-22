@@ -59,10 +59,11 @@ enum WindowFilterVerdict: Equatable {
 }
 
 /// The switchability decision (see design D1/D2): strict mode is byte-identical to the historical
-/// gate; relaxed mode is three-tier — a known-real subrole allowlist, a known-junk denylist, and
-/// real-window discriminators for the unknown middle — and is monotonic over strict (relaxation can
-/// only ever ADD windows, never drop one strict would list; the old `both dims ≥ 100` gate broke
-/// exactly that for small standard windows like Finder's copy-progress).
+/// gate; relaxed mode is three-tier — the standard subrole trusted outright, a known-junk denylist,
+/// and real-window identity discriminators (title / chrome) for everything else, dialogs included —
+/// and is monotonic over strict (relaxation can only ever ADD windows, never drop one strict would
+/// list; the old `both dims ≥ 100` gate broke exactly that for small standard windows like Finder's
+/// copy-progress).
 enum WindowFilter {
 
     /// Below this minimum side a frame is degenerate (a sliver/zero frame) — dropped in relaxed
@@ -70,9 +71,14 @@ enum WindowFilter {
     /// compact progress windows.
     static let degenerateFloor: CGFloat = 40
 
-    /// Subroles macOS itself uses for real user-facing windows — trusted outright in relaxed mode.
-    static let realSubroles: Set<String> = [
-        kAXStandardWindowSubrole as String,
+    /// Dialog subroles: real user-facing dialogs report these — but so do toolkit helper frames, so
+    /// they are NOT trusted outright. Qt stamps `AXDialog` on every window it creates, including the
+    /// Android emulator's untitled, chromeless 61×515 side-toolbar (live-probed 2026-07-22 via the
+    /// app's own trusted diag: both the real device window AND the toolbar report `AXDialog`). A
+    /// dialog therefore lists only when it shows identity — a title or window chrome — exactly like
+    /// the unknown tier; every real dialog we relaxed mode for (Finder's copy-progress, Xcode's
+    /// welcome, the emulator's device window) is titled. Only `AXStandardWindow` is trusted outright.
+    static let dialogSubroles: Set<String> = [
         kAXDialogSubrole as String,
         kAXSystemDialogSubrole as String,
     ]
@@ -105,14 +111,16 @@ enum WindowFilter {
         // Relaxed: three tiers over a degenerate floor.
         if minSide < degenerateFloor { return .dropped(.degenerateSize) }
         if let subrole = c.subrole {
-            if realSubroles.contains(subrole) { return .listed }
+            if subrole == (kAXStandardWindowSubrole as String) { return .listed }
             if junkSubroles.contains(subrole) { return .dropped(.junkSubrole) }
-            // Known-nothing subrole (AXUnknown, novel toolkit values): a real window shows identity —
-            // a title or chrome. Size proves NOTHING: the AirDrop share popover births untitled,
-            // chromeless clones of the host window at its exact 316×601 frame (three per attempt,
-            // Finder-owned, lingering after dismissal — live-probed 2026-07-19), so any "big enough
-            // to be real" bar admits them forever. A titleless-but-real oddball is recovered via the
-            // per-app `include` rule, visibly, in the inspector — not by a heuristic that guesses.
+            // Dialog subroles AND known-nothing subroles (AXUnknown, novel toolkit values): a real
+            // window shows identity — a title or chrome. Neither subrole nor size proves anything on
+            // its own: the AirDrop share popover births untitled, chromeless AXUnknown clones of the
+            // host window at its exact 316×601 frame (live-probed 2026-07-19), and Qt stamps AXDialog
+            // on the emulator's untitled, chromeless side-toolbar just as it does on the real device
+            // window (live-probed 2026-07-22 — trusting AXDialog outright was exactly the toolbar
+            // leak). A titleless-but-real oddball is recovered via the per-app `include` rule,
+            // visibly, in the inspector — not by a heuristic that guesses.
             let titled = !(c.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             return titled || c.hasCloseButton ? .listed : .dropped(.phantom)
         }

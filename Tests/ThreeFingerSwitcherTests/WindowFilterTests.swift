@@ -90,9 +90,31 @@ final class WindowFilterTests: XCTestCase {
         }
     }
 
-    func testRelaxedListsDialogs() {
-        XCTAssertEqual(WindowFilter.verdict(candidate(subrole: dialog), policy: relaxedPolicy), .listed)
-        XCTAssertEqual(WindowFilter.verdict(candidate(subrole: systemDialog), policy: relaxedPolicy), .listed)
+    func testRelaxedListsDialogsWithIdentity() {
+        // Dialogs are no longer trusted on subrole alone — a real dialog shows identity (title or
+        // chrome). Every dialog relaxed mode was built for is titled.
+        XCTAssertEqual(WindowFilter.verdict(candidate(subrole: dialog, title: "Copying…"),
+                                            policy: relaxedPolicy), .listed)
+        XCTAssertEqual(WindowFilter.verdict(candidate(subrole: systemDialog, hasCloseButton: true),
+                                            policy: relaxedPolicy), .listed)
+    }
+
+    func testUntitledChromelessDialogDropsAsPhantom() {
+        // THE qemu toolbar leak (live-probed 2026-07-22): Qt stamps AXDialog on every window it
+        // creates, so the emulator's untitled, chromeless 61×515 side-toolbar sailed through the
+        // old trust-dialogs-outright allowlist. Identity is required for dialog subroles too.
+        let toolbar = candidate(subrole: dialog, title: "", size: CGSize(width: 61, height: 515))
+        XCTAssertEqual(WindowFilter.verdict(toolbar, policy: relaxedPolicy), .dropped(.phantom))
+        XCTAssertEqual(WindowFilter.verdict(candidate(subrole: systemDialog, title: ""),
+                                            policy: relaxedPolicy), .dropped(.phantom))
+    }
+
+    func testQemuDeviceWindowStillListsViaTitle() {
+        // The emulator's REAL windows report AXDialog too — but titled, so they keep listing
+        // ("Android Emulator - Pixel_10_Pro:5554" 373×786, "Extended Controls - …" 820×648).
+        let device = candidate(subrole: dialog, title: "Android Emulator - Pixel_10_Pro:5554",
+                               size: CGSize(width: 373, height: 786))
+        XCTAssertEqual(WindowFilter.verdict(device, policy: relaxedPolicy), .listed)
     }
 
     func testRelaxedDropsFloatingPalettes() {
