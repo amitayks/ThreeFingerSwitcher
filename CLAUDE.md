@@ -2,7 +2,7 @@
 
 Orientation lives in **`README.md`** (it's written for an agent: Job A = install/run, Job B = work on the code). This file is the short list of things that are easy to get wrong. Read the **Building & signing** rule before you build anything.
 
-> **The great cleanup (`remove-local-ai`):** the on-device AI stack (Gemma/MLX, the AI command band + canvas, background agents, the notch timeline, voice/computer-use) and the Files band were **removed** — the app is refocused on the **switcher, the launcher, and clipboard history**. The `v1` branch / `v1.0.0` release preserve the full-featured app; don't reintroduce those features casually.
+> **The great cleanup (`remove-local-ai`, `remove-device-link`):** the on-device AI stack (Gemma/MLX, the AI command band + canvas, background agents, the notch timeline, voice/computer-use), the Files band, and the iPhone↔Mac device link (QR pairing, the local-network clipboard/file bridge, the vendored `DeviceLinkKit` package, the Hub Devices page) were **removed** — the app is refocused on the **switcher, the launcher, and clipboard history**. The `v1` branch / `v1.0.0` release preserve the full-featured app; don't reintroduce those features casually.
 
 ## Building & signing — read this first
 

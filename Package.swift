@@ -12,13 +12,7 @@ let package = Package(
         .executable(name: "TouchSpike", targets: ["TouchSpike"])
     ],
     dependencies: [
-        .package(url: "https://github.com/Kyome22/OpenMultitouchSupport.git", from: "4.0.0"),
-        // The shared device-link packages (wire contract / mirror store / pairing crypto): a standalone
-        // cross-platform package (macOS + iOS, no MLX) so the iOS companion app can consume the same code.
-        // VENDORED in-repo at ./DeviceLinkKit (rather than a `../` sibling) so CI can resolve it — the
-        // sibling path only existed on the maintainer's machine and broke the release build. Keep this
-        // copy in sync with the standalone package if the iOS app consumes a separate copy.
-        .package(path: "DeviceLinkKit")
+        .package(url: "https://github.com/Kyome22/OpenMultitouchSupport.git", from: "4.0.0")
     ],
     targets: [
         // All app logic lives in this library so the test target can `@testable import` it.
@@ -26,11 +20,7 @@ let package = Package(
         .target(
             name: "ThreeFingerSwitcherCore",
             dependencies: [
-                .product(name: "OpenMultitouchSupport", package: "OpenMultitouchSupport"),
-                // The shared wire contract — used by the device-link inbound adapter (LinkItem → ClipboardEntry).
-                .product(name: "DeviceLinkProtocol", package: "DeviceLinkKit"),
-                // The shared pairing crypto — used by the Mac QR pairing (PairingExchange / QR payload).
-                .product(name: "DeviceLinkPairing", package: "DeviceLinkKit")
+                .product(name: "OpenMultitouchSupport", package: "OpenMultitouchSupport")
             ],
             path: "Sources/ThreeFingerSwitcher",
             swiftSettings: [
@@ -53,10 +43,7 @@ let package = Package(
         .testTarget(
             name: "ThreeFingerSwitcherTests",
             dependencies: [
-                "ThreeFingerSwitcherCore",
-                // The adapter/connection/QR tests import the wire contract + pairing crypto directly.
-                .product(name: "DeviceLinkProtocol", package: "DeviceLinkKit"),
-                .product(name: "DeviceLinkPairing", package: "DeviceLinkKit")
+                "ThreeFingerSwitcherCore"
             ],
             path: "Tests/ThreeFingerSwitcherTests",
             swiftSettings: [

@@ -73,7 +73,7 @@ final class ClipboardStore {
     /// image bytes dropped, RTF dropped — so building the band never loads a full large payload into memory
     /// (opening the band with big entries can't OOM). The full content is materialized on demand for the
     /// selected preview / paste (`materializedEntry(id:)`). Use this for the launcher band; use
-    /// `recentWindow` where full bytes are needed (e.g. the device-link outbound send).
+    /// `recentWindow` where full bytes are needed.
     func bandWindow(limit: Int) -> [ClipboardEntry] {
         Self.recentWindow(entries, limit: limit).map(boundedForBand)
     }

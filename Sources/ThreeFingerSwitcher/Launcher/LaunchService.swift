@@ -220,8 +220,7 @@ final class LaunchService {
     /// Write a `ClipboardEntry`'s representations onto a pasteboard (default `NSPasteboard.general`),
     /// with the same image PNG+TIFF expansion and color/path plain-text fallbacks `pasteEntry` uses —
     /// but WITHOUT synthesizing a ⌘V. The single reusable writer for "make this entry the clipboard":
-    /// the launcher's paste path calls it (then pastes), and the device-link receive path calls it to
-    /// auto-paste a received item (no key synthesis). An entry with no inline bytes writes nothing.
+    /// the launcher's paste path calls it (then pastes). An entry with no inline bytes writes nothing.
     /// `nonisolated` + pasteboard-injectable so it's callable off the launcher and unit-testable.
     @discardableResult
     nonisolated static func writeToPasteboard(_ entry: ClipboardEntry,

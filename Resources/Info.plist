@@ -28,15 +28,5 @@
     <!-- Shown if macOS ever prompts for Input Monitoring on the multitouch read. -->
     <key>NSInputMonitoringUsageDescription</key>
     <string>Reads raw trackpad touches to detect the three-finger swipe.</string>
-    <!-- Shown when the device link first advertises/connects on the local network (Bonjour). -->
-    <key>NSLocalNetworkUsageDescription</key>
-    <string>Connects directly to your paired iPhone on your local network to move clipboard items and files between your devices.</string>
-    <!-- The device-link Bonjour service types: the data link AND the QR pairing channel.
-         BOTH must be declared or the OS denies advertising/browsing them (NoAuth / -65555). -->
-    <key>NSBonjourServices</key>
-    <array>
-        <string>_tfslink._tcp</string>
-        <string>_tfspair._tcp</string>
-    </array>
 </dict>
 </plist>

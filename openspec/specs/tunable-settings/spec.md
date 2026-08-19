@@ -163,17 +163,6 @@ The settings SHALL expose a "Keep clipboard history" opt-in that defaults to OFF
 - **WHEN** settings saved before this feature are loaded
 - **THEN** they decode successfully with the opt-in OFF and no clipboard history, and existing settings are not reset
 
-### Requirement: Device-link opt-in
-Settings SHALL expose an `enableDeviceLink` opt-in (default OFF) that gates the device-link receive/send service. Like the clipboard-history opt-in, it relocates no native gesture, needs no re-login, and has no `is…Effective` gate — it takes effect immediately when toggled. It SHALL persist across launches, and settings written before it existed SHALL load with it OFF.
-
-#### Scenario: Default off and persists
-- **WHEN** a fresh settings store is read
-- **THEN** `enableDeviceLink` is false; setting it true and reloading reads back true
-
-#### Scenario: Legacy settings load with it off
-- **WHEN** settings written before this opt-in existed are loaded
-- **THEN** `enableDeviceLink` reads as false (no key present)
-
 ### Requirement: Include-minimized-windows opt-in
 The system SHALL expose an "include minimized windows in the switcher" opt-in, **off by default**, that makes minimized windows appear in the three-finger switcher and the ⌘-Tab reel — each flagged and badged as minimized — with selection **un-minimizing the window in place** and raising it. It SHALL be independent of the include-non-standard-windows setting (either may be on without the other). It SHALL persist across launches, take effect on the next gesture without a restart, and appear in the Settings UI. "Reset to defaults" SHALL restore it to off (it has no system side effect, permission, or download to preserve).
 

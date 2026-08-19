@@ -130,12 +130,6 @@ final class AppSettings: ObservableObject {
     /// permission — it only enables local recording + the synthetic band. Default OFF (privacy).
     @Published var keepClipboardHistory: Bool { didSet { defaults.set(keepClipboardHistory, forKey: Keys.keepClipboardHistory) } }
 
-    /// Opt-in to the device link (iPhone↔Mac clipboard/file bridge). Like the clipboard opt-in it
-    /// relocates no native gesture, needs no re-login, and has no `is…Effective` gate — it just starts/
-    /// stops the receive/send service. Default OFF (privacy; it opens a local-network listener). Adds the
-    /// macOS Local Network prompt the first time the service advertises/connects.
-    @Published var enableDeviceLink: Bool { didSet { defaults.set(enableDeviceLink, forKey: Keys.enableDeviceLink) } }
-
     /// Temporarily stop recording without disabling the feature (the band still shows what's stored).
     @Published var clipboardPaused: Bool { didSet { defaults.set(clipboardPaused, forKey: Keys.clipboardPaused) } }
 
@@ -299,7 +293,6 @@ final class AppSettings: ObservableObject {
         dwellToArmDuration = defaults.object(forKey: Keys.dwellToArmDuration) as? Double ?? Defaults.dwellToArmDuration
         showDiagnostics = defaults.object(forKey: Keys.showDiagnostics) as? Bool ?? Defaults.showDiagnostics
         keepClipboardHistory = defaults.object(forKey: Keys.keepClipboardHistory) as? Bool ?? Defaults.keepClipboardHistory
-        enableDeviceLink = defaults.object(forKey: Keys.enableDeviceLink) as? Bool ?? Defaults.enableDeviceLink
         clipboardPaused = defaults.object(forKey: Keys.clipboardPaused) as? Bool ?? Defaults.clipboardPaused
         clipboardRecentWindow = defaults.object(forKey: Keys.clipboardRecentWindow) as? Int ?? Defaults.clipboardRecentWindow
         clipboardMaxCount = defaults.object(forKey: Keys.clipboardMaxCount) as? Int ?? Defaults.clipboardMaxCount
@@ -426,7 +419,6 @@ final class AppSettings: ObservableObject {
         static let dwellToArmDuration = 0.3        // quick tick; the charge stays readable
         static let showDiagnostics = false         // troubleshooting tools hidden from the menu by default
         static let keepClipboardHistory = false    // opt-in; records copied content locally (privacy)
-        static let enableDeviceLink = false        // opt-in; opens a local-network link to the phone (privacy)
         static let clipboardPaused = false
         static let clipboardRecentWindow = 30      // entries shown in the band (pinned float to top)
         static let clipboardMaxCount = 200         // stored-entry cap (pinned exempt)
@@ -479,7 +471,6 @@ final class AppSettings: ObservableObject {
         static let dwellToArmDuration = "dwellToArmDuration"
         static let showDiagnostics = "showDiagnostics"
         static let keepClipboardHistory = "keepClipboardHistory"
-        static let enableDeviceLink = "enableDeviceLink"
         static let clipboardPaused = "clipboardPaused"
         static let clipboardRecentWindow = "clipboardRecentWindow"
         static let clipboardMaxCount = "clipboardMaxCount"

@@ -2,7 +2,6 @@ import AppKit
 import Combine
 import ServiceManagement
 import SwiftUI
-import DeviceLinkProtocol
 import os
 
 private let windowGroupsLog = Logger(subsystem: "ThreeFingerSwitcher", category: "WindowGroups")
@@ -22,8 +21,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     private lazy var windowService = WindowService(mru: mru, focus: focus, settings: settings)
     private let thumbnails = ThumbnailService()
     private let overlay = OverlayController()
-    /// The transient on-receive notch HUD (success/failure feedback for inbound device-link items).
-    private lazy var receiveHUD = ReceiveHUDController()
     private let touchEngine = TouchEngine()
     private lazy var recognizer = GestureRecognizer(settings: settings)
     let spacesRearrange = SpacesRearrangeConfig()
@@ -113,28 +110,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     // Clipboard history (opt-in; the synthetic Clipboard band + the background recorder).
     private let clipboardStore = ClipboardStore.shared
     private lazy var clipboardMonitor = ClipboardMonitor(store: clipboardStore)
-
-    // Device link (opt-in; the iPhone↔Mac local-network bridge). Received items are adapted into the
-    // clipboard store (so they appear in the Clipboard band); the service is started/stopped by the
-    // `enableDeviceLink` toggle, like the clipboard recorder. Security (pinned TLS) is a pairing follow-up.
-    private var deviceLinkService: DeviceLinkService?
-    private let pairedDeviceStore = PairedDeviceStore(directory: PairedDeviceStore.defaultDirectory())
-    /// Host coordinator for QR pairing (show a code on the Hub, accept a scanner, pin it).
-    private lazy var macPairingCoordinator = MacPairingCoordinator(store: pairedDeviceStore, identity: localDeviceIdentity)
-    /// Received-item adapter: files land in a `received/` inbox beside the clipboard store.
-    private lazy var linkInboundAdapter = LinkInboundAdapter(
-        inboxDirectory: ClipboardStore.defaultDirectory().appendingPathComponent("inbox", isDirectory: true))
-    private let linkOutboundAdapter = LinkOutboundAdapter()
-    /// This Mac's stable link identity (id persisted so a peer's pin survives relaunches; name = host name).
-    private var localDeviceIdentity: DeviceIdentity {
-        let key = "deviceLinkLocalID"
-        let id = UserDefaults.standard.string(forKey: key) ?? {
-            let fresh = UUID().uuidString
-            UserDefaults.standard.set(fresh, forKey: key)
-            return fresh
-        }()
-        return DeviceIdentity(id: id, name: Host.current().localizedName ?? "Mac")
-    }
 
     // Per-app keyboard language (opt-in; remembers and re-selects the input source per app/site). Gated
     // on its OWN toggle, independent of the switcher master enable. The store holds the learned
@@ -273,7 +248,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         observeCommandTabToggle()
         observeLauncherToggle()
         observeClipboardToggle()
-        observeDeviceLinkToggle()
         observeKeyboardLanguageToggle()
         observeKeyboardLanguagePerSiteToggle()
         observeKeyboardLanguageBrowserControlToggle()
@@ -388,7 +362,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         overlay.hide()
         stopPreviewRefresh()
         launcherOverlay.cancel()
-        receiveHUD.hide()
         clipboardMonitor.stop()
         isEnabled = false
         settings.enabled = false
@@ -1046,74 +1019,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             .dropFirst()
             .sink { [weak self] on in MainActor.assumeIsolated { self?.snapMonitor.setEnabled(on) } }
             .store(in: &cancellables)
-    }
-
-    // MARK: - Device link lifecycle
-
-    /// React to the `enableDeviceLink` toggle (mirrors `observeClipboardToggle` — uses the emitted value,
-    /// since `@Published` fires in `willSet`).
-    private func observeDeviceLinkToggle() {
-        settings.$enableDeviceLink
-            .dropFirst()
-            .sink { [weak self] on in MainActor.assumeIsolated { self?.setDeviceLink(on) } }
-            .store(in: &cancellables)
-    }
-
-    /// Start the device-link service when opted in AND the app is enabled; otherwise stop it. Received
-    /// items are adapted into the clipboard store (where the Clipboard band surfaces them, tagged by
-    /// device). `on` is the authoritative state (the toggle's emitted value, or a stable read at launch).
-    private func setDeviceLink(_ on: Bool) {
-        if on && isEnabled {
-            guard deviceLinkService == nil else { return }
-            let service = DeviceLinkService(
-                localIdentity: localDeviceIdentity,
-                staticKey: MacLocalIdentity.privateKey,
-                pinnedFingerprints: { [weak self] in self?.pairedDeviceStore.pinnedFingerprints() ?? [] },
-                device: { [weak self] fingerprint in self?.pairedDeviceStore.device(forFingerprint: fingerprint) })
-            service.onItem = { [weak self] item in self?.receiveLinkItem(item) }
-            do {
-                try service.start()
-                deviceLinkService = service
-            } catch {
-                // Local-network start can fail (e.g. permission not yet granted) — leave the service nil
-                // so a later toggle / permission grant retries. Surfaced on the Devices page.
-                deviceLinkService = nil
-            }
-        } else {
-            deviceLinkService?.stop()
-            deviceLinkService = nil
-        }
-    }
-
-    /// A received item → `ClipboardEntry` (files written to the inbox) → the existing store. Runs on the
-    /// main queue (the service hops there before calling `onItem`).
-    private func receiveLinkItem(_ item: LinkItem) {
-        do {
-            let entry = try linkInboundAdapter.entry(from: item)
-            clipboardStore.insert(entry)
-            // Auto-paste: make the received item the system clipboard so it's immediately pasteable. Reuse
-            // the launcher's pasteboard writer (PNG+TIFF / color-hex / path fallbacks), without synthesizing
-            // a ⌘V. Then suppress the monitor's re-capture of THIS write by its `changeCount`, so the
-            // already-inserted `.peer(deviceName:)` entry keeps its origin/`capturedAt` and no duplicate is
-            // recorded. Suppression is a no-op when clipboard history is off (the monitor isn't polling).
-            LaunchService.writeToPasteboard(entry)
-            clipboardMonitor.suppressSelfWrite(changeCount: NSPasteboard.general.changeCount)
-            // Fire-and-forget feedback — the LAST, non-throwing step, so a HUD problem can never break
-            // receive/storage. On the failure path (a malformed representation / unwritable file, which
-            // `entry(from:)` throws) the same HUD surfaces what was previously a silent drop.
-            receiveHUD.show(kind: item.kind, from: item.origin?.name, success: true)
-        } catch {
-            receiveHUD.show(kind: item.kind, from: item.origin?.name, success: false)
-        }
-    }
-
-    /// v1 outbound trigger: send the most recent clipboard entry to every online paired peer. Per-device
-    /// targeting (a picker over `send(_:to:)`) is a later change; `sendToAll` is the thin convenience over
-    /// the per-peer primitive until then.
-    private func sendLatestClipboardToDevices() {
-        guard let entry = clipboardStore.recentWindow(limit: 1).first,
-              let item = try? linkOutboundAdapter.linkItem(from: entry, origin: localDeviceIdentity) else { return }
-        deviceLinkService?.sendToAll(item)
     }
 
     /// Push the tunables (retention, poll interval, exclusions) into the store/monitor. Does NOT read
@@ -2215,11 +2120,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         ctx.onToggleOpenAtLogin = { [weak self] in self?.toggleOpenAtLogin() }
         ctx.onWriteDiagnostics = { [weak self] in self?.writeDiagnostics() }
         ctx.onCopyFocusLog = { [weak self] in self?.copyFocusLog() }
-        // Devices (device link).
-        ctx.pairedDevices = { [weak self] in self?.pairedDeviceStore.all() ?? [] }
-        ctx.onForgetDevice = { [weak self] id in self?.pairedDeviceStore.remove(id: id) }
-        ctx.onSendLatestToDevices = { [weak self] in self?.sendLatestClipboardToDevices() }
-        ctx.pairingCoordinator = macPairingCoordinator
         // Danger zone.
         ctx.onDangerZoneClear = { [weak self] selection in self?.dangerZoneClear(selection) }
         ctx.onRestoreAllGestures = { [weak self] in self?.restoreAllNativeGestures() }

@@ -77,17 +77,6 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertTrue(reader.manageVerticalGesture, "persists across instances")
     }
 
-    func testEnableDeviceLinkDefaultsFalseAndPersists() {
-        let writer = makeSettings()
-        XCTAssertFalse(writer.enableDeviceLink, "default must be off (opt-in)")
-
-        writer.enableDeviceLink = true
-        XCTAssertEqual(defaults.object(forKey: "enableDeviceLink") as? Bool, true, "writes the documented key")
-
-        let reader = AppSettings(defaults: defaults)
-        XCTAssertTrue(reader.enableDeviceLink, "persists across instances")
-    }
-
     /// Spot-check the literal default values so a silent change to `Defaults` is caught.
     func testDefaultsEnumHasExpectedLiteralValues() {
         // The shipped gesture-feel numbers are the maintainer's dialed-in daily-use values

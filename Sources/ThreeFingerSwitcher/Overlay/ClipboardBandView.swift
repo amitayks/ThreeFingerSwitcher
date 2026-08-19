@@ -91,9 +91,6 @@ struct ClipboardBandView: View {
                 .truncationMode(.tail)
                 .foregroundStyle(selected ? .primary : .secondary)
             Spacer(minLength: 4)
-            if let entry = clipboardEntry(item), entry.isPeer {
-                ProvenanceChip(deviceName: entry.peerDeviceName, color: color)
-            }
             if model.isPinned(item) {
                 Image(systemName: "pin.fill").font(.system(size: 10)).foregroundStyle(color)
             }
@@ -373,30 +370,6 @@ private struct ClipboardImagePreview: View {
         ]
         guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
         return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
-    }
-}
-
-/// A small, unobtrusive "from \<device\>" marker on a Clipboard-band row whose entry arrived over the
-/// device link. Shows the device name when known, else a generic phone glyph. Does not alter the row's
-/// key text or value preview (per the provenance spec).
-private struct ProvenanceChip: View {
-    let deviceName: String?
-    let color: Color
-
-    var body: some View {
-        HStack(spacing: 3) {
-            Image(systemName: "iphone").font(.system(size: 9))
-            if let deviceName, !deviceName.isEmpty {
-                Text(deviceName).font(.system(size: 9, weight: .medium)).lineLimit(1)
-            }
-        }
-        .foregroundStyle(color)
-        .padding(.horizontal, 5)
-        .padding(.vertical, 1)
-        .background(
-            Capsule(style: .continuous).fill(color.opacity(0.14))
-        )
-        .accessibilityLabel(deviceName.map { "from \($0)" } ?? "from a paired device")
     }
 }
 

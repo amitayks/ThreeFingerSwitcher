@@ -8,7 +8,6 @@ enum HubDestination: Hashable, CaseIterable {
     case overview
     case bands
     case switcher, launcher, clipboard, keyboardLanguage
-    case devices
     case setup, general
 
     var title: String {
@@ -19,7 +18,6 @@ enum HubDestination: Hashable, CaseIterable {
         case .launcher: return "Launcher"
         case .clipboard: return "Clipboard"
         case .keyboardLanguage: return "Keyboard Language"
-        case .devices: return "Devices"
         case .setup: return "Setup & Permissions"
         case .general: return "General"
         }
@@ -43,7 +41,6 @@ enum HubDestination: Hashable, CaseIterable {
         case .launcher: return "square.grid.3x3.fill"
         case .clipboard: return "doc.on.clipboard"
         case .keyboardLanguage: return "globe"
-        case .devices: return "iphone.and.arrow.forward"
         case .setup: return "gearshape.2"
         case .general: return "slider.horizontal.3"
         }
@@ -138,12 +135,6 @@ final class HubContext {
     var onDangerZoneClear: (DangerZoneSelection) -> Void = { _ in }
     var onRestoreAllGestures: () -> Void = {}
 
-    // Devices page (device link).
-    var pairedDevices: () -> [PairedDevice] = { [] }
-    var onForgetDevice: (String) -> Void = { _ in }
-    var onSendLatestToDevices: () -> Void = {}
-    /// QR pairing host coordinator (show a code + accept a scanner). Observed by the Devices page.
-    var pairingCoordinator: MacPairingCoordinator?
 
     init(settings: AppSettings,
          favorites: FavoritesStore,
@@ -210,7 +201,7 @@ struct HubView: View {
                     railDivider
                     railButton(.bands)
                     railDivider
-                    railButton(.switcher); railButton(.launcher); railButton(.clipboard); railButton(.keyboardLanguage); railButton(.devices)
+                    railButton(.switcher); railButton(.launcher); railButton(.clipboard); railButton(.keyboardLanguage)
                     railDivider
                     railButton(.setup); railButton(.general)
                 }
@@ -263,7 +254,6 @@ struct HubView: View {
         case .launcher: LauncherPage(context: context)
         case .clipboard: ClipboardPage(context: context)
         case .keyboardLanguage: KeyboardLanguagePage(context: context)
-        case .devices: DevicesPage(context: context)
         case .setup: SetupPage(context: context)
         case .general: GeneralPage(context: context)
         }
