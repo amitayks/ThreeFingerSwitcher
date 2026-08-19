@@ -92,12 +92,6 @@ final class KeyboardSwitcherTap {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return pass
         }
-        // Agent-posted synthetic keystrokes (`add-voice-computer-use-agent`, spec: "Agent typing
-        // never triggers the app's own recognizers"): tagged at the source, passed through untouched
-        // — the agent's typing must reach the target app and never trip our own ⌘-Tab machinery.
-        if AgentActionArbiter.isSyntheticAgentEvent(event) {
-            return pass
-        }
         switch type {
         case .flagsChanged:
             // Track ⌘ and drive the session's arm/commit edges; NEVER consume a modifier change (other

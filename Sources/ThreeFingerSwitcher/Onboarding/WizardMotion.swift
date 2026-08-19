@@ -111,7 +111,7 @@ struct RippleRing: View {
 
 // MARK: - Breathing halo
 
-/// A soft breathing halo — the AI canvas's sparkle-pulse idiom generalized: `TimelineView`-driven
+/// A soft breathing halo: `TimelineView`-driven
 /// (no bound state), calm enough to wait on. Used behind the brand mark, behind waiting states
 /// (the re-login door), and under the demo strip while the user's hand drives it.
 struct PulseHalo: View {

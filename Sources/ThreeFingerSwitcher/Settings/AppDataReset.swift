@@ -11,8 +11,6 @@ struct DangerZoneSelection: OptionSet, Equatable {
     static let appData = DangerZoneSelection(rawValue: 1 << 0)
     /// ~/Library/Caches/<bid> and ~/Library/HTTPStorages/<bid>.
     static let caches = DangerZoneSelection(rawValue: 1 << 1)
-    /// The multi-GB weights directory (the AI opt-in is turned off first by the coordinator).
-    static let aiModels = DangerZoneSelection(rawValue: 1 << 2)
     /// `tccutil reset` for every service the app can hold.
     static let permissions = DangerZoneSelection(rawValue: 1 << 3)
 }
@@ -24,18 +22,14 @@ struct DangerZoneSelection: OptionSet, Equatable {
 final class AppDataReset {
     /// Every TCC service this app can hold a grant for, in `tccutil reset` spelling.
     static let tccServices = [
-        "Accessibility",   // window enumeration / raising / selection I/O
-        "ScreenCapture",   // thumbnails + vision input
+        "Accessibility",   // window enumeration / raising
+        "ScreenCapture",   // thumbnails
         "ListenEvent",     // Input Monitoring (usually never granted)
-        "AppleEvents",     // the per-site keyboard "allow browser control" reader
-        "Calendar",        // AI tasks (lazy)
-        "Reminders",
-        "AddressBook"      // Contacts
+        "AppleEvents"      // the per-site keyboard "allow browser control" reader
     ]
 
     /// What to delete for a selection: directories removed whole, plus directories whose CONTENTS
-    /// are removed except named survivors (the App-data/AI-models split: App data keeps `models/`
-    /// unless AI models is also selected, in which case the whole root goes).
+    /// are removed except named survivors.
     struct FilesystemTargets: Equatable {
         var removeWhole: [URL] = []
         var removeContentsExcept: [(directory: URL, keep: Set<String>)] = []
@@ -48,24 +42,16 @@ final class AppDataReset {
     }
 
     /// Pure: the filesystem footprint for a selection. `library` is `~/Library`; the Application
-    /// Support root is the app's `ThreeFingerSwitcher` directory (clipboard, projects, models).
+    /// Support root is the app's `ThreeFingerSwitcher` directory (clipboard, projects).
     nonisolated static func filesystemTargets(for selection: DangerZoneSelection,
                                               library: URL,
                                               bundleID: String) -> FilesystemTargets {
         var targets = FilesystemTargets()
         let appSupportRoot = library.appendingPathComponent("Application Support/ThreeFingerSwitcher",
                                                             isDirectory: true)
-        let modelsDir = appSupportRoot.appendingPathComponent("models", isDirectory: true)
 
-        switch (selection.contains(.appData), selection.contains(.aiModels)) {
-        case (true, true):
+        if selection.contains(.appData) {
             targets.removeWhole.append(appSupportRoot)
-        case (true, false):
-            targets.removeContentsExcept.append((appSupportRoot, ["models"]))
-        case (false, true):
-            targets.removeWhole.append(modelsDir)
-        case (false, false):
-            break
         }
         if selection.contains(.appData) {
             targets.removeWhole.append(

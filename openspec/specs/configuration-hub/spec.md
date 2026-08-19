@@ -2,16 +2,16 @@
 
 ## Purpose
 
-Define the single, unified configuration **Hub** window that is the only surface for configuring every feature: an Overview landing page of master toggles, grouped-sidebar navigation (Content → Bands; Features → Switcher/Launcher/Clipboard/AI; System → Setup/General), per-feature pages that preserve all tunables and persistence, a Setup page for permissions and native-gesture opt-ins, a Bands page that edits only authored bands, and a Liquid-Glass/material presentation consistent with the runtime overlays. All former configuration surfaces (Settings, Favorites editor, Setup/Onboarding, AI-command editor) fold into this one window.
+Define the single, unified configuration **Hub** window that is the only surface for configuring every feature: an Overview landing page of master toggles, grouped-sidebar navigation (Content → Bands; Features → Switcher/Launcher/Clipboard; System → Setup/General), per-feature pages that preserve all tunables and persistence, a Setup page for permissions and native-gesture opt-ins, a Bands page that edits only authored bands, and a Liquid-Glass/material presentation consistent with the runtime overlays. All former configuration surfaces (Settings, Favorites editor, Setup/Onboarding) fold into this one window.
 ## Requirements
 ### Requirement: Unified configuration Hub window
-The system SHALL provide a single configuration **Hub** window that is the only surface for configuring every feature. Opening any configuration entry point (from the status menu or from in-app deep links) SHALL open this one window — there SHALL be no separate Settings, Favorites, Setup, or AI-command-editor window or sheet. The Hub SHALL be a single reusable window: re-opening it SHALL bring the existing window forward rather than creating another, and its frame SHALL persist across launches.
+The system SHALL provide a single configuration **Hub** window that is the only surface for configuring every feature. Opening any configuration entry point (from the status menu or from in-app deep links) SHALL open this one window — there SHALL be no separate Settings, Favorites, or Setup window or sheet. The Hub SHALL be a single reusable window: re-opening it SHALL bring the existing window forward rather than creating another, and its frame SHALL persist across launches.
 
 The one exception is the **First Touch wizard**: a transient first-run/replay window that is an onboarding performance, not a configuration surface. Every preference the wizard writes SHALL be the same persisted preference the Hub owns, and the wizard SHALL NOT host any configuration capability beyond its onboarding steps — the Hub remains the only place to configure the app.
 
 #### Scenario: One window for all configuration
 - **WHEN** the user opens configuration from the status menu
-- **THEN** the Hub window opens, and no separate Settings, Favorites, Setup, or AI-command window exists
+- **THEN** the Hub window opens, and no separate Settings, Favorites, or Setup window exists
 
 #### Scenario: Re-opening reuses the same window
 - **WHEN** the Hub is already open and the user triggers it again
@@ -26,11 +26,11 @@ The one exception is the **First Touch wizard**: a transient first-run/replay wi
 - **THEN** it writes the identical persisted preference as the corresponding Hub page, and any further configuration of that feature happens in the Hub
 
 ### Requirement: Overview landing page with feature master toggles
-The Hub SHALL present an **Overview** landing page that shows every feature's master enable toggle at a glance — the window switcher, Space-row switching, the four-finger launcher, clipboard history, and AI commands — and SHALL let the user turn each feature on or off directly from this page. Each feature row SHALL deep-link to that feature's detail page. Toggling a feature on the Overview SHALL write the same persisted preference as toggling it on its detail page.
+The Hub SHALL present an **Overview** landing page that shows every feature's master enable toggle at a glance — the window switcher, Space-row switching, the four-finger launcher, and clipboard history — and SHALL let the user turn each feature on or off directly from this page. Each feature row SHALL deep-link to that feature's detail page. Toggling a feature on the Overview SHALL write the same persisted preference as toggling it on its detail page.
 
 #### Scenario: All master toggles visible at a glance
 - **WHEN** the user opens the Hub on the Overview page
-- **THEN** the on/off state of the switcher, Space-row switching, launcher, clipboard, and AI features is shown together
+- **THEN** the on/off state of the switcher, Space-row switching, launcher, and clipboard features is shown together
 
 #### Scenario: Toggle from the Overview
 - **WHEN** the user flips a feature's toggle on the Overview page
@@ -41,11 +41,11 @@ The Hub SHALL present an **Overview** landing page that shows every feature's ma
 - **THEN** the Hub navigates to that feature's detail page
 
 ### Requirement: Grouped sidebar navigation
-The Hub SHALL organize its pages in a sidebar grouped as: an **Overview** entry; a **Content** group containing **Bands**; a **Features** group containing **Switcher**, **Launcher**, **Clipboard**, and **AI**; and a **System** group containing **Setup** and **General**. The sidebar SHALL be a compact icon-only rail (each destination shown as its icon, with its name as a tooltip, the groups separated by dividers) to conserve horizontal space, and SHALL tint the selected destination. The sidebar SHALL provide a button to expand it to show icon + label and collapse it back to icons, transitioning smoothly (animated). Each destination's full row (not merely its glyph) SHALL be the click target. Selecting a sidebar entry SHALL show that page in the detail area. A disabled feature SHALL keep its page reachable (its controls shown disabled) so it can be re-enabled. Space-row switching is a sub-feature of the Switcher and SHALL appear as sections on the **Switcher** page (Space-row switching and Fixed order) rather than as its own sidebar destination.
+The Hub SHALL organize its pages in a sidebar grouped as: an **Overview** entry; a **Content** group containing **Bands**; a **Features** group containing **Switcher**, **Launcher**, and **Clipboard**; and a **System** group containing **Setup** and **General**. The sidebar SHALL be a compact icon-only rail (each destination shown as its icon, with its name as a tooltip, the groups separated by dividers) to conserve horizontal space, and SHALL tint the selected destination. The sidebar SHALL provide a button to expand it to show icon + label and collapse it back to icons, transitioning smoothly (animated). Each destination's full row (not merely its glyph) SHALL be the click target. Selecting a sidebar entry SHALL show that page in the detail area. A disabled feature SHALL keep its page reachable (its controls shown disabled) so it can be re-enabled. Space-row switching is a sub-feature of the Switcher and SHALL appear as sections on the **Switcher** page (Space-row switching and Fixed order) rather than as its own sidebar destination.
 
 #### Scenario: Sidebar groups
 - **WHEN** the user opens the Hub
-- **THEN** the sidebar shows Overview, a Content group with Bands, a Features group with Switcher/Launcher/Clipboard/AI, and a System group with Setup/General, as a compact icon-only rail with names as tooltips
+- **THEN** the sidebar shows Overview, a Content group with Bands, a Features group with Switcher/Launcher/Clipboard, and a System group with Setup/General, as a compact icon-only rail with names as tooltips
 - **AND** Space-row switching appears as sections on the Switcher page, not as its own sidebar entry
 
 #### Scenario: Disabled feature page still reachable
@@ -61,7 +61,7 @@ Every tunable and control that existed in the former Settings window SHALL be pr
 
 #### Scenario: Reset semantics are unchanged
 - **WHEN** the user resets to defaults from the Hub
-- **THEN** the same tunables reset and the same opt-in preferences (gesture relocations, clipboard and AI opt-ins, excluded apps, selected model) are preserved exactly as before
+- **THEN** the same tunables reset and the same opt-in preferences (gesture relocations, the clipboard opt-in, excluded apps) are preserved exactly as before
 
 ### Requirement: Setup page hosts permissions and native-gesture opt-ins
 The Hub SHALL provide a **Setup** page that hosts the permissions status and guidance and the native-gesture opt-ins for ongoing (post-onboarding) use. The configuration entry point for permissions and setup SHALL be this page. The Setup page SHALL also offer the First Touch wizard entry: **Resume the welcome tour** while first-run onboarding is incomplete, and **Replay the welcome tour** after completion.
@@ -75,11 +75,11 @@ The Hub SHALL provide a **Setup** page that hosts the permissions status and gui
 - **THEN** a resume entry is offered if onboarding is incomplete, or a replay entry if it is complete
 
 ### Requirement: Bands page edits only authored bands
-The Hub SHALL provide a **Bands** page that is the single surface for arranging launcher content. The Bands page SHALL edit only **authored** bands (the user's favorites bands, which now include AI-command items). It SHALL NOT present **live** bands — bands whose items are auto-populated rather than authored, such as the clipboard band — for item-level editing; such features are configured on their own feature page and projected into the launcher at runtime.
+The Hub SHALL provide a **Bands** page that is the single surface for arranging launcher content. The Bands page SHALL edit only **authored** bands (the user's favorites bands). It SHALL NOT present **live** bands — bands whose items are auto-populated rather than authored, such as the clipboard band — for item-level editing; such features are configured on their own feature page and projected into the launcher at runtime.
 
 #### Scenario: Authored bands are editable on the Bands page
 - **WHEN** the user opens the Bands page
-- **THEN** the user's favorites bands and their items (including AI commands) are shown and editable
+- **THEN** the user's favorites bands and their items are shown and editable
 
 #### Scenario: The clipboard live band is not edited on the Bands page
 - **WHEN** the user opens the Bands page with clipboard history enabled
@@ -110,7 +110,7 @@ The Hub's **General** page SHALL present its preference settings — **Self-heal
 ### Requirement: General page Danger zone
 The Hub's **General** page SHALL provide a "Danger zone" section with selective, explicit reset controls:
 
-- Four opt-in selectors, all default off, each gating one deletion category: **App data & settings** (the app's preferences domain, Application Support data excluding the AI model weights, and saved window state), **Caches**, **AI models** (the on-disk weights, with the AI opt-in turned off first), and **Permissions** (a TCC reset for every service the app can hold). The selectors SHALL be presented as a 2×2 grid of full-body toggle-cards: the whole card is the click target, and a selected card is visually highlighted (distinct from a plain on/off switch).
+- Opt-in selectors, all default off, each gating one deletion category: **App data & settings** (the app's preferences domain, Application Support data, and saved window state), **Caches**, and **Permissions** (a TCC reset for every service the app can hold). The selectors SHALL be presented as a grid of full-body toggle-cards: the whole card is the click target, and a selected card is visually highlighted (distinct from a plain on/off switch).
 - A destructive **Clear selected** action that SHALL be disabled while no category is selected and SHALL require an explicit confirmation enumerating exactly what will happen before anything is deleted.
 - WHEN App data & settings is selected and any native-gesture/Spaces backup exists, the relocations SHALL be restored FIRST (and the confirmation SHALL say so) — the wipe must never delete the backups while leaving the system relocated.
 - WHEN App data & settings or Permissions was cleared, the app SHALL relaunch itself so the fresh process reads the cleared state (a data wipe re-enters first-run onboarding); cache/model-only clears SHALL report a non-blocking summary and stay running.
@@ -121,8 +121,8 @@ The Hub's **General** page SHALL provide a "Danger zone" section with selective,
 - **THEN** the Clear action is disabled and nothing is deleted
 
 #### Scenario: Selective clear honors the selection
-- **WHEN** the user selects only Caches and AI models and confirms
-- **THEN** only the cache directories and the model weights are removed (the AI opt-in turning off first), preferences and permissions are untouched, and the app keeps running with a summary
+- **WHEN** the user selects only Caches and confirms
+- **THEN** only the cache directories are removed, preferences and permissions are untouched, and the app keeps running with a summary
 
 #### Scenario: Data wipe restores gestures first
 - **WHEN** App data & settings is selected while a trackpad relocation backup exists and the user confirms
@@ -139,82 +139,4 @@ The Hub's **General** page SHALL provide a "Danger zone" section with selective,
 #### Scenario: Selectors are a 2×2 toggle-card grid
 - **WHEN** the Danger zone is shown
 - **THEN** the four category selectors appear as a 2×2 grid of full-body toggle-cards where clicking anywhere on a card toggles its selection and the selected card is highlighted
-
-### Requirement: Files page hosts roots, appearance, and behavior
-
-The Hub SHALL provide a **Files** page (reachable from the grouped sidebar) that hosts the Files band's configuration: the **roots editor** (add / remove / reorder the local root folders that form the band's entry column), the **appearance** controls (column width / density, tint, and an icon-vs-preview choice), and the **behavior** controls (entry **sort order**, the default-open action, and which metadata a row shows). The page SHALL include the Files band **opt-in** master toggle. All controls SHALL **persist** their values (live-applied, like the other feature pages) and SHALL use the shared **Liquid Glass** presentation consistent with the rest of the Hub. The roots editor SHALL accept **local folders only**.
-
-#### Scenario: The Files page is reachable and toggles the band
-- **WHEN** the user opens the Hub and selects the Files page
-- **THEN** the page shows the Files opt-in toggle plus the roots, appearance, and behavior controls
-
-#### Scenario: Editing roots updates the entry column
-- **WHEN** the user adds, removes, or reorders a root on the Files page
-- **THEN** the Files band's entry column reflects the change on the next launcher open
-
-#### Scenario: Appearance and behavior changes persist and live-apply
-- **WHEN** the user changes column density, tint, sort order, or the default-open action
-- **THEN** the change persists across launches and applies to the Files band
-
-#### Scenario: Only local folders can be added as roots
-- **WHEN** the user attempts to add a root
-- **THEN** only local folders are accepted (network / iCloud-placeholder locations are rejected)
-
-### Requirement: The Files page configures the action menu and lift action
-
-The Hub's **Files page** SHALL let the user configure the Files-band action menu and the drill's lift action. It SHALL provide:
-
-- a **per-type menu editor** (separate for **file** and **folder**) to **add, remove, and reorder** items from the action catalog (the defaults plus the opt-in extras — Reveal in Finder, Add to Favorites, Open in ‹editor›, Copy name);
-- a **terminals/editors curation** control listing the **auto-detected** installed tools, each individually enable-able;
-- a control to set the Files **lift action** (deliver / open / open-menu), edited through the existing gesture-binding editor used by the other remappable surfaces.
-
-Edits SHALL persist (see *tunable-settings*) and SHALL take effect on the next time the band is shown. The page SHALL keep the existing previewed-section header and its other Files controls unchanged.
-
-#### Scenario: Reordering the file menu persists
-
-- **WHEN** the user reorders the **file** action menu on the Files page
-- **THEN** the next time the file action menu opens it reflects the new order, across launches
-
-#### Scenario: Curating terminals controls the menu
-
-- **WHEN** the user disables a detected terminal on the Files page
-- **THEN** that terminal no longer appears in the folder action menu
-
-#### Scenario: Setting the lift action
-
-- **WHEN** the user sets the Files lift action to "open"
-- **THEN** a lift on a highlighted entry opens it (instead of delivering), and the default can be restored
-
-#### Scenario: File and folder editors are independent
-
-- **WHEN** the user edits the folder menu
-- **THEN** the file menu editor and its result are unaffected
-
-### Requirement: The AI page hosts the Background autonomy whitelist and audit log
-The Hub's **AI** feature page SHALL provide a **Background autonomy** section with two surfaces:
-
-- a **whitelist editor** — add, remove, and review the trusted **folder path prefixes** (picked as **local folders only**) and the trusted **command patterns** that let a parked agent run a `confirm` write automatically. The editor SHALL default empty (a fresh install trusts nothing arbitrary), SHALL **persist** its values with the same keys/defaults/reset semantics as the other AI opt-ins, and SHALL state plainly that whitelisting a folder/command makes matching writes run in the background, and that dangerous operations (delete, overwrite-existing, arbitrary shell) are never made automatic by the whitelist.
-- an **audit log viewer** — a reverse-chronological "what your agents did while you were away" ledger of recent background and foreground tool steps, each showing the tool, a redacted arguments summary, the effective tier, the outcome (a failure shown as a clean headline with an opt-in details disclosure), and a timestamp, distinguishing background actions from foreground ones.
-
-Both surfaces SHALL use the shared Liquid Glass presentation consistent with the rest of the Hub. A failure to persist or load the audit log SHALL surface as a **bounded, non-blocking** banner (clean headline, opt-in details), **never** an app-modal alert.
-
-#### Scenario: The Background autonomy section is reachable on the AI page
-- **WHEN** the user opens the Hub and selects the AI feature page
-- **THEN** a Background autonomy section shows the whitelist editor (trusted folders + command patterns) and the audit log viewer
-
-#### Scenario: Editing the whitelist persists and live-applies
-- **WHEN** the user adds a trusted folder or command pattern and removes another
-- **THEN** the change persists across launches, is preserved by a reset-to-defaults like the other AI opt-ins, and the agent's effective-tier resolution reflects it on the next step
-
-#### Scenario: Only local folders can be added as trusted prefixes
-- **WHEN** the user adds a trusted folder
-- **THEN** only a local folder is accepted (network / iCloud-placeholder locations are rejected)
-
-#### Scenario: The audit viewer reads the ledger
-- **WHEN** the user opens the audit log viewer after the agent has worked
-- **THEN** the recent tool steps appear in reverse-chronological order with their tool, redacted args, effective tier, outcome, and timestamp, marking which ran in the background
-
-#### Scenario: An audit store failure is non-blocking
-- **WHEN** loading or persisting the audit log fails
-- **THEN** the viewer shows a bounded banner with a clean headline (details behind an opt-in disclosure) and the rest of the page stays usable, with no app-modal alert
 

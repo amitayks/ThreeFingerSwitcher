@@ -2,8 +2,8 @@ import XCTest
 @testable import ThreeFingerSwitcherCore
 
 /// Unit tests for the Danger zone's reset service (Settings/AppDataReset.swift): the pure
-/// filesystem-target computation per selection (including the App-data/AI-models split), the TCC
-/// service list, and the perform step against a temp directory + command spy.
+/// filesystem-target computation per selection, the TCC service list, and the perform step against
+/// a temp directory + command spy.
 @MainActor
 final class AppDataResetTests: XCTestCase {
     private let library = URL(fileURLWithPath: "/Users/test/Library", isDirectory: true)
@@ -23,28 +23,12 @@ final class AppDataResetTests: XCTestCase {
         XCTAssertTrue(t.removeContentsExcept.isEmpty)
     }
 
-    func testAppDataAloneKeepsTheModels() {
+    func testAppDataRemovesTheWholeRoot() {
         let t = targets(.appData)
-        XCTAssertEqual(t.removeContentsExcept.count, 1)
-        XCTAssertEqual(t.removeContentsExcept[0].directory.path,
-                       "/Users/test/Library/Application Support/ThreeFingerSwitcher")
-        XCTAssertEqual(t.removeContentsExcept[0].keep, ["models"],
-                       "the multi-GB weights survive a settings reset unless explicitly selected")
-        XCTAssertEqual(paths(t.removeWhole),
-                       ["/Users/test/Library/Saved Application State/\(bid).savedState"])
-    }
-
-    func testAIModelsAloneRemovesOnlyTheWeights() {
-        let t = targets(.aiModels)
-        XCTAssertEqual(paths(t.removeWhole),
-                       ["/Users/test/Library/Application Support/ThreeFingerSwitcher/models"])
         XCTAssertTrue(t.removeContentsExcept.isEmpty)
-    }
-
-    func testAppDataPlusModelsRemovesTheWholeRoot() {
-        let t = targets([.appData, .aiModels])
-        XCTAssertTrue(paths(t.removeWhole).contains("/Users/test/Library/Application Support/ThreeFingerSwitcher"))
-        XCTAssertTrue(t.removeContentsExcept.isEmpty, "no survivors when both are selected")
+        XCTAssertEqual(paths(t.removeWhole),
+                       ["/Users/test/Library/Application Support/ThreeFingerSwitcher",
+                        "/Users/test/Library/Saved Application State/\(bid).savedState"])
     }
 
     func testCaches() {
@@ -62,8 +46,7 @@ final class AppDataResetTests: XCTestCase {
 
     func testTCCServiceListCoversEverythingTheAppCanHold() {
         XCTAssertEqual(Set(AppDataReset.tccServices),
-                       ["Accessibility", "ScreenCapture", "ListenEvent", "AppleEvents",
-                        "Calendar", "Reminders", "AddressBook"])
+                       ["Accessibility", "ScreenCapture", "ListenEvent", "AppleEvents"])
     }
 
     // MARK: - Perform step (temp filesystem + command spy)

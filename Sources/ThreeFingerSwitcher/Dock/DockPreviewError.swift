@@ -2,16 +2,16 @@ import Foundation
 
 /// Failures the Dock-preview commit (raise / un-minimize-then-raise) can report.
 ///
-/// The Dock-domain parallel to the Files feature's `FileActionError`: a small Core taxonomy conforming to
+/// The Dock-domain error taxonomy: a small Core taxonomy conforming to
 /// `LocalizedError` with a clean, per-case, user-facing sentence for every case — so a failed commit
 /// surfaces as a bounded headline that reads the same everywhere, never a reflected enum dump or raw OS
-/// text. (The AI `RuntimeError` and `FileActionError` are deliberately NOT reused: their cases are
+/// text. (Other domains' taxonomies are deliberately NOT reused: their cases are
 /// model-/filesystem-layer concepts with no meaning for a window-raise action.)
 ///
 /// **Map at the boundary:** any underlying AX/OS failure is converted into one of these cases where it
 /// crosses into feature/UI code, and the raw text is stringified into the opt-in `details` payload there —
 /// kept ONLY for a "Show details / Copy" disclosure and logs, NEVER used as the headline. Carrying
-/// `details` as a `String?` (not a raw `Error`) keeps the enum `Equatable`, like `FileActionError`.
+/// `details` as a `String?` (not a raw `Error`) keeps the enum `Equatable`.
 enum DockPreviewError: Error, Equatable {
     /// The chosen window could no longer be found at commit time (closed, or moved off this Space).
     /// `name` is the window's display title.

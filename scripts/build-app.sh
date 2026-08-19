@@ -34,17 +34,13 @@ else
     echo "  Run ./scripts/make-dev-cert.sh once to fix this."
 fi
 
-# The app transitively links MLX (Gemma 4 runtime), whose Metal shaders ONLY compile under
-# xcodebuild — `swift build` cannot build the app target anymore. We still keep STABLE signing:
-# xcodebuild builds WITHOUT signing (CODE_SIGNING_ALLOWED=NO), then the codesign block below applies
-# the stable "ThreeFingerSwitcher Dev" identity, so TCC grants survive across rebuilds.
+# STABLE signing: xcodebuild builds WITHOUT signing (CODE_SIGNING_ALLOWED=NO), then the codesign
+# block below applies the stable "ThreeFingerSwitcher Dev" identity, so TCC grants survive across
+# rebuilds.
 echo "▸ xcodebuild build -scheme $PRODUCT -configuration $CONFIG (no xcodebuild signing; stable codesign below)"
 # `-onlyUsePackageVersionsFromResolvedFile`: build EXACTLY the versions in the committed
-# Package.resolved and never re-resolve. Some dependencies (gemma-4-swift-mlx, and its transitive
-# mlx-swift-lm) track `branch: main`, whose upstream HEAD drifts and has shipped commits that fail to
-# compile — without this flag a clean CI checkout re-resolves those branches to a broken newer HEAD
-# and fails the release build even though the lockfile pins known-good commits. The lockfile is the
-# source of truth; bump deliberately via `swift package update` + a verified `xcodebuild`.
+# Package.resolved and never re-resolve, so a clean CI checkout can never drift onto a broken
+# upstream HEAD. The lockfile is the source of truth; bump deliberately via `swift package update`.
 xcodebuild build \
     -scheme "$PRODUCT" \
     -destination 'platform=macOS' \
@@ -90,11 +86,10 @@ for dylib in "$BIN_PATH"/*.dylib; do
     cp "$dylib" "$APP/Contents/Frameworks/"
 done
 
-# SwiftPM resource bundles (e.g. mlx-swift_Cmlx.bundle, which holds default.metallib — MLX's compiled
-# Metal shaders). xcodebuild emits these into the products dir; they are NOT baked into the binary.
-# Each package finds its bundle via `Bundle.module`, whose first candidate is `Bundle.main.resourceURL`
-# = Contents/Resources. WITHOUT this copy the app is SIGKILLed with no crash report the instant MLX
-# touches the GPU — i.e. "it disappears at 100%". Copy every produced *.bundle into Resources.
+# SwiftPM resource bundles: xcodebuild emits these into the products dir; they are NOT baked into
+# the binary. Each package finds its bundle via `Bundle.module`, whose first candidate is
+# `Bundle.main.resourceURL` = Contents/Resources — so copy every produced *.bundle into Resources
+# (a no-op when no dependency ships resources).
 for bundle in "$BIN_PATH"/*.bundle; do
     [ -e "$bundle" ] || continue
     echo "▸ bundling resource: $(basename "$bundle")"

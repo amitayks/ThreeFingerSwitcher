@@ -20,9 +20,8 @@ final class FirstTouchWizardModelTests: XCTestCase {
         store = FirstRunStore(defaults: defaults)
         let settings = AppSettings(defaults: defaults)
         settings.keepClipboardHistory = false
-        settings.aiCommandsEnabled = false
         context = WizardContext(settings: settings, permissions: PermissionsService())
-        context.launcherBands = { clipboardOn, _ in
+        context.launcherBands = { clipboardOn in
             var bands = [ContextBand(name: "Work", color: ItemColor(red: 0, green: 0, blue: 1),
                                      items: [LaunchItem(title: "Thing", icon: .sfSymbol("star"),
                                                         kind: .url(URL(string: "https://example.com")!))])]
@@ -59,7 +58,7 @@ final class FirstTouchWizardModelTests: XCTestCase {
     }
 
     func testEmptyBandsLeaveTheDemoEmptyWithoutError() {
-        context.launcherBands = { _, _ in [] }
+        context.launcherBands = { _ in [] }
         store.stage = .playground
         let model = FirstTouchWizardModel(context: context, store: store)
         model.resume()

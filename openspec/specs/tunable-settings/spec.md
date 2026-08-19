@@ -163,40 +163,6 @@ The settings SHALL expose a "Keep clipboard history" opt-in that defaults to OFF
 - **WHEN** settings saved before this feature are loaded
 - **THEN** they decode successfully with the opt-in OFF and no clipboard history, and existing settings are not reset
 
-### Requirement: AI commands opt-in
-The settings SHALL expose an "AI commands" opt-in that defaults to OFF and gates both the AI command band and the on-device model (download and residency). Unlike the Space-row and launcher opt-ins, this opt-in SHALL NOT relocate any native gesture or require a re-login; unlike the clipboard opt-in, enabling it DOES initiate a one-time multi-gigabyte model download (and a calendar task will later request the Calendar permission at first use). Settings saved before this feature SHALL load unchanged with the opt-in OFF, no model downloaded, and no commands.
-
-#### Scenario: Opt-in defaults off and gates the feature
-- **WHEN** the app loads with no prior AI settings
-- **THEN** the AI commands opt-in is OFF, no model is downloaded, and no AI command band appears
-
-#### Scenario: Enabling needs no re-login or native-gesture change
-- **WHEN** the user turns the opt-in on
-- **THEN** the band and model become available without a re-login or any native-gesture relocation (a model download begins)
-
-#### Scenario: Older settings load with the feature off
-- **WHEN** settings saved before this feature are loaded
-- **THEN** they decode successfully with the opt-in OFF and no AI data, and existing settings are not reset
-
-### Requirement: AI model management settings
-With the AI commands opt-in on, the settings SHALL let the user manage the on-device model: choose which Gemma 4 model is selected, see the **selected** model's download status and size, trigger or retry the download, evict the resident model from memory, and **delete the selected model's weights from disk**. The displayed status SHALL track the selected model (switching the picker SHALL refresh it). These controls SHALL persist their state across launches and apply immediately.
-
-#### Scenario: Download status is visible
-- **WHEN** the user opens settings with the opt-in on and a model downloading
-- **THEN** the settings show the model identity, size, and download progress/status
-
-#### Scenario: Status tracks the selected model
-- **WHEN** the user switches the model picker to a different model
-- **THEN** the status row refreshes to that model's own download/loaded state
-
-#### Scenario: Delete the selected model
-- **WHEN** the user deletes the selected, downloaded model
-- **THEN** its weights are removed from disk and the row shows it as not-downloaded (re-downloadable)
-
-#### Scenario: Evict frees memory immediately
-- **WHEN** the user chooses to evict the resident model
-- **THEN** the model is unloaded from memory and the next command reloads it on demand
-
 ### Requirement: Device-link opt-in
 Settings SHALL expose an `enableDeviceLink` opt-in (default OFF) that gates the device-link receive/send service. Like the clipboard-history opt-in, it relocates no native gesture, needs no re-login, and has no `is…Effective` gate — it takes effect immediately when toggled. It SHALL persist across launches, and settings written before it existed SHALL load with it OFF.
 
@@ -207,36 +173,6 @@ Settings SHALL expose an `enableDeviceLink` opt-in (default OFF) that gates the 
 #### Scenario: Legacy settings load with it off
 - **WHEN** settings written before this opt-in existed are loaded
 - **THEN** `enableDeviceLink` reads as false (no key present)
-
-### Requirement: Persisted Files action-menu and lift settings
-
-The app SHALL persist the Files-band action configuration and SHALL default it to this change's grammar. The persisted settings SHALL include:
-
-- the **per-type action-menu item lists** (file and folder), each an ordered list drawn from the action catalog — defaulting to **file:** Copy as path · Copy · Paste · Open in ▸ and **folder:** Copy as path · Copy · Paste · ‹terminals› · Open in ▸;
-- the **Files lift action** — defaulting to **deliver** (with the menu excursion defaulting to the `+1`-finger lift and discard to the four-finger horizontal), stored as part of the Files gesture-binding vocabulary;
-- the **curated terminals/editors** allow-list — defaulting to the auto-detected installed set being enabled.
-
-These settings SHALL be included in the app's **reset-to-defaults** semantics and SHALL load to the defaults above when absent or unreadable.
-
-#### Scenario: Defaults reproduce the specified grammar
-
-- **WHEN** the user has never customized the Files action settings
-- **THEN** the file and folder menus, the lift action (deliver), and the enabled terminals are exactly the defaults above
-
-#### Scenario: Customizations persist across launches
-
-- **WHEN** the user changes a menu list, the lift action, or the enabled terminals and relaunches
-- **THEN** the changes are restored from persistence
-
-#### Scenario: Reset restores defaults
-
-- **WHEN** the user resets settings to defaults
-- **THEN** the Files action menus, lift action, and terminal allow-list return to the specified defaults
-
-#### Scenario: Missing or unreadable settings fall back to defaults
-
-- **WHEN** the persisted Files action settings are absent or cannot be decoded
-- **THEN** the app loads the specified defaults without error
 
 ### Requirement: Include-minimized-windows opt-in
 The system SHALL expose an "include minimized windows in the switcher" opt-in, **off by default**, that makes minimized windows appear in the three-finger switcher and the ⌘-Tab reel — each flagged and badged as minimized — with selection **un-minimizing the window in place** and raising it. It SHALL be independent of the include-non-standard-windows setting (either may be on without the other). It SHALL persist across launches, take effect on the next gesture without a restart, and appear in the Settings UI. "Reset to defaults" SHALL restore it to off (it has no system side effect, permission, or download to preserve).

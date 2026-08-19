@@ -85,13 +85,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         if !coordinator.isTrackpadAvailable { toggle.isEnabled = false }
         groups.append([toggle, quickAddMenuItem()])
 
-        // Speak-last-response (`add-voice-computer-use-agent`, the v0 wedge): read the front window's
-        // last assistant reply aloud. No mic, no conversation — TTS + AX only, so it's offered
-        // whenever AI commands are on (voice opt-in not required).
-        if coordinator.aiCommandsEnabledForMenu {
-            groups.append([item("Speak Last Response", #selector(speakLastResponse))])
-        }
-
         // Keep Awake fallback: while the automation is active (screen dimmed near-black), surface a
         // checked "Active — Stop" line as a fire escape so brightness can always be recovered even if
         // the trackpad first-touch stop misbehaves. Its own group, present only while active.
@@ -154,7 +147,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func toggleEnabled() { coordinator.toggleEnabled() }
     @objc private func stopKeepAwake() { coordinator.stopKeepAwake() }
 
-    @objc private func speakLastResponse() { coordinator.speakLastResponse() }
     @objc private func addFrontApp(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? UUID else { return }
         coordinator.addFrontAppToBand(id)

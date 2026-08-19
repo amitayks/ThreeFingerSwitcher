@@ -23,10 +23,6 @@ permissions:
 
 jobs:
   release:
-    # NOTE: the MLX/Gemma 4 dependency (gemma-4-swift-mlx → mlx-swift-lm) only compiles on a recent
-    # toolchain: Xcode 26.3 (Swift 6.3.x) FAILS to type-check it (LoRA/TurboQuant), while Xcode 26.5
-    # (Swift 6.3.2) builds it cleanly. macos-15 tops out at Xcode 26.3, so the release runs on macos-26
-    # (which ships 26.5) and the step below selects 26.5 explicitly.
     runs-on: macos-26
     env:
       PRODUCT: ThreeFingerSwitcher
@@ -36,11 +32,8 @@ jobs:
       - name: Select Xcode and gate on toolchain (fail fast)
         run: |
           set -euo pipefail
-          # Prefer the verified-working Xcode 26.5 (Swift 6.3.2 — the toolchain that compiles the
-          # MLX/Gemma deps; 26.3 does not). Fall back to the newest installed if that exact version is
-          # ever removed from the image; the Swift gate below still guards against a too-old toolchain.
-          XC="/Applications/Xcode_26.5.app"
-          [ -d "$XC" ] || XC="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          # Use the newest installed Xcode; the Swift gate below guards against a too-old toolchain.
+          XC="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
           echo "Using Xcode at: $XC"
           sudo xcode-select -s "$XC/Contents/Developer"
           swift --version

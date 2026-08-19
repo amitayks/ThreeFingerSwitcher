@@ -16,11 +16,6 @@ extension Color {
 /// dwell, then arms (haptic).
 struct LauncherView: View {
     @ObservedObject var model: LauncherModel
-    /// The AI command executor whose streaming state the preview canvas observes (nil when AI commands
-    /// aren't wired — the canvas is then never reached because no `.aiCommand` item can be fired).
-    var executor: AICommandExecutor? = nil
-    /// Enable/download wiring for the canvas's `.unavailable` state (configuration-hub).
-    var availability: AICanvasAvailability? = nil
 
     private var columns: [GridItem] {
         Array(repeating: GridItem(.fixed(LauncherGridLayout.cellWidth), spacing: LauncherGridLayout.spacing),
@@ -28,29 +23,17 @@ struct LauncherView: View {
     }
 
     var body: some View {
-        Group {
-            // The AI streaming preview canvas replaces the whole surface while it is open (an AI command
-            // was fired and is generating / awaiting commit) — no band list alongside it. Everything
-            // else is the master-detail shell: the band list on the left, the content on the right.
-            if model.canvasActive {
-                canvas
+        HStack(spacing: 0) {
+            // The left band-title list only exists when there's more than one band to choose
+            // between; a single band shows just its content (lands on `.grid`, item 0).
+            if model.bandCount > 1 {
+                bandList
+            }
+            // The right pane: the Clipboard band's master-detail, else the icon grid.
+            if model.currentBandIsClipboard {
+                ClipboardBandView(model: model)
             } else {
-                HStack(spacing: 0) {
-                    // The left band-title list only exists when there's more than one band to choose
-                    // between; a single band shows just its content (lands on `.grid`, item 0).
-                    if model.bandCount > 1 {
-                        bandList
-                    }
-                    // The right pane, in band-priority order: the Clipboard band's master-detail, then
-                    // the Files band's column navigator, else the icon grid (the default fallback).
-                    if model.currentBandIsClipboard {
-                        ClipboardBandView(model: model)
-                    } else if model.currentBandIsFiles {
-                        FilesBandView(model: model)
-                    } else {
-                        grid
-                    }
-                }
+                grid
             }
         }
         .padding(LauncherGridLayout.containerPadding)
@@ -58,19 +41,6 @@ struct LauncherView: View {
         .background(
             RoundedRectangle(cornerRadius: 30, style: .continuous).fill(.ultraThinMaterial)
         )
-    }
-
-    /// The AI preview canvas, bound to the executor's streaming state. When no executor is wired it
-    /// falls back to an empty surface (defensive — the canvas is unreachable without one).
-    @ViewBuilder
-    private var canvas: some View {
-        if let executor, let command = model.canvasCommand {
-            AICommandCanvasView(executor: executor, command: command,
-                                tint: command.tint.map(Color.init) ?? Color(model.currentBandColor),
-                                availability: availability)
-        } else {
-            Color.clear
-        }
     }
 
     // MARK: Band icon list (the left column)
@@ -218,7 +188,6 @@ struct LauncherView: View {
             switch item.kind {
             case .preset: return "square.stack.3d.up.fill"
             case .script: return "terminal.fill"
-            case .aiCommand: return "sparkles"
             case .claudeProject, .claudeProjectPrompt: return "terminal.fill"
             case .terminalCommand, .terminalCommandPrompt: return "terminal.fill"
             default: return nil

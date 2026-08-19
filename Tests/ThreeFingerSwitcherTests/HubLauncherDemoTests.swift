@@ -42,16 +42,9 @@ final class HubLauncherDemoTests: XCTestCase {
 
     // MARK: - Gesture grammar
 
-    func testBandJourneyGestureWithResolveAppendsFreshTail() {
+    func testBandJourneyGestureIsOpenPlusTraverse() {
         let plain = HubLauncherDemo.bandJourneyGesture(openLength: 0.3)
         XCTAssertEqual(plain.strokes.map(\.fingers), [4, 2], "open + traverse only")
-        let resolving = HubLauncherDemo.bandJourneyGesture(openLength: 0.3, resolve: .swipeDown)
-        XCTAssertEqual(resolving.strokes.map(\.fingers), [4, 2, 2],
-                       "a resolve journey appends the fresh two-finger canvas swipe")
-        XCTAssertNil(resolving.strokes[1].gapAfter,
-                     "the traverse LIFTS before the resolve (the firing lift — resolution is a fresh excursion)")
-        let tail = resolving.strokes[2]
-        XCTAssertGreaterThan(tail.from.y, tail.to.y, "the commit tail strokes downward (y-up coordinates)")
     }
 
     func testVerticalStrokesDescendInYUpCoordinates() {
@@ -115,7 +108,7 @@ final class HubLauncherDemoTests: XCTestCase {
         XCTAssertEqual(demo.model.selectedIndex, sel, "replayed frames don't re-step the highlight")
     }
 
-    // MARK: - Band-journey drive (Clipboard / Files / AI pages)
+    // MARK: - Band-journey drive (the Clipboard page)
 
     func testDriveBandJourneyWalksToLastBandAndCloses() {
         let demo = seededDemo(landOnLastBand: true)
@@ -135,25 +128,6 @@ final class HubLauncherDemoTests: XCTestCase {
         XCTAssertEqual(demo.model.focus, .bands, "the journey stays on the band rail")
         demo.drive(pose(1, 1.0, lifted: true), script: .bandJourney)
         XCTAssertFalse(demo.overlayShown, "the lift closes the loop")
-    }
-
-    func testDriveResolveJourneyKeepsPanelUpThroughFiringLift() {
-        let demo = seededDemo(landOnLastBand: true)
-        demo.drive(pose(2, 1.0, lifted: true), script: .bandJourneyResolve)   // prior loop's close
-        demo.drive(pose(0, 0.8), script: .bandJourneyResolve)
-        demo.drive(pose(1, 1.0), script: .bandJourneyResolve)
-        XCTAssertEqual(demo.model.currentBand, 2)
-
-        // The FIRING lift (after the traverse, before the resolve tail) keeps the panel up — the real
-        // launcher stays visible to show the canvas.
-        demo.drive(pose(1, 1.0, lifted: true), script: .bandJourneyResolve)
-        XCTAssertTrue(demo.overlayShown, "the firing lift never closes the panel")
-
-        // The resolve tail drives nothing; its closing lift ends the loop.
-        demo.drive(pose(2, 0.5), script: .bandJourneyResolve)
-        XCTAssertEqual(demo.model.currentBand, 2, "the canvas tail leaves the model untouched")
-        demo.drive(pose(2, 1.0, lifted: true), script: .bandJourneyResolve)
-        XCTAssertFalse(demo.overlayShown, "the resolve's lift closes the loop")
     }
 
     func testHoverPresentsThePageBandStatically() {

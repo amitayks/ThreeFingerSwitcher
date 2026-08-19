@@ -62,9 +62,6 @@ enum SystemAction: String, Codable, Equatable, CaseIterable, Identifiable {
     case missionControl, appExpose, showDesktop, nextSpace, previousSpace
     case lockScreen, screenSaver, sleepDisplay, emptyTrash
     case screenshotSelection, screenshotFullScreen, screenshotTools
-    /// Read the front window's last assistant reply aloud (`add-speak-last-response-launcher-action`
-    /// — the trackpad-native trigger for the menu-bar item; both route to the same coordinator verb).
-    case speakLastResponse
     // Media & display
     case playPause, nextTrack, previousTrack, volumeUp, volumeDown, mute, brightnessUp, brightnessDown
 
@@ -142,7 +139,6 @@ enum SystemAction: String, Codable, Equatable, CaseIterable, Identifiable {
         case .screenshotSelection: return ("Screenshot — Selection", "camera.viewfinder", "Capture a selected area (system shortcut).", .system)
         case .screenshotFullScreen:return ("Screenshot — Full Screen", "camera.fill", "Capture the whole screen (system shortcut).", .system)
         case .screenshotTools:     return ("Screenshot — Tools", "camera.on.rectangle", "Open the screenshot toolbar (system shortcut).", .system)
-        case .speakLastResponse:   return ("Speak Last Response", "speaker.wave.2.bubble", "Read the front window's last assistant reply aloud (great over a Claude terminal).", .system)
         case .playPause:           return ("Play / Pause", "playpause.fill", "Toggle media playback.", .media)
         case .nextTrack:           return ("Next Track", "forward.fill", "Skip to the next track.", .media)
         case .previousTrack:       return ("Previous Track", "backward.fill", "Go to the previous track.", .media)
@@ -246,22 +242,8 @@ enum LaunchItemKind: Codable, Equatable {
     /// built at launcher-open from `ClipboardStore`, never created in the editor and never written
     /// into the persisted `Favorites` record. Firing it pastes the entry into the captured front app.
     case clipboardEntry(ClipboardEntry)
-    /// A filesystem entry shown in the synthetic Files band. **Synthetic and ephemeral** (like
-    /// `.clipboardEntry`, not like the persisted `.aiCommand`): built at launcher-open by
-    /// `FilesBandBuilder` from a live directory listing, never created in the editor and never written
-    /// into the persisted `Favorites` record. The Files band resolves a chosen entry through its own
-    /// drill-down / open path (folders descend, files open in their default handler) rather than the
-    /// generic `LaunchService.fire`, so firing one here is a no-op.
-    case fileEntry(FileEntry)
-    /// A configured AI command. **Persisted, first-class band item** (configuration-hub fold-in):
-    /// authored on the Hub's Bands page like any other item and stored inside the `Favorites` record,
-    /// so it can live in ANY band and move between bands. Its display fields (`title`/`icon`/`tint`)
-    /// mirror the embedded command. Firing it hands off to the `AICommandExecutor` and opens the
-    /// streaming preview canvas — it does NOT dismiss the overlay or complete on the lift. (Unlike
-    /// `.clipboardEntry`, which remains synthetic/ephemeral — clipboard entries are captured data.)
-    case aiCommand(AICommand)
-    /// A folder-bound "Open Claude Here" item. **Persisted, first-class band item** (like `.aiCommand`,
-    /// NOT synthetic like `.fileEntry`): authored on the Hub's Bands page and stored in the `Favorites`
+    /// A folder-bound "Open Claude Here" item. **Persisted, first-class band item** (NOT synthetic
+    /// like `.clipboardEntry`): authored on the Hub's Bands page and stored in the `Favorites`
     /// record, so it can live in any band and move between bands. Firing it opens the user's default
     /// terminal at `folder` and runs `command` — fire-and-forget, no mid-gesture picker.
     /// `command` is the shell command(s) to run after `cd`-ing into the folder; **nil/empty means the
@@ -325,11 +307,8 @@ struct LaunchItem: Codable, Equatable, Identifiable {
     var isConsequential: Bool {
         switch kind {
         case .script, .preset, .claudeProject, .terminalCommand, .claudeProjectPrompt, .terminalCommandPrompt: return true
-        // `.aiCommand` reports its own success/failure through the executor's canvas state, not the
-        // launcher's fire notification, so it is not "consequential" in this sense. `.fileEntry`
-        // never flows through `fire` (the Files band resolves it via its own open path). `.automation`
-        // toggles a mode whose feedback IS the dimming/undimming, not a fire notification.
-        case .app, .path, .url, .shortcut, .action, .clipboardEntry, .aiCommand, .fileEntry, .automation: return false
+        // `.automation` toggles a mode whose feedback IS the dimming/undimming, not a fire notification.
+        case .app, .path, .url, .shortcut, .action, .clipboardEntry, .automation: return false
         }
     }
 }
@@ -356,6 +335,29 @@ struct ContextBand: Codable, Equatable, Identifiable {
 
     /// The band's launcher icon, resolving the nil/legacy case to a neutral default symbol.
     var resolvedIcon: ItemIcon { icon ?? .sfSymbol("square.grid.2x2.fill") }
+
+    // MARK: Lossy item decoding
+
+    /// Wraps one item so a single undecodable element never fails the whole band. This is the
+    /// v3 migration path for retired kinds (`.aiCommand`, `.fileEntry`, `.action(.speakLastResponse)`):
+    /// a stored record that still contains one decodes with that item dropped, instead of the whole
+    /// `Favorites` record failing to decode and being reseeded (which would wipe the user's bands).
+    private struct FailableItem: Decodable {
+        let item: LaunchItem?
+        init(from decoder: Decoder) throws { item = try? LaunchItem(from: decoder) }
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, name, color, icon, defaultAppStrategy, items }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        color = try c.decode(ItemColor.self, forKey: .color)
+        icon = try c.decodeIfPresent(ItemIcon.self, forKey: .icon)
+        defaultAppStrategy = try c.decode(AppStrategy.self, forKey: .defaultAppStrategy)
+        items = try c.decode([FailableItem].self, forKey: .items).compactMap(\.item)
+    }
 }
 
 /// The root favorites record — the single persisted value (see `FavoritesStore`).
@@ -375,14 +377,11 @@ struct Favorites: Codable, Equatable {
         self.homeColumn = homeColumn
     }
 
-    /// v2 folds AI commands into the band model (configuration-hub): `.aiCommand` items are now
-    /// persisted inside bands. A record at v1 (or older) triggers the one-time AI fold-in migration in
-    /// `FavoritesStore`, which imports any legacy `AICommandStore` record into a normal "AI" band.
-    static let currentSchemaVersion = 2
-
-    /// The schema version at which AI commands became persisted band items. A stored record older than
-    /// this is folded in once (legacy `aiCommands` → an "AI" band).
-    static let aiCommandsFoldedSchemaVersion = 2
+    /// v3 removes the retired kinds (`.aiCommand`, `.fileEntry`, `.action(.speakLastResponse)` — the
+    /// local-AI and Files-band removal): stored items of those kinds are dropped by the lossy band
+    /// decode (`ContextBand.FailableItem`), and `FavoritesStore.migrate` removes the seeded "AI" band
+    /// once it is empty. v2 had folded AI commands into the band model.
+    static let currentSchemaVersion = 3
 
     // MARK: Resolved, deterministic accessors (never recency-ordered)
 

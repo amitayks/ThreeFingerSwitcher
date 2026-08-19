@@ -28,27 +28,18 @@ final class LaunchService {
     /// window of the destination Space once the switch settles — macOS leaves it visually front but
     /// not key, exactly like the native shortcut. No-op by default / in tests.
     private let onSpaceSwitch: () -> Void
-    /// Called when an `.aiCommand` item is fired. Wired by the coordinator to hand the command off to
-    /// the `AICommandExecutor` (which streams into the overlay's preview canvas). Injected so
-    /// `LaunchService` stays decoupled from the AI layer; no-op by default / in tests. Firing an AI
-    /// command does NOT dismiss the overlay (the order-out-before-fire rule does not apply) — the
-    /// overlay handles that exception itself (see `LauncherOverlayController.end`).
-    private let onAICommand: (AICommand) -> Void
     /// Called after the user picks a folder for a choose-folder-at-launch item (`.claudeProjectPrompt` /
     /// `.terminalCommandPrompt`) — `(itemID, bandID, chosenFolder)`. Wired by the coordinator to persist
-    /// the folder back onto the item (its remembered last folder). Injected like `onAICommand` so
-    /// `LaunchService` stays decoupled/testable; no-op by default / in tests.
+    /// the folder back onto the item (its remembered last folder). Injected so `LaunchService` stays
+    /// decoupled/testable; no-op by default / in tests.
     private let onPromptedFolderChosen: (UUID, UUID, URL) -> Void
     /// Called when an `.automation` item is fired — `(kind, settings)`. Wired by the coordinator to
     /// TOGGLE the automation's stateful owner (`KeepAwakeController`) — start if inactive, stop if
     /// active — passing the item's resolved `AutomationSettings` (dim level, keyboard dim, guard lock).
-    /// Injected like `onAICommand` so `LaunchService` stays decoupled from the automation's state;
-    /// no-op by default / in tests. Unlike every other kind, firing an automation is a toggle, not a
-    /// one-shot completion.
+    /// Injected like `onPromptedFolderChosen` so `LaunchService` stays decoupled from the automation's
+    /// state; no-op by default / in tests. Unlike every other kind, firing an automation is a toggle,
+    /// not a one-shot completion.
     private let onAutomation: (AutomationKind, AutomationSettings) -> Void
-    /// Speak-last-response dispatch (`add-speak-last-response-launcher-action`): injected like
-    /// `onAICommand` so the launcher never references the AI stack; no-op by default / in tests.
-    private let onSpeakLastResponse: () -> Void
     /// Resolves a clipboard entry id to its **fully-materialized** entry at fire time. The band carries
     /// only bounded/light preview entries (image bytes dropped, large text truncated — see
     /// `ClipboardStore.bandWindow`), so paste must fetch the complete representations by id to restore the
@@ -61,20 +52,16 @@ final class LaunchService {
          goToWindow: @escaping (pid_t) -> Bool = { _ in false },
          frontAppProvider: @escaping () -> NSRunningApplication? = { NSWorkspace.shared.frontmostApplication },
          onSpaceSwitch: @escaping () -> Void = {},
-         onAICommand: @escaping (AICommand) -> Void = { _ in },
          onPromptedFolderChosen: @escaping (UUID, UUID, URL) -> Void = { _, _, _ in },
          onAutomation: @escaping (AutomationKind, AutomationSettings) -> Void = { _, _ in },
-         onSpeakLastResponse: @escaping () -> Void = {},
          clipboardResolver: @escaping (UUID) -> ClipboardEntry? = { _ in nil }) {
         self.favoritesProvider = favoritesProvider
         self.mover = mover ?? NullWindowMover()
         self.goToWindow = goToWindow
         self.frontAppProvider = frontAppProvider
         self.onSpaceSwitch = onSpaceSwitch
-        self.onAICommand = onAICommand
         self.onPromptedFolderChosen = onPromptedFolderChosen
         self.onAutomation = onAutomation
-        self.onSpeakLastResponse = onSpeakLastResponse
         self.clipboardResolver = clipboardResolver
     }
 
@@ -98,25 +85,15 @@ final class LaunchService {
         case .preset:
             firePreset(item, inBand: band)
         case .automation(let kind, let dimPercent, let dimKeyboard, let lockOnStop):
-            // Toggle the automation's stateful owner (start if inactive, stop if active). Like
-            // `.aiCommand`, this is NOT a one-shot that completes on the lift — it enters/leaves a
-            // persistent mode owned outside the launcher (see `onAutomation`). The item's authored
-            // optionals resolve here (nil = default) into one `AutomationSettings` for the owner.
+            // Toggle the automation's stateful owner (start if inactive, stop if active). This is
+            // NOT a one-shot that completes on the lift — it enters/leaves a persistent mode owned
+            // outside the launcher (see `onAutomation`). The item's authored optionals resolve here
+            // (nil = default) into one `AutomationSettings` for the owner.
             onAutomation(kind, AutomationSettings(dimPercent: dimPercent,
                                                   dimKeyboard: dimKeyboard ?? false,
                                                   lockOnStop: lockOnStop ?? false))
         case .clipboardEntry(let entry):
             pasteEntry(entry)
-        case .fileEntry:
-            // No-op: the synthetic Files band resolves a chosen entry through its OWN drill-down /
-            // open path (folders descend in place; files open via `FileOpenService`), not the generic
-            // fire — so a `.fileEntry` item never lands here in practice, and firing one is harmless.
-            break
-        case .aiCommand(let command):
-            // Hand off to the executor (which streams into the overlay's preview canvas). Unlike every
-            // other kind, this does NOT complete or dismiss on the lift — a fresh four-finger DOWN swipe
-            // (commit) / horizontal swipe (discard) resolve it (see `LauncherOverlayController`).
-            onAICommand(command)
         case .claudeProject(let folder, let command, let claudePath):
             launchClaude(folder: folder, command: command, claudePath: claudePath, title: item.title)
         case .terminalCommand(let folder, let command):
@@ -388,7 +365,6 @@ final class LaunchService {
         case .mute:                postMediaKey(7)
         case .brightnessUp:        adjustBrightness(up: true, adjustment)
         case .brightnessDown:      adjustBrightness(up: false, adjustment)
-        case .speakLastResponse:   onSpeakLastResponse()
         }
     }
 

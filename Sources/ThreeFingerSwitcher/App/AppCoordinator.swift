@@ -60,34 +60,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     private let windowGroups = WindowGroupStore()
     private lazy var snapMonitor = WindowSnapMonitor(store: windowGroups)
 
-    /// The notch home zone + notch-native sessions (`ai-parked-sessions` + `notch-native-conversations`):
-    /// the durable store, the one-active-now scheduler (K-ready for the batched runtime), the lifecycle
-    /// coordinator, the cursor-reveal rail, and the per-session conversation engines (born at the notch,
-    /// expanded in place). Gated by the agent feature (here: `aiCommandsEnabled`).
-    private lazy var parkController = ParkController(
-        maxParked: settings.agentMaxParkedSessions,
-        autoDismissCountdown: settings.agentParkAutoDismissCountdown,
-        revealDwell: settings.agentNotchRevealDwell,
-        // `unowned`: the coordinator owns the controller and outlives it (app-lifetime singleton), so the
-        // factory can't be called after self is gone; `weak` would force a nonsensical fallback engine.
-        engineFactory: { [unowned self] in self.makeNotchSessionEngine() },
-        // The shared ledger, for the purge-delete gesture only (`notch-conversation-gestures`).
-        auditLog: auditLog)
-        .configuredForTuning(
-            // The in-notch settings zone (`notch-timeline-and-tuning`): the slider reads/writes the
-            // notch's own dial; the model max caps the "Max" stop's token caption + snapshot.
-            provider: { [weak self] in self?.settings.notchTuning ?? .balanced },
-            modelMax: { [weak self] in self?.selectedAIModelDescriptor()?.maxContextTokens ?? 8_192 },
-            onChange: { [weak self] tuning in self?.settings.notchTuning = tuning })
-
-    /// Coarse repeating timer for park MAINTENANCE: the (opt-in) auto-dismiss pass — an idle, fully-seen
-    /// session past the configured countdown is dismissed forever — plus the background-driver advance
-    /// pass (recovered turns, scheduled retries). Installed/torn down alongside `parkController`'s
-    /// enable (mirrors `previewRefreshTimer`).
-    private var parkAutoDismissTimer: Timer?
-    /// How often the maintenance passes run (a minute is a fine grain for expiry and retries).
-    private static let parkAutoDismissInterval: TimeInterval = 60
-
     /// The Keep Awake automation's stateful owner (`automations`). Idle until a `.automation(.keepAwake)`
     /// item is fired (which toggles it via `LaunchService.onAutomation`). Fed the touch stream for its
     /// first-touch-to-stop arming, and force-stopped on quit / will-sleep so a dimmed screen is never
@@ -97,10 +69,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     // Four-finger launcher.
     private let favoritesStore = FavoritesStore.shared
     private let launcherOverlay = LauncherOverlayController()
-    /// The interactive screen-region picker (vision capture). Shown after a `screenRegion` AI command
-    /// dismisses the launcher; on a drag it captures the region and re-opens the canvas, on a
-    /// click-without-drag it cancels (`screen-region-picker`).
-    private let regionPicker = RegionPickerOverlay()
     private lazy var launchService = LaunchService(
         favoritesProvider: { [weak self] in self?.favoritesStore.favorites ?? Favorites() },
         mover: SpaceWindowMover(),
@@ -117,11 +85,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         // After a Next/Previous Space shortcut, focus the destination Space's front window once the
         // switch settles (the OS leaves it visually front but not key — same as the native shortcut).
         onSpaceSwitch: { [weak self] in self?.focusFrontWindowAfterSpaceSwitch() },
-        // An AI command hands off to the executor, which opens the CONVERSATIONAL canvas (design D1/D5,
-        // task 6.1 FIRE path): a generic "Ask…" opens showing the seed and WAITING; a preset (Fix Grammar,
-        // Translate, a task) pre-fills + auto-sends turn 1. Firing does NOT dismiss the overlay (the overlay
-        // handles that exception).
-        onAICommand: { [weak self] command in self?.aiCommandExecutor.fire(command) },
         // Persist the folder picked at fire time for a choose-folder-at-launch item, so its chooser
         // re-opens there next time (the item is the single source of truth for its last-used folder).
         onPromptedFolderChosen: { [weak self] itemID, bandID, folder in
@@ -139,9 +102,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
                     lockOnStop: settings.lockOnStop))
             }
         },
-        // Speak-last-response from a launcher band (`add-speak-last-response-launcher-action`) —
-        // same verb as the menu-bar item.
-        onSpeakLastResponse: { [weak self] in self?.speakLastResponse() },
         // The band carries only bounded/light clipboard previews (see `bandWindow`); resolve the FULL
         // entry by id at fire time so paste restores the complete payload, not the truncated preview.
         clipboardResolver: { [weak self] id in self?.clipboardStore.materializedEntry(id: id) }
@@ -149,42 +109,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
 
     /// Frontmost app captured at launcher-open time (target for `.action(.closeFrontWindow)`).
     private var capturedFrontApp: NSRunningApplication?
-
-    // Files band (opt-in; the synthetic Files band + the on-demand directory navigator). Like Clipboard,
-    // the band is synthetic and ephemeral — projected fresh on every launcher open from the current
-    // directory column, never persisted into Favorites.
-    /// Opens a chosen Files entry (a file in its default app / via Open-With, a folder as a Finder window)
-    /// as a defusable held open (design D7). Reuses `capturedFrontApp` exactly like `LaunchService` /
-    /// `SelectionService`, so the open targets the app the user was looking at before the non-activating
-    /// overlay appeared. `SystemFileWorkspace` maps every OS error to a typed `FileActionError` at the
-    /// boundary, surfaced only through the service's bounded `.failed` state.
-    private lazy var fileOpenService = FileOpenService(
-        workspace: SystemFileWorkspace(),
-        activateFrontAppContext: { [weak self] in
-            // Re-assert the captured front app before the open fires (mirrors `SelectionService`), so the
-            // opened document lands in the context the user was looking at, not the frontmost app at fire
-            // time. The `activate` result is best-effort and intentionally discarded.
-            _ = self?.capturedFrontApp?.activate(options: [])
-        }
-    )
-
-    /// The last Files open that was fired (default open / Open-With), captured so the failure row's **Retry**
-    /// can re-fire the identical open through `FileOpenService`. Set in `filesOpen`/`filesOpenWith`, replaced
-    /// by each new open; nil until the first Files open. A closure (not the entry) so the same defusable
-    /// prepare→commit path runs verbatim on a retry.
-    private var lastFilesOpen: (() -> Void)?
-
-    /// When the Open-With app grid was reached via the action menu's "Open in ▸", the entry it was opened
-    /// for — so a discard backs out to the **action menu** (one level), not straight to the folder list.
-    /// Nil when the picker isn't open or was opened directly.
-    private var filesPickerOriginEntry: FileEntry?
-
-    /// A pending **Cut** (move-on-Paste, Finder ⌘X): the file(s) cut and the pasteboard `changeCount` at cut
-    /// time. The next `pasteInto` MOVES them only while `NSPasteboard.general.changeCount` still equals this
-    /// (the pasteboard is still that cut); a Copy or any other write since bumps the count → the cut is
-    /// superseded and Paste copies. Cleared after the move (or when superseded). Coordinator state, so a cut
-    /// persists across launcher sessions until consumed — matching Finder.
-    private var pendingCut: (sources: [URL], changeCount: Int)?
 
     // Clipboard history (opt-in; the synthetic Clipboard band + the background recorder).
     private let clipboardStore = ClipboardStore.shared
@@ -210,332 +134,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             return fresh
         }()
         return DeviceIdentity(id: id, name: Host.current().localizedName ?? "Mac")
-    }
-
-    // AI commands (opt-in; the on-device model + the streaming canvas). AI commands now live as
-    // persisted items inside the favorites bands (configuration-hub fold-in), so there is no separate
-    // command store — a fired `.aiCommand` item carries its `AICommand` to the executor directly.
-    /// Reads/writes the captured front app's selection (and the clipboard / screen region) for an AI
-    /// command. Reuses `capturedFrontApp` exactly like `LaunchService`, so output lands in the app the
-    /// user was looking at (the overlay is non-activating).
-    private lazy var selectionService = SelectionService(
-        frontAppProvider: { [weak self] in self?.capturedFrontApp ?? NSWorkspace.shared.frontmostApplication }
-    )
-    /// Manages the on-device model lifecycle. Until the real MLX/Gemma runtime (phase 10) is wired,
-    /// this runs against a **dev stub**: a `StubLLMRuntime` + a registry whose integrity SHA matches a
-    /// fabricated dev payload, so download/verify/load succeed WITHOUT a real multi-gigabyte fetch and
-    /// the streaming canvas is fully usable in a signed build today. Swapping in the real runtime is a
-    /// one-line `runtimeFactory` change (design D1/D7) — feature code never sees a concrete model.
-    private lazy var modelManager: ModelManager = {
-        // Resolve the two heavy GPU/CPU gates through the SINGLE resolver (`FullPotentialGate.isUnlocked`):
-        // a master-OFF or ai-commands-OFF locks BOTH at once (the calm panic-off), and each sub-flag gates
-        // only its own capability. The factory then constructs the CPU ternary lane / multi-stream batched
-        // runtime only when unlocked; OFF → today's single-GPU-lane, single-session build.
-        let gate = settings.fullPotentialGate
-        return AIRuntimeInjection.modelManagerFactory?(settings.aiCommandsEnabled,
-                                                       gate.isUnlocked(.cpuLane),
-                                                       gate.isUnlocked(.batchedRuntime))
-            ?? DevAIRuntime.makeModelManager(optedIn: settings.aiCommandsEnabled)
-    }()
-    /// The agentic task layer (calendar / save-to-project / open-tool / send-to), driven by the model's
-    /// structured output. Calendar permission is requested lazily at first calendar-task use.
-    private lazy var taskDispatcher = TaskDispatcher(
-        modelManager: modelManager,
-        permissions: permissions
-    )
-    /// Orchestrates one AI command fire end-to-end (acquire → stream → commit), exposing the observable
-    /// state the launcher's preview canvas binds to. The context provider supplies the captured app
-    /// name so `{app}` resolves; input is filled by acquisition.
-    /// The append-only audit ledger ("what did my agents do while I was away", `ai-background-autonomy`,
-    /// design Decision 5). A single durable `DiskAuditLog` instance: the background route-loop host (when
-    /// wired) records every tool step here, and the Hub AI page's audit viewer reads `recent(limit:)`
-    /// synchronously + surfaces `lastPersistError` as a bounded, non-blocking banner. MLX-free Core.
-    private lazy var auditLog = DiskAuditLog()
-    /// The live tool registry the AI route loop advertises + dispatches through (`wire-tool-routing`).
-    /// v1 contributes the parameterless side-effecting `TaskKind`s (EventKit calendar/reminder, Contacts)
-    /// as routable tools, bridged back into the UNCHANGED `taskDispatcher`. This is the EXTENSION POINT:
-    /// later waves ADD contributors to this array (`MemoryToolContributor`, `SkillToolProvider`,
-    /// `MediaToolContributor`, `ClaudeHandoffContributor`) — no loop change, just more descriptors.
-    // Generative media (`wire-media-tool`): the `generate_image` tool routes to the app's image
-    // `MediaRuntime` and FAILS HONESTLY until Wave 2 builds the diffusion pipeline (a clean bounded
-    // `MediaError`, never the model's raw tool-call text, never a blank/false-Done). The runtime is
-    // injected at the same seam as Gemma (`AIRuntimeInjection.imageRuntimeFactory`, set in `main.swift`);
-    // Core/test builds leave it nil so the tool simply isn't advertised (MLX-free).
-    /// The persisted image-model selection (Q4 default / FP16 opt-in). No Hub picker is wired yet, so this
-    /// resolves to `nil` → the Q4 default (`ImageModelCatalog.selected`); when an `imageModelID` setting
-    /// lands it threads through here unchanged.
-    private var aiImageModelID: String? { nil }
-    /// The image backend for the selected `imageModelID`, or nil in a Core/test build. Resolved once from
-    /// the injected factory.
-    private lazy var aiImageRuntime: MediaRuntime? =
-        AIRuntimeInjection.imageRuntimeFactory?(aiImageModelID)
-    /// Output #1 — the generated-media gallery (a Files-band `.fileEntry` source). Local-only.
-    private let aiMediaGallery = MediaGallery()
-    /// The thread-safe live mirror of the AI route loop's `AppSettings`-derived gating inputs (Full
-    /// Potential master / media / cloud gates + the cloud-video budget). The route loop's contributors run
-    /// OFF the main actor (`AgentLoop` is a non-isolated `Sendable` struct), so their `@Sendable` gating
-    /// closures MUST read these values from any thread WITHOUT `MainActor.assumeIsolated` (which traps off
-    /// main — the first-routed-tool crash). The main actor refreshes it on every relevant settings change
-    /// (`refreshAIGatingSnapshot()`), so gating stays LIVE, not a stale build-time snapshot.
-    private let aiGatingSnapshot = AIGatingSnapshot()
-    /// The cloud-video per-day budget cap (consumed by the contributor + sink). Video has no provider
-    /// wired yet, so this is effectively dormant; the cap reads the live snapshot (refreshed on every
-    /// settings change) — thread-safe off the main actor, where the route loop's sink runs.
-    private lazy var aiMediaVideoBudget = PerDayVideoBudget(
-        cap: { [aiGatingSnapshot] in aiGatingSnapshot.mediaVideoBudgetPerDay })
-    /// The route-loop executor for a routed media call — drives the runtime, threads progress, writes the
-    /// gallery asset, and returns a clean `.done`/`.declined`/`.failed` step. Video runtime is nil (its
-    /// own wave); image is the injected `aiImageRuntime`.
-    private lazy var aiMediaGenSink = MediaGenSink(
-        imageRuntime: aiImageRuntime,
-        videoRuntime: nil,
-        gallery: aiMediaGallery,
-        budget: aiMediaVideoBudget,
-        audit: auditLog,
-        imageModelID: aiImageModelID)
-    /// The media-tool availability gate (master ∧ media floor; cloud-video extras). Reads the live
-    /// `fullPotentialEnabled`/`mediaGenEnabled` flags; no video provider is wired, so `generate_video`
-    /// stays dark until that wave.
-    private lazy var aiMediaAvailability = MediaToolAvailability(
-        // These `@Sendable` predicates are invoked by `MediaToolContributor.descriptors()`/`videoAvailable`,
-        // which the route loop reaches OFF the main actor (`AgentLoop` is a non-isolated `Sendable` struct).
-        // So they MUST read the gating flags thread-safely, NOT via `MainActor.assumeIsolated` (which TRAPS
-        // off main — the first-routed-tool crash). They read the live `aiGatingSnapshot`, which the main
-        // actor refreshes on every relevant settings change, so gating stays LIVE (never a stale snapshot).
-        // Each gate already routed through the SINGLE resolver (`FullPotentialGate.isUnlocked`) at refresh
-        // time — so `mediaGen` / `fleetCloud` are honestly locked whenever the master or ai-commands opt-in
-        // is off (the calm panic-off), never just their own sub-flag. `isFullPotentialEnabled` stays the raw
-        // master read (the contributor ANDs it with `isMediaGenEnabled`, which is already the full gate).
-        isFullPotentialEnabled: { [aiGatingSnapshot] in aiGatingSnapshot.isFullPotentialEnabled },
-        isMediaGenEnabled: { [aiGatingSnapshot] in aiGatingSnapshot.isMediaGenUnlocked },
-        isCloudEscalationEnabled: { [aiGatingSnapshot] in aiGatingSnapshot.isFleetCloudUnlocked },
-        hasVideoProvider: { false })
-
-    // MARK: - Memory + Skills (`wire-memory-skills`)
-    //
-    // The agent's long-term memory store: `core.md` facts + `subfiles/` notes under Application Support
-    // (`…/ThreeFingerSwitcher/memory`, created on first write). MLX-free Core; the `MemoryToolProvider`
-    // projects it into the `memory.read` (.auto) / `memory.write`/`update`/`forget`/`promote` (.confirm)
-    // routable tools the registry advertises. The default-directory init points at the live folder.
-    private let aiMemoryStore = MemoryStore()
-    private lazy var aiMemoryToolProvider = MemoryToolProvider(store: aiMemoryStore)
-
-    // The skills store: built-in skills are projected in-memory from `AICommandCatalog` (the catalog stays
-    // the source of truth) ∪ user `.skill.md` files dropped into `…/ThreeFingerSwitcher/Skills/`. The
-    // folder watcher coalesces edits into an off-main reload that republishes the snapshot (no rebuild).
-    // The migration is a no-op by design (built-ins are projected, never written to disk) and idempotent.
-    private let aiSkillStore = SkillStore(userFolder: AppCoordinator.skillsUserFolder())
-    // A lazily-resolving runtime: skills generate their text result through the resident model, loaded
-    // lazily by `ModelManager`. The forwarder resolves it at call time (cheap — kept resident) so the
-    // registry can be built before any model is loaded; a no-model state surfaces as a clean `.failed`.
-    private lazy var aiSkillRuntime = ForwardingLLMRuntime(
-        resolve: { [modelManager] caps in try await modelManager.runtime(requiring: caps) })
-    private lazy var aiSkillToolProvider = SkillToolProvider(
-        manifests: SkillStore.builtInManifests(),
-        runtime: aiSkillRuntime,
-        dispatcher: taskDispatcher,
-        globalReasoning: settings.aiReasoningEnabled)
-
-    /// Watches the user `Skills/` folder and coalesces edits into an off-main `store.loadAll()` that
-    /// republishes the snapshot — a dropped/edited `.skill.md` appears with NO rebuild. Built-ins are
-    /// projected in-memory (loaded once, never watched). Started in `start()`; nil until then.
-    private var aiSkillWatcher: SkillFolderWatcher?
-
-    /// The live Skills user folder (`…/Application Support/ThreeFingerSwitcher/Skills`, created on first
-    /// run by the store's load). Parallels `MemoryStore.defaultDirectory()`.
-    private static func skillsUserFolder() -> URL {
-        let base = (try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
-                                                 appropriateFor: nil, create: true))
-            ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        return base.appendingPathComponent("ThreeFingerSwitcher/Skills", isDirectory: true)
-    }
-
-    private lazy var aiToolRegistry = ToolRegistry([
-        TaskKindToolContributor(
-            dispatcher: taskDispatcher,
-            kinds: [.addToCalendar, .addToReminder, .newContact]),
-        // Generative media (`wire-media-tool`): advertises `generate_image` (and later `generate_video`)
-        // when the master ∧ media flags are on AND a capable runtime is wired; dispatches to the sink.
-        MediaToolContributor(
-            availability: aiMediaAvailability,
-            imageRuntime: aiImageRuntime,
-            videoRuntime: nil,
-            budget: aiMediaVideoBudget,
-            sink: aiMediaGenSink),
-        // Long-term memory (`wire-memory-skills`): `memory.read`/`write`/`update`/`forget`/`promote`.
-        aiMemoryToolProvider,
-        // Skills as tools (`wire-memory-skills`): each built-in/user skill projected as a routable tool.
-        aiSkillToolProvider,
-        // Subagents (`refactor-park-and-background-agents`): fixed fresh-context templates as routable
-        // tools — context hygiene, not parallelism; only the summary re-enters the orchestrator thread.
-        SubagentToolContributor(
-            templates: Subagent.builtIns,
-            runtimeProvider: { [modelManager] in try await modelManager.runtime(requiring: [.text]) }),
-        // Computer use (`add-voice-computer-use-agent`): AX-first read/focus/click/type over the
-        // switcher's own enumeration + commit path. Flag-gated LIVE (off = absent from candidates);
-        // UserDefaults reads are thread-safe (the loop queries descriptors off-main).
-        ComputerUseToolContributor(
-            enabled: { UserDefaults.standard.bool(forKey: "computerUseEnabled") },
-            resolveWindow: { [weak self] app, title in self?.resolveComputerUseWindow(app: app, title: title) },
-            focusWindow: { [weak self] target in self?.focusComputerUseWindow(target) ?? false },
-            performer: aiAXPerformer,
-            arbiter: aiActionArbiter,
-            narrate: { [weak self] text in self?.voiceNarrate(text) }),
-        // Voice tools: `speak` + the gated auto-mode pair.
-        VoiceToolContributor(
-            voiceEnabled: { UserDefaults.standard.bool(forKey: "voiceConversationEnabled") },
-            computerUseEnabled: { UserDefaults.standard.bool(forKey: "computerUseEnabled") },
-            speak: { [weak self] text in self?.voiceSpeak(text) },
-            setAutoMode: { [weak self] on in self?.setConversationAutoMode(on) })
-        // + future contributors here.
-    ])
-
-    // MARK: - Voice + computer-use composition (`add-voice-computer-use-agent`)
-
-    /// Hot-path arming flags (`fix-evict-thrash-and-hot-path`): the touch stream is the
-    /// latency-critical gesture pipeline, so its abort hook reads ONLY these plain stored Bools.
-    /// They're maintained by state-change sinks installed inside the lazy initializers below — a
-    /// touch frame can never instantiate the agent/voice stack and never reads settings.
-    private var agentActingNow = false
-    private var voicePhaseLive = false
-    /// Whether the lazy voice stack has ever been built (guards the quiescence read the same way).
-    private var voiceStackLive = false
-
-    /// The agent-vs-human input arbitration: tagged synthetic input + the any-touch kill switch.
-    private lazy var aiActionArbiter: AgentActionArbiter = {
-        let arbiter = AgentActionArbiter()
-        arbiter.onAbort = { [weak self] in self?.abortAgentAction() }
-        // Arm/disarm the hot-path flag on acting-state CHANGES (rare), never per frame.
-        arbiter.$isActing
-            .sink { [weak self] acting in
-                MainActor.assumeIsolated { self?.agentActingNow = acting }
-            }
-            .store(in: &cancellables)
-        return arbiter
-    }()
-    /// The AX read/act engine, posting through the arbiter's tagged event source.
-    private lazy var aiAXPerformer = AXActionPerformer(eventSource: aiActionArbiter.eventSource)
-    /// The process-wide synthesizer (sentence chunks + narration + speak-last-response).
-    private lazy var aiSpeechSynthesizer = SystemSpeechSynthesizer()
-    /// The voice conversation's transcript (in-memory v1 — voice sessions aren't parked rows yet).
-    private var voiceConversation = AgentConversation(title: "Voice", messages: [])
-    /// The VOICE conversation's auto-approve grant (per-engine grants live on the engines).
-    private let voiceAutoGrant = LockedBool()
-    /// The push-to-talk hold-key monitor (default Right Option), installed only while voice is on.
-    private lazy var pttMonitor = PTTKeyMonitor()
-    /// The voice session controller: pure turn model + seams; the turn runs the SAME agent loop and
-    /// tool registry as typed chat (voice is an input/output mode, not a second agent).
-    private lazy var voiceController: VoiceSessionController = {
-        let controller = VoiceSessionController(
-            transcriberFactory: {
-                if #available(macOS 26.0, *) { return SpeechAnalyzerTranscriber() }
-                return nil
-            },
-            synthesizer: aiSpeechSynthesizer,
-            micAuthorizer: { await MicrophoneAuthorizer.requestAccess() },
-            turnStarter: { [weak self] text in
-                self?.voiceTurnStream(text) ?? AsyncThrowingStream { $0.finish() }
-            })
-        voiceStackLive = true
-        // Arm the hot-path abort flag only for the phases a touch should interrupt.
-        controller.$phase
-            .sink { [weak self] phase in
-                MainActor.assumeIsolated {
-                    self?.voicePhaseLive = (phase == .thinking || phase == .speaking)
-                }
-            }
-            .store(in: &cancellables)
-        return controller
-    }()
-    /// The v1 candidate retriever: cheap keyword ranking over the registry's descriptors, offering ~5
-    /// tools per turn (the loop also offers `widen_candidates` so the model can ask for more).
-    private lazy var aiToolCandidateSource =
-        KeywordToolCandidateSource(all: { [aiToolRegistry] in aiToolRegistry.allDescriptors() })
-
-    /// Background autonomy (`ai-background-autonomy`): the per-step auto-vs-escalate runner. Built ONLY
-    /// when `FullPotentialGate.isUnlocked(.backgroundAutonomy)` (master ∧ sub-flag ∧ ai-commands) — when
-    /// LOCKED this is `nil`, so the `AICommandExecutor`/`AgentLoop` take the plain foreground path: a
-    /// parked session's step simply doesn't auto-run/escalate (calmly inert, no error, never a false
-    /// "Done"). Reads the live whitelist (the trust boundary) and routes escalation + park-state through
-    /// the live `ParkController`; every step is audited to the shared `auditLog`.
-    private lazy var aiBackgroundRunner: BackgroundToolRunner? = {
-        guard settings.fullPotentialGate.isUnlocked(.backgroundAutonomy) else { return nil }
-        // The route loop drives `BackgroundToolRunner.run` (and thus `parkStateOf`) OFF the main actor, so
-        // this `@Sendable` closure MUST read park state thread-safely, NOT via `MainActor.assumeIsolated`
-        // (which TRAPS off main). `ParkScheduler.parkState(of:)` is the lock-guarded, any-thread read (the
-        // same live state `ParkController.parkState(of:)` exposes) — no main-actor hop, fully live (an
-        // unknown id → `.active`, the foreground path).
-        let scheduler = parkController.parkScheduler
-        return BackgroundToolRunner(
-            resolver: BackgroundPolicyResolver(whitelist: settings.agentWhitelist),
-            audit: auditLog,
-            // Escalation routes through the CONTROLLER (persist + repaint —
-            // `refactor-park-and-background-agents`), hopping to the main actor from the off-main loop:
-            // a background needs-you survives relaunch and lights the rail, never a silent in-memory
-            // scheduler flag.
-            onEscalate: { [weak self] id, reason in
-                Task { @MainActor in self?.parkController.escalate(id, reason: reason) }
-            },
-            parkStateOf: { id in scheduler.parkState(of: id) })
-    }()
-
-    private lazy var aiCommandExecutor = AICommandExecutor(
-        modelManager: modelManager,
-        selection: selectionService,
-        dispatcher: taskDispatcher,
-        contextProvider: { [weak self] in
-            FireContext(capturedAppName: self?.capturedFrontApp?.localizedName)
-        },
-        loadLanguage: { [weak self] id in self?.settings.rememberedLanguage(for: id) },
-        saveLanguage: { [weak self] id, lang in self?.settings.rememberLanguage(lang, for: id) },
-        reasoning: { [weak self] in self?.settings.aiReasoningEnabled ?? false }
-    )
-
-    /// The notch-session conversation engine factory (`notch-native-conversations` D1): each notch session
-    /// with a live foreground turn gets its own engine; `ParkController` owns the instances. The engine
-    /// carries the tool-routing/skills/background-autonomy seams the executor shed when the command band
-    /// reverted to one-shot presets.
-    private func makeNotchSessionEngine() -> NotchSessionEngine {
-        NotchSessionEngine(
-            modelManager: modelManager,
-            selection: selectionService,
-            contextProvider: { [weak self] in
-                FireContext(capturedAppName: self?.capturedFrontApp?.localizedName)
-            },
-            reasoning: { [weak self] in self?.settings.aiReasoningEnabled ?? false },
-            // BORN-WITH tuning (`notch-timeline-and-tuning`): a NEW notch conversation snapshots the
-            // notch dial (reasoning + context tokens, clamped to the model max) at birth and carries it
-            // for life; the legacy `reasoning:` closure above remains the fallback for pre-change
-            // conversations with no stored tuning.
-            tuningDefault: { [weak self] in
-                guard let self else { return nil }
-                let tuning = self.settings.notchTuning
-                let modelMax = self.selectedAIModelDescriptor()?.maxContextTokens ?? 8_192
-                return (reasoning: tuning.reasoning,
-                        contextTokens: tuning.contextTokens(modelMax: modelMax))
-            },
-            registry: aiToolRegistry,
-            candidateSource: aiToolCandidateSource,
-            // Active-skill allow-list (`wire-memory-skills`): the bound skill's `toolNames` are always
-            // offered as candidates while it drives the conversation. Resolves through the live store
-            // (user skills, post-reload) with a synchronous built-in projection fallback.
-            skillTools: { [aiSkillStore] id in
-                (aiSkillStore.manifest(id: id)
-                    ?? SkillStore.builtInManifests().first { $0.id == id })?.toolNames ?? []
-            },
-            // Background autonomy: nil when `.backgroundAutonomy` is locked (the plain foreground path).
-            backgroundRunner: aiBackgroundRunner,
-            // The loop's wall-clock bounds (`add-voice-computer-use-agent` D8), settings-fed live.
-            loopBudget: { [weak self] in
-                guard let self else { return .default }
-                return LoopBudget(stepTimeout: TimeInterval(self.settings.agentStepTimeoutSeconds),
-                                  turnDeadline: TimeInterval(self.settings.agentTurnDeadlineSeconds))
-            },
-            // Auto-approved acts are narrated ALOUD when a voice conversation is live (always visible
-            // in the thinking stream regardless) — spec: silence never hides an act.
-            narrator: { [weak self] text in
-                Task { @MainActor in self?.voiceNarrate(text) }
-            })
     }
 
     // Per-app keyboard language (opt-in; remembers and re-selects the input source per app/site). Gated
@@ -610,10 +208,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     /// rebuild time (`StatusItemController.menuNeedsUpdate`), so no live observer is needed.
     var showDiagnostics: Bool { settings.showDiagnostics }
 
-    /// Whether the AI opt-in is on — gates the menu-bar "Speak Last Response" line
-    /// (`add-voice-computer-use-agent` v0; TTS + AX only, no mic).
-    var aiCommandsEnabledForMenu: Bool { settings.aiCommandsEnabled }
-
     var onStateChange: (() -> Void)?
 
     /// The wizard's menu-bar moment: pulses the real status-item mark (wired by
@@ -631,13 +225,10 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     /// window underneath; with both overlays closed it reverts to the `≥3`-fingers rule, leaving
     /// normal two-finger scroll alone.
     ///
-    /// `3+` finger is always consumed (gesture territory — a 4-finger resolve swipe's incidental
-    /// scroll must not leak to the front app); the normal launcher / switcher still consume 1-2
-    /// finger so stray scroll doesn't leak during nav; but while the AI **canvas** is active we
-    /// DON'T consume 1-2 finger scroll, so it reaches the canvas's SwiftUI ScrollView (the panel is
-    /// key + interactive and under the cursor) to scroll the thinking / response.
-    static func shouldConsumeScroll(fingerCount: Int, launcherOpen: Bool, switcherOpen: Bool, canvasActive: Bool) -> Bool {
-        fingerCount >= 3 || ((launcherOpen || switcherOpen) && !canvasActive)
+    /// `3+` finger is always consumed (gesture territory); the launcher / switcher consume 1-2
+    /// finger so stray scroll doesn't leak during nav.
+    static func shouldConsumeScroll(fingerCount: Int, launcherOpen: Bool, switcherOpen: Bool) -> Bool {
+        fingerCount >= 3 || launcherOpen || switcherOpen
     }
 
     /// Read-only tap on the touch stream for the wizard's live-hand act (the recognizer path is
@@ -657,23 +248,13 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             // Keep Awake's first-touch-to-stop arming (non-consuming — a no-op unless it's active, and it
             // never swallows the frame; the recognizer still sees it below).
             self.keepAwakeController.noteTouch(fingerCount: frame.fingerCount)
-            // The agent kill switch (`add-voice-computer-use-agent`): ANY human contact aborts an
-            // in-flight agent act / spoken reply. HOT-PATH RULE (`fix-evict-thrash-and-hot-path`):
-            // this is the latency-critical gesture pipeline — the check is two stored Bools, armed
-            // by state-change sinks; the agent/voice stack is NEVER touched (or instantiated) here
-            // unless one of them is genuinely live.
-            if frame.fingerCount > 0, self.agentActingNow || self.voicePhaseLive {
-                if self.agentActingNow { self.aiActionArbiter.humanTouchDetected() }
-                if self.voicePhaseLive { self.voiceController.humanTouch() }
-            }
             self.recognizer.feed(frame)
         }
         scrollTap.consumePredicate = { [weak self] in
             guard let self else { return false }
             return Self.shouldConsumeScroll(fingerCount: self.currentFingerCount,
                                             launcherOpen: self.launcherOverlay.isVisible,
-                                            switcherOpen: self.overlay.isVisible,
-                                            canvasActive: self.launcherOverlay.canvasActive)
+                                            switcherOpen: self.overlay.isVisible)
         }
         thumbnails.onThumbnail = { [weak self] id, image in
             self?.overlay.model.setThumbnail(image, for: id)
@@ -685,84 +266,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             guard case let .clipboardEntry(entry) = item.kind else { return }
             self?.clipboardStore.togglePin(id: entry.id)
         }
-        // AI preview canvas: the executor it observes, and the two-stage commit / discard gestures.
-        launcherOverlay.executor = aiCommandExecutor
-        // The canvas panel becomes key-interactive only AFTER the executor has read its input — otherwise
-        // a `.nonactivatingPanel` taking key focus first steals the front app's key focus and the selection
-        // read comes back empty (falling through to the clipboard). The executor calls this back once the
-        // input is acquired (or it resolves `.unavailable`, whose Enable/Download controls need the mouse).
-        aiCommandExecutor.onReadyForInteraction = { [weak self] in self?.launcherOverlay.makeCanvasInteractive() }
-        // Enable/download wiring for the canvas's `.unavailable` state (fired an AI item while AI is
-        // off or the model isn't downloaded → the canvas offers Enable/Download + a model picker).
-        launcherOverlay.aiAvailability = AICanvasAvailability(
-            settings: settings,
-            models: modelManager,
-            onDownload: { [weak self] in self?.downloadAIModel() }
-        )
-        launcherOverlay.onCommitCanvas = { [weak self] in
-            guard let self else { return }
-            // A fresh two-finger DOWN swipe commits: route the ready result / reviewed side effect via
-            // `commit()`. Errors surface in the executor's `.failed` state (the canvas is already
-            // dismissed by the controller, but the executor records them).
-            Task { @MainActor in
-                try? await self.aiCommandExecutor.commit()
-            }
-        }
-        launcherOverlay.onDiscardCanvas = { [weak self] in
-            // A one-shot fire is ephemeral: a discard cancels the in-flight generation and resets — it
-            // has no session, no parked row, nothing durable to clean up (notch-native-conversations).
-            self?.aiCommandExecutor.cancel()
-        }
-        // Notch conversation flick grammar (`notch-conversation-gestures`): the recognizer watches
-        // two-finger flick excursions only while a conversation is expanded. Driven from the controller's
-        // single choke point so the mode can never be left stuck on after a collapse from any path.
-        parkController.onExpandedChanged = { [weak self] expanded in
-            self?.recognizer.notchConversationActive = expanded
-        }
-        // Keep Awake flips active/inactive → rebuild the menu bar so its "Active / Stop" fallback tracks.
-        keepAwakeController.onActiveChanged = { [weak self] in self?.onStateChange?() }
-        // Screen-region (vision) command: the launcher already dismissed to reveal the desktop. Run the
-        // interactive region picker; on a drag, capture the designated region and re-open the canvas
-        // firing the executor with the captured image (the executor maps a permission gap → .failed and an
-        // unavailable capture → .noInput). A click-without-drag cancels — no canvas, nothing generated; the
-        // captured front app already retains focus (both the launcher and the picker are non-activating).
-        launcherOverlay.onScreenRegionCommand = { [weak self] command in
-            guard let self else { return }
-            self.regionPicker.show { [weak self] resolution in
-                guard let self else { return }
-                switch resolution {
-                case .cancel:
-                    break   // defused — the front app was never deactivated, so there is nothing to restore
-                case let .region(rect):
-                    Task { @MainActor in
-                        let outcome = await self.selectionService.captureScreenRegion(rect)
-                        self.launcherOverlay.showCanvas(for: command)
-                        self.aiCommandExecutor.fire(command, screenCapture: outcome)
-                    }
-                }
-            }
-        }
-        // When the canvas opens, put the recognizer in canvas-resolution mode so a FRESH four-finger
-        // swipe resolves it (horizontal = discard, down = apply) instead of re-opening the launcher.
-        launcherOverlay.onCanvasStateChanged = { [weak self] active in
-            self?.recognizer.launcherCanvasResolutionActive = active
-        }
-        // When the Files band becomes current, put the recognizer in the sustained Files-drill mode so a
-        // FRESH contact drills the directory tree (horizontal = depth, vertical = highlight) and a
-        // resolving lift opens / Open-Withs the highlighted entry — instead of stepping the grid. Mirrors
-        // the canvas-resolution wiring above.
-        launcherOverlay.onFilesColumnStateChanged = { [weak self] active in
-            self?.recognizer.filesDrillActive = active
-        }
-        // Persist the per-root remembered deepest location as the Files navigator drills (so the next open
-        // restores where the user left each root). Keyed/valued by standardized path.
-        launcherOverlay.model.onFilesRememberLocation = { [weak self] path, rootPath in
-            self?.settings.rememberLocation(path, forRoot: rootPath)
-        }
-        // The Files-band failure row's Retry re-fires the last open through `FileOpenService` (which the
-        // state sink mirrors back into `model.filesOpenFailure`), so a transient open failure can be retried
-        // without re-navigating. No-op when nothing was opened yet.
-        launcherOverlay.model.onFilesRetryOpen = { [weak self] in self?.retryLastFilesOpen() }
         observeSleepWake()
         observeEnabledToggle()
         observeSpacesRearrangeToggle()
@@ -771,19 +274,11 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         observeLauncherToggle()
         observeClipboardToggle()
         observeDeviceLinkToggle()
-        observeFileOpenState()
-        observeAICommandsToggle()
         observeKeyboardLanguageToggle()
         observeKeyboardLanguagePerSiteToggle()
         observeKeyboardLanguageBrowserControlToggle()
         observeDockPreviewsToggle()
         observeWindowGroupsToggle()
-        observeParkToggle()
-        observeAIGatingSnapshot()
-        reconcileAIModelAtLaunch()
-        installAutomaticModelEviction()
-        observeVoiceToggle()
-        syncVoicePTTMonitor()
     }
 
     deinit {
@@ -849,13 +344,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         // Snap-to-bind window groups: same standalone opt-in shape — when off, the left-mouse
         // monitors aren't even installed.
         snapMonitor.setEnabled(settings.enableWindowGroups)
-        // The notch home zone rail follows the agent feature (here: AI commands enabled). When off, the
-        // cursor monitor isn't even installed.
-        parkController.setEnabled(settings.aiCommandsEnabled)
-        setParkMaintenanceEnabled(settings.aiCommandsEnabled)
-        // Recover interrupted turns NOW (a quit mid-response was normalized to parked+scheduled at the
-        // controller's init) instead of waiting for the first coarse maintenance tick.
-        if settings.aiCommandsEnabled { parkController.runAdvancePass(now: Date()) }
         refreshRowSwitchingGate()
         refreshClipboardMonitor()
         applySpacesRearrangeOnLaunchIfManaged()
@@ -866,30 +354,11 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         // captures don't stall the reel slide mid-animation (SCK stays warm process-wide thereafter —
         // the reason only the first run stutters). No-op without Screen Recording permission.
         Task { await thumbnails.warmUp() }
-        // Skills-as-files (`wire-memory-skills`): load the built-in ∪ user skill corpus off-main once (this
-        // IS the idempotent catalog→skill-files migration — built-ins are projected in-memory, so there's
-        // nothing on disk to rewrite), then start the folder watcher so a dropped/edited user `.skill.md`
-        // re-indexes with no rebuild. The store's `loaded` snapshot backs `manifest(id:)` (the active-skill
-        // allow-list resolver) and `index()`. AI feature-gated, like the park rail.
-        if settings.aiCommandsEnabled { startSkillsLoadAndWatch() }
         // The First Touch wizard IS the first-run flow: it replaced the four one-shot consent
         // alerts (didPrompt* — set on the wizard's completion so they can never fire) and the
         // open-Hub-on-Setup fallback. Resume-aware: any interruption (relaunch, re-login, plain
         // quit) reopens at the right act.
         maybeShowFirstTouchWizard()
-    }
-
-    /// Load the skill corpus once + start the user-folder watcher (`wire-memory-skills`). Idempotent: a
-    /// re-call no-ops the watcher (it's started once) and re-loads the snapshot. The built-in projection is
-    /// already available synchronously to the provider/resolver; this populates the store's `loaded` so
-    /// user-folder skills (shadowing/extra) participate in `manifest(id:)`/`index()`.
-    private func startSkillsLoadAndWatch() {
-        guard aiSkillWatcher == nil else { return }
-        let store = aiSkillStore
-        Task { _ = await store.loadAll() }   // initial off-main load (the idempotent migration is a no-op)
-        let watcher = SkillFolderWatcher(store: store, onReload: { _ in })   // store.loadAll() updates `loaded`
-        aiSkillWatcher = watcher
-        watcher.start()
     }
 
     // MARK: - Enable / disable
@@ -1467,16 +936,8 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         // (the recognizer only emits these when the relocation is effective, so this is exactly
         // the post-re-login / replay case).
         if wizardOwnsGestures { wizardModel?.launcherTourActivate(); return }
-        // Defensive: while the AI preview canvas is open the recognizer is in canvas-resolution mode and
-        // routes swipes to `launcherCanvasResolve` (down = commit, horizontal = discard), so it does NOT
-        // call this. Should it ever reach here, do NOT re-show — that would discard the canvas and reset
-        // to the grid; let the open canvas keep handling the gesture.
-        guard !launcherOverlay.canvasActive else { return }
 
         let fav = favoritesStore.favorites
-        // AI commands are persisted band items now (configuration-hub fold-in), so they project from
-        // `fav.bands` like any item — no synthetic AI band, no opt-in filtering (a fired AI item
-        // resolves its availability in the canvas). Only the Clipboard band remains synthetic.
         var bands = fav.bands
         var clipboardBandIndex: Int?
         if settings.keepClipboardHistory {
@@ -1486,22 +947,9 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             bands.append(ClipboardBandBuilder.build(from: entries))
             clipboardBandIndex = bands.count - 1
         }
-        // The Files band is synthetic + ephemeral like Clipboard (never persisted into Favorites): build a
-        // fresh directory navigator over the configured roots, project its current column as the band, and
-        // thread both the band index and the controller through `show`. The controller owns the on-demand
-        // listing cache + the column state machine; the model routes the recognizer's drill into it.
-        var filesBandIndex: Int?
-        var filesColumn: FilesColumnController?
-        if settings.filesBandEnabled {
-            let controller = makeFilesColumnController()
-            bands.append(FilesBandBuilder.build(currentColumn: controller.visibleEntries))
-            filesBandIndex = bands.count - 1
-            filesColumn = controller
-        }
         guard !bands.isEmpty else { return }
         // Capture the app the user was looking at before the (non-activating) overlay appears, so a
-        // `.action(.closeFrontWindow)` item — a clipboard paste, and an AI command's selection I/O —
-        // targets that window.
+        // `.action(.closeFrontWindow)` item — and a clipboard paste — targets that window.
         let front = NSWorkspace.shared.frontmostApplication
         capturedFrontApp = (front?.processIdentifier == getpid()) ? capturedFrontApp : front
         // Edge-triggered auto-repeat acceleration.
@@ -1514,37 +962,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
                              startBand: fav.homeBandIndex,
                              startColumn: fav.resolvedHomeColumn,
                              dwell: settings.dwellToArmDuration,
-                             clipboardBandIndex: clipboardBandIndex,
-                             filesBandIndex: filesBandIndex,
-                             filesColumn: filesColumn)
-    }
-
-    /// Build a fresh `FilesColumnController` for a launcher open: the configured roots, the per-root
-    /// remembered deepest locations restored from settings, and the sort key/direction mapped from
-    /// settings. The controller seeds its current column synchronously from the cache (empty on a cold
-    /// open) and warms the landing column asynchronously; the band's items reproject when the listing
-    /// lands (via the model's `onColumnChanged` binding). Orphaned remembered locations (a removed root)
-    /// are pruned opportunistically so the map doesn't grow unbounded.
-    private func makeFilesColumnController() -> FilesColumnController {
-        let roots = settings.filesRoots.map { URL(fileURLWithPath: $0).standardizedFileURL }
-        // Restore root → deepest-folder from settings, keyed by the SAME standardized path the model
-        // persists with (`root.standardizedFileURL.path`), so the lookup matches what was written.
-        var remembered: [URL: URL] = [:]
-        for root in roots {
-            if let path = settings.rememberedLocation(forRoot: root.path) {
-                remembered[root] = URL(fileURLWithPath: path).standardizedFileURL
-            }
-        }
-        // Drop orphaned remembered entries whose root is no longer configured (standardized key space).
-        settings.pruneRememberedLocations(keepingRoots: Set(roots.map(\.path)))
-        return FilesColumnController(
-            roots: roots,
-            remembered: remembered,
-            sortOrder: FilesColumnController.sortOrder(field: settings.filesSortField),
-            sortDirection: settings.filesSortDirection,
-            // Open displaying the last folder visited (so crossing in from the band icon lands there,
-            // no jump) when the user has the Hub toggle on; otherwise land on the roots list.
-            restoreLastLocation: settings.filesRememberLocation)
+                             clipboardBandIndex: clipboardBandIndex)
     }
 
     func launcherDidStepItem(_ direction: Int) {
@@ -1580,71 +998,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         launcherOverlay.cancel()
     }
 
-    /// The action a canvas resolve excursion resolves to, once the binding is consulted. `commit` is
-    /// further gated by `canvasAtTop` at the call site (binding-independent); `discard`/`ignore` are not.
-    enum CanvasResolveDecision: Equatable { case commit, discard, ignore }
-
-    /// Pure decision: given the recognizer's axis-locked excursion (exactly one of `dx`/`dy` non-zero) and
-    /// the user's `canvas` binding, resolve which action it performs (`add-gesture-previews-and-bindings`
-    /// §9.3). The recognizer's sign convention is fixed: `dy<0 → swipeDown`, `dy>0 → swipeUp`,
-    /// `dx<0 → swipeLeft`, `dx>0 → swipeRight`. The rule (reproducing today's defaults and honoring any
-    /// remap): the excursion bound to commit → commit; to ignore → ignore; to dismiss → discard; the one
-    /// spare (unbound) excursion → discard if HORIZONTAL ("any horizontal = dismiss"), ignore if VERTICAL.
-    static func canvasResolveDecision(
-        dx: Int, dy: Int, binding: GestureBindings.CanvasBinding
-    ) -> CanvasResolveDecision {
-        let performed: GestureBindings.CanvasExcursion?
-        if dy < 0 { performed = .swipeDown }
-        else if dy > 0 { performed = .swipeUp }
-        else if dx < 0 { performed = .swipeLeft }
-        else if dx > 0 { performed = .swipeRight }
-        else { performed = nil }
-        guard let performed else { return .ignore }
-
-        if performed == binding.commit { return .commit }
-        if performed == binding.ignore { return .ignore }
-        if performed == binding.dismiss { return .discard }
-        // The one spare (unbound) excursion: a HORIZONTAL spare discards, a VERTICAL spare is ignored.
-        return (performed == .swipeLeft || performed == .swipeRight) ? .discard : .ignore
-    }
-
-    /// A fresh TWO-finger swipe while the AI preview canvas is open resolves it (change
-    /// `positional-navigation`, D5 — 4 fingers open/dismiss the platform, 2 fingers act within it). The
-    /// recognizer has already axis-locked; the performed excursion is mapped to an action through the
-    /// user's **configured canvas binding** (`add-gesture-previews-and-bindings` §9.3). Defaults reproduce
-    /// today's grammar exactly: down = commit-at-top, up = ignore, left = dismiss, spare (right) = discard.
-    /// A fresh two-finger FLICK while a notch conversation is expanded (`notch-conversation-gestures`):
-    /// fast UP minimizes it into the notch dock (the standard collapse — persisted, background-scheduled,
-    /// an in-flight turn untouched); fast RIGHT purge-deletes the session (authoritative discard + the
-    /// audit-ledger purge — no trace, no log line). Fast DOWN and fast LEFT are reserved no-ops. Soft
-    /// scrubs never reach here (the D4 classifier emits nothing for them), so thread scrolling is native.
-    func notchConversationResolve(dx: Int, dy: Int) {
-        guard let id = parkController.expandedID else { return }
-        if dy > 0 {
-            parkController.collapse(closingPanel: true)   // fast up → close straight into the notch (no rail dwell)
-        } else if dx > 0 {
-            parkController.purge(id)           // fast right → gone everywhere, no trace
-        }
-        // dy < 0 (fast down) and dx < 0 (fast left): reserved — deliberately nothing.
-    }
-
-    func launcherCanvasResolve(dx: Int, dy: Int) {
-        guard launcherOverlay.canvasActive else { return }
-        switch AppCoordinator.canvasResolveDecision(dx: dx, dy: dy, binding: settings.gestureBindings.canvas) {
-        case .commit:
-            // The commit-bound excursion applies — but ONLY when the canvas is scrolled to the TOP. Off the
-            // top the same two-finger pan is the user SCROLLING the response/thinking back up (the native
-            // scroll already handled it), so it must not insert the result. This at-top guard is
-            // binding-independent: it holds for whatever excursion is bound to commit.
-            guard aiCommandExecutor.canvasAtTop else { return }
-            launcherOverlay.resolveCanvasCommit()   // at top → apply (replace / paste / run task)
-        case .discard:
-            launcherOverlay.discardCanvas()
-        case .ignore:
-            break                                   // no-op (e.g. default up scrolls toward the tail)
-        }
-    }
-
     func launcherEdgeChanged(dx: Int, dy: Int) {
         guard !wizardOwnsGestures else { return }   // no edge auto-repeat in the wizard's tour
         guard launcherOverlay.isVisible else { return }
@@ -1652,447 +1005,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         if settings.reverseDirection { h = -h }            // match manual horizontal stepping
         if settings.reverseVerticalDirection { v = -v }    // match manual vertical stepping
         launcherOverlay.setEdgeAutoScroll(dx: h, dy: v)
-    }
-
-    // MARK: - GestureRecognizerDelegate (Files-band drill)
-
-    /// Horizontal drill while the Files band is current: descend / ascend the directory tree (the
-    /// direction is already reverse-adjusted in the recognizer). Forwarded to the overlay, which routes it
-    /// into the navigator and reprojects the band, then **recharges the dwell-to-arm** on the new row
-    /// (`filesManageDwell` — add-files-band-dwell-arm): a Files lift fires only when the row has armed.
-    ///
-    /// While the Open-With picker is open it is **vertical-only** (the apps are a single scrubbable column),
-    /// so a depth step is ignored — horizontal must not drill folders out from under the open popup.
-    func filesDepth(_ direction: Int) {
-        guard launcherOverlay.isVisible else { return }
-        // A popup (the Open-With grid or the action menu) is vertical-only — depth doesn't drill the tree.
-        if launcherOverlay.model.filesPicker != nil || launcherOverlay.model.filesActionMenu != nil { return }
-        launcherOverlay.filesDepth(direction)
-        launcherOverlay.filesManageDwell()   // descend/ascend lands on a new row → recharge the dwell-to-arm
-    }
-
-    /// Vertical highlight move while the Files band is current (reverse-adjusted upstream): an up-step at
-    /// the top of the column overflows into a focus-search request inside the model.
-    ///
-    /// While the Open-With picker is open the same vertical scrub moves the **picker** highlight (the app
-    /// list), not the folder list — the popup is what the user is navigating.
-    func filesHighlight(_ direction: Int) {
-        guard launcherOverlay.isVisible else { return }
-        // Route the vertical scrub to whichever popup is open (action menu, then Open-With grid), else the
-        // folder list — a popup is what the user is navigating while it is up.
-        if launcherOverlay.model.filesActionMenu != nil {
-            launcherOverlay.model.filesActionMenuMove(direction)
-        } else if launcherOverlay.model.filesPicker != nil {
-            launcherOverlay.model.filesPickerMove(direction)
-        } else {
-            launcherOverlay.filesHighlight(direction)
-        }
-        launcherOverlay.filesManageDwell()   // recharge the dwell-to-arm on the row/cell we landed on
-    }
-
-    /// The resolving lift with no added finger. Two cases:
-    ///
-    /// - **Picker open:** a lift CHOOSES the highlighted app — Open-With the highlighted file using that
-    ///   app's URL (the same defusable held open), then leave the picker and dismiss the navigator.
-    /// - **Picker closed:** open the highlighted entry in its default app (a folder as a Finder window),
-    ///   then dismiss.
-    ///
-    /// The open is a **defusable held open** under the hood (design D7): prepared then committed after a
-    /// short fuse, so a discard within the fuse window still cancels it. A failure surfaces ONLY through
-    /// `FileOpenService`'s bounded `.failed` state (its clean `FileActionError` headline) — never an alert
-    /// from here. A no-op (dismiss only) when nothing is highlighted (empty column / empty picker).
-    func filesOpen() {
-        guard launcherOverlay.isVisible else { return }
-        // DWELL GATE (mirrors the launcher's `end()`): a committing Files lift fires only when the highlighted
-        // row has armed (rested past the dwell); an unarmed scrub-and-lift just DISMISSES, acting on nothing.
-        // One gate covers every committing branch below — picker app, menu row, and the default deliver/open.
-        guard launcherOverlay.model.armed else { launcherOverlay.hide(); return }
-        // Picker open: the lift chooses the highlighted app and Open-Withs the file with it.
-        if launcherOverlay.model.filesPicker != nil {
-            defer { filesPickerOriginEntry = nil; launcherOverlay.model.exitFilesPicker(); launcherOverlay.hide() }
-            guard let entry = launcherOverlay.filesHighlightedEntry,
-                  case let .external(candidate)? = launcherOverlay.model.filesPickerSelected() else { return }
-            fireFilesOpen { [weak self] in
-                self?.fileOpenService.prepareOpenWith(entry, appURL: candidate.app.url)
-                    .commit(afterFuse: Self.filesOpenFuse)
-            }
-            return
-        }
-        // Action menu open: a lift COMMITS the highlighted row ("Open in ▸" descends into the app grid; a
-        // tool row opens the folder in that terminal/editor; any other action runs its effect).
-        if let menu = launcherOverlay.model.filesActionMenu {
-            filesCommitMenuRow(menu)
-            return
-        }
-        // Picker closed: perform the configured lift action on the highlighted entry — DELIVER it to the
-        // captured front app (the default — `files-contextual-delivery`) or OPEN it (file → default app,
-        // folder → Finder window). Open dismisses immediately (the defusable held open fires after a fuse);
-        // deliver keeps the navigator up until the async paste lands, so a no-front-app failure surfaces as
-        // a bounded row (mirroring `surfaceNoApplication` — `hide()` destroys the panel synchronously, so a
-        // failure can only show while the navigator is still open), and hides on success.
-        guard let entry = launcherOverlay.filesHighlightedEntry else { launcherOverlay.hide(); return }
-        switch settings.filesLiftAction {
-        case .open:
-            launcherOverlay.hide()
-            fireFilesOpen { [weak self] in
-                self?.fileOpenService.prepareOpen(entry).commit(afterFuse: Self.filesOpenFuse)
-            }
-        case .deliver:
-            filesDeliver(entry)
-        }
-    }
-
-    /// Deliver the highlighted entry to the captured front app (the default lift — `files-contextual-delivery`):
-    /// write the dual-representation payload (path string + file reference) and synthesize a paste, so a text
-    /// target receives the **path** and a Finder window receives the **file** — no context detection on our
-    /// side. On success the navigator dismisses; when there is **no captured front app** to deliver into, the
-    /// delivery surfaces a **bounded, non-blocking** failure row (never a false "Done", never an alert) and the
-    /// navigator stays open with the drill re-armed so the user can retry or discard. The keystroke landing
-    /// itself is unobservable, so a successful attempt is "delivered," not a confirmed paste.
-    private func filesDeliver(_ entry: FileEntry) {
-        let payload = FilesDelivery.payload(for: entry)
-        let deliver: () -> Void = { [weak self] in
-            guard let self else { return }
-            Task { @MainActor in
-                if await self.selectionService.deliverFile(url: payload.url, path: payload.path) {
-                    self.launcherOverlay.hide()
-                } else {
-                    self.launcherOverlay.model.filesOpenFailure = LauncherModel.FilesOpenFailure(
-                        headline: "Couldn't deliver — no app was frontmost to receive it.", details: nil)
-                    self.recognizer.rearmDrill()   // keep navigation alive for another try / discard
-                    self.launcherOverlay.filesRearmDwell()   // a re-lift must re-dwell first (Retry bypasses)
-                }
-            }
-        }
-        lastFilesOpen = deliver   // the failure row's Retry re-runs the identical delivery
-        deliver()
-    }
-
-    /// Capture `open` as the retryable last Files open (so the failure row's Retry re-runs the identical
-    /// prepare→commit), then fire it. The single fire path for both default opens and Open-With, so a retry
-    /// reproduces exactly what the lift did.
-    private func fireFilesOpen(_ open: @escaping () -> Void) {
-        lastFilesOpen = open
-        open()
-    }
-
-    /// The resolving lift after a relative +1 finger: open the **action menu** for the highlighted file or
-    /// folder (`files-action-menu`). Builds the per-type rows (the configured menu + the live pasteboard /
-    /// installed-tools context) and enters the navigable menu (the user scrubs vertically and lifts to commit
-    /// — see `filesOpen`/`filesCommitMenuRow`), then **re-arms** the drill so a fresh gesture scrubs the popup
-    /// (the firing lift already raised the fingers). A no-op when a popup is already open (a stray +1 inside
-    /// it must not reset it). The method name is retained because it is the recognizer's `+1`-finger delegate
-    /// hook; its action is now "open the menu" (Open-With folds in as the menu's "Open in ▸").
-    func filesOpenWith() {
-        guard launcherOverlay.isVisible else { return }
-        // Already in a popup: a stray +1 must not reset it — re-arm so it stays scrubbable (the lift latched
-        // the drill as resolved). The dwell is NOT recharged here (the same popup row stays highlighted).
-        guard launcherOverlay.model.filesPicker == nil, launcherOverlay.model.filesActionMenu == nil else {
-            recognizer.rearmDrill(); return
-        }
-        // DWELL GATE: the menu opens only over an armed row — a quick scrub-and-`+1`-lift dismisses, never
-        // popping a menu you didn't dwell on (the `+1`-finger morph itself moved no highlight, so the arm the
-        // user charged on this row is the same arm gating it here).
-        guard launcherOverlay.model.armed else { launcherOverlay.hide(); return }
-        defer { recognizer.rearmDrill() }
-        guard let entry = launcherOverlay.filesHighlightedEntry else { return }
-        let rows = buildActionMenuRows(for: entry)
-        guard !rows.isEmpty else { return }   // defensive — the default menus always have at least one row
-        launcherOverlay.model.enterFilesActionMenu(entry: entry, rows: rows)
-        launcherOverlay.filesManageDwell()   // entering the menu lands on row 0 → a fresh dwell there
-    }
-
-    /// Resolve the configured action menu into the concrete rows for `entry`, applying live context: whether
-    /// the pasteboard holds a file (gates Paste-into) and the installed, user-curated terminals/editors.
-    private func buildActionMenuRows(for entry: FileEntry) -> [FilesMenuRow] {
-        let hasFile = NSPasteboard.general.canReadObject(forClasses: [NSURL.self],
-                                                         options: [.urlReadingFileURLsOnly: true])
-        let tools = detectFilesTools()
-        return settings.filesActionMenu.visibleRows(for: entry, pasteboardHasFile: hasFile,
-                                                    terminals: tools.terminals, editors: tools.editors)
-    }
-
-    /// Probe which catalog terminals/editors are installed (`NSWorkspace.urlForApplication(withBundleIdentifier:)`)
-    /// and apply the user's curation (`filesToolsDisabled`). No new permission — a bundle-id lookup.
-    private func detectFilesTools() -> (terminals: [FilesTool], editors: [FilesTool]) {
-        let disabled = Set(settings.filesToolsDisabled)
-        func detect(_ seeds: [(bundleID: String, name: String)], role: FilesTool.Role) -> [FilesTool] {
-            seeds.compactMap { seed in
-                guard NSWorkspace.shared.urlForApplication(withBundleIdentifier: seed.bundleID) != nil else { return nil }
-                return FilesTool(bundleID: seed.bundleID, name: seed.name, role: role,
-                                 enabled: !disabled.contains(seed.bundleID))
-            }
-        }
-        return (detect(FilesToolCatalog.terminals, role: .terminal),
-                detect(FilesToolCatalog.editors, role: .editor))
-    }
-
-    /// Commit the highlighted action-menu row. "Open in ▸" descends into the Open-With app grid (remembering
-    /// it came from the menu, so a discard backs out to the menu); a tool row opens the folder in that
-    /// terminal/editor; any other action runs its effect (which dismisses, or surfaces a bounded failure).
-    private func filesCommitMenuRow(_ menu: LauncherModel.FilesActionMenuState) {
-        guard let row = menu.highlighted else {
-            launcherOverlay.model.exitFilesActionMenu(); recognizer.rearmDrill(); return
-        }
-        let entry = menu.entry
-        switch row {
-        case .action(.openIn):
-            launcherOverlay.model.exitFilesActionMenu()
-            filesPickerOriginEntry = entry
-            presentOpenWithPicker(for: entry)
-        case let .tool(_, tool):
-            openEntry(entry, inToolBundleID: tool.bundleID)
-            launcherOverlay.hide()
-        case let .action(action):
-            performMenuAction(action, on: entry)
-        }
-    }
-
-    /// Present the Open-With **app grid** for `entry`: for a **file**, the apps that can open it (default
-    /// indicated); for a **folder**, the folder-openers (Finder + the curated editors/terminals). When the
-    /// candidate list is empty, surface the bounded `noApplicationForFile` notice and keep the navigator
-    /// open. Always re-arms the drill so a fresh gesture scrubs the grid.
-    private func presentOpenWithPicker(for entry: FileEntry) {
-        // Entering the grid lands on the default app (or, on empty candidates, drops back to the folder row) —
-        // recharge the dwell so the landing cell must itself be dwelled before a lift opens it.
-        defer { recognizer.rearmDrill(); launcherOverlay.filesManageDwell() }
-        let candidates = entry.isDirectory
-            ? folderOpenerCandidates()
-            : fileOpenService.openWithCandidates(for: entry)
-        let entries = OpenWithEntries.build(externalApps: candidates)
-        guard !entries.isEmpty else {
-            fileOpenService.surfaceNoApplication(for: entry)
-            return
-        }
-        launcherOverlay.model.enterFilesPicker(entries)
-    }
-
-    /// The "Open in ▸" candidates for a **folder**: Finder (the default), then the installed, enabled
-    /// editors and terminals — a folder has no LaunchServices opener list of its own (which is exactly why
-    /// the menu was empty on folders before). Each opens the folder with that app via `prepareOpenWith`.
-    private func folderOpenerCandidates() -> [OpenWithCandidate] {
-        var candidates: [OpenWithCandidate] = []
-        if let finder = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.finder") {
-            candidates.append(OpenWithCandidate(app: AppCandidate(url: finder), isDefault: true))
-        }
-        let tools = detectFilesTools()
-        for tool in (tools.editors + tools.terminals) where tool.enabled {
-            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: tool.bundleID) {
-                candidates.append(OpenWithCandidate(app: AppCandidate(url: url), isDefault: false))
-            }
-        }
-        return candidates
-    }
-
-    /// Open the entry's folder (a folder itself, or a file's containing folder) as `bundleID`'s working
-    /// directory — the ‹terminals› / Open-in-‹editor› rows. Reuses the no-new-permission `NSWorkspace.open`
-    /// handoff; most terminals/editors set a folder argument as their CWD.
-    private func openEntry(_ entry: FileEntry, inToolBundleID bundleID: String) {
-        let folder = entry.isDirectory ? entry.url : entry.url.deletingLastPathComponent()
-        guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
-            surfaceFilesFailure(.openFailed(name: entry.name, details: "That app isn’t installed."))
-            return
-        }
-        let config = NSWorkspace.OpenConfiguration()
-        config.activates = true   // the user chose this tool — bring it forward
-        NSWorkspace.shared.open([folder], withApplicationAt: appURL, configuration: config) { [weak self] _, error in
-            guard let error else { return }
-            Task { @MainActor in
-                self?.surfaceFilesFailure(.openFailed(name: entry.name, details: String(describing: error)))
-            }
-        }
-    }
-
-    /// Run a non-navigation menu action and resolve the navigator. The copy/reveal/name/favorite actions
-    /// complete the interaction (dismiss); Paste-into keeps the navigator open on failure (a bounded row +
-    /// retry), and the copies land in clipboard history via the live monitor (no manual insert).
-    private func performMenuAction(_ action: FilesMenuAction, on entry: FileEntry) {
-        let pb = NSPasteboard.general
-        switch action {
-        case .copyAsPath:
-            pendingCut = nil                        // an explicit copy supersedes any pending cut
-            pb.clearContents()
-            pb.setString(entry.url.standardizedFileURL.path, forType: .string)
-            launcherOverlay.hide()
-        case .copy:
-            pendingCut = nil
-            pb.clearContents()
-            pb.writeObjects([entry.url as NSURL])   // the file/folder OBJECT (paste-in-Finder copies it)
-            launcherOverlay.hide()
-        case .cut:
-            // Mark for move: write the object like Copy, then record the cut keyed on the pasteboard's NEW
-            // change-count, so the next Paste moves it only while the pasteboard is still this cut.
-            pb.clearContents()
-            pb.writeObjects([entry.url as NSURL])
-            pendingCut = (sources: [entry.url], changeCount: pb.changeCount)
-            launcherOverlay.hide()
-        case .copyName:
-            pendingCut = nil
-            pb.clearContents()
-            pb.setString(entry.name, forType: .string)
-            launcherOverlay.hide()
-        case .revealInFinder:
-            NSWorkspace.shared.activateFileViewerSelecting([entry.url])
-            launcherOverlay.hide()
-        case .addToFavorites:
-            addEntryToFavorites(entry)
-            launcherOverlay.hide()
-        case .pasteInto:
-            pasteIntoFolder(for: entry)
-        case .delete:
-            deleteEntry(entry)
-        case .openIn, .openInTerminals, .openInEditor:
-            // openIn descends (handled in `filesCommitMenuRow`); the tool groups expand to `.tool` rows, so
-            // a bare `.action` here is an unreachable fallthrough — dismiss to be safe.
-            launcherOverlay.hide()
-        }
-    }
-
-    /// Paste-into: put the pasteboard's file(s) INTO the target folder (a highlighted folder, or a file's
-    /// containing folder) — **dual-mode**: a **move** when fulfilling a pending Cut (the pasteboard is still
-    /// that cut), else a **copy**; **keep-both** on conflict (auto-rename) either way, never overwriting.
-    /// Dismisses on success; on failure surfaces a bounded `pasteFailed` row and keeps the navigator open
-    /// (re-armed). File URLs only in v1.
-    private func pasteIntoFolder(for entry: FileEntry) {
-        // Capture the paste as the retryable last action, so the failure row's Retry re-pastes (not a stale
-        // open). Keep-both makes a re-paste safe (it never overwrites).
-        let paste: () -> Void = { [weak self] in self?.performPasteInto(for: entry) }
-        lastFilesOpen = paste
-        paste()
-    }
-
-    private func performPasteInto(for entry: FileEntry) {
-        let destination = entry.isDirectory ? entry.url : entry.url.deletingLastPathComponent()
-        let sources = (NSPasteboard.general.readObjects(forClasses: [NSURL.self],
-                       options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
-        guard !sources.isEmpty else {
-            surfaceFilesFailure(.pasteFailed(name: destination.lastPathComponent,
-                                             details: "The clipboard holds no file to paste."))
-            recognizer.rearmDrill(); return
-        }
-        // MOVE iff the live pasteboard is still the pending cut (its change-count is unchanged); otherwise
-        // COPY. Any Copy / external write since the Cut bumps the count → the cut is superseded → we copy.
-        let isMove = pendingCut.map { $0.changeCount == NSPasteboard.general.changeCount } ?? false
-        let fm = FileManager.default
-        do {
-            var taken = Set((try? fm.contentsOfDirectory(atPath: destination.path)) ?? [])
-            for source in sources {
-                let unique = FilesPasteName.uniqueName(for: source.lastPathComponent, existing: taken)
-                let target = destination.appendingPathComponent(unique)
-                if isMove { try fm.moveItem(at: source, to: target) }
-                else      { try fm.copyItem(at: source, to: target) }
-                taken.insert(unique)
-            }
-            if isMove { pendingCut = nil }   // the cut is consumed by the move
-            launcherOverlay.hide()
-        } catch {
-            surfaceFilesFailure(.pasteFailed(name: destination.lastPathComponent, details: String(describing: error)))
-            recognizer.rearmDrill()
-        }
-    }
-
-    /// Delete: move the entry to the **Trash** (recoverable from Finder) — never a permanent `removeItem`.
-    /// Dismisses on success (the entry is simply gone on the next listing); on failure surfaces a bounded
-    /// `trashFailed` row and keeps the navigator open (re-armed). Committed by the dwell-armed lift, so a
-    /// stray scrub-and-lift never deletes (`add-files-band-dwell-arm`).
-    private func deleteEntry(_ entry: FileEntry) {
-        let delete: () -> Void = { [weak self] in self?.performDelete(for: entry) }
-        lastFilesOpen = delete   // the failure row's Retry re-tries the trash
-        delete()
-    }
-
-    private func performDelete(for entry: FileEntry) {
-        do {
-            try FileManager.default.trashItem(at: entry.url, resultingItemURL: nil)
-            launcherOverlay.hide()
-        } catch {
-            surfaceFilesFailure(.trashFailed(name: entry.name, details: String(describing: error)))
-            recognizer.rearmDrill()
-        }
-    }
-
-    /// Add `entry` to the launcher as a persistent favorite (`.path` opens it in its default handler) — the
-    /// opt-in "Add to Favorites" item, bridging the Files band back into the launcher. Lands in the home
-    /// band, else the first band, else a fresh "Files" band.
-    private func addEntryToFavorites(_ entry: FileEntry) {
-        let item = LaunchItem(title: entry.name, icon: .fileIcon, kind: .path(entry.url))
-        let fav = favoritesStore.favorites
-        let bandID = fav.homeBandID ?? fav.bands.first?.id ?? favoritesStore.addBand(name: "Files")
-        favoritesStore.addItem(item, toBand: bandID)
-    }
-
-    /// Surface a Files-band action failure as the existing bounded, non-blocking row (clean headline + opt-in
-    /// copyable details) — never an alert, never raw text in a headline.
-    private func surfaceFilesFailure(_ error: FileActionError) {
-        launcherOverlay.model.filesOpenFailure = LauncherModel.FilesOpenFailure(
-            headline: error.errorDescription ?? "Something went wrong.", details: error.copyableDetails)
-    }
-
-    /// A fresh deliberate four-finger horizontal swipe-away while drilled: discard.
-    ///
-    /// - **Picker open:** the swipe backs OUT of the picker to the folder list — the navigator stays open
-    ///   (it is not a full dismiss), and any pending open is defused.
-    /// - **Picker closed:** dismiss the navigator. Defuses any held open (it never terminates an
-    ///   already-running app — `cancelPending` only cancels a not-yet-fired open).
-    func filesDiscard() {
-        guard launcherOverlay.isVisible else { return }
-        fileOpenService.cancelPending()
-        // Action menu open: back out to the folder list (navigator stays).
-        if launcherOverlay.model.filesActionMenu != nil {
-            launcherOverlay.model.exitFilesActionMenu()
-            recognizer.rearmDrill()
-            launcherOverlay.filesManageDwell()        // landed back on the folder row → recharge its dwell
-            return
-        }
-        if launcherOverlay.model.filesPicker != nil {
-            launcherOverlay.model.exitFilesPicker()
-            // If the grid was reached via the action menu's "Open in ▸", back out ONE level — re-open the
-            // menu — rather than dropping straight to the folder list.
-            if let origin = filesPickerOriginEntry {
-                filesPickerOriginEntry = nil
-                let rows = buildActionMenuRows(for: origin)
-                if !rows.isEmpty { launcherOverlay.model.enterFilesActionMenu(entry: origin, rows: rows) }
-            }
-            recognizer.rearmDrill()                   // a fresh gesture resumes navigation
-            launcherOverlay.filesManageDwell()        // landed back on the menu / folder row → recharge
-            return
-        }
-        launcherOverlay.hide()
-    }
-
-    /// Short pre-launch fuse on a committed Files open, so a discard issued within the window still defuses
-    /// it (design D7). Tiny — the held → swipe-to-resolve UI (a longer visible hold) is the view stage; here
-    /// the fuse just preserves the defuse seam.
-    private static let filesOpenFuse: Duration = .milliseconds(120)
-
-    /// Mirror `FileOpenService`'s observable state into `model.filesOpenFailure`, so a failed open surfaces
-    /// as a **bounded, non-blocking** row in the navigator (never an app-modal alert — spec: bounded +
-    /// non-blocking, never silent). On `.failed` it sets the clean headline + opt-in details; on
-    /// `.idle`/`.opening`/`.opened` it clears the row to nil (a fresh / in-flight / succeeded open has no
-    /// failure to show). Mirrors `observeClipboardToggle`'s emitted-value sink pattern (the `@Published`
-    /// `willSet` reports the new value); no `dropFirst()` — the service starts `.idle`, which clears anyway.
-    private func observeFileOpenState() {
-        fileOpenService.$state
-            .sink { [weak self] state in
-                MainActor.assumeIsolated {
-                    guard let self else { return }
-                    switch state {
-                    case let .failed(headline, details):
-                        self.launcherOverlay.model.filesOpenFailure =
-                            LauncherModel.FilesOpenFailure(headline: headline, details: details)
-                    case .idle, .opening, .opened:
-                        self.launcherOverlay.model.filesOpenFailure = nil
-                    }
-                }
-            }
-            .store(in: &cancellables)
-    }
-
-    /// Re-fire the last Files open (the failure row's Retry). Re-running it transitions `FileOpenService`
-    /// back through `.opening` (which the state sink clears the failure row on) and then to `.opened` or a
-    /// fresh `.failed` — so a transient failure can be retried in place. A no-op when nothing has been opened.
-    private func retryLastFilesOpen() {
-        lastFilesOpen?()
     }
 
     // MARK: - Clipboard history monitor lifecycle
@@ -2134,71 +1046,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             .dropFirst()
             .sink { [weak self] on in MainActor.assumeIsolated { self?.snapMonitor.setEnabled(on) } }
             .store(in: &cancellables)
-    }
-
-    /// The notch home zone rail follows the agent feature (here: `aiCommandsEnabled`) — install/remove the
-    /// cursor-reveal monitor off the toggle (mirrors `observeDockPreviewsToggle`).
-    private func observeParkToggle() {
-        settings.$aiCommandsEnabled
-            .dropFirst()
-            .sink { [weak self] on in
-                MainActor.assumeIsolated {
-                    self?.parkController.setEnabled(on)
-                    self?.setParkMaintenanceEnabled(on)
-                }
-            }
-            .store(in: &cancellables)
-        // Live-update the notch reveal dwell as the Hub slider moves.
-        settings.$agentNotchRevealDwell
-            .dropFirst()
-            .sink { [weak self] dwell in
-                MainActor.assumeIsolated { self?.parkController.setRevealDwell(dwell) }
-            }
-            .store(in: &cancellables)
-    }
-
-    /// Keep the off-main `aiGatingSnapshot` in step with the live Full Potential gating flags + cloud-video
-    /// budget, so the route loop's `@Sendable` gating closures read CURRENT values (not a stale build-time
-    /// snapshot) WITHOUT trapping off the main actor. Seeds once now, then refreshes on every relevant
-    /// `@Published` change (`@Published` fires in `willSet`, so we re-read the assembled gate AFTER the
-    /// change lands by hopping onto the main run loop's next tick via `receive(on:)`). The flags feeding the
-    /// gate: the ai-commands opt-in + the master + the media/cloud sub-flags + the cloud-video budget.
-    private func observeAIGatingSnapshot() {
-        aiGatingSnapshot.refresh(from: settings)   // seed before the first AI command can route a tool
-        // Each `@Published` emits its current value on subscribe; those initial emissions are harmless
-        // (they re-seed the same values just set above — `refresh` is idempotent). Every later emission is a
-        // real flag edit; `receive(on:)` defers the re-read to the next main-run-loop tick so the new value
-        // (set in `willSet`) has landed before we re-assemble the gate.
-        Publishers.MergeMany(
-            settings.$aiCommandsEnabled.map { _ in () }.eraseToAnyPublisher(),
-            settings.$fullPotentialEnabled.map { _ in () }.eraseToAnyPublisher(),
-            settings.$mediaGenEnabled.map { _ in () }.eraseToAnyPublisher(),
-            settings.$fleetCloudEscalationEnabled.map { _ in () }.eraseToAnyPublisher(),
-            settings.$mediaVideoBudgetPerDay.map { _ in () }.eraseToAnyPublisher()
-        )
-        .receive(on: RunLoop.main)
-        .sink { [weak self] in
-            guard let self else { return }
-            self.aiGatingSnapshot.refresh(from: self.settings)
-        }
-        .store(in: &cancellables)
-    }
-
-    /// Install / tear down the coarse park MAINTENANCE timer alongside the park rail. Each tick runs the
-    /// (opt-in) auto-dismiss pass AND the background-driver advance pass (serving runnable sessions —
-    /// recovered turns, scheduled retries — one at a time); idempotent (invalidates any prior timer
-    /// first) and safe to call with `false` repeatedly.
-    private func setParkMaintenanceEnabled(_ on: Bool) {
-        parkAutoDismissTimer?.invalidate()
-        parkAutoDismissTimer = nil
-        guard on else { return }
-        parkAutoDismissTimer = Timer.scheduledTimer(withTimeInterval: Self.parkAutoDismissInterval,
-                                                    repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated {
-                _ = self?.parkController.runAutoDismissPass(now: Date())
-                _ = self?.parkController.runAdvancePass(now: Date())
-            }
-        }
     }
 
     // MARK: - Device link lifecycle
@@ -2298,300 +1145,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         setClipboardRecording(settings.keepClipboardHistory)
     }
 
-    // MARK: - AI commands opt-in lifecycle
-
-    /// React to the "Enable AI commands" toggle: drive the model manager's opt-in. Turning it OFF
-    /// evicts any resident model and forgets download progress (privacy + frees weights — handled in
-    /// `ModelManager`); turning it ON only allows a download (it never auto-fetches — the user starts
-    /// it from Settings). Uses the EMITTED value, not a re-read (the `@Published` willSet would still
-    /// report the OLD value here — same reason the gesture toggles pass `enabled` through).
-    private func observeAICommandsToggle() {
-        settings.$aiCommandsEnabled
-            .dropFirst()
-            .sink { [weak self] on in
-                MainActor.assumeIsolated {
-                    guard let self else { return }
-                    self.modelManager.setOptedIn(on)
-                    // Re-enabling rediscovers an already-downloaded model (→ .ready) so the user isn't
-                    // asked to "Download" again; the heavy load stays lazy (first command). Then settle
-                    // the displayed status to the SELECTED model (reconcile probes only the default).
-                    if on {
-                        self.modelManager.reconcileWithDisk()
-                        if let d = self.selectedAIModelDescriptor() { self.modelManager.showStatus(for: d) }
-                    }
-                }
-            }
-            .store(in: &cancellables)
-    }
-
-    /// Wire the automatic model-weight eviction triggers (`model-idle-ttl-and-memory-pressure`): the
-    /// REAL memory-pressure observer (the previously-aspirational "evict on memory pressure" comment,
-    /// now true) + the quiescence-keyed idle TTL. The quiescence snapshot pulls from the park
-    /// controller on the main actor at decision time; the TTL closure reads the live setting so a Hub
-    /// change applies without re-wiring. Installed unconditionally — `evaluateAutomaticEviction`
-    /// itself no-ops while not opted in / nothing resident. An open VOICE conversation joins through
-    /// `foregroundSessionActive` (the OR-shaped flag) so a live dialogue never pays a mid-chat evict.
-    private func installAutomaticModelEviction() {
-        modelManager.installAutomaticEviction(
-            pressure: SystemMemoryPressureSource(),
-            quiescence: { [weak self] in
-                guard let self else { return QuiescenceSnapshot() }
-                // EVERY conversational surface joins the snapshot (`fix-evict-thrash-and-hot-path`
-                // — the original only saw notch sessions, so canvas conversations were invisible
-                // and eviction fired between canvas turns → the reload storm):
-                var snapshot = self.parkController.quiescenceSnapshot()
-                // The launcher-canvas executor: a loading/streaming turn blocks ALL eviction; an
-                // open canvas (incl. a paused action review) is a foreground conversation.
-                if self.aiCommandExecutor.state.isTurnInFlight {
-                    snapshot.turnInFlight = true
-                }
-                if self.launcherOverlay.canvasActive {
-                    snapshot.foregroundSessionActive = true
-                }
-                // A live voice conversation (checked WITHOUT instantiating the lazy voice stack).
-                if self.voicePhaseLive || (self.settings.voiceConversationEnabled
-                                           && self.voiceStackLive
-                                           && self.voiceController.isConversationActive) {
-                    snapshot.foregroundSessionActive = true
-                }
-                return snapshot
-            },
-            idleTTL: { [weak self] in TimeInterval((self?.settings.aiIdleEvictMinutes ?? 0) * 60) })
-    }
-
-    // MARK: - Voice + computer-use behaviors (`add-voice-computer-use-agent`)
-
-    /// Resolve a computer-use window target against the switcher's OWN enumeration (fuzzy app-name
-    /// contains + optional title hint; nil app = the frontmost app's window).
-    private func resolveComputerUseWindow(app: String?, title: String?) -> ComputerUseWindowTarget? {
-        let windows = windowService.snapshot()
-        let appQuery = app?.lowercased().trimmingCharacters(in: .whitespaces) ?? ""
-        let titleQuery = title?.lowercased() ?? ""
-        var candidates = windows
-        if !appQuery.isEmpty {
-            candidates = candidates.filter { $0.appName.lowercased().contains(appQuery) }
-        } else if let front = NSWorkspace.shared.frontmostApplication {
-            let own = candidates.filter { $0.pid == front.processIdentifier }
-            if !own.isEmpty { candidates = own }
-        }
-        if !titleQuery.isEmpty {
-            let titled = candidates.filter { $0.title.lowercased().contains(titleQuery) }
-            if !titled.isEmpty { candidates = titled }
-        }
-        // Prefer the current Space (the cheap raise path; reading works regardless).
-        let pick = candidates.first(where: { $0.isOnCurrentSpace }) ?? candidates.first
-        return pick.map { ComputerUseWindowTarget(pid: $0.pid, title: $0.title, appName: $0.appName) }
-    }
-
-    /// Focus a resolved target through the EXISTING hardened commit path (`raiseCommitted` — the
-    /// agent is the third caller after trackpad and ⌘-Tab; switcher-as-API).
-    private func focusComputerUseWindow(_ target: ComputerUseWindowTarget) -> Bool {
-        guard let window = windowService.snapshot().first(where: {
-            $0.pid == target.pid && ($0.title == target.title || target.title.isEmpty)
-        }) ?? windowService.snapshot().first(where: { $0.pid == target.pid }) else { return false }
-        raiseCommitted(window)
-        return true
-    }
-
-    /// The one voice turn: run the SAME bounded agent loop over the voice conversation, streaming
-    /// `.response` tokens back for sentence-chunked speech. Failures speak a clean headline and the
-    /// stream throws so the turn model returns to idle.
-    private func voiceTurnStream(_ text: String) -> AsyncThrowingStream<Token, Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task { @MainActor [weak self] in
-                guard let self else { continuation.finish(); return }
-                self.applySpokenAutoIntent(text)
-                self.voiceConversation.messages.append(AgentMessage(role: .user, text: text))
-                do {
-                    let runtime = try await self.modelManager.runtime(requiring: [.text])
-                    let speakLine: @Sendable (String) -> Void = { [weak self] line in
-                        Task { @MainActor in self?.voiceSpeak(line) }
-                    }
-                    // Voice approvals (design D7): no canvas → guidance-and-skip base gate; the
-                    // auto-mode grant (spoken explicitly) lifts `.confirm` acts, narrated.
-                    let gate = AutoApprovingGate(base: SpokenGuidanceGate(speak: speakLine),
-                                                 isGranted: { [grant = self.voiceAutoGrant] in grant.value },
-                                                 narrate: speakLine)
-                    let budget = LoopBudget(
-                        stepTimeout: TimeInterval(self.settings.agentStepTimeoutSeconds),
-                        turnDeadline: TimeInterval(self.settings.agentTurnDeadlineSeconds))
-                    let loop = AgentLoop(runtime: runtime, registry: self.aiToolRegistry,
-                                         candidateSource: self.aiToolCandidateSource,
-                                         gate: gate,
-                                         reasoning: false,   // voice favors latency; reasoning is a chat affair
-                                         source: TaskSource(),
-                                         budget: budget,
-                                         isAutoGranted: { [grant = self.voiceAutoGrant] in grant.value },
-                                         onResponseToken: { token in
-                                             continuation.yield(Token(token, isFinal: false))
-                                         })
-                    let result = await loop.run(
-                        context: RouteContext(messages: self.voiceConversation.messages))
-                    switch result.outcome {
-                    case let .answered(answer), let .capReached(answer):
-                        if !answer.isEmpty {
-                            self.voiceConversation.messages.append(AgentMessage(role: .assistant, text: answer))
-                        }
-                        continuation.finish()
-                    case let .stopped(_, answer):
-                        if !answer.isEmpty {
-                            self.voiceConversation.messages.append(AgentMessage(role: .assistant, text: answer))
-                        }
-                        continuation.finish()
-                    case .pausedAwaitingUser:
-                        continuation.finish()
-                    case let .failed(headline):
-                        self.voiceSpeak(headline)
-                        continuation.finish(throwing: RuntimeError.unavailable(reason: headline))
-                    }
-                } catch {
-                    let presented = AIError.message(for: error)
-                    self.voiceSpeak(presented.headline)
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
-    }
-
-    /// The USER's explicit spoken auto-mode grant/revoke: the gate protects against MODEL-initiated
-    /// acts; a deliberate, push-to-talk-held spoken grant IS user consent (design D7 — the
-    /// initial-command intent path).
-    private func applySpokenAutoIntent(_ transcript: String) {
-        let lowered = transcript.lowercased()
-        let grants = ["enable auto mode", "auto mode on", "without asking", "don't ask", "dont ask"]
-        let revokes = ["disable auto mode", "auto mode off", "stop auto mode", "ask me again"]
-        if revokes.contains(where: lowered.contains) {
-            voiceAutoGrant.value = false
-            voiceSpeak("Auto mode off.")
-        } else if grants.contains(where: lowered.contains) {
-            voiceAutoGrant.value = true
-            voiceSpeak("Auto mode on for this conversation.")
-        }
-    }
-
-    /// Speak a line through the shared synthesizer (the `speak` tool + failure lines + narration).
-    private func voiceSpeak(_ text: String) {
-        guard settings.voiceConversationEnabled else { return }
-        aiSpeechSynthesizer.speak(text)
-    }
-
-    /// Narrate an auto-executed act: SPOKEN when a voice conversation is live; the visible step list
-    /// carries it regardless (the loop's thinking stream — spec: silence never hides an act).
-    private func voiceNarrate(_ text: String) {
-        guard settings.voiceConversationEnabled, voiceController.isConversationActive else { return }
-        aiSpeechSynthesizer.speak(text)
-    }
-
-    /// The `set_auto_mode` tools land here: an expanded/live engine's conversation takes the grant;
-    /// otherwise the voice conversation does.
-    private func setConversationAutoMode(_ on: Bool) {
-        if let engine = parkController.expandedEngine() {
-            engine.setAutoApprove(on)
-        } else {
-            voiceAutoGrant.value = on
-        }
-    }
-
-    /// The any-human-touch kill switch (spec: "The human always wins the input"): cancel every
-    /// in-flight turn as a DISCARD and acknowledge.
-    private func abortAgentAction() {
-        parkController.discardInFlightTurns()
-        voiceController.humanTouch()
-    }
-
-    /// Speak-last-response (the v0 wedge — no mic, no conversation): resolve the frontmost (or
-    /// terminal-looking) window, read it via AX, extract the tail, speak it. Uses the model for the
-    /// extraction when it's resident; falls back to the last visible lines so the command ALWAYS
-    /// works. Failures surface as one spoken line + a log — bounded, never a modal.
-    func speakLastResponse() {
-        Task { @MainActor in
-            do {
-                guard let target = resolveComputerUseWindow(app: nil, title: nil) else {
-                    aiSpeechSynthesizer.speak("I can't find a window to read.")
-                    return
-                }
-                let snapshot = try await aiAXPerformer.snapshot(pid: target.pid, titleHint: target.title)
-                let text = snapshot.joinedText
-                guard !text.isEmpty else {
-                    aiSpeechSynthesizer.speak("That window has no readable text.")
-                    return
-                }
-                let tail = String(text.suffix(6_000))
-                var toSpeak: String
-                if modelManager.isResident, let runtime = try? await modelManager.runtime(requiring: [.text]) {
-                    let prompt = """
-                    Below is the tail of a window's visible text (likely a terminal transcript). \
-                    Extract the FINAL assistant/agent response verbatim, or if none exists, briefly \
-                    summarize what the window shows. Reply with only that text.
-
-                    \(tail)
-                    """
-                    toSpeak = (try? await runtime.generateText(LLMRequest(prompt: prompt))) ?? ""
-                } else {
-                    toSpeak = ""
-                }
-                if toSpeak.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    // Model not resident / extraction failed → the last visible lines, honestly.
-                    toSpeak = snapshot.textBlocks.suffix(12).joined(separator: "\n")
-                }
-                var chunker = SentenceChunker()
-                for chunk in chunker.consume(toSpeak) { aiSpeechSynthesizer.speak(chunk) }
-                if let rest = chunker.flush() { aiSpeechSynthesizer.speak(rest) }
-            } catch {
-                let presented = AIError.message(for: error)
-                aiSpeechSynthesizer.speak(presented.headline)
-                NSLog("[ThreeFingerSwitcher] speak-last-response failed: \(presented.details ?? presented.headline)")
-            }
-        }
-    }
-
-    /// Install/remove the PTT trigger with the voice opt-in (and at launch).
-    private func syncVoicePTTMonitor() {
-        if settings.voiceConversationEnabled {
-            pttMonitor.setKeyCode(UInt16(clamping: settings.voicePTTKeyCode))
-            pttMonitor.onDown = { [weak self] in self?.voiceController.pttDown() }
-            pttMonitor.onUp = { [weak self] in self?.voiceController.pttUp() }
-            pttMonitor.start()
-        } else {
-            pttMonitor.stop()
-        }
-    }
-
-    private func observeVoiceToggle() {
-        settings.$voiceConversationEnabled
-            .dropFirst()
-            .sink { [weak self] _ in
-                MainActor.assumeIsolated { self?.syncVoicePTTMonitor() }
-            }
-            .store(in: &cancellables)
-        settings.$voicePTTKeyCode
-            .dropFirst()
-            .sink { [weak self] code in
-                MainActor.assumeIsolated { self?.pttMonitor.setKeyCode(UInt16(clamping: code)) }
-            }
-            .store(in: &cancellables)
-    }
-
-    /// At launch, if AI commands are already opted in, rediscover a previously-downloaded model so its
-    /// status shows "Downloaded" (and a command can lazy-load it) instead of resetting to "Not
-    /// downloaded" and forcing the user to click Download again every relaunch. Pure disk probe — no
-    /// network, no heavy load (that happens on first command). No-op if nothing is on disk.
-    private func reconcileAIModelAtLaunch() {
-        guard settings.aiCommandsEnabled else { return }
-        modelManager.reconcileWithDisk()
-        if let d = selectedAIModelDescriptor() { modelManager.showStatus(for: d) }
-    }
-
-    /// The model the AI surfaces act on: the user's pinned selection if it resolves, else the registry
-    /// default. Single source of truth for the download action and the displayed-status settle
-    /// (`showStatus`) across launch and the opt-in observer.
-    private func selectedAIModelDescriptor() -> ModelDescriptor? {
-        let registry = modelManager.registry
-        return settings.aiSelectedModelID.flatMap { registry.descriptor(id: $0) }
-            ?? registry.defaultDescriptor ?? registry.models.first
-    }
-
     // MARK: - Keyboard language opt-in lifecycle
 
     /// React to the "Remember the keyboard language per app" toggle: start/stop the service so its
@@ -2661,54 +1214,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             keyboardLanguageBrowserMonitor.start()
         } else {
             keyboardLanguageBrowserMonitor.stop()
-        }
-    }
-
-    /// Begin (or retry) the on-device model download from Settings. Gated on the opt-in by the manager
-    /// itself. The PRIMARY (and only) error surface is the in-window `.failed` status row + its Retry
-    /// button — the manager's observable state already carries the clean headline (and copyable
-    /// details) for it. No app-modal `NSAlert.runModal()` here: its nested run loop would freeze the
-    /// Settings window, and it would just duplicate the row's message (spec: "Error surfaces are
-    /// non-blocking and bounded"; design D3).
-    private func downloadAIModel() {
-        modelManager.setOptedIn(settings.aiCommandsEnabled)
-        // Honor the user's pinned model selection (the AI page / unavailable canvas picker), falling
-        // back to the registry default.
-        guard let descriptor = selectedAIModelDescriptor() else { return }
-        Task { @MainActor in
-            do {
-                try await modelManager.downloadAndVerify(descriptor)
-            } catch is CancellationError {
-                // User cancelled — not a failure; the manager already reset its state.
-            } catch RuntimeError.cancelled {
-                // Same: a cancelled provision is not a failure surface.
-            } catch {
-                // The manager already reflects `.failed` (clean headline + details) in its observable
-                // state, which the Settings row renders with a Retry action. Just log for diagnostics.
-                NSLog("[ThreeFingerSwitcher] AI model download failed: \(AIError.message(for: error).details ?? AIError.message(for: error).headline)")
-            }
-        }
-    }
-
-    /// Download a SPECIFIC capability fleet model (image / ternary / video) the user just enabled in the
-    /// roster. Reuses the EXISTING `ModelManager.downloadAndVerify` path (the same provisioner / byte-SHA
-    /// pipeline `downloadAIModel` drives) — no new provisioning seam. The PRIMARY error surface is the
-    /// roster row's per-model `.failed` status + Retry; the manager's observable state already carries the
-    /// clean headline + copyable details. No app-modal `NSAlert` here (it would freeze the Settings window).
-    private func downloadCapabilityModel(_ descriptor: ModelDescriptor) {
-        modelManager.setOptedIn(settings.aiCommandsEnabled)
-        Task { @MainActor in
-            do {
-                try await modelManager.downloadAndVerify(descriptor)
-            } catch is CancellationError {
-                // User cancelled — not a failure; the manager already reset its state.
-            } catch RuntimeError.cancelled {
-                // Same: a cancelled provision is not a failure surface.
-            } catch {
-                // The manager already reflects `.failed` (clean headline + details) in its observable
-                // state, which the roster row renders. Just log for diagnostics.
-                NSLog("[ThreeFingerSwitcher] AI capability model download failed: \(AIError.message(for: error).details ?? AIError.message(for: error).headline)")
-            }
         }
     }
 
@@ -3261,13 +1766,12 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
 
         var lines: [String] = []
         if selection.contains(.appData) {
-            lines.append("• App data & settings — preferences, bands, AI commands, keyboard-language memory, clipboard history, project outputs, first-run state.")
+            lines.append("• App data & settings — preferences, bands, keyboard-language memory, clipboard history, project outputs, first-run state.")
             if anyGestureBackupExists {
                 lines.append("  Gesture relocations will be restored FIRST so their backups aren't lost.")
             }
         }
         if selection.contains(.caches) { lines.append("• Caches.") }
-        if selection.contains(.aiModels) { lines.append("• AI models — the downloaded weights are deleted (re-downloadable); the AI opt-in turns off.") }
         if selection.contains(.permissions) { lines.append("• Permissions — every granted permission is reset; macOS will prompt again.") }
         let relaunches = selection.contains(.appData) || selection.contains(.permissions)
         if relaunches { lines.append("\nThe app will relaunch afterwards.") }
@@ -3287,16 +1791,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         }
         // 2. Quiesce writers so nothing re-creates what's being removed.
         clipboardMonitor.stop()
-        if selection.contains(.aiModels) || selection.contains(.appData) {
-            settings.aiCommandsEnabled = false   // evicts residency + forgets download progress
-        }
-        if selection.contains(.aiModels) {
-            // Delete the weights from the dir the runtime actually loads from (the HF cache, via the
-            // manager's injected provisioner-delete). `appDataReset` below only removes the app-support
-            // `models/` dir — the WRONG location on the real path — so without this the weights survive
-            // and the model re-discovers as "Downloaded" on the next opt-in.
-            modelManager.deleteAllFromDisk()
-        }
         // 3. Delete (preferences last, inside `clear`).
         let outcome = appDataReset.clear(selection)
         // 4. A cleared identity needs a fresh process (and a data wipe replays the wizard).
@@ -3495,16 +1989,9 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         ctx.relocationsPending = { [weak self] in self?.relocationsStillPending ?? false }
         ctx.logOutNow = { [weak self] in self?.sendLogOutKeystroke() }
         // The tour's fixed composition (WizardTourBands): the flame band of every app across the
-        // user's bands, the display band of the twelve window actions, plus the AI band when AI is
-        // on and the Clipboard band when history is on (sample entries while the store is empty).
-        //
-        // The Files band is INTENTIONALLY SKIPPED for the v1 onboarding tour. Unlike Clipboard (a static
-        // list of sample entries that reads identically in the tour and the real launcher), the Files band
-        // is a LIVE, controller-backed drill surface: its navigation is meaningless without a
-        // `FilesColumnController` + the recognizer's `filesDrillActive` routing, neither of which the
-        // wizard's static `launcherTour*` path wires. A non-drillable sample Files row would misrepresent
-        // the band, so it's discovered via the Hub's Files page + its own opt-in, not the first-touch tour.
-        ctx.launcherBands = { [weak self] clipboardOn, aiOn in
+        // user's bands, the display band of the twelve window actions, plus the Clipboard band when
+        // history is on (sample entries while the store is empty).
+        ctx.launcherBands = { [weak self] clipboardOn in
             guard let self else { return [] }
             let clipboard: ContextBand? = clipboardOn ? {
                 let entries = self.clipboardStore.bandWindow(limit: self.settings.clipboardRecentWindow)
@@ -3512,8 +1999,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
                     from: entries.isEmpty ? WizardSampleContent.clipboardEntries() : entries)
             }() : nil
             return WizardTourBands.compose(userBands: self.favoritesStore.favorites.bands,
-                                           aiOn: aiOn,
-                                           seededAIBand: AIBand.seededBand,
                                            clipboardBand: clipboard)
         }
         ctx.launcherLive = { [weak self] in self?.isLauncherEffective ?? false }
@@ -3646,7 +2131,6 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         let ctx = HubContext(settings: settings,
                              favorites: favoritesStore,
                              clipboard: clipboardStore,
-                             models: modelManager,
                              permissions: permissions)
         // §11.2 Real demo content for the gesture previews — the SAME providers `makeWizardContext`
         // wires, so the Hub renders the real switcher/launcher seeded with the user's content. No new
@@ -3683,7 +2167,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
                 }
             }
         }
-        ctx.launcherBands = { [weak self] clipboardOn, aiOn in
+        ctx.launcherBands = { [weak self] clipboardOn in
             guard let self else { return [] }
             let clipboard: ContextBand? = clipboardOn ? {
                 let entries = self.clipboardStore.bandWindow(limit: self.settings.clipboardRecentWindow)
@@ -3691,23 +2175,10 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
                     from: entries.isEmpty ? WizardSampleContent.clipboardEntries() : entries)
             }() : nil
             return WizardTourBands.compose(userBands: self.favoritesStore.favorites.bands,
-                                           aiOn: aiOn,
-                                           seededAIBand: AIBand.seededBand,
                                            clipboardBand: clipboard)
         }
         // Clipboard.
         ctx.onClearClipboard = { [weak self] includingPinned in self?.clipboardStore.clear(includingPinned: includingPinned) }
-        // AI.
-        ctx.onDownloadModel = { [weak self] in self?.downloadAIModel() }
-        ctx.onDownloadCapabilityModel = { [weak self] descriptor in self?.downloadCapabilityModel(descriptor) }
-        // AI — Background autonomy audit viewer (`ai-background-autonomy`, §7). The viewer reads the
-        // durable ledger synchronously; a store-persist failure is surfaced as a bounded, non-blocking
-        // banner (headline routed through the single `AIError.message(for:)` translator — never raw OS text).
-        ctx.recentAuditRecords = { [weak self] limit in self?.auditLog.recent(limit: limit) ?? [] }
-        ctx.auditStorePersistError = { [weak self] in
-            guard let error = self?.auditLog.lastPersistError else { return nil }
-            return AIError.message(for: error)
-        }
         // Keyboard Language — the picker's source list (forwarded from the service's controller seam so
         // the page never imports Carbon).
         ctx.enabledInputSources = { [weak self] in self?.keyboardLanguageService.controllerEnabledSources() ?? [] }

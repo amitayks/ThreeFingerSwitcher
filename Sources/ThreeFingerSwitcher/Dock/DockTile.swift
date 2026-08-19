@@ -35,7 +35,7 @@ struct DockSnapshot: Equatable {
     let screenFrame: CGRect
 }
 
-/// The seam onto the Dock's Accessibility tree — mirrors the `FileWorkspace` / `LLMRuntime` idea so the
+/// The seam onto the Dock's Accessibility tree — a protocol seam so the
 /// hover logic depends only on this protocol and can be driven by a static fake in tests. The real
 /// conformer (`AXDockReader`) reads `Dock.app`'s AX tree; it degrades to `nil` (no crash, no raw error)
 /// when the tree or an attribute can't be read.

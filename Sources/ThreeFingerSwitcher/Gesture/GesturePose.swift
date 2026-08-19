@@ -1,7 +1,7 @@
 import CoreGraphics
 import Foundation
 
-/// A pure, MLX-free ghost-hand pose generator — the "self-playing clip" engine behind both the
+/// A pure ghost-hand pose generator — the "self-playing clip" engine behind both the
 /// First Touch wizard's attract loop and the Hub's gesture previews. Given a continuous `phase`
 /// it returns one frame: a centroid plus a hand-like arc of fingertips, all normalized to 0..1
 /// trackpad space and clamped to `[0.05, 0.95]` (so the hand never leaves the pad). Generalized
@@ -180,24 +180,23 @@ enum GesturePose {
         }
     }
 
-    /// The in-surface gesture a band journey (or a canvas resolve) ends on / demonstrates — a directed
-    /// excursion in one of four cardinal directions, or a `.lift` (rest-and-open, no excursion). Mirrors
-    /// the `HubGesturePreview.BandInSurfaceGesture` semantics, lifted into MLX-free Core so the pose
-    /// driver can build directed strokes from it. `.swipeHorizontal` is the dismiss-style horizontal
-    /// excursion (a left-going stroke), kept as an alias of the canvas-dismiss default for parity with
-    /// the existing Hub vocabulary.
+    /// The in-surface gesture a band journey ends on / demonstrates — a directed excursion in one of
+    /// four cardinal directions, or a `.lift` (rest-and-open, no excursion). Mirrors the
+    /// `HubGesturePreview.BandInSurfaceGesture` semantics, lifted into Core so the pose driver can
+    /// build directed strokes from it. `.swipeHorizontal` is the dismiss-style horizontal excursion
+    /// (a left-going stroke), kept for parity with the existing Hub vocabulary.
     enum BandInSurfaceGesture: Equatable {
-        /// Rest on the band and lift (Files / Clipboard land-and-open) — no directional excursion.
+        /// Rest on the band and lift (Clipboard land-and-open) — no directional excursion.
         case lift
-        /// A downward two-finger resolve (the canvas commit default: top-middle → center-middle).
+        /// A downward two-finger excursion (top-middle → center-middle).
         case swipeDown
-        /// An upward two-finger resolve (the canvas ignore default).
+        /// An upward two-finger excursion.
         case swipeUp
-        /// A leftward two-finger resolve.
+        /// A leftward two-finger excursion.
         case swipeLeft
-        /// A rightward two-finger resolve.
+        /// A rightward two-finger excursion.
         case swipeRight
-        /// A horizontal two-finger resolve (the canvas dismiss default) — a leftward stroke.
+        /// A horizontal two-finger excursion — a leftward stroke.
         case swipeHorizontal
     }
 
@@ -359,15 +358,6 @@ enum GesturePose {
             strokes.append(act)
         }
         return DemoGesture(strokes: strokes, liftGap: 0.5)
-    }
-
-    /// A standalone **canvas resolve** demonstration: a single decisive **two-finger** directed swipe in `dir`
-    /// (e.g. `.swipeDown` = top-middle → center-middle), carrying the hand angle/bow, then a lift and a loop.
-    nonisolated static func canvasResolve(_ dir: BandInSurfaceGesture) -> DemoGesture {
-        let center = CGPoint(x: 0.5, y: 0.5)
-        let stroke = inSurfaceStroke(dir, at: center.x, mid: center.y)
-            ?? Stroke(fingers: 2, from: center, to: center)
-        return DemoGesture(strokes: [stroke], liftGap: 0.6)
     }
 
     /// The directed two-finger stroke for an in-surface excursion, anchored at the landing column `land`

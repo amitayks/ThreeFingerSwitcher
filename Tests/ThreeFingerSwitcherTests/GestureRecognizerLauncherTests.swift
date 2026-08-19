@@ -10,7 +10,6 @@ private final class LauncherMockDelegate: GestureRecognizerDelegate {
         case activate, step(Int), stepRow(Int), missionControl(Bool), commit, cancel
         case lActivate, lItem(Int), lContext(Int), lEnd, lCancel
         case lEdge(Int, Int)
-        case lCanvasResolve(Int, Int)
     }
     private(set) var events: [Event] = []
     /// Simulates the launcher cursor sitting on the band-title list (left), so **vertical** travel is
@@ -34,7 +33,6 @@ private final class LauncherMockDelegate: GestureRecognizerDelegate {
     func launcherDidCancel() { events.append(.lCancel) }
     func launcherEdgeChanged(dx: Int, dy: Int) { events.append(.lEdge(dx, dy)) }
     func launcherFocusIsOnBandList() -> Bool { onBandList }
-    func launcherCanvasResolve(dx: Int, dy: Int) { events.append(.lCanvasResolve(dx, dy)) }
 
     /// The sequence of edge states emitted (dx, dy) per change.
     var edges: [(Int, Int)] { events.compactMap { if case let .lEdge(x, y) = $0 { return (x, y) } else { return nil } } }
@@ -45,10 +43,6 @@ private final class LauncherMockDelegate: GestureRecognizerDelegate {
     var lCancelCount: Int { events.filter { $0 == .lCancel }.count }
     var lItems: [Int] { events.compactMap { if case let .lItem(d) = $0 { return d } else { return nil } } }
     var lContexts: [Int] { events.compactMap { if case let .lContext(d) = $0 { return d } else { return nil } } }
-    /// The (dx, dy) of each canvas-resolution emitted (horizontal swipe = discard; dy −1 down = apply).
-    var canvasResolves: [(Int, Int)] {
-        events.compactMap { if case let .lCanvasResolve(x, y) = $0 { return (x, y) } else { return nil } }
-    }
     var commitCount: Int { events.filter { $0 == .commit }.count }
     var cancelCount: Int { events.filter { $0 == .cancel }.count }
     var didSwitcherActivate: Bool { events.contains(.activate) }
@@ -310,149 +304,5 @@ final class GestureRecognizerLauncherTests: XCTestCase {
         feed(rec, x: 0.46, y: 0.50, fingers: 0)   // lift below two → end
         XCTAssertEqual(d.lEndCount, 1)
         XCTAssertEqual(d.lCancelCount, 0)
-    }
-
-    // MARK: - Canvas-resolution mode (a fresh TWO-finger FLICK-LIFT resolves the open AI canvas)
-    //
-    // The canvas resolves on two fingers (4 = open/dismiss the platform, 2 = act within it). D4
-    // (scroll-vs-flick): the resolve fires only on a genuine FLICK-LIFT — the dominant axis must (a) cross
-    // the travel floor (0.12), (b) reach a peak smoothed velocity ≥ `flickVelocityThreshold` (default 0.8),
-    // and (c) lift within `flickLiftWindow` (default 0.12s) of the last high-velocity frame. A slow
-    // deliberate scrub (reading the canvas) — sub-threshold peak velocity, or fingers held without a prompt
-    // lift — is SCROLL and never resolves. The defaults below match `AppSettings.Defaults`.
-    //
-    // Velocities here are synthetic (normalized units/sec). The lift frame is empty (.zero velocity), so the
-    // flick speed is carried from the last in-contact frame — the tests feed a fast in-contact frame, then a
-    // `fingers: 0` lift.
-
-    func test_canvasFlick_horizontal_emitsDiscard() {
-        // A fast two-finger HORIZONTAL flick + lift resolves as a discard: dx != 0, dy == 0.
-        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
-        rec.launcherCanvasResolutionActive = true
-        feed(rec, x: 0.50, y: 0.50, fingers: 2, t: 0.00)              // begin
-        feed(rec, x: 0.64, y: 0.50, fingers: 2, vx: 2.0, t: 0.02)    // dx +0.14, fast → flick candidate
-        feed(rec, x: 0.64, y: 0.50, fingers: 0, t: 0.03)             // prompt lift → discard
-        XCTAssertEqual(d.canvasResolves.map { [$0.0, $0.1] }, [[1, 0]], "horizontal flick → discard (dx=+1)")
-        XCTAssertEqual(d.lActivateCount, 0, "resolution mode never opens the launcher")
-        XCTAssertFalse(d.didSwitcherActivate)
-    }
-
-    func test_canvasFlick_down_emitsApply() {
-        // A fast two-finger DOWN flick (y decreases in OMS coords) + lift resolves as apply: dy = −1.
-        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
-        rec.launcherCanvasResolutionActive = true
-        feed(rec, x: 0.50, y: 0.50, fingers: 2, t: 0.00)
-        feed(rec, x: 0.50, y: 0.36, fingers: 2, vy: -2.0, t: 0.02)   // dy −0.14, fast → flick candidate
-        feed(rec, x: 0.50, y: 0.36, fingers: 0, t: 0.03)             // prompt lift → apply
-        XCTAssertEqual(d.canvasResolves.map { [$0.0, $0.1] }, [[0, -1]], "down flick → apply (dy=−1)")
-    }
-
-    func test_canvasFlick_up_emitsUp() {
-        // A fast UP flick + lift emits dy = +1 (the coordinator parks/ignores it; the recognizer just reports
-        // the axis-locked sign).
-        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
-        rec.launcherCanvasResolutionActive = true
-        feed(rec, x: 0.50, y: 0.50, fingers: 2, t: 0.00)
-        feed(rec, x: 0.50, y: 0.64, fingers: 2, vy: 2.0, t: 0.02)    // dy +0.14, fast upward
-        feed(rec, x: 0.50, y: 0.64, fingers: 0, t: 0.03)             // prompt lift → dy=+1
-        XCTAssertEqual(d.canvasResolves.map { [$0.0, $0.1] }, [[0, 1]], "up flick → dy=+1")
-    }
-
-    func test_canvasScroll_slowPastThreshold_doesNotResolve() {
-        // D4: a SLOW deliberate scrub past the 0.12 travel floor with LOW velocity is reading-scroll — even
-        // with a lift it must NOT resolve (peak velocity never crossed the flick threshold).
-        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
-        rec.launcherCanvasResolutionActive = true
-        feed(rec, x: 0.50, y: 0.50, fingers: 2, t: 0.00)
-        feed(rec, x: 0.57, y: 0.50, fingers: 2, vx: 0.1, t: 0.20)   // dx +0.07, slow
-        feed(rec, x: 0.64, y: 0.50, fingers: 2, vx: 0.1, t: 0.40)   // dx +0.14 past floor, still slow
-        feed(rec, x: 0.64, y: 0.50, fingers: 0, t: 0.41)            // lift after a slow scrub
-        XCTAssertTrue(d.canvasResolves.isEmpty, "a slow scrub past the floor is SCROLL, never a resolve")
-        XCTAssertEqual(d.lActivateCount, 0)
-        XCTAssertFalse(d.didSwitcherActivate)
-    }
-
-    func test_canvasScroll_fastButHeldWithoutLift_doesNotResolve() {
-        // A fast excursion past the floor that is HELD (fingers still down, no lift) never resolves — the
-        // resolve fires only on the lift frame. (A continuous scrub that keeps the fingers down is scroll.)
-        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
-        rec.launcherCanvasResolutionActive = true
-        feed(rec, x: 0.50, y: 0.50, fingers: 2, t: 0.00)
-        feed(rec, x: 0.64, y: 0.50, fingers: 2, vx: 2.0, t: 0.02)   // fast + past floor, but still down…
-        feed(rec, x: 0.70, y: 0.50, fingers: 2, vx: 0.05, t: 0.30)  // …and decelerated, still no lift
-        XCTAssertTrue(d.canvasResolves.isEmpty, "no lift → no resolve while fingers are held")
-    }
-
-    func test_canvasScroll_subThresholdPeakVelocity_doesNotResolve() {
-        // Crosses the 0.12 distance floor but the peak velocity stays BELOW `flickVelocityThreshold`, so even
-        // a prompt lift is classified SCROLL, not a flick.
-        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
-        rec.launcherCanvasResolutionActive = true
-        feed(rec, x: 0.50, y: 0.50, fingers: 2, t: 0.00)
-        feed(rec, x: 0.64, y: 0.50, fingers: 2, vx: 0.5, t: 0.02)   // dx +0.14 but vx 0.5 < 0.8
-        feed(rec, x: 0.64, y: 0.50, fingers: 0, t: 0.03)            // prompt lift, but sub-threshold peak
-        XCTAssertTrue(d.canvasResolves.isEmpty, "sub-threshold peak velocity → scroll, no resolve")
-    }
-
-    func test_canvasFlick_belowTravelFloor_doesNotResolve() {
-        // Fast but BELOW the 0.12 travel floor → no resolve (the floor is still a minimum-travel gate).
-        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
-        rec.launcherCanvasResolutionActive = true
-        feed(rec, x: 0.50, y: 0.50, fingers: 2, t: 0.00)
-        feed(rec, x: 0.56, y: 0.50, fingers: 2, vx: 2.0, t: 0.02)   // dx +0.06 < 0.12, even though fast
-        feed(rec, x: 0.56, y: 0.50, fingers: 0, t: 0.03)            // lift
-        XCTAssertTrue(d.canvasResolves.isEmpty, "below the travel floor never resolves")
-    }
-
-    func test_canvasFlick_pauseBeforeLift_doesNotResolve() {
-        // A fast frame followed by a PAUSE (the lift arrives well after the last fast frame, beyond
-        // `flickLiftWindow`) is a decelerated hold, not a flick-lift → no resolve.
-        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
-        rec.launcherCanvasResolutionActive = true
-        feed(rec, x: 0.50, y: 0.50, fingers: 2, t: 0.00)
-        feed(rec, x: 0.64, y: 0.50, fingers: 2, vx: 2.0, t: 0.02)   // fast, last fast frame at t=0.02
-        feed(rec, x: 0.65, y: 0.50, fingers: 2, vx: 0.05, t: 0.50)  // long pause; last contact at t=0.50
-        feed(rec, x: 0.65, y: 0.50, fingers: 0, t: 0.51)            // lift, 0.48s after the last fast frame
-        XCTAssertTrue(d.canvasResolves.isEmpty, "a pause past the flick window before lift → no resolve")
-    }
-
-    func test_canvasFlick_emitsOncePerGesture() {
-        // A flick-lift resolves exactly once; the lift frame's one-shot guard plus the reset mean no
-        // double-emit even if extra frames arrive.
-        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
-        rec.launcherCanvasResolutionActive = true
-        feed(rec, x: 0.50, y: 0.50, fingers: 2, t: 0.00)
-        feed(rec, x: 0.64, y: 0.50, fingers: 2, vx: 2.0, t: 0.02)   // fast
-        feed(rec, x: 0.64, y: 0.50, fingers: 0, t: 0.03)            // lift → resolve once
-        feed(rec, x: 0.64, y: 0.50, fingers: 0, t: 0.04)            // stray re-lift → no-op
-        XCTAssertEqual(d.canvasResolves.count, 1, "exactly one resolution per flick-lift")
-    }
-
-    func test_canvasFlick_liftReArmsAndResetsVelocityFields() {
-        // After a flick-lift, a second fresh two-finger flick resolves again — and the velocity/lift fields
-        // reset, so a stale peak from the first gesture doesn't promote a slow second scrub into a flick.
-        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
-        rec.launcherCanvasResolutionActive = true
-        // Flick #1 (horizontal discard).
-        feed(rec, x: 0.50, y: 0.50, fingers: 2, t: 0.00)
-        feed(rec, x: 0.64, y: 0.50, fingers: 2, vx: 2.0, t: 0.02)
-        feed(rec, x: 0.64, y: 0.50, fingers: 0, t: 0.03)
-        // A SLOW second scrub — if the peak velocity hadn't reset it would falsely resolve.
-        feed(rec, x: 0.50, y: 0.50, fingers: 2, t: 0.10)
-        feed(rec, x: 0.50, y: 0.36, fingers: 2, vy: 0.1, t: 0.40)   // dy −0.14 past floor but SLOW
-        feed(rec, x: 0.50, y: 0.36, fingers: 0, t: 0.41)
-        XCTAssertEqual(d.canvasResolves.map { [$0.0, $0.1] }, [[1, 0]],
-                       "only the first (fast) flick resolves; the slow re-armed scrub does not")
-    }
-
-    func test_canvasFlick_relaxToTwoFingers_stillResolves() {
-        // Matching the launcher latch feel: after a four-finger start the user may relax to two and a
-        // flick-lift still resolves.
-        let (rec, d) = makeRecognizer(makeSettings(), launcher: true)
-        rec.launcherCanvasResolutionActive = true
-        feed(rec, x: 0.50, y: 0.50, fingers: 4, t: 0.00)             // begin (relaxed-to-two latch)
-        feed(rec, x: 0.50, y: 0.38, fingers: 2, vy: -2.0, t: 0.02)   // relaxed + fast downward
-        feed(rec, x: 0.50, y: 0.38, fingers: 0, t: 0.03)             // flick-lift → apply
-        XCTAssertEqual(d.canvasResolves.map { [$0.0, $0.1] }, [[0, -1]])
     }
 }

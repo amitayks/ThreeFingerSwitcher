@@ -500,10 +500,9 @@ final class FirstTouchWizardModel: ObservableObject {
     /// Seed (or re-seed) the tour from the context's band composition. Toggle parameters carry the
     /// EMITTED values from the optional-feature switches — `@Published` fires on willSet, so a
     /// property re-read in those observers would still see the old value.
-    private func seedLauncherDemo(clipboardOn: Bool? = nil, aiOn: Bool? = nil) {
+    private func seedLauncherDemo(clipboardOn: Bool? = nil) {
         let clipboard = clipboardOn ?? context.settings.keepClipboardHistory
-        let ai = aiOn ?? context.settings.aiCommandsEnabled
-        let bands = context.launcherBands(clipboard, ai)
+        let bands = context.launcherBands(clipboard)
         guard !bands.isEmpty else { return }
         launcherDemo.dwell = context.settings.dwellToArmDuration
         launcherDemo.setBands(bands.map(\.items),
@@ -516,7 +515,7 @@ final class FirstTouchWizardModel: ObservableObject {
     }
 
     /// Re-seed the tour live when the optional-feature toggles change on the playground act, so
-    /// flipping Clipboard / AI immediately shows (or removes) the band it controls.
+    /// flipping Clipboard immediately shows (or removes) the band it controls.
     private func observeTourToggles() {
         context.settings.$keepClipboardHistory
             .dropFirst()
@@ -525,15 +524,6 @@ final class FirstTouchWizardModel: ObservableObject {
                     guard let self, self.stage == .playground else { return }
                     // Animated: the band a toggle controls slides into (or out of) the tour.
                     withAnimation(.easeInOut(duration: 0.3)) { self.seedLauncherDemo(clipboardOn: on) }
-                }
-            }
-            .store(in: &cancellables)
-        context.settings.$aiCommandsEnabled
-            .dropFirst()
-            .sink { [weak self] on in
-                MainActor.assumeIsolated {
-                    guard let self, self.stage == .playground else { return }
-                    withAnimation(.easeInOut(duration: 0.3)) { self.seedLauncherDemo(aiOn: on) }
                 }
             }
             .store(in: &cancellables)

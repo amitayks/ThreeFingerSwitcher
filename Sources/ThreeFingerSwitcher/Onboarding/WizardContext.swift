@@ -60,7 +60,7 @@ final class WizardContext {
     // toggles: the favorites bands, the seeded AI band when AI is on but no AI command survives in
     // the favorites, and the Clipboard band when history is on (with example entries while the
     // store is still empty, so the user sees what to expect).
-    var launcherBands: (_ clipboardOn: Bool, _ aiOn: Bool) -> [ContextBand] = { _, _ in [] }
+    var launcherBands: (_ clipboardOn: Bool) -> [ContextBand] = { _ in [] }
     /// Whether the four-finger lanes are already effective — the recognizer then drives the tour;
     /// until they are, the wizard's raw touch feed does.
     var launcherLive: () -> Bool = { false }

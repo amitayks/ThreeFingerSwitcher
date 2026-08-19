@@ -451,7 +451,7 @@ struct PlaygroundAct: View {
                     // the moment four fingers land it MORPHS to (near-)actual size, floating
                     // over the act while the hand plays the real thing, and settles back into
                     // its slot on the lift. The slot never changes size, so nothing reflows.
-                    LauncherView(model: launcherDemo, executor: nil, availability: nil)
+                    LauncherView(model: launcherDemo)
                         .frame(width: tourSize.width, height: tourSize.height)
                         // Completing the contract washes light across the tour — the scene's
                         // applause for the hand that just learned it.
@@ -478,13 +478,9 @@ struct PlaygroundAct: View {
                             cost: "Records what you copy. Stays on this Mac. No permission, instant.",
                             isOn: $settings.keepClipboardHistory, index: 1)
                         OptionalFeatureCard(
-                            symbol: "sparkles", title: "AI commands",
-                            cost: "On-device Gemma model — a one-time multi-gigabyte download. Apple Silicon only.",
-                            isOn: $settings.aiCommandsEnabled, index: 2)
-                        OptionalFeatureCard(
                             symbol: "globe", title: "Keyboard language",
                             cost: "Remembers your input source per app. No permission, no re-login.",
-                            isOn: $settings.keyboardLanguageEnabled, index: 3)
+                            isOn: $settings.keyboardLanguageEnabled, index: 2)
                     }
                     Text("Tip: add favorites from any app via the menu-bar icon — “Add Front App to Band”.")
                         .font(.caption)
