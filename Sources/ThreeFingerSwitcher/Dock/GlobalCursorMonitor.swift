@@ -23,12 +23,17 @@ final class GlobalCursorMonitor: CursorMonitor {
 
     func start() {
         guard monitors.isEmpty else { return }
-        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged]
         // Right-click: PASSIVE only. The global monitor observes the right-click delivered to Dock.app
         // (it cannot consume it → the native Dock action menu still opens unmodified); the local one
         // covers a right-click into our own panel. Both just report the location. Left down/up follow
         // the same report-only contract (drag-end detection for snap-to-bind).
-        install(mask) { [weak self] in self?.onMove?($0) }
+        //
+        // The move-monitor pair (the only high-frequency one — it fires per cursor sample) is
+        // installed only when a consumer actually wired `onMove`: the window-groups snap monitor
+        // uses just down/up, and 4 per-move monitors firing into a nil closure is pure overhead.
+        if onMove != nil {
+            install([.mouseMoved, .leftMouseDragged]) { [weak self] in self?.onMove?($0) }
+        }
         install([.rightMouseDown]) { [weak self] in self?.onRightClick?($0) }
         install([.leftMouseDown]) { [weak self] in self?.onLeftDown?($0) }
         install([.leftMouseUp]) { [weak self] in self?.onLeftUp?($0) }

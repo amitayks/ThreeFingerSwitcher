@@ -88,7 +88,10 @@ enum HubSwitcherEntry {
     /// window via `present` instead of the cross-Space SkyLight raise). A `nil` `windowNumber` (the Hub
     /// was never created) never matches.
     static func isHub(selectedID: CGWindowID, hubWindowNumber: Int?) -> Bool {
-        guard let hubWindowNumber else { return false }
+        // `NSWindow.windowNumber` is ≤ 0 for a window with no window device (e.g. the retained Hub
+        // after it was closed), and `CGWindowID(Int)` TRAPS on a negative value — this ran on every
+        // switcher commit once the Hub had been opened and closed.
+        guard let hubWindowNumber, hubWindowNumber > 0 else { return false }
         return selectedID == CGWindowID(hubWindowNumber)
     }
 }

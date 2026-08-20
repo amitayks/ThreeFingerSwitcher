@@ -2,7 +2,7 @@ import Foundation
 
 /// The two pure decision rules for the per-app keyboard-language feature (design D4). These are the
 /// "brains": no AppKit, no Carbon, no I/O — just dictionary math — so they compile and unit-test
-/// under `swift build` / `swift test` in the MLX-free Core. All side effects (reading/selecting the
+/// under `swift build` / `swift test` in Core. All side effects (reading/selecting the
 /// input source) live behind `InputSourceController`; all persistence lives in `KeyboardLanguageStore`.
 enum KeyboardLanguagePolicy {
     /// What to select when `bundleID` becomes frontmost: its remembered source if we have one, else

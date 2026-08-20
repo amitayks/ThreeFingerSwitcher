@@ -12,29 +12,7 @@ let package = Package(
         .executable(name: "TouchSpike", targets: ["TouchSpike"])
     ],
     dependencies: [
-        .package(url: "https://github.com/Kyome22/OpenMultitouchSupport.git", from: "4.0.0"),
-        // The shared device-link packages (wire contract / mirror store / pairing crypto): a standalone
-        // cross-platform package (macOS + iOS, no MLX) so the iOS companion app can consume the same code.
-        // VENDORED in-repo at ./DeviceLinkKit (rather than a `../` sibling) so CI can resolve it — the
-        // sibling path only existed on the maintainer's machine and broke the release build. Keep this
-        // copy in sync with the standalone package if the iOS app consumes a separate copy.
-        .package(path: "DeviceLinkKit"),
-        // The MLX/Gemma 4 runtime. Pulls mlx-swift / swift-transformers / mlx-swift-lm transitively.
-        // Building anything that links this needs `xcodebuild` (Metal shaders) — see GemmaRuntime target.
-        // PINNED to an exact revision (not `branch: "main"`): the upstream `main` drifts and has shipped
-        // commits that fail to compile (e.g. a `Float`→`MLXArray` type error in LoRA/TurboQuant). A
-        // branch requirement let CI re-resolve to a broken HEAD and fail the release build even though
-        // the committed Package.resolved pinned a good commit. An exact revision freezes it everywhere.
-        // To bump: change the SHA here, re-resolve, and verify with `xcodebuild`.
-        .package(url: "https://github.com/VincentGourbin/gemma-4-swift-mlx",
-                 revision: "c6f8ab5820379898b1d437e8e5c463f376672613"),
-        // Flux 2 image-generation runtime (MLX). Pins mlx-swift to the SAME exact 0.31.4 as
-        // gemma-4-swift-mlx, so it resolves with no version change. Linked into GemmaRuntime ONLY
-        // (keeps ThreeFingerSwitcherCore MLX-free). PINNED to an exact revision (same rationale as
-        // gemma above: upstream `main` drifts). To bump: change the SHA here, re-resolve, verify
-        // with `xcodebuild`.
-        .package(url: "https://github.com/VincentGourbin/flux-2-swift-mlx",
-                 revision: "add498c4a30581d4457ef513bbfe8c9c097c504c")
+        .package(url: "https://github.com/Kyome22/OpenMultitouchSupport.git", from: "4.0.0")
     ],
     targets: [
         // All app logic lives in this library so the test target can `@testable import` it.
@@ -42,11 +20,7 @@ let package = Package(
         .target(
             name: "ThreeFingerSwitcherCore",
             dependencies: [
-                .product(name: "OpenMultitouchSupport", package: "OpenMultitouchSupport"),
-                // The shared wire contract — used by the device-link inbound adapter (LinkItem → ClipboardEntry).
-                .product(name: "DeviceLinkProtocol", package: "DeviceLinkKit"),
-                // The shared pairing crypto — used by the Mac QR pairing (PairingExchange / QR payload).
-                .product(name: "DeviceLinkPairing", package: "DeviceLinkKit")
+                .product(name: "OpenMultitouchSupport", package: "OpenMultitouchSupport")
             ],
             path: "Sources/ThreeFingerSwitcher",
             swiftSettings: [
@@ -55,31 +29,11 @@ let package = Package(
                 .swiftLanguageMode(.v5)
             ]
         ),
-        // The MLX/Gemma 4 runtime, ISOLATED in its own target so `ThreeFingerSwitcherCore` and the
-        // test target stay MLX-free and keep building under plain `swift build`/`swift test`. This
-        // target links MLX (Metal shaders) so it — and anything depending on it (the app) — builds
-        // ONLY via `xcodebuild`, never `swift build`. It conforms to Core's public `LLMRuntime` seam.
-        .target(
-            name: "GemmaRuntime",
-            dependencies: [
-                "ThreeFingerSwitcherCore",
-                .product(name: "Gemma4Swift", package: "gemma-4-swift-mlx"),
-                // Flux 2 image-generation (MLX). Same exact mlx-swift 0.31.4 as Gemma — no version
-                // change. Kept in GemmaRuntime so Core stays MLX-free.
-                .product(name: "Flux2Core", package: "flux-2-swift-mlx"),
-                .product(name: "FluxTextEncoders", package: "flux-2-swift-mlx")
-            ],
-            path: "Sources/GemmaRuntime",
-            swiftSettings: [
-                .swiftLanguageMode(.v5)
-            ]
-        ),
-        // Thin executable: calls runThreeFingerSwitcher() from Core and injects the real Gemma runtime
-        // (from GemmaRuntime) at the model seam. Builds via `xcodebuild` (it transitively links MLX).
+        // Thin executable: calls runThreeFingerSwitcher() from Core.
         .executableTarget(
             name: "ThreeFingerSwitcher",
             dependencies: [
-                "ThreeFingerSwitcherCore", "GemmaRuntime"
+                "ThreeFingerSwitcherCore"
             ],
             path: "Sources/ThreeFingerSwitcherApp",
             swiftSettings: [
@@ -89,10 +43,7 @@ let package = Package(
         .testTarget(
             name: "ThreeFingerSwitcherTests",
             dependencies: [
-                "ThreeFingerSwitcherCore",
-                // The adapter/connection/QR tests import the wire contract + pairing crypto directly.
-                .product(name: "DeviceLinkProtocol", package: "DeviceLinkKit"),
-                .product(name: "DeviceLinkPairing", package: "DeviceLinkKit")
+                "ThreeFingerSwitcherCore"
             ],
             path: "Tests/ThreeFingerSwitcherTests",
             swiftSettings: [

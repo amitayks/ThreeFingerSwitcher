@@ -33,6 +33,20 @@ final class DockPreviewController {
 
     private var enabled = false
     private var snapshot: DockSnapshot?
+    /// Short-lived cache for `reader.read()` (see `handleCursor`). `nil` snap is cached too — an
+    /// auto-hidden Dock reads empty, and re-walking it per mouse move is the same waste.
+    private var cachedDockRead: (at: TimeInterval, snap: DockSnapshot?)?
+    private static let dockReadTTL: TimeInterval = 0.08
+
+    /// The Dock snapshot, re-walked at most once per `dockReadTTL` (every cursor/click path goes
+    /// through here so none bypasses the throttle).
+    private func currentDockRead() -> DockSnapshot? {
+        let tick = now()
+        if let cached = cachedDockRead, tick - cached.at < Self.dockReadTTL { return cached.snap }
+        let snap = reader.read()
+        cachedDockRead = (at: tick, snap: snap)
+        return snap
+    }
     private var shownPID: pid_t?
     private var emptyPID: pid_t?
     /// The tile whose native action menu we just opened with a right-click. While the cursor lingers on
@@ -102,7 +116,12 @@ final class DockPreviewController {
         // Edge-gate: only read the Dock when something is shown or the cursor is near a screen edge.
         guard overlay.isVisible || nearDockEdge(point) else { return }
 
-        let snap = reader.read()
+        // Throttle the AX walk, not the hit-test: `read()` is a full cross-process AX traversal of
+        // Dock.app plus a running-apps enumeration, and this handler fires per mouse-move event
+        // (60–125 Hz near an edge) — a large steady main-thread tax competing with the gesture
+        // path. Tile frames only matter at ~UI rates, so a snapshot ≤80 ms old is reused; the
+        // hover model still gets every cursor sample at full rate for grace/anchor timing.
+        let snap = currentDockRead()
         snapshot = snap
         let tiles = snap?.tiles ?? []
 
@@ -119,6 +138,11 @@ final class DockPreviewController {
 
         switch decision {
         case .idle:
+            // Reset the per-app suppressions here too: an app with no current-Space windows set
+            // `emptyPID` with the popup never shown, so `dismiss()` (the only other clearer) never
+            // ran, and that app's preview stayed dead until some OTHER preview opened and closed.
+            emptyPID = nil
+            menuSuppressedPID = nil
             if overlay.isVisible { dismiss() }
         case .dismiss:
             dismiss()
@@ -141,7 +165,7 @@ final class DockPreviewController {
     /// opens unmodified.
     private func handleRightClick(_ point: CGPoint) {
         guard enabled else { return }
-        let tiles = reader.read()?.tiles ?? snapshot?.tiles ?? []
+        let tiles = currentDockRead()?.tiles ?? snapshot?.tiles ?? []
         guard hover.rightClick(at: point, tiles: tiles) == .dismiss,
               let pid = DockHoverModel.tile(at: point, in: tiles)?.pid else { return }
         if overlay.isVisible { dismiss(restore: true) }
@@ -159,7 +183,7 @@ final class DockPreviewController {
     /// so the native Dock still receives it unmodified (and also acts — see design D3).
     private func handleLeftClick(_ point: CGPoint) {
         guard enabled, overlay.isVisible else { return }
-        let tiles = reader.read()?.tiles ?? snapshot?.tiles ?? []
+        let tiles = currentDockRead()?.tiles ?? snapshot?.tiles ?? []
         guard hover.leftClick(at: point, tiles: tiles) != nil,
               let id = overlay.model.highlightedID else { return }
         commit(id)
@@ -236,6 +260,10 @@ final class DockPreviewController {
         // so the tab only refreshed on enter/leave. Swaps happen via the next card's `inside == true`;
         // the highlight is cleared in `dismiss`.
         guard inside else { return }
+        // The same flicker re-enters the SAME card too: without this guard each false/true cycle
+        // republished an unchanged highlight (full row rebuild), re-issued the AX peek raise, and
+        // restarted the 0.5 s capture timer — so the tab's thumbnail could never actually land.
+        guard overlay.model.highlightedID != id else { return }
         overlay.model.highlightedID = id
         peek(id)
     }

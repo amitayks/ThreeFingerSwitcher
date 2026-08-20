@@ -103,13 +103,17 @@ final class KeepAwakeController {
         case armed           // active + armed: the next contact stops us
     }
 
+    // `nonisolated`: immutable constants referenced from default-argument and default-initializer
+    // expressions, which Swift evaluates in the CALLER's isolation — hence the "main actor-isolated
+    // static property … from a nonisolated context" warnings (errors in Swift 6 mode).
+
     /// The default dim level (minimum). `DisplayServices` clamps to the panel's real floor.
-    static let dimLevel: Float = 0
+    nonisolated static let dimLevel: Float = 0
     /// Heartbeat cadence: re-pin brightness + re-declare user activity.
-    static let heartbeatInterval: TimeInterval = 300
+    nonisolated static let heartbeatInterval: TimeInterval = 300
 
     /// Convert an item's optional 0…100 dim percent (nil = minimum) to a clamped 0…1 brightness fraction.
-    static func fraction(fromPercent percent: Double?) -> Float {
+    nonisolated static func fraction(fromPercent percent: Double?) -> Float {
         Float(max(0, min(100, percent ?? 0)) / 100)
     }
 
@@ -173,6 +177,7 @@ final class KeepAwakeController {
         heartbeat = Timer.scheduledTimer(withTimeInterval: heartbeatInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.heartbeatTick() }
         }
+        heartbeat?.tolerance = 30   // a 5-minute heartbeat needn't force a precise wake on a dark screen
         onActiveChanged?()
     }
 

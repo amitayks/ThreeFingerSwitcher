@@ -2,13 +2,12 @@ import SwiftUI
 import AppKit
 
 /// The pages of the configuration Hub, as sidebar destinations. One window, grouped navigation:
-/// Overview · Content(Bands) · Features(Switcher/Launcher/Clipboard/AI) · System(Setup/General).
+/// Overview · Content(Bands) · Features(Switcher/Launcher/Clipboard) · System(Setup/General).
 /// Space-row switching is a sub-feature of the Switcher and lives on the Switcher page (no own destination).
 enum HubDestination: Hashable, CaseIterable {
     case overview
     case bands
-    case switcher, launcher, clipboard, files, ai, keyboardLanguage
-    case devices
+    case switcher, launcher, clipboard, keyboardLanguage
     case setup, general
 
     var title: String {
@@ -18,10 +17,7 @@ enum HubDestination: Hashable, CaseIterable {
         case .switcher: return "Window Switcher"
         case .launcher: return "Launcher"
         case .clipboard: return "Clipboard"
-        case .files: return "Files"
-        case .ai: return "AI Commands"
         case .keyboardLanguage: return "Keyboard Language"
-        case .devices: return "Devices"
         case .setup: return "Setup & Permissions"
         case .general: return "General"
         }
@@ -31,7 +27,6 @@ enum HubDestination: Hashable, CaseIterable {
     var sidebarTitle: String {
         switch self {
         case .switcher: return "Switcher"
-        case .ai: return "AI"
         case .keyboardLanguage: return "Language"
         case .setup: return "Setup"
         default: return title
@@ -45,10 +40,7 @@ enum HubDestination: Hashable, CaseIterable {
         case .switcher: return "arrow.left.arrow.right"
         case .launcher: return "square.grid.3x3.fill"
         case .clipboard: return "doc.on.clipboard"
-        case .files: return "folder"
-        case .ai: return "sparkles"
         case .keyboardLanguage: return "globe"
-        case .devices: return "iphone.and.arrow.forward"
         case .setup: return "gearshape.2"
         case .general: return "slider.horizontal.3"
         }
@@ -71,7 +63,6 @@ final class HubContext {
     let settings: AppSettings
     let favorites: FavoritesStore
     let clipboard: ClipboardStore
-    let models: ModelManager
     let permissions: PermissionsService
 
     /// The gesture-preview VISIBILITY gate. `AppCoordinator` flips `isActive` false the instant the Hub
@@ -92,28 +83,11 @@ final class HubContext {
     var inspectWindows: () -> [WindowInspectorEntry] = { [] }
     /// Seed/prefetch live thumbnails into the passed demo model (post-Screen-Recording reveal).
     var seedThumbnails: (SwitcherModel) -> Void = { _ in }
-    /// The launcher's bands for the current toggles (favorites + AI/Clipboard when on).
-    var launcherBands: (_ clipboardOn: Bool, _ aiOn: Bool) -> [ContextBand] = { _, _ in [] }
+    /// The launcher's bands for the current toggles (favorites + Clipboard when on).
+    var launcherBands: (_ clipboardOn: Bool) -> [ContextBand] = { _ in [] }
 
     // Clipboard feature page.
     var onClearClipboard: (_ includingPinned: Bool) -> Void = { _ in }
-
-    // AI feature page.
-    var onDownloadModel: () -> Void = {}
-    /// Download a SPECIFIC capability fleet model (image / ternary / video) the user just enabled in the
-    /// roster. Routes to the EXISTING `ModelManager` download path in the coordinator — no new seam. A
-    /// failure surfaces through the manager's per-row `.failed` state, never a false "Done".
-    var onDownloadCapabilityModel: (ModelDescriptor) -> Void = { _ in }
-
-    // AI feature page — Background autonomy (`ai-background-autonomy`, §7). The whitelist editor binds
-    // directly to `settings.agentWhitelistPaths` / `agentWhitelistCommands` (no provider needed). The
-    // audit viewer reads recent records synchronously through this seam (the Core `AuditLog`), and the
-    // store-persist failure surfaces as a bounded, non-blocking banner via the optional headline.
-    /// The most-recent audit records, reverse-chronological, capped at `limit`.
-    var recentAuditRecords: (_ limit: Int) -> [AuditRecord] = { _ in [] }
-    /// A clean, bounded headline if the durable audit store last failed to persist (else `nil`). Routed
-    /// through `AIError.message(for:)` so it never carries raw OS text.
-    var auditStorePersistError: () -> AIPresentedError? = { nil }
 
     // Keyboard Language feature page — the picker's source list (read fresh on each render). Provided by
     // the coordinator so the page never imports Carbon directly (the list comes from the service's
@@ -161,22 +135,14 @@ final class HubContext {
     var onDangerZoneClear: (DangerZoneSelection) -> Void = { _ in }
     var onRestoreAllGestures: () -> Void = {}
 
-    // Devices page (device link).
-    var pairedDevices: () -> [PairedDevice] = { [] }
-    var onForgetDevice: (String) -> Void = { _ in }
-    var onSendLatestToDevices: () -> Void = {}
-    /// QR pairing host coordinator (show a code + accept a scanner). Observed by the Devices page.
-    var pairingCoordinator: MacPairingCoordinator?
 
     init(settings: AppSettings,
          favorites: FavoritesStore,
          clipboard: ClipboardStore,
-         models: ModelManager,
          permissions: PermissionsService) {
         self.settings = settings
         self.favorites = favorites
         self.clipboard = clipboard
-        self.models = models
         self.permissions = permissions
     }
 }
@@ -235,7 +201,7 @@ struct HubView: View {
                     railDivider
                     railButton(.bands)
                     railDivider
-                    railButton(.switcher); railButton(.launcher); railButton(.clipboard); railButton(.files); railButton(.ai); railButton(.keyboardLanguage); railButton(.devices)
+                    railButton(.switcher); railButton(.launcher); railButton(.clipboard); railButton(.keyboardLanguage)
                     railDivider
                     railButton(.setup); railButton(.general)
                 }
@@ -287,10 +253,7 @@ struct HubView: View {
         case .switcher: SwitcherPage(context: context)
         case .launcher: LauncherPage(context: context)
         case .clipboard: ClipboardPage(context: context)
-        case .files: FilesPage(context: context)
-        case .ai: AIPage(context: context)
         case .keyboardLanguage: KeyboardLanguagePage(context: context)
-        case .devices: DevicesPage(context: context)
         case .setup: SetupPage(context: context)
         case .general: GeneralPage(context: context)
         }

@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import QuartzCore
 import OpenMultitouchSupport
@@ -52,6 +53,36 @@ final class TouchEngine {
     private let manager = OMSManager.shared
     private var consumer: Task<Void, Never>?
 
+    init() {
+        // `manager` (the property initializer above) has already forced the framework's ObjC
+        // singleton into existence — its init registered the observers we now strip.
+        Self.neutralizeFrameworkSleepWakeObservers()
+    }
+
+    /// Strip the vendored framework's OWN sleep/wake observers — AppCoordinator owns that policy.
+    ///
+    /// OpenMTManager (the binary XCFramework under OpenMultitouchSupport) registers for
+    /// `NSWorkspaceWillSleepNotification` / `NSWorkspaceDidWakeNotification` in its init, and its
+    /// wake handler calls `startHandlingMultitouchEvents` UNCONDITIONALLY: `makeDevice` overwrites
+    /// its device pointer without stopping or releasing the previous device. Combined with our own
+    /// coordinator-driven stop/start on the same notifications, every sleep/wake cycle ORPHANED one
+    /// still-running, callback-registered MTDevice. After N wakes each physical touch frame was
+    /// processed N+1 times through one serial queue — the progressive "the longer I run, the slower
+    /// gestures get" degradation, plus a use-after-free window in the framework's willSleep handler
+    /// (`MTDeviceIsRunning` on the freed device — the EXC_BREAKPOINT the pre-sleep stop in
+    /// `AppCoordinator.handleWillSleep` works around).
+    ///
+    /// The class is reached via the ObjC runtime (it ships as a prebuilt binary; the Swift package
+    /// doesn't export it), so this degrades to a no-op if a future framework version renames things —
+    /// worst case we're back to the old behavior, never worse.
+    private static func neutralizeFrameworkSleepWakeObservers() {
+        guard let cls = NSClassFromString("OpenMTManager") as? NSObject.Type else { return }
+        let shared = NSSelectorFromString("sharedManager")
+        guard cls.responds(to: shared),
+              let frameworkManager = cls.perform(shared)?.takeUnretainedValue() else { return }
+        NSWorkspace.shared.notificationCenter.removeObserver(frameworkManager)
+    }
+
     private var lastCentroid: CGPoint?
     private var lastTime: CFTimeInterval?
     private var smoothedVelocity = CGVector.zero
@@ -72,17 +103,25 @@ final class TouchEngine {
         isListening = true
         resetMotion()
 
+        // Generation-tagged: `stop()` cancels the task, but a task parked in `next()` with no
+        // fingers down only observes cancellation once a frame arrives. If the shared stream's side
+        // ever outlived that cancellation, a stale consumer would feed the engine alongside the new
+        // one — the app-layer twin of the framework's orphaned-device bug. The tag makes a stale
+        // side inert the moment it wakes, whatever the stream does.
+        consumerGeneration &+= 1
+        let generation = consumerGeneration
         consumer = Task { @MainActor [weak self] in
-            guard let self else { return }
-            for await frame in manager.touchDataStream {
-                if Task.isCancelled { break }
+            for await frame in OMSManager.shared.touchDataStream {
+                guard let self, !Task.isCancelled, self.consumerGeneration == generation else { break }
                 self.process(frame)
             }
         }
     }
+    private var consumerGeneration = 0
 
     func stop() {
         guard isListening else { return }
+        consumerGeneration &+= 1   // retire the current consumer even before its cancellation lands
         consumer?.cancel()
         consumer = nil
         _ = manager.stopListening()

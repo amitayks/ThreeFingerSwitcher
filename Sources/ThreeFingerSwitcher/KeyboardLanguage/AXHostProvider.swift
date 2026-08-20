@@ -43,7 +43,9 @@ final class AXHostProvider: HostProvider {
         // Guard: never record a private/incognito window's host (best-effort; "if unsure, skip").
         guard !looksPrivate(window) else { return nil }
 
-        guard let field = addressField(in: window) else { return nil }
+        guard let field = cachedAddressField(pid: app.processIdentifier, window: window)
+                ?? addressField(in: window) else { return nil }
+        lastField = (app.processIdentifier, window, field)
 
         // Guard: if the address field is the focused element, its value is the user's typed text mid-edit,
         // not a committed host — treat as no-host so we never learn/apply from a half-typed URL.
@@ -74,6 +76,23 @@ final class AXHostProvider: HostProvider {
     }
 
     // MARK: - Address-bar search
+
+    /// The last resolved address field, keyed by the window it was found in. This provider is driven
+    /// by a 0.5 s poll for as long as a browser is frontmost, and each `addressField` search is a
+    /// breadth-first AX walk of up to 400 elements — each a synchronous round-trip serviced by the
+    /// BROWSER's main thread. Re-walking per tick was a standing 2 Hz main-thread tax; re-validating
+    /// the remembered field costs one round-trip instead.
+    private var lastField: (pid: pid_t, window: AXUIElement, field: AXUIElement)?
+
+    /// The remembered field when it belongs to this exact window and still reads as a text field
+    /// (the one-call liveness probe — a closed/rebuilt toolbar fails it and triggers a fresh walk).
+    private func cachedAddressField(pid: pid_t, window: AXUIElement) -> AXUIElement? {
+        guard let last = lastField, last.pid == pid, CFEqual(last.window, window),
+              axString(last.field, kAXRoleAttribute as String) == (kAXTextFieldRole as String) else {
+            return nil
+        }
+        return last.field
+    }
 
     /// Find the window's address-bar text field. Browser AX trees vary, so this is heuristic and
     /// defensive: we breadth-first walk the window subtree (depth-bounded so a deep toolbar can't stall

@@ -6,8 +6,6 @@ import Foundation
 /// - **flame** — every app currently scattered across the user's bands, gathered into one row.
 /// - **display** — the twelve window-management actions (halves, quarters, maximize, center,
 ///   minimize, full screen): two exact rows of six.
-/// - **sparkles** — only when AI is on: the user's AI commands (or the seeded set when they have
-///   none yet).
 /// - **clipboard** — only when history is on: the real clipboard band (sample entries while empty).
 ///
 /// Nothing more. Pure value composition — unit-tested; the coordinator supplies the inputs.
@@ -22,13 +20,8 @@ enum WizardTourBands {
     ]
 
     static func compose(userBands: [ContextBand],
-                        aiOn: Bool,
-                        seededAIBand: () -> ContextBand,
                         clipboardBand: ContextBand?) -> [ContextBand] {
         var result: [ContextBand] = [appsBand(from: userBands), windowsBand()]
-        if aiOn {
-            result.append(aiBand(from: userBands, seeded: seededAIBand))
-        }
         if let clipboardBand {
             result.append(clipboardBand)
         }
@@ -65,16 +58,4 @@ enum WizardTourBands {
                     })
     }
 
-    /// sparkles: the user's own AI commands gathered from their bands; the seeded band when they
-    /// have none yet (fresh install, or AI just switched on in the wizard).
-    private static func aiBand(from userBands: [ContextBand], seeded: () -> ContextBand) -> ContextBand {
-        let owned = userBands.flatMap(\.items).filter {
-            if case .aiCommand = $0.kind { return true } else { return false }
-        }
-        guard !owned.isEmpty else { return seeded() }
-        return ContextBand(name: "AI",
-                           color: ItemColor(red: 0.66, green: 0.36, blue: 0.86),
-                           icon: .sfSymbol("sparkles"),
-                           items: owned)
-    }
 }

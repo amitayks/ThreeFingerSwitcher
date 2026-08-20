@@ -16,11 +16,11 @@ import AppKit
 struct HubPreviewModels {
     private let realWindowRows: () -> [[WindowInfo]]
     private let seedThumbnails: (SwitcherModel) -> Void
-    private let launcherBands: (_ clipboardOn: Bool, _ aiOn: Bool) -> [ContextBand]
+    private let launcherBands: (_ clipboardOn: Bool) -> [ContextBand]
 
     init(realWindowRows: @escaping () -> [[WindowInfo]],
          seedThumbnails: @escaping (SwitcherModel) -> Void,
-         launcherBands: @escaping (_ clipboardOn: Bool, _ aiOn: Bool) -> [ContextBand]) {
+         launcherBands: @escaping (_ clipboardOn: Bool) -> [ContextBand]) {
         self.realWindowRows = realWindowRows
         self.seedThumbnails = seedThumbnails
         self.launcherBands = launcherBands
@@ -59,10 +59,10 @@ struct HubPreviewModels {
     /// Build a `LauncherModel` seeded from the user's bands for the given toggles. `dwell` comes from
     /// the caller's settings (`dwellToArmDuration`). Lands on the band list at the home band (nothing
     /// armed), exactly as the real launcher / the wizard tour do.
-    func makeLauncherModel(clipboardOn: Bool, aiOn: Bool, dwell: Double) -> LauncherModel {
+    func makeLauncherModel(clipboardOn: Bool, dwell: Double) -> LauncherModel {
         let model = LauncherModel()
         model.dwell = dwell
-        let bands = launcherBands(clipboardOn, aiOn)
+        let bands = launcherBands(clipboardOn)
         guard !bands.isEmpty else { return model }
         model.setBands(bands.map(\.items),
                        names: bands.map(\.name),

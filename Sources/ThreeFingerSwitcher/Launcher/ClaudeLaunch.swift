@@ -11,7 +11,7 @@ import Foundation
 /// user's shell PATH), which the app's headless `.script` runner (`/bin/zsh -c`) can't provide and
 /// which Claude (an interactive TUI) requires.
 
-/// A small Core error taxonomy for the Open-Claude-Here flow, parallel to `FileActionError`:
+/// A small Core error taxonomy for the Open-Claude-Here flow:
 /// `LocalizedError` with a clean, per-case, user-facing headline for every case (never a reflected
 /// enum dump or raw OS text). Vendor/OS errors are stringified into the opt-in `copyableDetails`
 /// payload at the boundary (a `String?`, kept `Equatable`) — surfaced only as a "Show details / Copy"

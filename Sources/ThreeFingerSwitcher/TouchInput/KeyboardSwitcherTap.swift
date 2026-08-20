@@ -19,6 +19,11 @@ final class KeyboardSwitcherTap {
 
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
+    /// Health watchdog — same rationale as ScrollEventTap's: the in-band `tapDisabledByTimeout`
+    /// self-heal only runs when the next event arrives, so a system-disabled tap otherwise drops
+    /// the first post-stall ⌘-Tab. Re-enables independently of event delivery.
+    private var watchdog: Timer?
+    private static let watchdogInterval: TimeInterval = 2.0
     private(set) var isRunning = false
 
     /// Whether ⌘ is currently held (tracked from `flagsChanged`); gates Tab consumption.
@@ -70,14 +75,29 @@ final class KeyboardSwitcherTap {
         source = src
         CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        watchdog = Timer.scheduledTimer(withTimeInterval: Self.watchdogInterval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.reviveIfDisabled() }
+        }
+        watchdog?.tolerance = Self.watchdogInterval / 2   // cheap check; let the OS coalesce it
+        // `.common` so a revive isn't deferred for as long as a menu or drag keeps the run loop in a
+        // tracking mode (the tap source itself is already in `.commonModes`).
+        if let watchdog { RunLoop.main.add(watchdog, forMode: .common) }
         isRunning = true
         return true
     }
 
     func stop() {
         guard isRunning else { return }
+        watchdog?.invalidate()
+        watchdog = nil
         if let source { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
-        if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
+        if let tap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+            // Destroy the mach receive right deterministically — the gate refreshes cycle
+            // start/stop on every toggle flip, and relying on CF dealloc leaves port teardown
+            // timing to autorelease.
+            CFMachPortInvalidate(tap)
+        }
         source = nil
         tap = nil
         isRunning = false
@@ -85,17 +105,16 @@ final class KeyboardSwitcherTap {
         consumedKeyDowns.removeAll()
     }
 
+    private func reviveIfDisabled() {
+        guard let tap, !CGEvent.tapIsEnabled(tap: tap) else { return }
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
+
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         let pass = Unmanaged.passUnretained(event)
         // The system disables the tap if our callback stalls or input is interrupted; re-enable it.
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
-            return pass
-        }
-        // Agent-posted synthetic keystrokes (`add-voice-computer-use-agent`, spec: "Agent typing
-        // never triggers the app's own recognizers"): tagged at the source, passed through untouched
-        // — the agent's typing must reach the target app and never trip our own ⌘-Tab machinery.
-        if AgentActionArbiter.isSyntheticAgentEvent(event) {
             return pass
         }
         switch type {

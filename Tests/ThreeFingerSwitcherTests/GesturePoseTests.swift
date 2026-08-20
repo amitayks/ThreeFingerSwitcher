@@ -239,18 +239,6 @@ final class GesturePoseTests: XCTestCase {
                        "a lift journey is open + traverse only (rest-and-open, no excursion stroke)")
     }
 
-    func testCanvasResolveDownIsTwoFingerDirected() {
-        // A canvas commit: a single two-finger downward stroke from top-middle toward center.
-        let g = GesturePose.canvasResolve(.swipeDown)
-        XCTAssertEqual(g.strokes.count, 1)
-        let s = g.strokes[0]
-        XCTAssertEqual(s.fingers, 2, "the canvas resolve is a two-finger excursion")
-        // Pose coordinates are y-UP (the trackpad's bottom-left origin, matching the pad renderer's
-        // `(1 - y)` flip): a DOWNWARD stroke therefore starts at the HIGHER y and descends.
-        XCTAssertGreaterThan(s.from.y, s.to.y, "swipeDown strokes from the pad's top downward (top → center)")
-        XCTAssertEqual(s.from.x, s.to.x, accuracy: 1e-9, "a vertical resolve keeps X fixed")
-    }
-
     func testLiftGapsEmitLifted() {
         // Across a multi-stroke gesture there must be frames where the hand is lifted (dots empty).
         let g = GesturePose.launcherOpen()
@@ -275,10 +263,7 @@ final class GesturePoseTests: XCTestCase {
             GesturePose.launcherOpen(),
             GesturePose.bandJourney(bandFraction: 0.0, inSurface: .lift),
             GesturePose.bandJourney(bandFraction: 1.0, inSurface: .swipeDown),
-            GesturePose.bandJourney(bandFraction: 0.5, inSurface: .swipeHorizontal),
-            GesturePose.canvasResolve(.swipeUp),
-            GesturePose.canvasResolve(.swipeLeft),
-            GesturePose.canvasResolve(.swipeRight)
+            GesturePose.bandJourney(bandFraction: 0.5, inSurface: .swipeHorizontal)
         ]
         for g in builders {
             sweepGesture(g) { frame in

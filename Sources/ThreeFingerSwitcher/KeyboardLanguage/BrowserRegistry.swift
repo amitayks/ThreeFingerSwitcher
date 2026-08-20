@@ -16,7 +16,7 @@ enum BrowserFamily {
 /// behavior unchanged (Firefox has no scriptable URL and is deliberately omitted — best-effort/unsupported).
 ///
 /// This is intentionally a small static table with no AppKit/Carbon/AX dependency, so it compiles and
-/// unit-tests under `swift build` / `swift test` in the MLX-free Core. `ContextResolver` consults it to
+/// unit-tests under `swift build` / `swift test` in Core. `ContextResolver` consults it to
 /// decide whether to resolve a host at all; the host readers consult `family(for:)` to pick the right
 /// AX layout / Apple Events vocabulary.
 enum BrowserRegistry {

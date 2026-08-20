@@ -28,27 +28,18 @@ final class LaunchService {
     /// window of the destination Space once the switch settles — macOS leaves it visually front but
     /// not key, exactly like the native shortcut. No-op by default / in tests.
     private let onSpaceSwitch: () -> Void
-    /// Called when an `.aiCommand` item is fired. Wired by the coordinator to hand the command off to
-    /// the `AICommandExecutor` (which streams into the overlay's preview canvas). Injected so
-    /// `LaunchService` stays decoupled from the AI layer; no-op by default / in tests. Firing an AI
-    /// command does NOT dismiss the overlay (the order-out-before-fire rule does not apply) — the
-    /// overlay handles that exception itself (see `LauncherOverlayController.end`).
-    private let onAICommand: (AICommand) -> Void
     /// Called after the user picks a folder for a choose-folder-at-launch item (`.claudeProjectPrompt` /
     /// `.terminalCommandPrompt`) — `(itemID, bandID, chosenFolder)`. Wired by the coordinator to persist
-    /// the folder back onto the item (its remembered last folder). Injected like `onAICommand` so
-    /// `LaunchService` stays decoupled/testable; no-op by default / in tests.
+    /// the folder back onto the item (its remembered last folder). Injected so `LaunchService` stays
+    /// decoupled/testable; no-op by default / in tests.
     private let onPromptedFolderChosen: (UUID, UUID, URL) -> Void
     /// Called when an `.automation` item is fired — `(kind, settings)`. Wired by the coordinator to
     /// TOGGLE the automation's stateful owner (`KeepAwakeController`) — start if inactive, stop if
     /// active — passing the item's resolved `AutomationSettings` (dim level, keyboard dim, guard lock).
-    /// Injected like `onAICommand` so `LaunchService` stays decoupled from the automation's state;
-    /// no-op by default / in tests. Unlike every other kind, firing an automation is a toggle, not a
-    /// one-shot completion.
+    /// Injected like `onPromptedFolderChosen` so `LaunchService` stays decoupled from the automation's
+    /// state; no-op by default / in tests. Unlike every other kind, firing an automation is a toggle,
+    /// not a one-shot completion.
     private let onAutomation: (AutomationKind, AutomationSettings) -> Void
-    /// Speak-last-response dispatch (`add-speak-last-response-launcher-action`): injected like
-    /// `onAICommand` so the launcher never references the AI stack; no-op by default / in tests.
-    private let onSpeakLastResponse: () -> Void
     /// Resolves a clipboard entry id to its **fully-materialized** entry at fire time. The band carries
     /// only bounded/light preview entries (image bytes dropped, large text truncated — see
     /// `ClipboardStore.bandWindow`), so paste must fetch the complete representations by id to restore the
@@ -61,20 +52,16 @@ final class LaunchService {
          goToWindow: @escaping (pid_t) -> Bool = { _ in false },
          frontAppProvider: @escaping () -> NSRunningApplication? = { NSWorkspace.shared.frontmostApplication },
          onSpaceSwitch: @escaping () -> Void = {},
-         onAICommand: @escaping (AICommand) -> Void = { _ in },
          onPromptedFolderChosen: @escaping (UUID, UUID, URL) -> Void = { _, _, _ in },
          onAutomation: @escaping (AutomationKind, AutomationSettings) -> Void = { _, _ in },
-         onSpeakLastResponse: @escaping () -> Void = {},
          clipboardResolver: @escaping (UUID) -> ClipboardEntry? = { _ in nil }) {
         self.favoritesProvider = favoritesProvider
         self.mover = mover ?? NullWindowMover()
         self.goToWindow = goToWindow
         self.frontAppProvider = frontAppProvider
         self.onSpaceSwitch = onSpaceSwitch
-        self.onAICommand = onAICommand
         self.onPromptedFolderChosen = onPromptedFolderChosen
         self.onAutomation = onAutomation
-        self.onSpeakLastResponse = onSpeakLastResponse
         self.clipboardResolver = clipboardResolver
     }
 
@@ -98,25 +85,15 @@ final class LaunchService {
         case .preset:
             firePreset(item, inBand: band)
         case .automation(let kind, let dimPercent, let dimKeyboard, let lockOnStop):
-            // Toggle the automation's stateful owner (start if inactive, stop if active). Like
-            // `.aiCommand`, this is NOT a one-shot that completes on the lift — it enters/leaves a
-            // persistent mode owned outside the launcher (see `onAutomation`). The item's authored
-            // optionals resolve here (nil = default) into one `AutomationSettings` for the owner.
+            // Toggle the automation's stateful owner (start if inactive, stop if active). This is
+            // NOT a one-shot that completes on the lift — it enters/leaves a persistent mode owned
+            // outside the launcher (see `onAutomation`). The item's authored optionals resolve here
+            // (nil = default) into one `AutomationSettings` for the owner.
             onAutomation(kind, AutomationSettings(dimPercent: dimPercent,
                                                   dimKeyboard: dimKeyboard ?? false,
                                                   lockOnStop: lockOnStop ?? false))
         case .clipboardEntry(let entry):
             pasteEntry(entry)
-        case .fileEntry:
-            // No-op: the synthetic Files band resolves a chosen entry through its OWN drill-down /
-            // open path (folders descend in place; files open via `FileOpenService`), not the generic
-            // fire — so a `.fileEntry` item never lands here in practice, and firing one is harmless.
-            break
-        case .aiCommand(let command):
-            // Hand off to the executor (which streams into the overlay's preview canvas). Unlike every
-            // other kind, this does NOT complete or dismiss on the lift — a fresh four-finger DOWN swipe
-            // (commit) / horizontal swipe (discard) resolve it (see `LauncherOverlayController`).
-            onAICommand(command)
         case .claudeProject(let folder, let command, let claudePath):
             launchClaude(folder: folder, command: command, claudePath: claudePath, title: item.title)
         case .terminalCommand(let folder, let command):
@@ -243,8 +220,7 @@ final class LaunchService {
     /// Write a `ClipboardEntry`'s representations onto a pasteboard (default `NSPasteboard.general`),
     /// with the same image PNG+TIFF expansion and color/path plain-text fallbacks `pasteEntry` uses —
     /// but WITHOUT synthesizing a ⌘V. The single reusable writer for "make this entry the clipboard":
-    /// the launcher's paste path calls it (then pastes), and the device-link receive path calls it to
-    /// auto-paste a received item (no key synthesis). An entry with no inline bytes writes nothing.
+    /// the launcher's paste path calls it (then pastes). An entry with no inline bytes writes nothing.
     /// `nonisolated` + pasteboard-injectable so it's callable off the launcher and unit-testable.
     @discardableResult
     nonisolated static func writeToPasteboard(_ entry: ClipboardEntry,
@@ -252,8 +228,10 @@ final class LaunchService {
         var writes = pasteboardWrites(for: entry)
         writes = expandImageFormats(writes)            // offer both PNG + TIFF for broad image paste
         appendColorTextFallback(&writes, entry: entry) // hex text for a copied color
-        pasteboard.clearContents()
+        // Nothing to write (e.g. the entry's blob was pruned between band build and fire) must NOT
+        // wipe the user's current clipboard — clear only once there is content to replace it with.
         guard !writes.isEmpty else { return false }
+        pasteboard.clearContents()
         let pbItem = NSPasteboardItem()
         for write in writes {
             pbItem.setData(write.data, forType: NSPasteboard.PasteboardType(write.uti))
@@ -388,7 +366,6 @@ final class LaunchService {
         case .mute:                postMediaKey(7)
         case .brightnessUp:        adjustBrightness(up: true, adjustment)
         case .brightnessDown:      adjustBrightness(up: false, adjustment)
-        case .speakLastResponse:   onSpeakLastResponse()
         }
     }
 
@@ -445,10 +422,14 @@ final class LaunchService {
     }
 
     private func emptyTrash() {
-        let fm = FileManager.default
-        guard let trash = try? fm.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: nil, create: false),
-              let items = try? fm.contentsOfDirectory(at: trash, includingPropertiesForKeys: nil) else { return }
-        for item in items { try? fm.removeItem(at: item) }
+        // Off the main thread: a large Trash (thousands of items) took seconds to unlink, freezing
+        // the app — gestures included — right after the launcher dismissed. Nothing is reported back.
+        DispatchQueue.global(qos: .utility).async {
+            let fm = FileManager.default
+            guard let trash = try? fm.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: nil, create: false),
+                  let items = try? fm.contentsOfDirectory(at: trash, includingPropertiesForKeys: nil) else { return }
+            for item in items { try? fm.removeItem(at: item) }
+        }
     }
 
     // MARK: - URL / link opening
@@ -461,15 +442,21 @@ final class LaunchService {
     private func openURL(_ url: URL, handler: URL?, newWindow: Bool) {
         if newWindow, let appName = Self.handlerAppName(handler: handler, for: url) {
             let script = Self.newWindowScript(url: url, appName: appName)
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-                p.arguments = ["-e", script]
-                let started = (try? p.run()) != nil
-                if started { p.waitUntilExit() }
-                if !started || p.terminationStatus != 0 {
-                    DispatchQueue.main.async { self?.plainOpen(url, handler: handler) }
+            // Completion via `terminationHandler` (see `run`): an `osascript` blocked on a pending
+            // Automation prompt otherwise held a global-queue thread for as long as the prompt sat.
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            p.arguments = ["-e", script]
+            p.terminationHandler = { [weak self] finished in
+                Task { @MainActor in
+                    self?.runningProcesses.remove(finished)
+                    if finished.terminationStatus != 0 { self?.plainOpen(url, handler: handler) }
                 }
+            }
+            if (try? p.run()) != nil {
+                runningProcesses.insert(p)
+            } else {
+                plainOpen(url, handler: handler)
             }
             return
         }
@@ -734,6 +721,10 @@ final class LaunchService {
     /// lands on the current Space), falling back to a synthesized ⌘N if the item can't be pressed.
     private func makeNewWindow(for app: NSRunningApplication) {
         let pid = app.processIdentifier
+        // One in-flight new-window request per app: a double-lift on the dwell-arm (two fires
+        // within the deferral) otherwise pressed New Window twice and opened two windows.
+        guard !pendingNewWindowPids.contains(pid) else { return }
+        pendingNewWindowPids.insert(pid)
         // Do NOT activate first. Activating fronts the app's existing window and, if it lives on
         // another Space, teleports the user there before the new window even exists. Triggering the
         // new window while we stay put makes it appear on the CURRENT Space (AX menu-press and ⌘N
@@ -744,10 +735,13 @@ final class LaunchService {
         // The new window is being created on the current Space; bring the app forward to it once it
         // exists. Deferred so we never activate while the only window is still off-Space.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            guard let self else { return }
+            self.pendingNewWindowPids.remove(pid)
             app.activate(options: [])
-            self?.raiseFrontWindow(pid: pid)
+            self.raiseFrontWindow(pid: pid)
         }
     }
+    private var pendingNewWindowPids: Set<pid_t> = []
 
     /// Focus a single-window app's existing window. If a window is already on the current Space we
     /// focus it locally (no teleport). If it lives only off-Space, macOS won't let an unprivileged app
@@ -784,13 +778,20 @@ final class LaunchService {
     /// become the active one after the reopen activates the app. An app that responds to neither needs
     /// the explicit `.quitAndReopenHere` strategy.
     private func reopenWindowlessApp(_ app: NSRunningApplication, bundleURL: URL) {
-        launch(bundleURL: bundleURL, newInstance: false)
         let pid = app.processIdentifier
+        // Same single-flight rule as `makeNewWindow`: two rapid fires on a windowless app must not
+        // both see "still no window" at +0.5 s and escalate to two New Window presses.
+        guard !pendingReopenPids.contains(pid) else { return }
+        pendingReopenPids.insert(pid)
+        launch(bundleURL: bundleURL, newInstance: false)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self, self.windowCount(pid: pid) == 0 else { return }
+            guard let self else { return }
+            self.pendingReopenPids.remove(pid)
+            guard self.windowCount(pid: pid) == 0 else { return }
             self.makeNewWindow(for: app)
         }
     }
+    private var pendingReopenPids: Set<pid_t> = []
 
     /// Number of the app's AX windows (across all Spaces) — used to tell whether a reopen actually
     /// produced a window before escalating to a new-window command.
@@ -864,25 +865,31 @@ final class LaunchService {
         }
     }
 
-    /// Run a process off the main thread and report success/failure when it exits.
+    /// Run a process and report success/failure when it exits. Completion arrives via
+    /// `terminationHandler` — NOT `waitUntilExit()` on a global queue, which parked one GCD worker
+    /// thread per running script for its whole lifetime (a hung script held it forever, and enough
+    /// of them starved every other global-queue user in the process).
     private func run(executable: String, args: [String], title: String) {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: executable)
-            process.arguments = args
-            var ok = false
-            var message = ""
-            do {
-                try process.run()
-                process.waitUntilExit()
-                ok = process.terminationStatus == 0
-                if !ok { message = "Exited with status \(process.terminationStatus)." }
-            } catch {
-                message = error.localizedDescription
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = args
+        process.terminationHandler = { [weak self] finished in
+            let ok = finished.terminationStatus == 0
+            let message = ok ? "Done." : "Exited with status \(finished.terminationStatus)."
+            Task { @MainActor in
+                self?.runningProcesses.remove(finished)
+                self?.notify(title: title, body: message, success: ok)
             }
-            Task { @MainActor in self?.notify(title: title, body: ok ? "Done." : message, success: ok) }
+        }
+        do {
+            try process.run()   // spawn only; returns immediately
+            runningProcesses.insert(process)
+        } catch {
+            notify(title: title, body: error.localizedDescription, success: false)
         }
     }
+    /// Keeps spawned processes alive until their termination handler fires.
+    private var runningProcesses: Set<Process> = []
 
     // MARK: - Accessibility: menu-bar new-window
 
@@ -909,8 +916,8 @@ final class LaunchService {
     /// Walk the app's menu bar for a File-menu item whose title matches a new-window candidate.
     private func findNewWindowItem(pid: pid_t) -> AXUIElement? {
         let appEl = AXUIElementCreateApplication(pid)
-        guard let menuBar = axCopy(appEl, kAXMenuBarAttribute as String),
-              let topItems = axChildren(menuBar as! AXUIElement) else { return nil }
+        guard let menuBar = axElement(appEl, kAXMenuBarAttribute as String),
+              let topItems = axChildren(menuBar) else { return nil }
         for top in topItems {
             // The File menu's single child is the AXMenu holding the items.
             guard let submenus = axChildren(top), let menu = submenus.first,

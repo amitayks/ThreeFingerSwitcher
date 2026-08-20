@@ -10,7 +10,7 @@ import CoreGraphics
 ///
 /// ## Autoplay-only (deliberately simple)
 /// This is **pure autoplay**: a `TimelineView(.periodic)` advances a continuous `phase` through the shared,
-/// MLX-free directed-stroke pose driver (`GesturePose.pose(phase:gesture:)`) and renders the resulting ghost
+/// pure directed-stroke pose driver (`GesturePose.pose(phase:gesture:)`) and renders the resulting ghost
 /// fingertips on the pad. The miniature is whatever the caller draws; the preview itself touches no overlay
 /// model — a page that wants its miniature to follow the hand observes the optional `sync` seam (quantized
 /// pose frames, emitted only while the clock runs) and steps its own model. Two autoplay states layer over

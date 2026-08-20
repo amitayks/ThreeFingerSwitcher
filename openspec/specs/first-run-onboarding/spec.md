@@ -94,15 +94,11 @@ On completion the system SHALL record a single first-run-completed flag and SHAL
 - **THEN** those acts show their done states and no setting is written unless the user makes a new choice
 
 ### Requirement: Optional features are offered honestly and lazily
-The wizard SHALL offer clipboard history, AI commands, and keyboard language as optional cards that state each feature's true cost plainly (clipboard records copied content locally; AI requires a one-time multi-gigabyte on-device model download and Apple Silicon; keyboard language needs no permission or re-login). Toggles SHALL write the same persisted preferences as the Hub pages. The wizard SHALL NOT request Calendar, Reminders, or Contacts permissions, SHALL NOT block on the AI model download, and SHALL treat skipping every optional feature as a first-class path to completion.
+The wizard SHALL offer clipboard history and keyboard language as optional cards that state each feature's true cost plainly (clipboard records copied content locally; keyboard language relocates nothing and needs no new permission), all default off; enabling one never blocks the wizard's flow.
 
 #### Scenario: Skipping everything completes cleanly
 - **WHEN** the user declines all optional features
 - **THEN** the wizard reaches completion with the core switcher configured and nothing else changed
-
-#### Scenario: AI enablement does not block
-- **WHEN** the user enables AI commands in the wizard
-- **THEN** the model download proceeds in the background via the existing machinery and the wizard advances without waiting
 
 ### Requirement: The curtain offers permanence
 The wizard's final act SHALL offer Open at Login (using the existing registration path, including its /Applications failure guidance), show where the app lives (the menu-bar mark) and where configuration lives (the Hub), and present a clear completion state.

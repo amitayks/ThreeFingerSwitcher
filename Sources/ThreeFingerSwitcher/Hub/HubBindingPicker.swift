@@ -1,15 +1,15 @@
 import SwiftUI
 
 /// A reusable, presentation-only editor for a single remappable surface's gesture **bindings**, shown
-/// beside that page's `HubGesturePreview`. It renders one row per surface *action* (e.g. the AI canvas's
+/// beside that page's `HubGesturePreview`. It renders one row per surface *action* (e.g. the switcher's
 /// `commit` / `dismiss` / `ignore`): a label and a `Picker` listing the surface's whole *excursion*
 /// vocabulary. Choosing an excursion calls the page-supplied `assign` closure, which routes through the
 /// pure `GestureBindings.…assigning(_:to:)` — so the model (not this view) enforces per-surface
 /// mutual-exclusivity (assigning a taken excursion swaps it). This view holds no binding state itself.
 ///
-/// It is generic over the action and excursion vocabularies so it serves all three surfaces (canvas,
-/// Files drill, switcher direction) unchanged; a page supplies:
-///   - `actions` — the surface's action cases (e.g. `GestureBindings.CanvasAction.allCases`);
+/// It is generic over the action and excursion vocabularies so it serves any bindable surface
+/// unchanged; a page supplies:
+///   - `actions` — the surface's action cases;
 ///   - `excursions` — the surface's bindable excursion vocabulary;
 ///   - `actionLabel` / `excursionLabel` — human-readable strings for each (use `HubBindingLabels`);
 ///   - `current(action)` — the excursion the binding currently maps that action to (the picker's value);
@@ -97,42 +97,6 @@ struct HubBindingPicker<Action: Hashable & Identifiable, Excursion: Hashable & I
 /// The single source of presentation strings for the gesture-binding vocabularies, so every surface's
 /// picker reads identically. Pages pass the matching closure into `HubBindingPicker.excursionLabel`.
 enum HubBindingLabels {
-    static func canvas(_ excursion: GestureBindings.CanvasExcursion) -> String {
-        switch excursion {
-        case .swipeUp:    return "Swipe up"
-        case .swipeDown:  return "Swipe down"
-        case .swipeLeft:  return "Swipe left"
-        case .swipeRight: return "Swipe right"
-        }
-    }
-
-    static func canvasAction(_ action: GestureBindings.CanvasAction) -> String {
-        switch action {
-        case .commit:  return "Commit"
-        case .dismiss: return "Dismiss"
-        case .ignore:  return "Ignore"
-        }
-    }
-
-    static func files(_ excursion: GestureBindings.FilesExcursion) -> String {
-        switch excursion {
-        case .lift:                 return "Lift"
-        case .plusOneFingerLift:    return "+1 finger then lift"
-        case .fourFingerHorizontal: return "Four fingers sideways"
-        }
-    }
-
-    static func filesAction(_ action: GestureBindings.FilesAction) -> String {
-        switch action {
-        // The Files-band-actions change repurposes these excursions: `open` is the primary resolve (it runs
-        // the configured lift action — deliver or open), and `openWith` opens the action menu (Open-With
-        // folds in as the menu's "Open in ▸"). The enum case names are kept; only the labels reflect this.
-        case .open:     return "Lift action"
-        case .openWith: return "Action menu"
-        case .discard:  return "Discard"
-        }
-    }
-
     static func axisDirection(_ direction: GestureBindings.AxisDirection) -> String {
         switch direction {
         case .normal:   return "Normal"
@@ -141,26 +105,3 @@ enum HubBindingLabels {
     }
 }
 
-#if DEBUG
-private struct HubBindingPickerPreviewHost: View {
-    @State private var binding = GestureBindings.CanvasBinding.default
-    @State private var demo: GesturePose.Axis?
-
-    var body: some View {
-        HubBindingPicker(
-            actions: GestureBindings.CanvasAction.allCases,
-            excursions: GestureBindings.CanvasExcursion.allCases,
-            actionLabel: HubBindingLabels.canvasAction,
-            excursionLabel: HubBindingLabels.canvas,
-            current: { binding.excursion(for: $0) },
-            assign: { excursion, action in binding = binding.assigning(excursion, to: action) },
-            demoAxis: { _ in .horizontal },
-            demo: { demo = $0 }
-        )
-        .frame(width: 360)
-        .padding()
-    }
-}
-
-#Preview("HubBindingPicker — canvas") { HubBindingPickerPreviewHost() }
-#endif

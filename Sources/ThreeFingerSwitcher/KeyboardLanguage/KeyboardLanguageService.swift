@@ -68,6 +68,10 @@ final class KeyboardLanguageService {
     /// the baseline context (so the next change can learn it); the first real apply happens on the next
     /// context change, not on the current source.
     func start() {
+        // Idempotent: a second start() without an intervening stop() would overwrite (and thereby
+        // permanently leak) the activation observer — every duplicate re-runs the full context
+        // resolution on each app switch. The settings sink can re-emit `true` without a `false` between.
+        guard activationObserver == nil else { return }
         activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
             object: nil,
@@ -101,6 +105,10 @@ final class KeyboardLanguageService {
         activationObserver = nil
         lastActiveContextID = nil
         settledSourceForActiveContext = nil
+    }
+
+    deinit {
+        if let activationObserver { NSWorkspace.shared.notificationCenter.removeObserver(activationObserver) }
     }
 
     // MARK: - Picker source list

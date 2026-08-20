@@ -46,38 +46,6 @@ protocol GestureRecognizerDelegate: AnyObject {
     /// and the finer item-step to in-grid item movement — so the two can be tuned independently.
     /// Defaults to false.
     func launcherFocusIsOnBandList() -> Bool
-    /// While the launcher's AI preview canvas is open, a fresh four-finger swipe RESOLVES it instead of
-    /// navigating: `dx != 0` is a horizontal swipe (discard); `dy` is vertical (`+1` up, `-1` down) — a
-    /// DOWN swipe applies the result ("bring it into the document"). Emitted once per gesture, only
-    /// while `launcherCanvasResolutionActive`.
-    func launcherCanvasResolve(dx: Int, dy: Int)
-    /// While a notch conversation is EXPANDED, a fresh two-finger FLICK resolves it
-    /// (`notch-conversation-gestures`): `dy == +1` (fast up) minimizes it into the notch dock,
-    /// `dx == +1` (fast right) purge-deletes the session; fast down/left are reserved no-ops at the
-    /// consumer. Soft scrubs never emit (the D4 classifier ignores them). Emitted at most once per
-    /// excursion, only while `notchConversationActive`.
-    func notchConversationResolve(dx: Int, dy: Int)
-
-    // MARK: Files-drill intents (emitted only while `filesDrillActive`; the controller drives entry/exit).
-    // The recognizer emits pure intents — directory navigation, preview, search-field focus (an up-step
-    // while already at the top of the list), arm, and fire all live in the model/controller, not here.
-    // Default no-op implementations are provided below so non-Files conformers compile unchanged.
-
-    /// While the Files column navigator is open, horizontal travel past one item-step steps the depth
-    /// (descend / ascend), already direction-adjusted (`+1` / `-1`). The controller maps it to descend
-    /// the current folder / ascend to the parent.
-    func filesDepth(_ direction: Int)
-    /// Vertical travel past one item-step moves the highlighted entry, already direction-adjusted
-    /// (`+1` / `-1`). An up-step while already clamped at the top of the list is interpreted by the
-    /// controller/model as focus-search; the recognizer just keeps emitting steps.
-    func filesHighlight(_ direction: Int)
-    /// The resolving lift with no added finger: open the highlighted entry (default action). One-shot.
-    func filesOpen()
-    /// The resolving lift after a relative +1 finger was added: Open-With the highlighted entry. One-shot.
-    func filesOpenWith()
-    /// A fresh deliberate four-finger horizontal swipe-away while drilled: discard (defuse a held open /
-    /// dismiss the navigator). One-shot.
-    func filesDiscard()
 }
 
 extension GestureRecognizerDelegate {
@@ -88,13 +56,6 @@ extension GestureRecognizerDelegate {
     func launcherDidCancel() {}
     func launcherEdgeChanged(dx: Int, dy: Int) {}
     func launcherFocusIsOnBandList() -> Bool { false }
-    func launcherCanvasResolve(dx: Int, dy: Int) {}
-    func notchConversationResolve(dx: Int, dy: Int) {}
-    func filesDepth(_ direction: Int) {}
-    func filesHighlight(_ direction: Int) {}
-    func filesOpen() {}
-    func filesOpenWith() {}
-    func filesDiscard() {}
 }
 
 /// Multi-finger scrub state machine. The active finger count is **latched at gesture start**:
@@ -133,57 +94,6 @@ final class GestureRecognizer {
     /// have actually been freed). When false, four fingers behave exactly as before.
     var launcherEnabled = false
 
-    /// While true (the launcher's AI preview canvas is open), a fresh four-finger swipe is interpreted
-    /// as a one-shot canvas RESOLUTION (horizontal = discard, down = apply) via `launcherCanvasResolve`,
-    /// bypassing the normal launcher/switcher latch. The coordinator sets it from the canvas state.
-    var launcherCanvasResolutionActive = false
-    private var canvasResResolved = false
-    /// The per-excursion D4 flick state for the canvas resolve — the shared classifier
-    /// (`FlickExcursionClassifier`), one instance per surface so excursions never cross-talk.
-    private var canvasFlick = FlickExcursionClassifier()
-
-    /// While true (a notch conversation is EXPANDED — `notch-conversation-gestures`), a fresh
-    /// **two-finger** flick resolves the conversation via `notchConversationResolve` (up = minimize to
-    /// the dock, right = purge-delete; soft scrubs classify as nothing and scroll natively). Unlike the
-    /// canvas mode this NEVER swallows the wider grammar: it watches two-finger excursions only, begins
-    /// them only while the normal machine is idle (a switcher relaxed to two fingers keeps its frames),
-    /// and a 2→3+ morph resets the tracker and hands the frame straight to the normal latch — the
-    /// switcher/launcher stay fully usable while a chat is open. The coordinator sets it from
-    /// `ParkController.onExpandedChanged`.
-    var notchConversationActive = false {
-        didSet { if notchConversationActive != oldValue { notchFlick.reset() } }
-    }
-    private var notchFlick = FlickExcursionClassifier()
-
-    /// While true (the Files column navigator is open), every frame routes to `trackFilesDrill` and the
-    /// normal finger-count latch is bypassed — a fresh contact during the drill never opens the switcher
-    /// or a second launcher. The controller flips it from the navigator's open/close state (mirroring
-    /// `launcherCanvasResolutionActive`). Setting it `true` re-seeds a fresh drill session; while `false`
-    /// (the default + all non-Files use) everything below is byte-identical to before.
-    var filesDrillActive = false {
-        didSet { if filesDrillActive && !oldValue { resetDrill() } }
-    }
-    /// Whether the current drill session has seeded its baseline yet (a fresh contact seeds it). Cleared
-    /// on entry and on a true lift so the next contact re-seeds the origin.
-    private var drillStarted = false
-    /// Set once the session has resolved (open / open-with / discard). The resolution is **one-shot** for
-    /// the whole session: while set, no further intent is emitted, so a stray re-lift is a no-op. Cleared
-    /// only when the controller re-enters the sub-state.
-    private var drillResolved = false
-    /// Set once a relative +1 finger (a contact above the current relaxed baseline) is seen, so the
-    /// resolving lift emits Open-With instead of a plain Open. Latched for the session.
-    private var pendingOpenWith = false
-    /// Relaxed contact baseline of the drill, re-baselined on every contact-count change (the gesture
-    /// lives while ≥2 remain, so the user may relax fingers). A count rising ABOVE this is the relative
-    /// +1 Open-With morph (D4) — not an absolute three.
-    private var drillContacts = 0
-    /// Reference origin for the drill, re-baselined (with the accumulators cleared) on every contact-count
-    /// change so a leaving or landing finger's centroid shift emits no spurious step.
-    private var drillStart = CGPoint.zero
-    private var drillLast = CGPoint.zero
-    private var drillAccumX: CGFloat = 0   // horizontal → depth steps
-    private var drillAccumY: CGFloat = 0   // vertical → highlight steps
-
     private enum Axis { case undetermined, horizontal, vertical }
     private enum State { case idle, tracking }
     private enum Mode { case switcher, launcher }
@@ -202,8 +112,7 @@ final class GestureRecognizer {
     private var launcherContacts = 0
     /// Edge-hold state for auto-repeat, per axis (−1 / 0 / +1): `edgeDX +1` = right edge, `edgeDY +1` =
     /// top edge. Emitted to the delegate (`launcherEdgeChanged`) when either changes; the controller drives
-    /// the edge-triggered auto-repeat off it. Shared by the launcher and the Files drill (mutually exclusive
-    /// sub-states).
+    /// the edge-triggered auto-repeat off it.
     private var edgeDX = 0
     private var edgeDY = 0
     /// Normalized distance from a trackpad edge within which a held contact triggers auto-repeat, with
@@ -228,44 +137,11 @@ final class GestureRecognizer {
     /// Control / App Exposé — larger than axis detection so it isn't twitchy.
     private let missionControlThreshold: CGFloat = 0.10
 
-    /// Deliberate travel (normalized) before a fresh TWO-finger swipe resolves the AI canvas (change
-    /// `positional-navigation`, D5). Deliberately **larger than incidental two-finger scrolling** so
-    /// reading/scrolling the canvas is never mistaken for a commit/discard.
-    private let canvasResolveThreshold: CGFloat = 0.12
-
-    /// Peak smoothed centroid speed (normalized/sec) the dominant axis must reach for a canvas excursion's
-    /// lift to count as a FLICK rather than a reading-scroll (D4). Sourced from `settings.flickVelocityThreshold`.
-    private var flickVelocityThreshold: CGFloat { CGFloat(settings.flickVelocityThreshold) }
-    /// Maximum gap (seconds) between the last high-velocity in-contact frame and the lift for that lift to
-    /// count as a flick (D4). Sourced from `settings.flickLiftWindow`.
-    private var flickLiftWindow: CFTimeInterval { CFTimeInterval(settings.flickLiftWindow) }
-
     init(settings: AppSettings) {
         self.settings = settings
     }
 
     func feed(_ frame: TouchFrame) {
-        // While the launcher's AI preview canvas is open, a fresh four-finger swipe RESOLVES it
-        // (horizontal = discard, down = apply) — bypassing the normal launcher/switcher latch. When the
-        // flag is off (the default + all normal use), everything below is byte-identical to before.
-        if launcherCanvasResolutionActive {
-            trackCanvasResolution(frame)
-            return
-        }
-        // While the Files column navigator is open, route every frame to the sustained drill tracker
-        // BEFORE the idle re-latch below, so a fresh contact during drill-in never opens the switcher or
-        // a second launcher on top of the navigator. Off by default → byte-identical to before.
-        if filesDrillActive {
-            trackFilesDrill(frame)
-            return
-        }
-        // While a notch conversation is EXPANDED (`notch-conversation-gestures`), watch two-finger flick
-        // excursions — but never at the wider grammar's expense: an excursion may BEGIN only while the
-        // normal machine is idle (a switcher relaxed to two fingers keeps every frame), and any frame the
-        // handler declines (0/1/3/4 fingers, or a 2→3+ morph) falls straight through to the machine below.
-        if notchConversationActive, notchFlick.started || state == .idle {
-            if handleNotchConversationFrame(frame) { return }
-        }
         let switcherTarget = settings.requireExactlyThree ? (frame.fingerCount == 3) : (frame.fingerCount >= 3)
 
         switch state {
@@ -297,89 +173,6 @@ final class GestureRecognizer {
         case .switcher: cancel()
         case .launcher: cancelLauncher()
         }
-    }
-
-    /// One-shot canvas-resolution tracking (see `launcherCanvasResolutionActive`). A fresh **two-finger**
-    /// FLICK-LIFT reports a single `launcherCanvasResolve`: vertical-dominant → `dy` (`+1` up, `-1` down;
-    /// down applies, up is ignored / parks upstream), else horizontal → `dx` (discard). Two-finger
-    /// resolution (change `positional-navigation`, D5) aligns the grammar — 4 fingers open / dismiss the
-    /// platform, 2 fingers act within it. Runs INSTEAD of the normal state machine while the canvas is open,
-    /// so it never opens the launcher or switcher; it self-resets on lift.
-    ///
-    /// D4 (scroll-vs-flick): the resolve does NOT fire the instant travel crosses `canvasResolveThreshold` —
-    /// that floor is a MINIMUM only. While fingers are down we accumulate the signed dominant-axis travel, a
-    /// running PEAK of `abs(centroidVelocity)` per axis, and the timing of the last high-velocity frame
-    /// (`frame.centroidVelocity`/`frame.time` from the engine — the lift frame is empty with `.zero`
-    /// velocity, so the flick speed must come from the LAST in-contact frame). On the lift frame we classify:
-    /// a FLICK (→ emit) requires (a) the travel floor was crossed, (b) the dominant axis's peak velocity
-    /// exceeded `flickVelocityThreshold`, AND (c) the lift arrived within `flickLiftWindow` of the last
-    /// high-velocity frame. A slow continuous scrub (sub-threshold peak, or held without a prompt lift) is
-    /// SCROLL and emits nothing.
-    private func trackCanvasResolution(_ frame: TouchFrame) {
-        let count = frame.fingerCount
-        if count == 0 {                       // lift → classify the just-ended excursion, then re-arm
-            if canvasFlick.started, !canvasResResolved,
-               let flick = canvasFlick.classifyOnLift(travelFloor: canvasResolveThreshold,
-                                                      velocityThreshold: flickVelocityThreshold,
-                                                      liftWindow: flickLiftWindow,
-                                                      axisLockRatio: CGFloat(settings.axisLockRatio)) {
-                canvasResResolved = true
-                delegate?.launcherCanvasResolve(dx: flick.dx, dy: flick.dy)
-            }
-            canvasFlick.reset()
-            canvasResResolved = false
-            return
-        }
-        if !canvasFlick.started {
-            guard count >= 2 else { return }  // require a fresh (≥) two-finger contact to begin
-            canvasResResolved = false
-            canvasFlick.begin(at: frame.centroid, time: frame.time)
-            return
-        }
-        guard !canvasResResolved, count >= 2 else { return }
-        // Accumulate travel + per-axis velocity peaks + last-fast-frame timing in the shared classifier.
-        // `canvasResolveThreshold` stays a travel FLOOR only — nothing ever fires mid-contact.
-        canvasFlick.track(centroid: frame.centroid, velocity: frame.centroidVelocity, time: frame.time,
-                          velocityThreshold: flickVelocityThreshold,
-                          axisLockRatio: CGFloat(settings.axisLockRatio))
-    }
-
-    // MARK: - Notch conversation flick (two-finger only, falls through — `notch-conversation-gestures`)
-
-    /// Route one frame while a notch conversation is expanded. Returns true when the frame was consumed
-    /// by the flick tracker; false hands the SAME frame to the normal machine (fall-through). Routing:
-    /// a started excursion's lift classifies + emits one-shot `notchConversationResolve`; a 2→3+ morph
-    /// resets and falls through (the user is growing a switcher/launcher gesture out of a scroll — that
-    /// must win); an un-started tracker begins only on exactly two fingers (and only from the machine's
-    /// idle state — the caller gates that), so 0/1/3/4-finger frames always belong to the normal grammar.
-    private func handleNotchConversationFrame(_ frame: TouchFrame) -> Bool {
-        let count = frame.fingerCount
-        if notchFlick.started {
-            if count == 0 {                   // lift → classify, emit at most once, re-arm
-                if let flick = notchFlick.classifyOnLift(travelFloor: canvasResolveThreshold,
-                                                         velocityThreshold: flickVelocityThreshold,
-                                                         liftWindow: flickLiftWindow,
-                                                         axisLockRatio: CGFloat(settings.axisLockRatio)) {
-                    delegate?.notchConversationResolve(dx: flick.dx, dy: flick.dy)
-                }
-                notchFlick.reset()
-                return true
-            }
-            if count >= 3 {                   // growing contact → the wider grammar owns this frame
-                notchFlick.reset()
-                return false
-            }
-            if count == 2 {
-                notchFlick.track(centroid: frame.centroid, velocity: frame.centroidVelocity,
-                                 time: frame.time,
-                                 velocityThreshold: flickVelocityThreshold,
-                                 axisLockRatio: CGFloat(settings.axisLockRatio))
-            }
-            return true                       // a transient 1-finger dip is ignored, state retained
-        }
-        guard count == 2 else { return false }
-        notchFlick.begin(at: frame.centroid, time: frame.time)
-        return true
     }
 
     // MARK: - Switcher (three-finger; relaxes to two after activation)
@@ -711,173 +504,4 @@ final class GestureRecognizer {
         activated = false
         if wasActivated { delegate?.launcherDidCancel() }
     }
-
-    // MARK: - Files drill (sustained modal sub-state; bypasses the latch while the navigator is open)
-
-    /// Re-seed a fresh drill session. Called when the controller ENTERS the sub-state (the `didSet`
-    /// false→true edge); the next contact re-baselines the origin. A truly one-shot resolution means
-    /// `drillResolved` survives a lift WITHIN a session and only clears here, on the next entry.
-    private func resetDrill() {
-        drillStarted = false
-        drillResolved = false
-        pendingOpenWith = false
-        drillContacts = 0
-        belowTargetFrames = 0
-        drillAccumX = 0
-        drillAccumY = 0
-        clearEdges()   // no held auto-repeat carried into a fresh drill session
-    }
-
-    /// Re-arm the SAME drill session for a fresh resolution **without** toggling `filesDrillActive`. After
-    /// the +1-finger lift resolved the drill (`filesOpenWith`, one-shot — `drillResolved` latched), the
-    /// Open-With picker opens and needs fresh gesture input to scrub it: this clears the one-shot resolution
-    /// latch and re-seeds the drill scalars (exactly as a fresh entry would) so the next contact re-baselines
-    /// and navigation resumes. It is NOT a re-entry — `filesDrillActive` stays true throughout — so the
-    /// controller drives it explicitly right after entering the picker (mirroring how a re-entry would seed,
-    /// but in place). The lift that opens the picker has already raised the fingers, so seeding from scratch
-    /// here is correct: the picker is scrubbed by a brand-new gesture.
-    func rearmDrill() {
-        resetDrill()
-    }
-
-    /// Sustained drill tracking (see `filesDrillActive`). Unlike the one-shot canvas tracker this lives
-    /// for the whole session while ≥2 contacts remain, emitting many depth/highlight steps. The origin is
-    /// re-baselined (and carry cleared) on EVERY contact-count change so a leaving/landing finger emits no
-    /// phantom step. Navigation (depth/highlight) happens at the relaxed posture (≤3 contacts); a FULL
-    /// four-finger contact is the resolution-arming posture — a deliberate horizontal swipe-away there is a
-    /// discard, a plain lift is an open (Open-With if a relative +1 finger was added). The resolving lift
-    /// (count below two, with the standard below-target debounce) is a ONE-SHOT resolution; a stray re-lift
-    /// after that emits nothing.
-    private func trackFilesDrill(_ frame: TouchFrame) {
-        let count = frame.fingerCount
-
-        if count >= 2 {
-            belowTargetFrames = 0
-            if !drillStarted {
-                drillStarted = true
-                drillContacts = count
-                drillStart = frame.centroid       // baseline for the 4-finger discard swipe
-                drillLast = frame.centroid
-                drillAccumX = 0
-                drillAccumY = 0
-                return
-            }
-            // A contact-count change shifts the centroid as fingers leave or land. Re-baseline the origin
-            // (and clear carry) so the jump emits no step, and stop any held auto-repeat across the
-            // re-baseline; a count rising ABOVE the relaxed baseline is the relative +1 Open-With morph
-            // (latched for the lift). The baseline then follows the count. While resolved, the session is inert.
-            if count != drillContacts {
-                if count > drillContacts && !drillResolved { pendingOpenWith = true }
-                drillContacts = count
-                drillStart = frame.centroid
-                drillLast = frame.centroid
-                drillAccumX = 0
-                drillAccumY = 0
-                clearEdges()
-                return
-            }
-            guard !drillResolved else { return }
-            updateFilesDrill(frame)
-        } else {
-            // Below two contacts ("lift"): a real lift reports 0 immediately; an edge flicker dips to 1 for
-            // a frame or two. Resolve on a true lift or a sustained drop (the same debounce as the launcher).
-            belowTargetFrames += 1
-            if count == 0 || belowTargetFrames >= 2 {
-                resolveFilesDrillLift()
-            }
-        }
-    }
-
-    private func updateFilesDrill(_ frame: TouchFrame) {
-        let c = frame.centroid
-
-        // A full four-finger contact is the resolution-arming posture (the +1 morph past the navigation
-        // postures). It does NOT navigate — instead a fresh deliberate horizontal swipe-away past the
-        // activation threshold is a one-shot DISCARD (mirroring the canvas-resolution swipe). A plain lift
-        // from here resolves Open-With (the +1 latch). Measuring from the re-baselined `drillStart` (set
-        // when the 4th finger landed) means a small depth-sized nudge won't trip it; a deliberate sweep will.
-        if drillContacts >= 4 {
-            let dx = c.x - drillStart.x
-            let dy = c.y - drillStart.y
-            let threshold = CGFloat(settings.launcherActivationThreshold)
-            let ratio = CGFloat(settings.axisLockRatio)
-            if abs(dx) >= threshold && abs(dx) >= ratio * abs(dy) {
-                drillResolved = true
-                // The physical four-finger horizontal swipe-away → its bound action
-                // (`add-gesture-previews-and-bindings` §9.4; default: discard).
-                resolveFilesDrillExcursion(.fourFingerHorizontal)
-            }
-            drillLast = c
-            return
-        }
-
-        // Relaxed navigation posture (≥2, ≤3 contacts): ODOMETER (restored v0.11.0 model). Accumulate signed
-        // travel and emit discrete steps with carry — HIGHLIGHT (vertical) moves the selection, DEPTH
-        // (horizontal) descends/ascends folders. Unlike the launcher's flat grid a horizontal step here
-        // mutates the folder stack, so holding at the trackpad edge AUTO-DRILLS through the tree (uniform
-        // edge auto-repeat on BOTH axes — the user opted into this).
-        drillAccumX += (c.x - drillLast.x)
-        drillAccumY += (c.y - drillLast.y)
-        drillLast = c
-
-        let step = CGFloat(max(settings.launcherStepDistance, 0.005))
-        while drillAccumX >= step { drillAccumX -= step; emitDrillDepth(forward: true) }
-        while drillAccumX <= -step { drillAccumX += step; emitDrillDepth(forward: false) }
-        while drillAccumY >= step { drillAccumY -= step; emitDrillHighlight(up: true) }
-        while drillAccumY <= -step { drillAccumY += step; emitDrillHighlight(up: false) }
-
-        updateEdges(c)   // both axes auto-repeat at the edge: highlight (vertical) + depth auto-drill (horizontal)
-    }
-
-    /// The resolving lift: a one-shot Open-With (if a relative +1 finger was added) or plain Open. A lift
-    /// after the session already resolved (e.g. a stray re-lift, or a four-finger discard) emits nothing.
-    private func resolveFilesDrillLift() {
-        clearEdges()   // the lift stops any held highlight auto-repeat
-        guard !drillResolved else {
-            drillStarted = false
-            return
-        }
-        // Only resolve a session that actually started (a sub-threshold flicker before any contact does
-        // nothing); seeding requires a real ≥2-finger contact.
-        if drillStarted {
-            drillResolved = true
-            // The physical lift → its bound action: a relative +1-finger lift is `.plusOneFingerLift`, a
-            // plain lift is `.lift` (`add-gesture-previews-and-bindings` §9.4; defaults: Open-With / open).
-            resolveFilesDrillExcursion(pendingOpenWith ? .plusOneFingerLift : .lift)
-        }
-        drillStarted = false
-    }
-
-    /// Map a DETECTED physical Files-drill excursion to its bound action via the user's configured
-    /// `filesDrill` binding (`add-gesture-previews-and-bindings` §9.4), then fire the matching delegate
-    /// intent. The recognizer detects only the *physical* move; which intent it carries is the binding's
-    /// job — defaults reproduce today's grammar (lift → open, +1-finger lift → Open-With, four-finger
-    /// horizontal → discard). All downstream guards (one-shot `drillResolved`, the defuse window, and
-    /// "discard never terminates a running app") live in the delegate/controller and are untouched.
-    private func resolveFilesDrillExcursion(_ excursion: GestureBindings.FilesExcursion) {
-        let binding = settings.gestureBindings.filesDrill
-        // Find which action is bound to the detected excursion (the binding is strictly one-to-one).
-        let action = GestureBindings.FilesAction.allCases.first {
-            binding.excursion(for: $0) == excursion
-        }
-        switch action {
-        case .open:     delegate?.filesOpen()
-        case .openWith: delegate?.filesOpenWith()
-        case .discard:  delegate?.filesDiscard()
-        case .none:     break   // unreachable: every excursion is bound to exactly one action
-        }
-    }
-
-    private func emitDrillDepth(forward: Bool) {
-        var dir = forward ? 1 : -1
-        if settings.reverseDirection { dir = -dir }
-        delegate?.filesDepth(dir)
-    }
-
-    private func emitDrillHighlight(up: Bool) {
-        var dir = up ? 1 : -1
-        if settings.reverseVerticalDirection { dir = -dir }
-        delegate?.filesHighlight(dir)
-    }
-
 }

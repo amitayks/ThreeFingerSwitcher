@@ -18,6 +18,8 @@ struct SwitcherPage: View {
     /// from `docs/postmortem-idle-cpu-spin.md`; the old free-running driver stays deleted).
     @StateObject private var demo = HubSwitcherDemo()
     @State private var seeded = false
+    /// Coalesces the "Window size" slider's live re-solve (see the `onChange` below).
+    @State private var scaleDebounce: DispatchWorkItem?
     /// The base autoplay gesture — the teaching story, its open swipe scaled to the activation threshold.
     @State private var gesture: GesturePose.DemoGesture
     /// The hover-demo override pushed into the preview by the direction pickers: hovering the windows-axis
@@ -85,8 +87,16 @@ struct SwitcherPage: View {
                 )
                 .onAppear { seedIfNeeded() }
                 // Live window-size: dragging "Window size" grows/shrinks the preview cards in real time.
+                // Coalesced to ~16 updates/s: each update re-solves every Space's grid from scratch
+                // (binary searches over the packer) inside a fresh 0.25 s animation, and a 60 Hz drag
+                // otherwise stacked ~15 overlapping re-solves + retargeting animations per frame.
                 .onChange(of: settings.switcherWindowScale) { _, scale in
-                    demo.setMaxScale(SwitcherLayout.kMax * CGFloat(scale))
+                    scaleDebounce?.cancel()
+                    let work = DispatchWorkItem {
+                        MainActor.assumeIsolated { demo.setMaxScale(SwitcherLayout.kMax * CGFloat(scale)) }
+                    }
+                    scaleDebounce = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: work)
                 }
                 // The demo's opening swipe tracks the real activation distance as you tune it.
                 .onChange(of: settings.activationThreshold) { _, threshold in
@@ -228,7 +238,7 @@ struct LauncherPage: View {
         let models = HubPreviewModels(realWindowRows: context.realWindowRows,
                                       seedThumbnails: context.seedThumbnails,
                                       launcherBands: context.launcherBands)
-        demo.seed(from: models.makeLauncherModel(clipboardOn: false, aiOn: false, dwell: settings.dwellToArmDuration))
+        demo.seed(from: models.makeLauncherModel(clipboardOn: false, dwell: settings.dwellToArmDuration))
     }
 
     var body: some View {
@@ -315,7 +325,7 @@ struct ClipboardPage: View {
         let models = HubPreviewModels(realWindowRows: context.realWindowRows,
                                       seedThumbnails: context.seedThumbnails,
                                       launcherBands: context.launcherBands)
-        demo.seed(from: models.makeLauncherModel(clipboardOn: true, aiOn: false, dwell: settings.dwellToArmDuration),
+        demo.seed(from: models.makeLauncherModel(clipboardOn: true, dwell: settings.dwellToArmDuration),
                   landOnLastBand: true)
     }
 
@@ -384,425 +394,6 @@ struct ClipboardPage: View {
                 }
                 .disabled(!settings.keepClipboardHistory)
             }
-        }
-    }
-}
-
-// MARK: - AI
-
-struct AIPage: View {
-    let context: HubContext
-    @ObservedObject private var settings: AppSettings
-    @ObservedObject private var models: ModelManager
-
-    /// §11.5 — the REAL launcher showing its AI band (the hero): a `LauncherView` seeded once with the AI
-    /// band on (the last band) and landed on it (the resting frame shows the band). The ghost-hand autoplay
-    /// plays the full path — 4-finger open → 2-finger traverse down to the AI band → the firing lift → a
-    /// directed two-finger commit swipe — and the preview's `sync` seam replays the journey on the model
-    /// (the resolve tail plays over it; the canvas isn't miniature); clockless, visibility-gated, never
-    /// grows (see `docs/postmortem-idle-cpu-spin.md`).
-    @StateObject private var demo = HubLauncherDemo()
-    @State private var seeded = false
-    /// The base autoplay journey, and the hover-demo override the canvas-resolve binding rows push in:
-    /// hovering a row demos that action's currently-bound excursion as a directed canvas-resolve swipe.
-    @State private var hoverGesture: GesturePose.DemoGesture?
-    /// The excursion the hovered binding row maps to — stashed by the picker's `demoAxis` closure (an
-    /// event-handler call) so the `demo` closure can build the matching directed candidate swipe. The
-    /// `HubBindingPicker` is a shared component that speaks `GesturePose.Axis`; this bridges its hover
-    /// signal to the preview's `DemoGesture` candidate without changing the component.
-    @State private var hoveredExcursion: GestureBindings.CanvasExcursion?
-
-    init(context: HubContext) {
-        self.context = context
-        _settings = ObservedObject(wrappedValue: context.settings)
-        _models = ObservedObject(wrappedValue: context.models)
-    }
-
-    /// The preview's attract journey: open the four-finger launcher → traverse DOWN the band list to the
-    /// AI band (the real band-rail grammar, so the driven miniature can follow stroke for stroke) → the
-    /// firing lift → a fresh directed downward canvas-commit swipe. The hover-demo override
-    /// (`hoverGesture`) plays a candidate resolve instead.
-    private static let aiJourney = HubLauncherDemo.bandJourneyGesture(openLength: 0.30, resolve: .swipeDown)
-
-    /// The coarse axis a canvas excursion sweeps along (up/down ⇒ vertical, left/right ⇒ horizontal) —
-    /// the `GesturePose.Axis` the shared `HubBindingPicker` component expects from `demoAxis`.
-    private func axis(for excursion: GestureBindings.CanvasExcursion) -> GesturePose.Axis {
-        switch excursion {
-        case .swipeUp, .swipeDown:    return .vertical
-        case .swipeLeft, .swipeRight: return .horizontal
-        }
-    }
-
-    /// Map a canvas excursion to the directed resolve swipe its hover-demo should play (a standalone
-    /// two-finger `canvasResolve` in that direction) — pushed into the preview's `hoverGesture`.
-    private func candidate(for excursion: GestureBindings.CanvasExcursion) -> GesturePose.DemoGesture {
-        switch excursion {
-        case .swipeUp:    return GesturePose.canvasResolve(.swipeUp)
-        case .swipeDown:  return GesturePose.canvasResolve(.swipeDown)
-        case .swipeLeft:  return GesturePose.canvasResolve(.swipeLeft)
-        case .swipeRight: return GesturePose.canvasResolve(.swipeRight)
-        }
-    }
-
-    /// Seed once with the AI band on, landing the static preview on the last (AI) band.
-    private func seedIfNeeded() {
-        guard !seeded else { return }
-        seeded = true
-        let previewModels = HubPreviewModels(realWindowRows: context.realWindowRows,
-                                             seedThumbnails: context.seedThumbnails,
-                                             launcherBands: context.launcherBands)
-        demo.seed(from: previewModels.makeLauncherModel(clipboardOn: false, aiOn: true, dwell: settings.dwellToArmDuration),
-                  landOnLastBand: true)
-    }
-
-    /// Picker binding: maps `aiSelectedModelID` (nil = registry default) to the picker's optional-string.
-    private var modelSelection: Binding<String?> {
-        Binding(get: { settings.aiSelectedModelID },
-                set: { settings.aiSelectedModelID = $0 })
-    }
-
-    /// The fleet roster's ACTIVE CHAT radio binding (`aiSelectedChatModelID`; nil = chat default).
-    /// Whether this OS can run the on-device transcriber (`SpeechAnalyzer`, macOS 26).
-    private var voiceOSSupported: Bool {
-        if #available(macOS 26.0, *) { return true }
-        return false
-    }
-
-    /// The voice section's cost disclosure — includes the OS-floor message when it applies.
-    private var voiceFootnote: String {
-        if !voiceOSSupported {
-            return "Requires macOS 26 (on-device speech recognition)."
-        }
-        return "Push-to-talk with the on-device assistant. The microphone opens ONLY while the key is held (asked for on first press) — no wake word, never always-listening. Speech is transcribed on this Mac; audio never leaves the device."
-    }
-
-    private var chatModelSelection: Binding<String?> {
-        Binding(get: { settings.aiSelectedChatModelID },
-                set: { settings.aiSelectedChatModelID = $0 })
-    }
-
-    /// The fleet roster's ENABLED CAPABILITY toggles binding (`aiEnabledCapabilityModelIDs`).
-    private var capabilityModelSelection: Binding<Set<String>> {
-        Binding(get: { settings.aiEnabledCapabilityModelIDs },
-                set: { settings.aiEnabledCapabilityModelIDs = $0 })
-    }
-
-    /// The model the management surface shows: the user's pinned selection if it resolves, else default.
-    private var selectedModelDescriptor: ModelDescriptor {
-        let registry = ModelCatalog.standard
-        if let id = settings.aiSelectedModelID, let d = registry.descriptor(id: id) { return d }
-        return registry.defaultDescriptor ?? registry.models[0]
-    }
-
-    // MARK: - Context tuning + cost surface (tasks 5.2 / 5.3 / 5.4, design D5)
-
-    /// The effective context-token budget for the chosen preset, clamped to the selected model's max.
-    /// `agentContextTokens` is the persisted resolution; for a non-custom preset it follows the preset.
-    private var effectiveContextTokens: Int {
-        let modelMax = selectedModelDescriptor.maxContextTokens
-        return settings.agentContextPreset.tokens(modelMax: modelMax, custom: settings.agentContextTokens)
-    }
-
-    /// The live cost surface (estimated RAM + concurrent-stream count + relative speed) for the chosen
-    /// context — derived from the SAME pure `ConcurrencyBudget` the batched conformer uses (never silent
-    /// OOM, house requirement). Recomputes whenever the preset / toggle / model changes.
-    private var cost: AgentContextCostModel {
-        AgentContextCostModel(contextTokens: effectiveContextTokens,
-                              compactKV: settings.agentCompactKV,
-                              weightBytes: selectedModelDescriptor.sizeBytes)
-    }
-
-    /// Picker binding: the preset segmented control writes the preset AND resolves `agentContextTokens` to
-    /// the preset's token value (clamped to the model max) so the persisted budget the runtime / compaction
-    /// reads always matches the chosen preset.
-    private var presetSelection: Binding<AgentContextPreset> {
-        Binding(get: { settings.agentContextPreset },
-                set: { preset in
-                    settings.agentContextPreset = preset
-                    settings.agentContextTokens = preset.tokens(modelMax: selectedModelDescriptor.maxContextTokens,
-                                                                custom: settings.agentContextTokens)
-                })
-    }
-
-    @ViewBuilder private var contextSection: some View {
-        HubSection("Context",
-                   footnote: "Longer context remembers more of a conversation, skills, and memory — but the KV cache grows per background session, so more context means fewer concurrent background sessions and slower per-token speed. The estimate below updates as you choose; the foreground session always fits.") {
-            // The Balanced / Long / Max preset (custom is implicit when a heavy skill raises it).
-            Picker("Context size", selection: presetSelection) {
-                ForEach([AgentContextPreset.balanced, .long, .max], id: \.self) { preset in
-                    Text(preset.title).tag(preset)
-                }
-            }
-            .pickerStyle(.segmented)
-            .disabled(!settings.aiCommandsEnabled)
-
-            // The single comprehensible KV-quant lever (8-bit) — a longer context fits the same RAM.
-            Toggle("Compact long contexts (8-bit KV)", isOn: $settings.agentCompactKV)
-                .disabled(!settings.aiCommandsEnabled)
-
-            // The cost surface (RAM · concurrent background sessions · relative speed) — live.
-            HStack(spacing: 6) {
-                Image(systemName: "memorychip")
-                    .foregroundStyle(.secondary)
-                Text("\(effectiveContextTokens.formatted()) tokens · \(cost.summary)")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .truncationMode(.middle)
-                Spacer(minLength: 0)
-            }
-
-            // Per-skill override (read-only) — a heavy skill may raise the effective context (task 5.4).
-            // The override value rides on the skill file (`ai-skills-as-files`); this surface only displays
-            // that capability. With no skill source wired, the default resolves to no raise.
-            if let overrideNote = skillOverrideNote {
-                HStack(spacing: 6) {
-                    Image(systemName: "wand.and.stars")
-                        .foregroundStyle(.secondary)
-                    Text(overrideNote)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                    Spacer(minLength: 0)
-                }
-            }
-        }
-    }
-
-    // MARK: - Parked sessions (the opt-in auto-dismiss countdown)
-
-    /// The auto-dismiss countdown surfaced in MINUTES: an idle, fully-seen session untouched this long is
-    /// dismissed forever — **0 = never (the default)**. `agentParkAutoDismissCountdown` is persisted in
-    /// SECONDS, so this binding divides on read / multiplies on write, keeping the Hub slider human.
-    /// Clamped to whole minutes so the readout is clean.
-    private var autoDismissMinutes: Binding<Double> {
-        Binding(get: { (settings.agentParkAutoDismissCountdown / 60).rounded() },
-                set: { settings.agentParkAutoDismissCountdown = max(0, $0.rounded()) * 60 })
-    }
-
-    @ViewBuilder private var parkedSessionsSection: some View {
-        HubSection("Parked sessions",
-                   footnote: "A conversation you park to the notch waits for you here — it keeps its results until you delete it. Set a countdown to auto-dismiss idle, already-seen sessions (0 = never; unseen results and sessions that need you always stay). Raise the cap to keep more parked at once.") {
-            LabeledSlider(title: "Reveal dwell (seconds)", value: $settings.agentNotchRevealDwell,
-                          range: 0...1, format: "%.2f",
-                          help: "How long the cursor must linger behind the notch before the dock opens. Keeps a quick pass through the notch — reaching for the menu bar or another corner — from popping it. Set to 0 to open instantly. Default 0.30s.")
-                .disabled(!settings.aiCommandsEnabled)
-
-            LabeledSlider(title: "Auto-dismiss after (minutes, 0 = never)", value: autoDismissMinutes,
-                          range: 0...30, format: "%.0f",
-                          help: "How long an idle, already-seen session waits before it's dismissed forever. 0 (the default) keeps sessions until you delete them; sessions with unseen results never expire.")
-                .disabled(!settings.aiCommandsEnabled)
-
-            LabeledIntSlider(title: "Maximum parked sessions", value: $settings.agentMaxParkedSessions,
-                             range: 1...12,
-                             help: "Soft cap on parked sessions. When exceeded, the least-recently-used idle one is evicted (never an active or needs-you session).")
-                .disabled(!settings.aiCommandsEnabled)
-        }
-    }
-
-    /// The read-only per-skill-override note (task 5.4). Resolves the effective budget through the concrete
-    /// `AgentContextBudgetProvider` (∩ model max ∩ per-skill override) — when a heavy skill raises it above
-    /// the chosen preset, the note reports the raised number; otherwise it explains the capability.
-    private var skillOverrideNote: String? {
-        let provider = AgentContextBudgetProvider(userContextTokens: effectiveContextTokens,
-                                                  modelMaxContextTokens: selectedModelDescriptor.maxContextTokens)
-        let resolved = provider.maxContextTokens
-        if resolved > effectiveContextTokens {
-            return "A heavy skill raises the effective context to \(resolved.formatted()) tokens for that session."
-        }
-        return "A heavy skill may raise the effective context for its own session (read-only — authored on the skill)."
-    }
-
-    // MARK: - Release Full Potential (ai-full-potential-toggle, addendum §D1)
-
-    /// Per-capability binding into `AppSettings` for the five sub-flags. The gate reads these at consult
-    /// time; the Hub writes them directly (turning the master off NEVER zeroes them — see `panic-off`).
-    private func subFlagBinding(_ capability: FullPotentialCapability) -> Binding<Bool> {
-        switch capability {
-        case .cpuLane:            return $settings.cpuLaneEnabled
-        case .batchedRuntime:     return $settings.batchedRuntimeEnabled
-        case .mediaGen:           return $settings.mediaGenEnabled
-        case .backgroundAutonomy: return $settings.backgroundAutonomyEnabled
-        case .fleetCloud:         return $settings.fleetCloudEscalationEnabled
-        }
-    }
-
-    /// The sub-toggle's human title.
-    private func subFlagTitle(_ capability: FullPotentialCapability) -> String {
-        switch capability {
-        case .cpuLane:            return "CPU lane"
-        case .batchedRuntime:     return "Batched runtime"
-        case .mediaGen:           return "Media generation"
-        case .backgroundAutonomy: return "Background autonomy"
-        case .fleetCloud:         return "Cloud escalation"
-        }
-    }
-
-    /// The persistent, ALWAYS-VISIBLE cost line (RAM / heat / latency / $) — rendered inline as the row's
-    /// caption, never behind a tooltip (design Decision 4; the honest-surface ethos). The media + cloud
-    /// rows state the hard truths plainly: media evicts chat; cloud spends real money + sends data
-    /// off-device.
-    private func subFlagCost(_ capability: FullPotentialCapability) -> String {
-        switch capability {
-        case .cpuLane:
-            return "Heat / battery — a second (CPU) lane runs concurrently for fast small jobs. Short structured bursts only; CPU per-token is slower."
-        case .batchedRuntime:
-            return "RAM + latency — multiplexes several background sessions over one weight read. Larger context means more resident KV cache, and latency rises under load."
-        case .mediaGen:
-            return "RAM (eviction) + latency + disk — a heavy generation evicts chat: the assistant goes quiet while it paints. Minutes per clip; tens of gigabytes of weights."
-        case .backgroundAutonomy:
-            return "Unattended action — the agent may act while you're away. Only whitelisted, contained writes auto-run; dangerous ones still ask, and everything is audited."
-        case .fleetCloud:
-            return "$ + network — spends real money and sends data off-device to a paid cloud model (Claude / GLM-5.2). Budget-capped + audited; off until you arm it."
-        }
-    }
-
-    /// The Full Potential section: the master toggle FIRST, then the five sub-toggles (disabled while the
-    /// master is off — visibly relocked — but their persisted values RETAINED). Each sub-row carries its
-    /// cost inline. Shared Liquid Glass presentation (`HubSection` card). The whole section is itself gated
-    /// behind the AI-commands opt-in (the fleet is a strict subset of the AI feature).
-    @ViewBuilder private var fullPotentialSection: some View {
-        HubSection("Release Full Potential",
-                   footnote: "The agent ships calm: every heavy capability below is off until you release it here, and each states its own cost in the same breath it offers itself. Turning the master off relocks them all at once (your choices are kept, just inert) — a single calm panic-off. Cloud escalation stays off until you arm it: no surprise spend, no data leaving the device.") {
-            // The master toggle FIRST. No cost line of its own — it just lights up the section.
-            SwitchRow("Release Full Potential", isOn: $settings.fullPotentialEnabled,
-                      caption: "Lights up the agent fleet. Each capability below states its own cost.")
-                .disabled(!settings.aiCommandsEnabled)
-
-            Divider()
-
-            // The five sub-toggles, rendered by iterating the capability enum. Disabled (visibly relocked)
-            // while the master is off; flipping the master off retains these stored values (no zeroing).
-            ForEach(FullPotentialCapability.allCases, id: \.self) { capability in
-                SwitchRow(subFlagTitle(capability),
-                          isOn: subFlagBinding(capability),
-                          caption: subFlagCost(capability))
-                    .disabled(!settings.aiCommandsEnabled || !settings.fullPotentialEnabled)
-            }
-        }
-    }
-
-    var body: some View {
-        HubPage(HubDestination.ai.title,
-                subtitle: "Run on-device AI commands. Author the commands themselves on the Bands page.") {
-            HubSection(footnote: "Runs an on-device Gemma 4 model — turning this on starts a one-time multi-gigabyte download. No new permission or logout needed (a calendar task asks for Calendar access the first time it runs). Add AI commands to any band on the Bands page. Off by default.") {
-                HubFeatureHeader(
-                    preview: HubGesturePreview(
-                        gesture: Self.aiJourney,
-                        hoverGesture: hoverGesture,
-                        // The sync seam: the miniature replays the journey to the AI band; the resolve
-                        // tail and any hovered candidate swipe play over it (the canvas isn't miniature).
-                        sync: { demo.drive($0, script: .bandJourneyResolve) }
-                    ) {
-                        LauncherDemoMiniature(demo: demo)
-                    },
-                    icon: HubDestination.ai.systemImage,
-                    title: HubDestination.ai.title,
-                    subtitle: "Run on-device AI commands on your selection, clipboard, or screen.",
-                    isOn: $settings.aiCommandsEnabled
-                )
-                .onAppear { seedIfNeeded() }
-            }
-            HubSection("Resolve gestures",
-                       footnote: "Choose which two-finger swipe commits, dismisses, or is ignored while the AI command canvas is open. Each move maps to one action — picking a taken move swaps it. Hover a row to preview the move above.") {
-                HubBindingPicker(
-                    actions: GestureBindings.CanvasAction.allCases,
-                    excursions: GestureBindings.CanvasExcursion.allCases,
-                    actionLabel: HubBindingLabels.canvasAction,
-                    excursionLabel: HubBindingLabels.canvas,
-                    current: { settings.gestureBindings.canvas.excursion(for: $0) },
-                    assign: { excursion, action in
-                        settings.gestureBindings.canvas = settings.gestureBindings.canvas.assigning(excursion, to: action)
-                    },
-                    demoAxis: { excursion in
-                        // Stash the hovered excursion (event-handler context) so `demo` can build the
-                        // matching directed candidate; return the coarse axis the component expects.
-                        hoveredExcursion = excursion
-                        return axis(for: excursion)
-                    },
-                    demo: { axis in
-                        // The component signals enter (non-nil axis) / exit (nil); translate to a
-                        // directed candidate swipe for the hovered excursion, or clear the override.
-                        hoverGesture = (axis == nil) ? nil : hoveredExcursion.map { candidate(for: $0) }
-                    }
-                )
-                .disabled(!settings.aiCommandsEnabled)
-            }
-            HubSection("Model",
-                       footnote: "The fleet: a chat model + a small CPU model co-reside; an image or video model evicts chat while it generates (the assistant goes quiet, then reloads). Cloud models never run on-device and are off until you enable cloud escalation.") {
-                // The §C1 fleet roster (`ai-model-fleet`, D6): role / lane / provider / per-model status /
-                // honest residency cost, with the plan-driven evict-chat disclosure and the gated cloud
-                // rows. `fleetCloudEscalationEnabled` is owned by `ai-full-potential-toggle` — consumed
-                // here (default false) until that flag lands. Fleet-of-one renders as the single picker.
-                HubFleetRosterView(cloudEscalationEnabled: { settings.fullPotentialGate.isUnlocked(.fleetCloud) },
-                                   activeChatID: chatModelSelection,
-                                   enabledCapabilityModelIDs: capabilityModelSelection,
-                                   onDownloadCapabilityModel: context.onDownloadCapabilityModel,
-                                   manager: models,
-                                   aiEnabled: settings.aiCommandsEnabled)
-
-                // The existing per-model lifecycle surface (download / status / evict / delete) for the
-                // SELECTED model — preserved unchanged so the per-model status rule still holds.
-                ModelManagementView(manager: models,
-                                    descriptor: selectedModelDescriptor,
-                                    onDownload: context.onDownloadModel)
-                    .disabled(!settings.aiCommandsEnabled)
-
-                // Idle-TTL for the resident weights (`model-idle-ttl-and-memory-pressure`): after this
-                // long fully idle (no turn, no open chat, nothing scheduled) the loaded model is freed
-                // from memory; the next command reloads it on demand. Memory-pressure eviction is
-                // always armed and not a setting. "Never" = the pre-change keep-forever behavior.
-                Picker("Free model memory after", selection: $settings.aiIdleEvictMinutes) {
-                    Text("Never").tag(0)
-                    Text("15 minutes").tag(15)
-                    Text("30 minutes").tag(30)
-                    Text("1 hour").tag(60)
-                    Text("2 hours").tag(120)
-                    Text("4 hours").tag(240)
-                }
-                .disabled(!settings.aiCommandsEnabled)
-                .help("When the AI has been idle this long, the loaded model is freed from memory. The next command reloads it automatically.")
-            }
-            // Release Full Potential: the master gate + five cost-disclosing sub-toggles for the heavy
-            // fleet capabilities (`ai-full-potential-toggle`, addendum §D1).
-            fullPotentialSection
-            HubSection("Reasoning",
-                       footnote: "Let the model think before answering for higher-quality results (a bit slower). Thinking is never shown or pasted — only the final result.") {
-                Toggle("Reasoning", isOn: $settings.aiReasoningEnabled)
-                    .disabled(!settings.aiCommandsEnabled)
-            }
-            // Voice + computer use (`add-voice-computer-use-agent`): two separate opt-ins with honest
-            // cost disclosure. Voice needs macOS 26 (SpeechAnalyzer) + the microphone permission on
-            // first press; computer use reuses the existing Accessibility grant — no new permission.
-            HubSection("Voice conversation",
-                       footnote: voiceFootnote) {
-                Toggle("Talk with the assistant (push-to-talk)", isOn: $settings.voiceConversationEnabled)
-                    .disabled(!settings.aiCommandsEnabled || !voiceOSSupported)
-                Text("Double-tap Right Option and hold the second press to talk; release to send. The same double-tap-and-hold interrupts it mid-reply. Any trackpad touch stops it. Single presses and shortcuts like ⌥⌫ are never affected.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            HubSection("Computer use",
-                       footnote: "The assistant can read windows, focus them, and — with your approval — click and type in them. Uses the Accessibility permission you already granted; no new permission. Every action needs approval unless you turn on auto mode for a conversation, and any trackpad touch instantly stops it.") {
-                Toggle("Let the assistant use windows", isOn: $settings.computerUseEnabled)
-                    .disabled(!settings.aiCommandsEnabled)
-            }
-            contextSection
-            parkedSessionsSection
-            // Background autonomy (`ai-background-autonomy`, §7): the user-editable trust boundary (the
-            // whitelist) + the append-only "what your agents did while you were away" ledger.
-            HubWhitelistEditor(trustedPaths: $settings.agentWhitelistPaths,
-                               trustedCommands: $settings.agentWhitelistCommands,
-                               isEnabled: settings.aiCommandsEnabled)
-            HubAuditLogViewer(records: context.recentAuditRecords,
-                              persistError: context.auditStorePersistError)
-        }
-        // Keep the status row tied to the SELECTED model: re-settle the manager's displayed state on
-        // appear, when the picked model changes, and when AI is turned on — otherwise the single shared
-        // status would keep showing whichever model was last active.
-        .onAppear { models.showStatus(for: selectedModelDescriptor) }
-        .onChange(of: settings.aiSelectedModelID) { models.showStatus(for: selectedModelDescriptor) }
-        .onChange(of: settings.aiCommandsEnabled) {
-            if settings.aiCommandsEnabled { models.showStatus(for: selectedModelDescriptor) }
         }
     }
 }
@@ -945,13 +536,11 @@ struct GeneralPage: View {
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)],
                       alignment: .leading, spacing: 12) {
                 ToggleCard("App data & settings", isOn: $wipeAppData,
-                           caption: "Preferences, bands, AI commands, keyboard-language memory, clipboard history, project outputs, first-run state.")
+                           caption: "Preferences, bands, keyboard-language memory, clipboard history, project outputs, first-run state.")
                 ToggleCard("Caches", isOn: $wipeCaches,
                            caption: "The app's cache and HTTP storage directories.")
-                ToggleCard("AI models", isOn: $wipeAIModels,
-                           caption: "The downloaded on-device model weights (multi-GB, re-downloadable). Turns the AI opt-in off.")
                 ToggleCard("Permissions", isOn: $wipePermissions,
-                           caption: "Resets every permission the app can hold (Accessibility, Screen Recording, Input Monitoring, Automation, Calendar, Reminders, Contacts) — macOS will prompt again.")
+                           caption: "Resets every permission the app can hold (Accessibility, Screen Recording, Input Monitoring, Automation) — macOS will prompt again.")
             }
             Divider()
             HStack {
@@ -967,14 +556,12 @@ struct GeneralPage: View {
 
     @State private var wipeAppData = false
     @State private var wipeCaches = false
-    @State private var wipeAIModels = false
     @State private var wipePermissions = false
 
     private var dangerSelection: DangerZoneSelection {
         var selection: DangerZoneSelection = []
         if wipeAppData { selection.insert(.appData) }
         if wipeCaches { selection.insert(.caches) }
-        if wipeAIModels { selection.insert(.aiModels) }
         if wipePermissions { selection.insert(.permissions) }
         return selection
     }
@@ -982,7 +569,7 @@ struct GeneralPage: View {
 
 // MARK: - §13 Launcher demo holder (the user's REAL launcher, stepped by the sync drive)
 
-/// The §13 holder behind the Launcher / Clipboard / Files / AI previews: it owns the **real** `LauncherModel`
+/// The §13 holder behind the Launcher / Clipboard previews: it owns the **real** `LauncherModel`
 /// (rendered by a real `LauncherView`), seeded once with the user's real bands so the preview shows the actual
 /// launcher. Like `HubSwitcherDemo`, the model follows the ghost hand through the preview's **sync seam**
 /// (`drive(_:script:)`): the four-finger open pops the panel in at the activation beat, the two-finger
@@ -992,7 +579,7 @@ struct GeneralPage: View {
 /// owns no clock — frames arrive only from the preview's visibility-gated `TimelineView`, and every mutation
 /// is state-guarded (idempotent per frame).
 ///
-/// Band pages (Clipboard / Files / AI) seed with `landOnLastBand: true` so the preview's resting/static frame
+/// Band pages (Clipboard) seed with `landOnLastBand: true` so the preview's resting/static frame
 /// *shows* their band (the last band) — the driven loop then replays the journey from the home band toward it.
 @MainActor
 final class HubLauncherDemo: ObservableObject {
@@ -1024,7 +611,7 @@ final class HubLauncherDemo: ObservableObject {
     private var hoverPresented = false
 
     /// Seed the model from a `HubPreviewModels`-built launcher (the user's real bands). `landOnLastBand`
-    /// lands the selection on the last band (the Clipboard / Files / AI band) so a band page's resting
+    /// lands the selection on the last band (the Clipboard band) so a band page's resting
     /// preview shows that band; otherwise it rests on the home band, exactly as the real launcher opens.
     func seed(from source: LauncherModel, landOnLastBand: Bool = false) {
         model.dwell = source.dwell
@@ -1072,15 +659,12 @@ extension HubLauncherDemo {
         return GesturePose.DemoGesture(strokes: [open, band, items], liftGap: 0.6)
     }
 
-    /// The band-journey teaching gesture (Clipboard / Files / AI): a **four-finger** open, then — CONNECTED —
+    /// The band-journey teaching gesture (Clipboard): a **four-finger** open, then — CONNECTED —
     /// a long two-finger DOWN stroke that traverses the band list toward the last band, then a settle + lift.
     /// The traverse is target-based in the holder, so the exact stroke extent need only read as "down the
     /// bands"; the open length still tracks the activation distance. Coordinates are y-UP, so "down the band
-    /// list" descends from `topY` to the smaller `botY`. An optional `resolve` appends the AI canvas's
-    /// resolve tail: the traverse's lift *fires* the armed command, then a FRESH two-finger directed swipe
-    /// (the real canvas grammar — a stray re-lift is a no-op; resolution is a new excursion) commits it.
-    static func bandJourneyGesture(openLength: CGFloat,
-                                   resolve: GesturePose.BandInSurfaceGesture? = nil) -> GesturePose.DemoGesture {
+    /// list" descends from `topY` to the smaller `botY`.
+    static func bandJourneyGesture(openLength: CGFloat) -> GesturePose.DemoGesture {
         let openL = max(0.10, min(0.46, openLength))
         let xL: CGFloat = 0.34, topY: CGFloat = 0.66, botY: CGFloat = 0.20
         let open = GesturePose.Stroke(fingers: 4,
@@ -1088,12 +672,7 @@ extension HubLauncherDemo {
                                       to: CGPoint(x: xL, y: topY), gapAfter: 0)
         let traverse = GesturePose.Stroke(fingers: 2, from: CGPoint(x: xL, y: topY), to: CGPoint(x: xL, y: botY),
                                           hold: 0.22)
-        var strokes = [open, traverse]
-        if let resolve, resolve != .lift {
-            // A fresh, centered two-finger resolve after the firing lift (the canvas-resolve vocabulary).
-            strokes.append(contentsOf: GesturePose.canvasResolve(resolve).strokes)
-        }
-        return GesturePose.DemoGesture(strokes: strokes, liftGap: 0.6)
+        return GesturePose.DemoGesture(strokes: [open, traverse], liftGap: 0.6)
     }
 
     /// Map the configurable activation threshold (`0.01…0.15`, the real trigger distance) to the demo's
@@ -1115,11 +694,8 @@ extension HubLauncherDemo {
         /// The Launcher page's attract loop: open → one band down → scrub into the grid and across the
         /// items (arming the last one) → lift.
         case teaching
-        /// A band page's journey (Clipboard / Files): open → traverse the band list to the LAST band → lift.
+        /// A band page's journey (Clipboard): open → traverse the band list to the LAST band → lift.
         case bandJourney
-        /// The AI page's journey: open → traverse to the AI band → the firing lift → a fresh two-finger
-        /// canvas-resolve swipe (the tail drives nothing — the miniature never shows the canvas).
-        case bandJourneyResolve
     }
 
     /// The band-step / grid-step pace, matching the real launcher's snappy selection moves.
@@ -1130,7 +706,7 @@ extension HubLauncherDemo {
     /// real launcher stays up to show the canvas.
     private static func finalStrokeIndex(_ script: SyncScript) -> Int {
         switch script {
-        case .teaching, .bandJourneyResolve: return 2
+        case .teaching: return 2
         case .bandJourney: return 1
         }
     }
@@ -1164,10 +740,9 @@ extension HubLauncherDemo {
             if pose.fraction >= 0.5 { walkBands(to: min(1, model.bandCount - 1)) }
         case (.teaching, 2):
             scrubItems(fraction: pose.fraction)
-        case (.bandJourney, 1), (.bandJourneyResolve, 1):
+        case (.bandJourney, 1):
             walkBands(to: model.bandCount - 1, fraction: pose.fraction)
         default:
-            // The AI resolve tail: the canvas isn't rendered in the miniature — nothing to drive.
             break
         }
     }
@@ -1260,7 +835,7 @@ private struct LauncherDemoMiniature: View {
     var body: some View {
         let n = launcherNaturalSize(model)
         let h = min(n.height, 320)               // a compact preview slot
-        LauncherView(model: model, executor: nil, availability: nil)
+        LauncherView(model: model)
             .frame(width: n.width, height: h)
             .scaleEffect(scale * (demo.overlayShown ? 1.0 : 0.92))
             .opacity(demo.overlayShown ? 1 : 0)
@@ -1281,7 +856,9 @@ struct LauncherActionMap: View {
         let detail: String
     }
 
-    private let steps: [Step] = [
+    // `static`: see SwitcherActionMap — stable identities, so re-renders update rows instead of
+    // rebuilding them.
+    private static let steps: [Step] = [
         Step(symbol: "hand.raised.fill", title: "Slide four fingers", detail: "Swipe sideways to open your launcher"),
         Step(symbol: "hand.point.up.left.fill", title: "Lift two fingers", detail: "Keep two fingers resting to navigate"),
         Step(symbol: "arrow.up.arrow.down", title: "Up / down", detail: "Move between bands"),
@@ -1291,7 +868,7 @@ struct LauncherActionMap: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            ForEach(Array(steps.enumerated()), id: \.element.id) { index, step in
+            ForEach(Array(Self.steps.enumerated()), id: \.element.id) { index, step in
                 HStack(alignment: .center, spacing: 12) {
                     ZStack {
                         Circle().fill(Color.accentColor.opacity(0.16)).frame(width: 26, height: 26)

@@ -38,31 +38,6 @@ final class AppSettingsTests: XCTestCase {
         AppSettings(defaults: defaults)
     }
 
-    // MARK: - Per-command runtime language persistence (spec: ai-command-band)
-
-    /// A remembered language round-trips per command, survives a reload from the same suite, and
-    /// orphan entries (commands no longer present) are pruned best-effort without touching live ones.
-    func testPerCommandLanguagePersistenceRoundTripsAndPrunes() {
-        let a = UUID(), b = UUID()
-        let settings = makeSettings()
-        XCTAssertNil(settings.rememberedLanguage(for: a), "no remembered language at cold start")
-
-        settings.rememberLanguage("Hebrew", for: a)
-        settings.rememberLanguage("Spanish", for: b)
-        XCTAssertEqual(settings.rememberedLanguage(for: a), "Hebrew")
-        XCTAssertEqual(settings.rememberedLanguage(for: b), "Spanish", "two commands remember independently")
-
-        // Reload from the SAME suite: the choices persisted across instances.
-        let reloaded = AppSettings(defaults: defaults)
-        XCTAssertEqual(reloaded.rememberedLanguage(for: a), "Hebrew", "survives a reload")
-        XCTAssertEqual(reloaded.rememberedLanguage(for: b), "Spanish")
-
-        // Prune keeping only `a`: b's orphan entry is dropped, a is untouched.
-        reloaded.pruneCommandLanguages(keeping: [a])
-        XCTAssertEqual(reloaded.rememberedLanguage(for: a), "Hebrew", "a live command's entry is kept")
-        XCTAssertNil(reloaded.rememberedLanguage(for: b), "an orphaned entry is pruned")
-    }
-
     // MARK: - First-run defaults
 
     /// On first run (empty suite) every tunable must equal its `AppSettings.Defaults` value,
@@ -100,17 +75,6 @@ final class AppSettingsTests: XCTestCase {
 
         let reader = AppSettings(defaults: defaults)
         XCTAssertTrue(reader.manageVerticalGesture, "persists across instances")
-    }
-
-    func testEnableDeviceLinkDefaultsFalseAndPersists() {
-        let writer = makeSettings()
-        XCTAssertFalse(writer.enableDeviceLink, "default must be off (opt-in)")
-
-        writer.enableDeviceLink = true
-        XCTAssertEqual(defaults.object(forKey: "enableDeviceLink") as? Bool, true, "writes the documented key")
-
-        let reader = AppSettings(defaults: defaults)
-        XCTAssertTrue(reader.enableDeviceLink, "persists across instances")
     }
 
     /// Spot-check the literal default values so a silent change to `Defaults` is caught.
@@ -384,128 +348,6 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertFalse(settings.includeNonStandardWindows, "reset restores the strict default (OFF)")
     }
 
-    // MARK: - AI commands opt-in
-
-    /// The AI-commands opt-in is off on first run (it gates a multi-gigabyte model download), and the
-    /// selected-model pin starts nil ("registry default").
-    func testAICommandsDefaultsOffAndNoSelectedModel() {
-        let settings = makeSettings()
-        XCTAssertFalse(settings.aiCommandsEnabled, "AI commands must default OFF (opt-in)")
-        XCTAssertEqual(settings.aiCommandsEnabled, AppSettings.Defaults.aiCommandsEnabled)
-        XCTAssertNil(settings.aiSelectedModelID, "no model pinned by default")
-        XCTAssertNil(AppSettings.Defaults.aiSelectedModelID)
-    }
-
-    /// The opt-in persists across a "relaunch" (a fresh instance on the same suite) and writes through
-    /// to the documented raw key, both directions.
-    func testAICommandsEnabledPersistsAcrossInstances() {
-        let writer = makeSettings()
-        XCTAssertFalse(writer.aiCommandsEnabled)
-
-        writer.aiCommandsEnabled = true
-        XCTAssertEqual(defaults.object(forKey: "aiCommandsEnabled") as? Bool, true, "writes the documented key")
-
-        let reader = AppSettings(defaults: defaults)
-        XCTAssertTrue(reader.aiCommandsEnabled, "persists across instances")
-
-        reader.aiCommandsEnabled = false
-        XCTAssertFalse(AppSettings(defaults: defaults).aiCommandsEnabled, "the off state persists too")
-    }
-
-    /// The selected-model pin persists across instances and writes through to its key.
-    func testAISelectedModelIDPersistsAcrossInstances() {
-        let writer = makeSettings()
-        writer.aiSelectedModelID = "gemma-4-26b-a4b"
-        XCTAssertEqual(defaults.object(forKey: "aiSelectedModelID") as? String, "gemma-4-26b-a4b")
-
-        let reader = AppSettings(defaults: defaults)
-        XCTAssertEqual(reader.aiSelectedModelID, "gemma-4-26b-a4b", "persists across instances")
-    }
-
-    /// Older settings (no AI keys present) decode with the opt-in OFF and no pinned model, while every
-    /// pre-existing setting is left untouched — proving the addition is purely additive.
-    func testOlderSettingsDecodeWithAICommandsOffAndUntouched() {
-        // Arrange: simulate a pre-feature store — populate unrelated keys, but NO AI keys.
-        defaults.set(0.0777, forKey: "stepDistance")
-        defaults.set(true, forKey: "wrapAtEnds")
-        defaults.set(true, forKey: "keepClipboardHistory")
-        XCTAssertNil(defaults.object(forKey: "aiCommandsEnabled"), "precondition: no AI key on disk")
-        XCTAssertNil(defaults.object(forKey: "aiSelectedModelID"), "precondition: no AI model key on disk")
-
-        // Act
-        let settings = AppSettings(defaults: defaults)
-
-        // Assert: the new opt-in defaults off / nil without a stored value...
-        XCTAssertFalse(settings.aiCommandsEnabled)
-        XCTAssertNil(settings.aiSelectedModelID)
-        // ...and the pre-existing settings are loaded exactly as stored (not reset).
-        XCTAssertEqual(settings.stepDistance, 0.0777, accuracy: eps)
-        XCTAssertTrue(settings.wrapAtEnds)
-        XCTAssertTrue(settings.keepClipboardHistory)
-    }
-
-    /// `resetToDefaults()` must NOT touch the AI opt-in (it's a consent-gated choice that allows a
-    /// multi-gigabyte download) nor the pinned model — mirrors the launcher / clipboard opt-in handling.
-    func testResetToDefaultsDoesNotTouchAICommands() {
-        let settings = makeSettings()
-        settings.aiCommandsEnabled = true
-        settings.aiSelectedModelID = "gemma-4-12b"
-
-        settings.resetToDefaults()
-
-        XCTAssertTrue(settings.aiCommandsEnabled, "reset must not flip the AI opt-in")
-        XCTAssertEqual(settings.aiSelectedModelID, "gemma-4-12b", "reset must not clear the pinned model")
-    }
-
-    // MARK: - AI reasoning opt-in ("let the model think")
-
-    /// `aiReasoningEnabled` defaults ON (the model thinks; the thinking is shown but filtered out of the
-    /// committed result) and matches the `Defaults` enum value.
-    func testAIReasoningDefaultsOn() {
-        let settings = makeSettings()
-        XCTAssertTrue(settings.aiReasoningEnabled, "reasoning must default ON")
-        XCTAssertEqual(settings.aiReasoningEnabled, AppSettings.Defaults.aiReasoningEnabled)
-        XCTAssertTrue(AppSettings.Defaults.aiReasoningEnabled, "the Defaults literal is true")
-    }
-
-    /// The reasoning opt-in round-trips and persists across instances (both directions) and writes
-    /// through to its documented raw key.
-    func testAIReasoningEnabledPersistsAcrossInstances() {
-        let writer = makeSettings()
-        XCTAssertTrue(writer.aiReasoningEnabled)
-
-        writer.aiReasoningEnabled = false
-        XCTAssertEqual(defaults.object(forKey: "aiReasoningEnabled") as? Bool, false, "writes the documented key")
-
-        let reader = AppSettings(defaults: defaults)
-        XCTAssertFalse(reader.aiReasoningEnabled, "the off state persists across instances")
-
-        reader.aiReasoningEnabled = true
-        XCTAssertTrue(AppSettings(defaults: defaults).aiReasoningEnabled, "the on state persists too")
-    }
-
-    /// Older settings (no reasoning key present) decode with reasoning ON (the additive default), while
-    /// pre-existing settings are left untouched.
-    func testOlderSettingsDecodeWithReasoningOnAndUntouched() {
-        defaults.set(0.0777, forKey: "stepDistance")
-        XCTAssertNil(defaults.object(forKey: "aiReasoningEnabled"), "precondition: no reasoning key on disk")
-
-        let settings = AppSettings(defaults: defaults)
-        XCTAssertTrue(settings.aiReasoningEnabled, "absent key falls back to the ON default")
-        XCTAssertEqual(settings.stepDistance, 0.0777, accuracy: eps, "pre-existing settings untouched")
-    }
-
-    /// `resetToDefaults()` must NOT touch the reasoning opt-in — like the AI opt-in, it's a user choice
-    /// the tunables reset leaves alone (a disabled reasoning stays disabled across a reset).
-    func testResetToDefaultsDoesNotTouchAIReasoning() {
-        let settings = makeSettings()
-        settings.aiReasoningEnabled = false
-
-        settings.resetToDefaults()
-
-        XCTAssertFalse(settings.aiReasoningEnabled, "reset must not flip the reasoning opt-in")
-    }
-
     // MARK: - Minimized windows in the switcher + minimize-all-on-down opt-ins
 
     /// Both opt-ins default OFF (preserve today's behavior: minimized windows excluded, down-swipe = App
@@ -600,26 +442,6 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertFalse(settings.includeMinimizedWindows, "absent key falls back to OFF")
         XCTAssertFalse(settings.swipeDownMinimizesAll, "absent key falls back to OFF")
         XCTAssertEqual(settings.stepDistance, 0.0777, accuracy: eps, "pre-existing settings untouched")
-    }
-
-    // MARK: - Notch tuning (`notch-timeline-and-tuning`)
-
-    /// The notch chat's thinking+context dial: defaults Balanced, round-trips its raw value, and resets
-    /// with the other behavior tunables.
-    func testNotchTuningDefaultsBalancedRoundTripsAndResets() {
-        let settings = makeSettings()
-        XCTAssertEqual(settings.notchTuning, .balanced, "default: thinking on · base context")
-
-        settings.notchTuning = .max
-        let reloaded = AppSettings(defaults: defaults)
-        XCTAssertEqual(reloaded.notchTuning, .max, "the selected stop persists across relaunch")
-
-        settings.resetToDefaults()
-        XCTAssertEqual(settings.notchTuning, .balanced, "reset returns the dial to Balanced")
-
-        // A corrupt/unknown stored value falls back to the default rather than crashing.
-        defaults.set("garbage", forKey: "notchTuning")
-        XCTAssertEqual(AppSettings(defaults: defaults).notchTuning, .balanced)
     }
 
     // MARK: - Isolation

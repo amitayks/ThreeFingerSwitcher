@@ -23,36 +23,16 @@
     <!-- Menu-bar agent: no Dock icon, no main window. -->
     <key>LSUIElement</key>
     <true/>
+    <!-- Never App-Nap this process: a never-frontmost accessory is the textbook nap target, and
+         napping demotes the touch-frame consumer + event taps exactly when other apps are busy
+         (gesture latency "waking up"). Belt-and-suspenders with the beginActivity assertion in
+         AppDelegate; neither prevents system idle sleep. -->
+    <key>NSAppSleepDisabled</key>
+    <true/>
     <key>NSHumanReadableCopyright</key>
     <string>GPL-3.0. See LICENSE.</string>
     <!-- Shown if macOS ever prompts for Input Monitoring on the multitouch read. -->
     <key>NSInputMonitoringUsageDescription</key>
     <string>Reads raw trackpad touches to detect the three-finger swipe.</string>
-    <!-- Shown when an "add to calendar" AI command first creates an event (EventKit, lazy first-use). -->
-    <key>NSCalendarsFullAccessUsageDescription</key>
-    <string>Creates calendar events from text when you run an "add to calendar" AI command.</string>
-    <!-- Shown when an "add to reminders" AI command first creates a reminder (EventKit, lazy first-use). -->
-    <key>NSRemindersFullAccessUsageDescription</key>
-    <string>Creates reminders from text when you run an "add to reminders" AI command.</string>
-    <!-- Shown when a "new contact" AI command first creates a contact card (Contacts, lazy first-use). -->
-    <key>NSContactsUsageDescription</key>
-    <string>Creates a contact card from text when you run a "new contact" AI command.</string>
-    <!-- Shown on the FIRST actual push-to-talk press (voice conversation, `add-voice-computer-use-agent`).
-         The mic is open ONLY while push-to-talk is held — no wake word, no always-listening. -->
-    <key>NSMicrophoneUsageDescription</key>
-    <string>Hears you only while you hold the push-to-talk key, to talk with the on-device assistant.</string>
-    <!-- Shown if SpeechAnalyzer additionally requires speech-recognition authorization (on-device only). -->
-    <key>NSSpeechRecognitionUsageDescription</key>
-    <string>Transcribes your push-to-talk speech on this Mac. Audio never leaves the device.</string>
-    <!-- Shown when the device link first advertises/connects on the local network (Bonjour). -->
-    <key>NSLocalNetworkUsageDescription</key>
-    <string>Connects directly to your paired iPhone on your local network to move clipboard items and files between your devices.</string>
-    <!-- The device-link Bonjour service types: the data link AND the QR pairing channel.
-         BOTH must be declared or the OS denies advertising/browsing them (NoAuth / -65555). -->
-    <key>NSBonjourServices</key>
-    <array>
-        <string>_tfslink._tcp</string>
-        <string>_tfspair._tcp</string>
-    </array>
 </dict>
 </plist>

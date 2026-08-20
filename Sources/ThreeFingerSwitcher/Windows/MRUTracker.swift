@@ -10,6 +10,9 @@ final class MRUTracker {
     private var observer: NSObjectProtocol?
 
     func start() {
+        // Idempotent: a second start() without an intervening stop() would leak the activation
+        // observer — the no-trackpad toggle path can re-enter enable() without disable() tearing down.
+        guard observer == nil else { return }
         // Seed with the current frontmost app.
         if let front = NSWorkspace.shared.frontmostApplication {
             promote(front.processIdentifier)
@@ -31,6 +34,10 @@ final class MRUTracker {
         observer = nil
     }
 
+    deinit {
+        if let observer { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+    }
+
     func promote(_ pid: pid_t) {
         order.removeAll { $0 == pid }
         order.insert(pid, at: 0)
@@ -39,5 +46,11 @@ final class MRUTracker {
     /// Rank for a pid; lower is more recent. Unknown pids sort after all known ones.
     func rank(_ pid: pid_t) -> Int {
         order.firstIndex(of: pid) ?? Int.max
+    }
+
+    /// Drop pids that no longer correspond to running apps so `order` (scanned linearly by
+    /// `rank`) can't grow without bound over a long session. Mirrors WindowFocusTracker.evict.
+    func evict(keepingLive live: Set<pid_t>) {
+        order.removeAll { !live.contains($0) }
     }
 }

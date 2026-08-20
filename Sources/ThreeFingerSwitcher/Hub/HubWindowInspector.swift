@@ -12,9 +12,14 @@ struct HubWindowInspector: View {
 
     @State private var entries: [WindowInspectorEntry] = []
     @State private var loaded = false
+    /// Grouped + sorted ONCE per snapshot. This view observes `AppSettings` and shares a page with
+    /// five sliders, so it re-renders on every slider tick — re-grouping and ICU-sorting every
+    /// window (twice: body + summary) per tick was pure waste.
+    @State private var groups: [(key: String, name: String, icon: NSImage?, rows: [WindowInspectorEntry])] = []
 
-    private var groups: [(key: String, name: String, icon: NSImage?, rows: [WindowInspectorEntry])] {
-        Dictionary(grouping: entries, by: \.appKey)
+    private func setEntries(_ new: [WindowInspectorEntry]) {
+        entries = new
+        groups = Dictionary(grouping: new, by: \.appKey)
             .map { (key: $0.key, name: $0.value.first?.appName ?? $0.key,
                     icon: $0.value.first?.appIcon, rows: $0.value) }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -26,7 +31,7 @@ struct HubWindowInspector: View {
                 Text(summary)
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button { entries = inspect() } label: {
+                Button { setEntries(inspect()) } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
             }
@@ -59,7 +64,7 @@ struct HubWindowInspector: View {
         .onAppear {
             guard !loaded else { return }
             loaded = true
-            entries = inspect()
+            setEntries(inspect())
         }
     }
 
@@ -138,7 +143,7 @@ struct HubWindowInspector: View {
                 } else {
                     settings.windowAppRules.removeValue(forKey: key)
                 }
-                entries = inspect()
+                setEntries(inspect())
             })) {
             Text("Follow global setting").tag("global")
             Text("Include all windows").tag(WindowAppRule.include.rawValue)

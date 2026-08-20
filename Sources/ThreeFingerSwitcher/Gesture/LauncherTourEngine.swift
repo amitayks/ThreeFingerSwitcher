@@ -1,6 +1,6 @@
 import CoreGraphics
 
-/// The pure, MLX-free **launcher tour brain** (§13 / design D12) — one settings-driven odometer that turns a
+/// The pure **launcher tour brain** (§13 / design D12) — one settings-driven odometer that turns a
 /// stream of trackpad frames (finger count + normalized centroid) into discrete launcher intents, so the Hub
 /// launcher/band previews navigate exactly like the real launcher and the wizard tour. It folds the three
 /// today-triplicated copies of this logic (`GestureRecognizer`'s launcher activation/step math, the wizard's

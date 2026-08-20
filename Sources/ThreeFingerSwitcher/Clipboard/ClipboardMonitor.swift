@@ -29,14 +29,6 @@ final class ClipboardMonitor {
 
     private var timer: Timer?
     private var lastChangeCount: Int
-    /// One pasteboard `changeCount` to skip capturing (a self-write we just made, e.g. auto-pasting a
-    /// received item). On the next poll, if the board's `changeCount` equals this, we advance
-    /// `lastChangeCount` without capturing and clear the suppression — so the already-recorded entry
-    /// keeps its origin/`capturedAt`. A *newer* change arriving first means a real user copy happened in
-    /// between, so the suppression is dropped without skipping it (that copy is still captured). Nil = no
-    /// pending suppression. Safe whether or not the monitor is running (a stopped monitor catches it up
-    /// on `start()` / next `poll()`).
-    private var suppressedChangeCount: Int?
 
     init(store: ClipboardStore,
          pasteboard: NSPasteboard = .general,
@@ -67,33 +59,14 @@ final class ClipboardMonitor {
         let t = Timer.scheduledTimer(withTimeInterval: max(0.1, pollInterval), repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
         }
+        t.tolerance = max(0.1, pollInterval) / 4   // a changeCount poll isn't deadline-critical
         timer = t
     }
 
-    /// Tell the monitor to ignore exactly ONE upcoming pasteboard change — the one we are about to make
-    /// (or just made) ourselves. Pass the `changeCount` read right after writing to `NSPasteboard.general`.
-    /// On the next poll, if the board is still at that exact count, we advance past it without capturing
-    /// (so a received item's `.peer` origin/`capturedAt` survive — no self-capture). If a *different*
-    /// (newer) change lands first, a real user copy intervened, so we drop the suppression and capture
-    /// normally. Idempotent and safe whether or not the monitor is running.
-    func suppressSelfWrite(changeCount: Int) {
-        suppressedChangeCount = changeCount
-    }
-
-    /// Visible for testing: a single poll tick (the timer also calls this). Honors the self-write
-    /// suppression, then captures on a genuine change.
+    /// Visible for testing: a single poll tick (the timer also calls this). Captures on a genuine change.
     func poll() {
         guard !isPaused else { return }
         let current = pasteboard.changeCount
-        if let suppressed = suppressedChangeCount {
-            suppressedChangeCount = nil
-            if current == suppressed {
-                // Our own write — advance past it without capturing, so the peer entry keeps its origin.
-                lastChangeCount = current
-                return
-            }
-            // A different (newer) change arrived first: a real user copy. Fall through and capture it.
-        }
         guard current != lastChangeCount else { return }
         lastChangeCount = current
         capture()
@@ -134,8 +107,8 @@ final class ClipboardMonitor {
                     ?? item.data(forType: .init(ClipboardUTI.tiff)) else { return nil }
             let uti = item.data(forType: .init(ClipboardUTI.png)) != nil ? ClipboardUTI.png : ClipboardUTI.tiff
             reps[uti] = .inline(data)
-            let rep = NSBitmapImageRep(data: data)
-            key = ClipboardKey.fromImage(width: rep?.pixelsWide ?? 0, height: rep?.pixelsHigh ?? 0)
+            let dims = Self.imagePixelSize(data)
+            key = ClipboardKey.fromImage(width: dims.width, height: dims.height)
             fingerprint = "image:\(Self.hash(data))"
 
         case .color:
@@ -179,10 +152,35 @@ final class ClipboardMonitor {
                               sourceApp: sourceID, representations: reps, fingerprint: fingerprint)
     }
 
-    /// Cheap content hash (FNV-1a 64-bit) for image/color/rtf fingerprints.
-    private static func hash(_ data: Data) -> String {
+    /// Bounded content fingerprint (FNV-1a 64-bit over the byte count + a head and tail sample).
+    ///
+    /// This runs on the MAIN thread from the 0.5 s pasteboard poll, once per copy. The previous
+    /// whole-payload `for byte in data` walk cost 2–10 ns/byte through `Data`'s generic iterator —
+    /// a 10 MB screenshot froze the app (gestures included) for up to ~100 ms on every ⌘⇧4. Sampling
+    /// makes it O(1) in payload size; the length + both ends distinguish real-world clipboard payloads
+    /// (a collision merely de-dups two copies into one entry — a fingerprint, not a checksum).
+    static func hash(_ data: Data) -> String {
         var h: UInt64 = 0xcbf29ce484222325
-        for byte in data { h ^= UInt64(byte); h = h &* 0x100000001b3 }
+        @inline(__always) func mix(_ byte: UInt8) { h ^= UInt64(byte); h = h &* 0x100000001b3 }
+        withUnsafeBytes(of: UInt64(data.count).littleEndian) { for b in $0 { mix(b) } }
+        let sample = min(data.count, hashSampleBytes)
+        data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+            for b in buf.prefix(sample) { mix(b) }
+            if data.count > sample { for b in buf.suffix(sample) { mix(b) } }
+        }
         return String(h, radix: 16)
+    }
+    private static let hashSampleBytes = 64 * 1024
+
+    /// Pixel dimensions from the image HEADER only (ImageIO properties, no decode). The previous
+    /// `NSBitmapImageRep(data:)` fully decompressed the bitmap just to label the entry "Image W×H".
+    private static func imagePixelSize(_ data: Data) -> (width: Int, height: Int) {
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithData(data as CFData, options),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, options) as? [CFString: Any] else {
+            return (0, 0)
+        }
+        return ((props[kCGImagePropertyPixelWidth] as? Int) ?? 0,
+                (props[kCGImagePropertyPixelHeight] as? Int) ?? 0)
     }
 }
