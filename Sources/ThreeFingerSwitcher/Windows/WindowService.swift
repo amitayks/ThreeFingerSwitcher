@@ -181,6 +181,10 @@ final class WindowService {
             return legacySnapshot()
         }
         let selfPid = getpid()
+        // One deadline for ALL per-app brute-force sweeps in this snapshot (see the off-Space
+        // branch below) — bounds the gesture-open worst case regardless of how many apps hold
+        // off-Space windows.
+        let bruteForceDeadline = DispatchTime.now() + .milliseconds(250)
 
         // Backstop: re-assert the current frontmost app's focused window as most-recent before
         // ordering, so the current window is index 0 even if an earlier focus event did not resolve a
@@ -211,6 +215,7 @@ final class WindowService {
         // Prune the focus history to currently-enumerated window ids so closed windows don't linger
         // (ids are unique per window lifetime, so a stale id can never mis-rank a new window).
         focus.evict(keepingLive: Set(spaceForWindow.keys))
+        mru.evict(keepingLive: Set(appsByPid.keys))
 
         let meta = metadata(for: Array(spaceForWindow.keys))
 
@@ -236,7 +241,17 @@ final class WindowService {
                 element = axCurrentByPid[m.pid]?[wid]
             } else {
                 if axBruteByPid[m.pid] == nil {
-                    axBruteByPid[m.pid] = Dictionary(bruteForceWindows(pid: m.pid, includeNonStandard: bruteIncludesNonStandard(pid: m.pid)), uniquingKeysWith: { a, _ in a })
+                    // Aggregate brute-force budget across the WHOLE snapshot: each per-app sweep is
+                    // budgeted (~100 ms of synchronous AX IPC worst case), but the number of apps
+                    // holding off-Space windows grows over a long session, and N × 100 ms sits
+                    // inline in the gesture-open path. Past the aggregate cap, remaining apps skip
+                    // the sweep and resolve via `elementCache` (windows seen reachable before) —
+                    // the next snapshot retries, so coverage self-heals across opens.
+                    if DispatchTime.now() < bruteForceDeadline {
+                        axBruteByPid[m.pid] = Dictionary(bruteForceWindows(pid: m.pid, includeNonStandard: bruteIncludesNonStandard(pid: m.pid)), uniquingKeysWith: { a, _ in a })
+                    } else {
+                        axBruteByPid[m.pid] = [:]
+                    }
                 }
                 element = axBruteByPid[m.pid]?[wid]
             }

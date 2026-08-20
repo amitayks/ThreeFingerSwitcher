@@ -23,6 +23,15 @@ final class ThumbnailService {
 
     private var inFlight: Set<CGWindowID> = []
 
+    /// The one in-flight refresh sweep (see `prefetch`). Single-slot: a tick that arrives while a
+    /// sweep is still running is SKIPPED, not queued — without this, every 0.8 s timer tick spawned
+    /// a fresh unstructured Task, and once a sweep overran the interval (enumeration cost scales
+    /// with the system's total window count) sweeps stacked without bound: each paid a full
+    /// `SCShareableContent` enumeration before discovering every window was already in flight.
+    private var sweepTask: Task<Void, Never>?
+    /// Monotonic sweep token so a finished sweep never clears a slot a newer sweep now owns.
+    private var sweepGeneration = 0
+
     /// When set (env var `TFS_THUMB_LOG`), each capture logs its ScreenCaptureKit frame next to the
     /// window's logical frame so the set-aside/off-screen "degraded" signal can be confirmed and the
     /// thresholds in `isDegradedCapture` tuned against real data (see the change's task 1.2 / 1.3).
@@ -76,12 +85,28 @@ final class ThumbnailService {
     /// windows still capture; minimized windows never reach here (`snapshot()`'s `isSwitchable` excludes them).
     func prefetch(_ windows: [WindowInfo]) {
         guard CGPreflightScreenCaptureAccess() else { return }
+        // Per-sweep back-pressure: while the previous sweep still runs, this tick is skipped (the
+        // next one re-captures everything anyway — sweeps are idempotent refreshes, never a queue).
+        guard sweepTask == nil else { return }
         // Skip minimized windows: macOS renders no fresh pixels for a minimized window, so a live capture
         // would be wasted/degraded. They keep their seeded last-good frame or icon and surface live only on
         // commit (which un-minimizes). Load-bearing now that the include-minimized-windows opt-in can list them.
         let targets = windows.filter { !inFlight.contains($0.id) && !$0.isMinimized }
         guard !targets.isEmpty else { return }
-        Task { await self.refreshBatch(targets) }
+        sweepGeneration += 1
+        let generation = sweepGeneration
+        sweepTask = Task {
+            await self.refreshBatch(targets)
+            if self.sweepGeneration == generation { self.sweepTask = nil }
+        }
+    }
+
+    /// Cancel the in-flight refresh sweep (if any). Called when the switcher session ends so a
+    /// long-running sweep doesn't keep enumerating + capturing into a hidden overlay.
+    func cancelSweeps() {
+        sweepGeneration += 1
+        sweepTask?.cancel()
+        sweepTask = nil
     }
 
     /// Capture the given windows NOW and AWAIT completion — used to grab each window's live frame right
@@ -108,6 +133,7 @@ final class ThumbnailService {
         }
         let byID = Dictionary(content.windows.map { ($0.windowID, $0) }, uniquingKeysWith: { _, new in new })
         for w in windows {
+            if Task.isCancelled { return }   // session ended: stop capturing into a hidden overlay
             guard !inFlight.contains(w.id) else { continue }
             // Skip a not-cleanly-presented window (parked off every display, or a Stage-Manager strip
             // proxy); `seed` already shows its cached/icon. Pass the real (AX) frame as the logical frame
@@ -350,11 +376,25 @@ final class ThumbnailService {
     }
 
     private func store(_ id: CGWindowID, _ image: NSImage) {
-        if cache[id] == nil { cacheOrder.append(id) }
+        // True LRU: a re-store moves the id to the back. The previous insert-order-only (FIFO)
+        // eviction let long-dead windows outlive actively-refreshed ones, degrading the hit rate
+        // over a long session (each entry pins up to ~1 MB of image backing store).
+        cacheOrder.removeAll { $0 == id }
+        cacheOrder.append(id)
         cache[id] = image
         while cacheOrder.count > cacheLimit {
             let evicted = cacheOrder.removeFirst()
             cache.removeValue(forKey: evicted)
         }
+    }
+
+    /// Drop cached frames whose windows no longer exist anywhere (any Space). Closed windows'
+    /// frames otherwise sit in the cache — pinning image memory — until 64 newer insertions push
+    /// them out. Callers pass the full cross-Space enumeration (e.g. `snapshot()`'s id set); an
+    /// empty set is ignored (an enumeration hiccup must not wipe the last-good-frame store).
+    func retain(only live: Set<CGWindowID>) {
+        guard !live.isEmpty else { return }
+        cacheOrder.removeAll { !live.contains($0) }
+        cache = cache.filter { live.contains($0.key) }
     }
 }

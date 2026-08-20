@@ -33,6 +33,10 @@ final class DockPreviewController {
 
     private var enabled = false
     private var snapshot: DockSnapshot?
+    /// Short-lived cache for `reader.read()` (see `handleCursor`). `nil` snap is cached too — an
+    /// auto-hidden Dock reads empty, and re-walking it per mouse move is the same waste.
+    private var cachedDockRead: (at: TimeInterval, snap: DockSnapshot?)?
+    private static let dockReadTTL: TimeInterval = 0.08
     private var shownPID: pid_t?
     private var emptyPID: pid_t?
     /// The tile whose native action menu we just opened with a right-click. While the cursor lingers on
@@ -102,7 +106,19 @@ final class DockPreviewController {
         // Edge-gate: only read the Dock when something is shown or the cursor is near a screen edge.
         guard overlay.isVisible || nearDockEdge(point) else { return }
 
-        let snap = reader.read()
+        // Throttle the AX walk, not the hit-test: `read()` is a full cross-process AX traversal of
+        // Dock.app plus a running-apps enumeration, and this handler fires per mouse-move event
+        // (60–125 Hz near an edge) — a large steady main-thread tax competing with the gesture
+        // path. Tile frames only matter at ~UI rates, so a snapshot ≤80 ms old is reused; the
+        // hover model still gets every cursor sample at full rate for grace/anchor timing.
+        let tick = now()
+        let snap: DockSnapshot?
+        if let cached = cachedDockRead, tick - cached.at < Self.dockReadTTL {
+            snap = cached.snap
+        } else {
+            snap = reader.read()
+            cachedDockRead = (at: tick, snap: snap)
+        }
         snapshot = snap
         let tiles = snap?.tiles ?? []
 

@@ -20,6 +20,13 @@ final class ScrollEventTap {
 
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
+    /// Low-frequency health watchdog. The `tapDisabledByTimeout` self-heal in `handle` is delivered
+    /// through the tap itself, so once the system disables the tap under main-thread congestion the
+    /// re-enable only runs when the NEXT event limps through — the first post-stall gesture is
+    /// silently dropped ("the trigger needs to wake up"). This timer re-enables independently of
+    /// event delivery, bounding a dead tap to one watchdog interval.
+    private var watchdog: Timer?
+    private static let watchdogInterval: TimeInterval = 2.0
 
     private(set) var isRunning = false
 
@@ -49,17 +56,34 @@ final class ScrollEventTap {
         source = src
         CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        watchdog = Timer.scheduledTimer(withTimeInterval: Self.watchdogInterval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.reviveIfDisabled() }
+        }
+        watchdog?.tolerance = Self.watchdogInterval / 2   // cheap check; let the OS coalesce it
         isRunning = true
         return true
     }
 
     func stop() {
         guard isRunning else { return }
+        watchdog?.invalidate()
+        watchdog = nil
         if let source { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
-        if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
+        if let tap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+            // Destroy the mach receive right deterministically — the gate refreshes cycle
+            // start/stop on every toggle flip, and relying on CF dealloc leaves port teardown
+            // timing to autorelease.
+            CFMachPortInvalidate(tap)
+        }
         source = nil
         tap = nil
         isRunning = false
+    }
+
+    private func reviveIfDisabled() {
+        guard let tap, !CGEvent.tapIsEnabled(tap: tap) else { return }
+        CGEvent.tapEnable(tap: tap, enable: true)
     }
 
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {

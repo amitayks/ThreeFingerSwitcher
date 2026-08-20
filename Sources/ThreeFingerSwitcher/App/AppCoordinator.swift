@@ -394,6 +394,14 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     private func observeEnabledToggle() {
         settings.$enabled
             .dropFirst()
+            // `@Published` fires on every WRITE (willSet), not every change — and `enable()`/`disable()`
+            // re-write `settings.enabled` internally. Because the body below is deferred with
+            // `DispatchQueue.main.async`, the `applyingEnabledToggle` flag is already false again by the
+            // time the deferred block runs, so a same-value re-emission slipped past the guard. In the
+            // no-trackpad case (`enable()` can never set `isEnabled = true`) that produced an UNBOUNDED
+            // main-queue ping-pong — enable → write → emission → enable … — each lap re-running the full
+            // enable path forever. Dropping same-value emissions ends the cycle after one lap.
+            .removeDuplicates()
             .sink { [weak self] on in
                 // Defer off the `willSet` emission so the master toggle updates in place immediately;
                 // enabling/disabling starts or tears down the touch engine + taps, which otherwise stalled
@@ -545,6 +553,10 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             windows.append(hub)
         }
         guard !windows.isEmpty else { return false }
+        // Prune the last-good-frame cache to windows that still exist somewhere (the snapshot is the
+        // full cross-Space enumeration): closed windows' frames otherwise pin image memory and, under
+        // the LRU cap, evict frames of windows that are still alive.
+        thumbnails.retain(only: Set(windows.map(\.id)))
         let grid = SpaceGrouping.group(windows)
         // When the app has Mission Control open, float the overlay above it (otherwise it renders
         // behind the MC windows). The elevated config is scoped to this case in `OverlayController`.
@@ -705,10 +717,12 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
 
     /// Stop the periodic preview refresh. Idempotent — safe when already stopped (the timer is nil) — so it
     /// can be paired with every overlay teardown site unconditionally. The thumbnail cache persists as the
-    /// last-good-frame store.
+    /// last-good-frame store; only the in-flight SWEEP is cancelled (it would otherwise keep enumerating +
+    /// capturing into the now-hidden overlay until it drained).
     private func stopPreviewRefresh() {
         previewRefreshTimer?.invalidate()
         previewRefreshTimer = nil
+        thumbnails.cancelSweeps()
     }
 
     func gestureDidCommit() {
@@ -1060,6 +1074,10 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     private func observeKeyboardLanguageToggle() {
         settings.$keyboardLanguageEnabled
             .dropFirst()
+            // Same-value writes re-emit (`@Published` fires on willSet); without de-duplication each
+            // redundant `true` write re-ran `start()` — which used to stack a permanent extra
+            // activation observer per lap (now also guarded in the service itself).
+            .removeDuplicates()
             .sink { [weak self] on in
                 MainActor.assumeIsolated {
                     guard let self else { return }
@@ -1781,12 +1799,21 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             window.setContentSize(NSSize(width: 960, height: 640))
             window.center()
             wizardWindow = window
-            // Closing the window mid-flow is "later": progress is already persisted, but the
-            // model's machinery (attract loop, permission polling, the touch feed) must stop.
+            // Closing the window mid-flow is "later": progress is already persisted, so tear the
+            // wizard down COMPLETELY — window, model, and hosting tree. suspend() alone left the
+            // retained NSHostingView's TimelineView breathers (PulseHalo / BreathingGlowBackdrop,
+            // 15–20 Hz, ungated) ticking in the ordered-out window for the rest of the process —
+            // the docs/postmortem-idle-cpu-spin.md main-thread spin, reachable from the red button.
+            // Resume/Replay rebuilds the wizard from scratch (state is persisted in `firstRun`).
             wizardCloseObserver = NotificationCenter.default.addObserver(
                 forName: NSWindow.willCloseNotification, object: window, queue: .main
             ) { [weak self] _ in
-                MainActor.assumeIsolated { self?.wizardModel?.suspend() }
+                MainActor.assumeIsolated {
+                    let window = self?.releaseWizardReferences()
+                    // Releasing the hosting tree is what actually stops its animation clocks; the
+                    // window is already closing, so no close() here (it would re-enter willClose).
+                    window?.contentViewController = nil
+                }
             }
         }
         let firstPresentation = !(wizardWindow?.isVisible ?? true)
@@ -1823,7 +1850,11 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         showFirstTouchWizard()
     }
 
-    private func closeWizard() {
+    /// Shared teardown of the wizard's model / observer / window references. Does NOT close or
+    /// blank the window — callers own that: from willClose the window is already closing; from
+    /// `closeWizard` the exhale animation still needs the content on screen. Removing the
+    /// willClose observer here also means a subsequent `close()` cannot re-enter the teardown.
+    private func releaseWizardReferences() -> NSWindow? {
         wizardModel?.suspend()
         onWizardTouchFrame = nil
         if let wizardCloseObserver {
@@ -1833,9 +1864,17 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         let window = wizardWindow
         wizardWindow = nil
         wizardModel = nil
-        guard let window else { return }
+        return window
+    }
+
+    private func closeWizard() {
+        guard let window = releaseWizardReferences() else { return }
+        // Both exits release the SwiftUI tree with the window (`contentViewController = nil`) —
+        // the hosting view's TimelineView clocks only stop when the tree is destroyed (see
+        // docs/postmortem-idle-cpu-spin.md).
         guard window.isVisible else {
             window.orderOut(nil)
+            window.contentViewController = nil
             window.close()
             return
         }
@@ -1848,6 +1887,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             window.animator().setFrame(window.frame.offsetBy(dx: 0, dy: 10), display: true)
         }, completionHandler: {
             window.orderOut(nil)
+            window.contentViewController = nil
             window.close()
         })
     }

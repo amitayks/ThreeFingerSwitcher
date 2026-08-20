@@ -1,13 +1,34 @@
 import AppKit
+import ApplicationServices
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var coordinator: AppCoordinator?
     private var statusItem: StatusItemController?
+    /// Process-lifetime App Nap opt-out (see `applicationDidFinishLaunching`). Held, never ended.
+    private var appNapActivity: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory) // menu-bar agent: no Dock icon, no main window
         installMainMenu()
+
+        // Bound every Accessibility round-trip this process makes. AX calls are serviced by the
+        // TARGET app's main thread with a 6-SECOND default timeout — and the switcher's snapshot
+        // makes several per window, synchronously, inline in the gesture. One busy/hung peer app
+        // otherwise stalls the gesture for seconds ("the trigger needs to wake up"). Setting the
+        // timeout on the system-wide element makes it the process-global default: a peer that
+        // can't answer in 0.5 s is dropped from that snapshot and picked up on the next one.
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.5)
+
+        // Opt out of App Nap for the process's lifetime. An LSUIElement accessory that is never
+        // frontmost is the textbook nap target: macOS demotes its threads and coalesces its timers
+        // exactly when other apps are busy — which starved the touch-frame consumer and both event
+        // taps ("slow after a break", "can't compete when the Mac is loaded"). The variant that
+        // still allows idle SYSTEM sleep is used, so the Mac's own sleep is unaffected.
+        appNapActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep],
+            reason: "Realtime trackpad gesture recognition"
+        )
 
         let coordinator = AppCoordinator()
         self.coordinator = coordinator

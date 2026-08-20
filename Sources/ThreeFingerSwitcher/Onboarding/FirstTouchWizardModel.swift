@@ -357,8 +357,10 @@ final class FirstTouchWizardModel: ObservableObject {
     /// and strip move as one body, demonstrating the exact gesture they invite.
     private func startAttract() {
         guard attractTimer == nil, !liveTouchActive else { return }
-        attractTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { _ in
-            Task { @MainActor in self.attractTick() }
+        // [weak self]: a strong capture would make the timer retain the model (and its demo
+        // SwitcherModel + thumbnails) past teardown if the timer is ever left running.
+        attractTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.attractTick() }
         }
     }
 

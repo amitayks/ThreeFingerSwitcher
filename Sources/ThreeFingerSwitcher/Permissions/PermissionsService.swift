@@ -65,12 +65,28 @@ final class PermissionsService: ObservableObject {
         pollCount += 1
         guard pollTimer == nil else { return }
         refresh()
-        pollTimer = pollTimerFactory(interval) { [weak self] in self?.refresh() }
+        pollTimer = pollTimerFactory(interval) { [weak self] in self?.pollTick() }
         activationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.refresh() }
         }
+    }
+
+    /// One poll tick. The (six cross-process TCC/XPC round-trips) refresh runs only while a regular
+    /// window is actually visible: the pollers are the wizard and the Hub Setup page, and SwiftUI's
+    /// `.onDisappear` never fires when their RETAINED window is closed directly (the postmortem's
+    /// guardrail) — a stranded unbalanced `startPolling()` would otherwise tax the main thread with
+    /// permission probes once a second for the rest of the process. Overlay panels are excluded on
+    /// purpose: gesture surfaces poll nothing, and the switcher being open must not re-enable a
+    /// stranded poll. The `didBecomeActive` refresh still covers returning from System Settings.
+    private func pollTick() {
+        // `NSApp` is nil under `swift test` (no NSApplication is ever created there) — poll
+        // unconditionally in that case so the timer's contract stays testable.
+        if let app = NSApp, !app.windows.contains(where: { $0.isVisible && !($0 is NSPanel) }) {
+            return
+        }
+        refresh()
     }
 
     func stopPolling() {

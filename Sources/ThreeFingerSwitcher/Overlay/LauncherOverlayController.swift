@@ -14,6 +14,13 @@ final class LauncherOverlayController {
     /// Called when a RIGHT step pins/unpins the selected clipboard entry. Wired to `ClipboardStore`.
     var onTogglePin: ((LaunchItem) -> Void)?
     private var panel: SwitcherPanel?
+    /// The ONE SwiftUI hosting view, reused across panels. The panel is destroyed per-hide (the
+    /// ghost-on-Space-switch fix — see `hide()`), but rebuilding the hosting view with it meant a
+    /// full SwiftUI graph construction on the main thread at trigger time on EVERY launcher open,
+    /// and left each dead graph's `model` subscription to die with its panel — which any stray
+    /// AppKit retention (in-flight animation, autorelease) turned into a permanent extra observer
+    /// fanning out per gesture tick. One graph, one subscription, for the process lifetime.
+    private var hosting: NSHostingView<LauncherView>?
     private var bands: [ContextBand] = []
     private var dwell: Double = 0.5
     /// Shared with the wizard's hold-to-continue (Overlay/DwellArmDriver.swift) so the taught
@@ -118,7 +125,10 @@ final class LauncherOverlayController {
         // Space you switch to (verified: a Space-switch action left the launcher visible on the
         // destination even though isVisible was already false). Closing the window removes it from the
         // WindowServer entirely; `show()` recreates it fresh on the current Space.
+        // The hosting view is detached FIRST so the reusable SwiftUI graph deterministically survives
+        // the window's death (see `hosting`).
         panel?.orderOut(nil)
+        panel?.contentView = nil
         panel?.close()
         panel = nil
     }
@@ -238,7 +248,11 @@ final class LauncherOverlayController {
         panel.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle]
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
-        panel.contentView = NSHostingView(rootView: LauncherView(model: model))
+        // Reuse the one SwiftUI graph across panel rebuilds (see `hosting`): the panel is disposable
+        // (Space-binding), the graph is not (construction cost + model subscription).
+        let hosting = self.hosting ?? NSHostingView(rootView: LauncherView(model: model))
+        self.hosting = hosting
+        panel.contentView = hosting
         return panel
     }
 

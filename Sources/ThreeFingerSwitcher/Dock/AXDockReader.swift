@@ -98,9 +98,13 @@ final class AXDockReader: DockReader {
                       width: rect.width, height: rect.height)
     }
 
+    /// One reused defaults handle — constructing a `UserDefaults(suiteName:)` per read is real
+    /// per-call cost on a path invoked at cursor rates. The handle still reads live values.
+    private static let dockDefaults = UserDefaults(suiteName: "com.apple.dock")
+
     /// The Dock's orientation, read from the `com.apple.dock` defaults (`bottom`/`left`/`right`).
     static func orientation() -> DockOrientation {
-        switch UserDefaults(suiteName: "com.apple.dock")?.string(forKey: "orientation") {
+        switch dockDefaults?.string(forKey: "orientation") {
         case "left": return .left
         case "right": return .right
         default: return .bottom

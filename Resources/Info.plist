@@ -23,6 +23,12 @@
     <!-- Menu-bar agent: no Dock icon, no main window. -->
     <key>LSUIElement</key>
     <true/>
+    <!-- Never App-Nap this process: a never-frontmost accessory is the textbook nap target, and
+         napping demotes the touch-frame consumer + event taps exactly when other apps are busy
+         (gesture latency "waking up"). Belt-and-suspenders with the beginActivity assertion in
+         AppDelegate; neither prevents system idle sleep. -->
+    <key>NSAppSleepDisabled</key>
+    <true/>
     <key>NSHumanReadableCopyright</key>
     <string>GPL-3.0. See LICENSE.</string>
     <!-- Shown if macOS ever prompts for Input Monitoring on the multitouch read. -->
