@@ -103,17 +103,25 @@ final class TouchEngine {
         isListening = true
         resetMotion()
 
+        // Generation-tagged: `stop()` cancels the task, but a task parked in `next()` with no
+        // fingers down only observes cancellation once a frame arrives. If the shared stream's side
+        // ever outlived that cancellation, a stale consumer would feed the engine alongside the new
+        // one — the app-layer twin of the framework's orphaned-device bug. The tag makes a stale
+        // side inert the moment it wakes, whatever the stream does.
+        consumerGeneration &+= 1
+        let generation = consumerGeneration
         consumer = Task { @MainActor [weak self] in
-            guard let self else { return }
-            for await frame in manager.touchDataStream {
-                if Task.isCancelled { break }
+            for await frame in OMSManager.shared.touchDataStream {
+                guard let self, !Task.isCancelled, self.consumerGeneration == generation else { break }
                 self.process(frame)
             }
         }
     }
+    private var consumerGeneration = 0
 
     func stop() {
         guard isListening else { return }
+        consumerGeneration &+= 1   // retire the current consumer even before its cancellation lands
         consumer?.cancel()
         consumer = nil
         _ = manager.stopListening()

@@ -69,7 +69,15 @@ final class WindowService {
     private func seedElementCache(pid: pid_t) {
         guard pid != getpid(), AXIsProcessTrusted() else { return }
         for (wid, el) in currentSpaceElements(pid: pid) { elementCache[wid] = el }
+        // The cache is pruned to live windows only inside `snapshot()`; a long session that never
+        // opens the switcher (Dock previews / ⌘-Tab off) would otherwise accumulate an element for
+        // every window of every app ever activated. Past a generous ceiling, drop elements whose
+        // owning process is gone — `AXUIElementGetPid` is a local token read, no IPC.
+        guard elementCache.count > Self.elementCacheSoftCap else { return }
+        let running = Set(NSWorkspace.shared.runningApplications.map(\.processIdentifier))
+        elementCache = elementCache.filter { axPid($0.value).map(running.contains) ?? false }
     }
+    private static let elementCacheSoftCap = 512
 
     private struct CGMeta {
         let pid: pid_t
@@ -216,6 +224,7 @@ final class WindowService {
         // (ids are unique per window lifetime, so a stale id can never mis-rank a new window).
         focus.evict(keepingLive: Set(spaceForWindow.keys))
         mru.evict(keepingLive: Set(appsByPid.keys))
+        bundleKeyByPid = bundleKeyByPid.filter { appsByPid[$0.key] != nil }
 
         let meta = metadata(for: Array(spaceForWindow.keys))
 
@@ -273,9 +282,9 @@ final class WindowService {
             // apart from a real window. Genuine off-Space windows — including Chromium reachable only
             // via a cached element (Bug A) — keep listing via `elementCache`. `isSwitchable` still
             // excludes minimized windows and non-standard subroles (dialogs/sheets).
-            guard let element, isSwitchable(element) else { continue }
+            guard let element, let facts = switchableFacts(element) else { continue }
 
-            let title = axString(element, kAXTitleAttribute as String)
+            let title = facts.candidate.title
                 ?? m.name
                 ?? (app.localizedName ?? "")
 
@@ -286,14 +295,14 @@ final class WindowService {
                 title: title,
                 appIcon: app.icon,
                 frame: m.bounds,
-                realFrame: axFrame(element),
+                realFrame: facts.frame,
                 axElement: element,
                 isOnCurrentSpace: onCurrent,
                 spaceID: placement.space,
                 spaceIndex: model.indexBySpace[placement.space] ?? Int.max,
                 // Only minimized windows that passed the relaxed gate reach here, so the flag is false unless
-                // the opt-in is on; gating the AX read keeps the default (setting-off) hot path unchanged.
-                isMinimized: settings.includeMinimizedWindows ? axBool(element, kAXMinimizedAttribute as String) : false
+                // the opt-in is on (the candidate read it for the verdict either way).
+                isMinimized: settings.includeMinimizedWindows ? facts.candidate.isMinimized : false
             )
             rows.append((info, focus.rank(wid), mru.rank(m.pid), onCurrent, model.indexBySpace[placement.space] ?? Int.max, placement.z))
         }
@@ -672,9 +681,8 @@ final class WindowService {
               let app = NSWorkspace.shared.frontmostApplication,
               app.processIdentifier != getpid() else { return nil }
         let appEl = AXUIElementCreateApplication(app.processIdentifier)
-        guard let focusedRef = axCopy(appEl, kAXFocusedWindowAttribute as String) else { return nil }
-        let el = focusedRef as! AXUIElement
-        guard let wid = axWindowID(el) else { return nil }
+        guard let el = axElement(appEl, kAXFocusedWindowAttribute as String),
+              let wid = axWindowID(el) else { return nil }
         return WindowInfo(
             id: wid, pid: app.processIdentifier, appName: app.localizedName ?? "",
             title: axString(el, kAXTitleAttribute as String) ?? "", appIcon: app.icon,
@@ -825,7 +833,7 @@ final class WindowService {
             return
         }
 
-        recover(window, attempt: attempt)
+        recover(window, attempt: attempt, token: token)
         scheduleWatchdog(window, token: token, attempt: attempt + 1)
     }
 
@@ -833,7 +841,7 @@ final class WindowService {
     /// Attempt 2: the "benign nudge" — bounce activation through our own agent for one runloop
     /// tick, then re-activate the target, re-seating the WindowServer's key arbitration without
     /// the user touching Mission Control.
-    private func recover(_ window: WindowInfo, attempt: Int) {
+    private func recover(_ window: WindowInfo, attempt: Int, token: UInt64) {
         if attempt == 0 {
             // Re-validate the wid against the re-resolved element so we don't poke a dead id.
             if let el = resolveElement(window), let liveWid = axWindowID(el), liveWid == window.id {
@@ -843,10 +851,13 @@ final class WindowService {
                 NSRunningApplication(processIdentifier: window.pid)?.activate()
             }
         } else {
-            // Benign nudge: activate ourselves for one tick, then re-activate the target.
+            // Benign nudge: activate ourselves for one tick, then re-activate the target. The hop is
+            // token-guarded like every other deferred step on this path: a NEWER commit landing in
+            // that one run-loop turn must not be stomped by the previous target's focus sequence.
             NSApp.activate(ignoringOtherApps: true)
             DispatchQueue.main.async { [weak self] in
-                self?.focusSequence(window, offSpaceHandshake: !window.isOnCurrentSpace)
+                guard let self, self.commitSeq == token else { return }
+                self.focusSequence(window, offSpaceHandshake: !window.isOnCurrentSpace)
             }
         }
     }
@@ -958,15 +969,35 @@ final class WindowService {
     /// `WindowFilter` (design D1). Size is the AX (real) size, so a Stage-Manager strip proxy —
     /// small in CGWindowList bounds but really large — is measured by its true size and not
     /// mistaken for a helper window.
-    private func candidate(for axWin: AXUIElement) -> WindowCandidate {
+    private func candidate(for axWin: AXUIElement, frame: CGRect? = nil) -> WindowCandidate {
         WindowCandidate(
             role: axString(axWin, kAXRoleAttribute as String),
             subrole: axString(axWin, kAXSubroleAttribute as String),
             title: axString(axWin, kAXTitleAttribute as String),
-            size: axFrame(axWin).size,
+            size: (frame ?? axFrame(axWin)).size,
             hasCloseButton: axCopy(axWin, kAXCloseButtonAttribute as String) != nil,
             isMinimized: axBool(axWin, kAXMinimizedAttribute as String)
         )
+    }
+
+    /// The snapshot's fused per-window read: ONE set of attribute round-trips yields both the
+    /// switchability verdict and the facts the listing needs (title, real frame, minimized). The
+    /// main loop used to re-read those three after `isSwitchable` had already fetched them — a
+    /// third of the blocking AX calls per window, inline in the gesture. Returns nil when the
+    /// window is not listed.
+    private func switchableFacts(_ axWin: AXUIElement) -> (candidate: WindowCandidate, frame: CGRect)? {
+        let frame = axFrame(axWin)
+        let cand = candidate(for: axWin, frame: frame)
+        guard WindowFilter.verdict(cand, policy: policy(for: axWin)) == .listed else { return nil }
+        return (cand, frame)
+    }
+
+    /// The filter policy for a window element: its owning app's rule, or the global policy when
+    /// the pid can't be read.
+    private func policy(for axWin: AXUIElement) -> WindowFilterPolicy {
+        axPid(axWin).map(policy(forPid:))
+            ?? WindowFilterPolicy(relaxed: settings.includeNonStandardWindows,
+                                  includeMinimized: settings.includeMinimizedWindows)
     }
 
     /// The per-app rule key: bundle ID, falling back to executable name (Qt/CLI-hosted apps like the
@@ -1012,10 +1043,7 @@ final class WindowService {
     /// `minimizeAllWindows()` skips already-minimized windows BEFORE this gate, so admitting
     /// minimized windows here never re-minimizes one.
     private func isSwitchable(_ axWin: AXUIElement) -> Bool {
-        let pol = axPid(axWin).map(policy(forPid:))
-            ?? WindowFilterPolicy(relaxed: settings.includeNonStandardWindows,
-                                  includeMinimized: settings.includeMinimizedWindows)
-        return WindowFilter.verdict(candidate(for: axWin), policy: pol) == .listed
+        WindowFilter.verdict(candidate(for: axWin), policy: policy(for: axWin)) == .listed
     }
 
     // MARK: - Window Inspector
@@ -1063,11 +1091,11 @@ final class WindowService {
     private func axFrame(_ axWin: AXUIElement) -> CGRect {
         var origin = CGPoint.zero
         var size = CGSize.zero
-        if let posValue = axCopy(axWin, kAXPositionAttribute as String) {
-            AXValueGetValue(posValue as! AXValue, .cgPoint, &origin)
+        if let posValue = axValue(axWin, kAXPositionAttribute as String) {
+            AXValueGetValue(posValue, .cgPoint, &origin)
         }
-        if let sizeValue = axCopy(axWin, kAXSizeAttribute as String) {
-            AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
+        if let sizeValue = axValue(axWin, kAXSizeAttribute as String) {
+            AXValueGetValue(sizeValue, .cgSize, &size)
         }
         return CGRect(origin: origin, size: size)
     }

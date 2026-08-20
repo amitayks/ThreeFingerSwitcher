@@ -18,6 +18,8 @@ struct SwitcherPage: View {
     /// from `docs/postmortem-idle-cpu-spin.md`; the old free-running driver stays deleted).
     @StateObject private var demo = HubSwitcherDemo()
     @State private var seeded = false
+    /// Coalesces the "Window size" slider's live re-solve (see the `onChange` below).
+    @State private var scaleDebounce: DispatchWorkItem?
     /// The base autoplay gesture — the teaching story, its open swipe scaled to the activation threshold.
     @State private var gesture: GesturePose.DemoGesture
     /// The hover-demo override pushed into the preview by the direction pickers: hovering the windows-axis
@@ -85,8 +87,16 @@ struct SwitcherPage: View {
                 )
                 .onAppear { seedIfNeeded() }
                 // Live window-size: dragging "Window size" grows/shrinks the preview cards in real time.
+                // Coalesced to ~16 updates/s: each update re-solves every Space's grid from scratch
+                // (binary searches over the packer) inside a fresh 0.25 s animation, and a 60 Hz drag
+                // otherwise stacked ~15 overlapping re-solves + retargeting animations per frame.
                 .onChange(of: settings.switcherWindowScale) { _, scale in
-                    demo.setMaxScale(SwitcherLayout.kMax * CGFloat(scale))
+                    scaleDebounce?.cancel()
+                    let work = DispatchWorkItem {
+                        MainActor.assumeIsolated { demo.setMaxScale(SwitcherLayout.kMax * CGFloat(scale)) }
+                    }
+                    scaleDebounce = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: work)
                 }
                 // The demo's opening swipe tracks the real activation distance as you tune it.
                 .onChange(of: settings.activationThreshold) { _, threshold in
@@ -846,7 +856,9 @@ struct LauncherActionMap: View {
         let detail: String
     }
 
-    private let steps: [Step] = [
+    // `static`: see SwitcherActionMap — stable identities, so re-renders update rows instead of
+    // rebuilding them.
+    private static let steps: [Step] = [
         Step(symbol: "hand.raised.fill", title: "Slide four fingers", detail: "Swipe sideways to open your launcher"),
         Step(symbol: "hand.point.up.left.fill", title: "Lift two fingers", detail: "Keep two fingers resting to navigate"),
         Step(symbol: "arrow.up.arrow.down", title: "Up / down", detail: "Move between bands"),
@@ -856,7 +868,7 @@ struct LauncherActionMap: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            ForEach(Array(steps.enumerated()), id: \.element.id) { index, step in
+            ForEach(Array(Self.steps.enumerated()), id: \.element.id) { index, step in
                 HStack(alignment: .center, spacing: 12) {
                     ZStack {
                         Circle().fill(Color.accentColor.opacity(0.16)).frame(width: 26, height: 26)

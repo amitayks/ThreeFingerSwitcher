@@ -67,11 +67,15 @@ private struct WizardDemoStrip: View {
                 .scaleEffect(model.liveTouchActive ? 0.845 : 0.82)
                 .frame(height: SwitcherLayout.panelHeight * 0.85)
                 .allowsHitTesting(false)
-                .background(
-                    BreathingGlowBackdrop()
-                        .opacity(model.liveTouchActive ? 1 : 0)
-                        .animation(.easeInOut(duration: 0.6), value: model.liveTouchActive)
-                )
+                .background {
+                    // Mounted only while active: at `.opacity(0)` the backdrop's 15 Hz TimelineView
+                    // kept ticking and re-drawing a blurred gradient nobody could see.
+                    if model.liveTouchActive {
+                        BreathingGlowBackdrop()
+                            .transition(.opacity)
+                    }
+                }
+                .animation(.easeInOut(duration: 0.6), value: model.liveTouchActive)
                 .animation(WizardMotion.arrival, value: model.liveTouchActive)
             if model.stage == .hand {
                 FingerDotsPad(dots: model.liveTouchActive ? model.fingerDots : model.ghostDots,

@@ -79,6 +79,9 @@ final class KeyboardSwitcherTap {
             MainActor.assumeIsolated { self?.reviveIfDisabled() }
         }
         watchdog?.tolerance = Self.watchdogInterval / 2   // cheap check; let the OS coalesce it
+        // `.common` so a revive isn't deferred for as long as a menu or drag keeps the run loop in a
+        // tracking mode (the tap source itself is already in `.commonModes`).
+        if let watchdog { RunLoop.main.add(watchdog, forMode: .common) }
         isRunning = true
         return true
     }

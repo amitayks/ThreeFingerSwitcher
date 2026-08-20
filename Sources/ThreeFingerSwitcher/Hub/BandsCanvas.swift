@@ -288,7 +288,7 @@ private struct AppBrowser: View {
                                                   kind: .app(bundleURL: app.url, strategy: nil)))
                             } label: {
                                 GridTile(title: app.name, subtitle: "App") {
-                                    Image(nsImage: NSWorkspace.shared.icon(forFile: app.url.path)).resizable()
+                                    Image(nsImage: IconCache.icon(forFile: app.url.path)).resizable()
                                         .frame(width: 44, height: 44)
                                 }
                             }
@@ -1611,11 +1611,11 @@ struct LaunchItemIconView: View {
             switch item.icon {
             case .appDefault:
                 if case let .app(url, _) = item.kind {
-                    Image(nsImage: NSWorkspace.shared.icon(forFile: url.path)).resizable()
+                    Image(nsImage: IconCache.icon(forFile: url.path)).resizable()
                 } else { symbol("app.dashed") }
             case .fileIcon:
                 if case let .path(url) = item.kind {
-                    Image(nsImage: NSWorkspace.shared.icon(forFile: url.path)).resizable()
+                    Image(nsImage: IconCache.icon(forFile: url.path)).resizable()
                 } else { symbol("doc") }
             case .sfSymbol(let n):
                 Image(systemName: n).resizable().scaledToFit()

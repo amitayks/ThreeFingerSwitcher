@@ -25,6 +25,16 @@ The app degrades over hours of use: CPU creeps up, switcher previews refresh slo
 - **Dock reads throttled.** The per-mouse-move full AX walk of Dock.app (60–125 Hz near any screen edge) is cached for 80 ms; the hover model still sees every cursor sample. The `com.apple.dock` defaults handle is reused. The window-snap monitor no longer installs the per-move monitor pair it never consumed.
 - **Launcher graph reused.** The launcher rebuilt its entire SwiftUI hosting view on EVERY open (main-thread graph construction at trigger time, plus a dead-graph subscription leak risk). The panel stays disposable (the ghost-on-Space-switch fix is untouched); the hosting view is now built once and re-parented.
 
+**Second sweep (five new lenses) — what the first pass missed:**
+
+- **A subprocess on the gesture path.** With Space-row switching on, every switcher open shelled out to `/usr/bin/defaults` on the main thread (30–100 ms, at the moment the overlay should appear). The open now reads the recognizer's cached gate.
+- **Per-copy main-thread cost.** The clipboard poll hashed the whole payload byte-by-byte and fully decoded every image just to label it; a 10 MB screenshot froze gestures ~100 ms per ⌘⇧4. Bounded sample hash + header-only dimensions.
+- **Standing 2 Hz taxes** (browser AX tree-walk, `cfprefsd` round-trips per raise/hover, LaunchServices lookups per cell per render in the launcher grid) are memoized or throttled.
+- **Two latent crashes** (`CGWindowID(windowNumber)` on the closed Hub — every commit after the Hub had been opened once; unguarded `as!` on cross-process Accessibility data) and **one system-wide stuck state** (a sleep with three fingers down left the scroll tap swallowing all scrolling in every app) are fixed.
+- **Deferred actions are tokened** (Space-settle poll, de-minimize raise, focus recovery, MC-dismiss commit, new-window single-flight), **ownership edges closed** (generation-tagged touch consumer, held observer tokens, `deinit` removals), and the **Swift 6 isolation warnings** in `KeepAwakeController` / `CursorMonitor` are resolved at the root.
+
+Full itemized list in `tasks.md` §3.
+
 ## Capabilities
 
 ### Modified Capabilities

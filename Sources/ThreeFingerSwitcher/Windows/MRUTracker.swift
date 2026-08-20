@@ -34,6 +34,10 @@ final class MRUTracker {
         observer = nil
     }
 
+    deinit {
+        if let observer { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+    }
+
     func promote(_ pid: pid_t) {
         order.removeAll { $0 == pid }
         order.insert(pid, at: 0)

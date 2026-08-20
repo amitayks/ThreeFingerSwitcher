@@ -360,7 +360,8 @@ final class FirstTouchWizardModel: ObservableObject {
         // [weak self]: a strong capture would make the timer retain the model (and its demo
         // SwitcherModel + thumbnails) past teardown if the timer is ever left running.
         attractTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.attractTick() }
+            // The timer fires on the main run loop; assumeIsolated avoids allocating a Task 30×/s.
+            MainActor.assumeIsolated { self?.attractTick() }
         }
     }
 

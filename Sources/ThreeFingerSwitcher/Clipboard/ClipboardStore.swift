@@ -19,13 +19,13 @@ final class ClipboardStore {
         static let `default` = Retention(maxCount: 200, maxBytes: 256 * 1024 * 1024, maxAge: 0)
     }
 
-    static let currentSchemaVersion = 1
+    nonisolated static let currentSchemaVersion = 1
     /// Inline payloads larger than this are externalized to a blob file on save.
-    private static let blobThreshold = 16 * 1024
+    nonisolated private static let blobThreshold = 16 * 1024
     /// Upper bound on the bytes a **band** item carries for its value preview. Textual payloads are
     /// truncated to this at band-build time so the band never holds (or renders) a large payload; the
     /// full content is materialized on demand for paste. Small payloads (≤ this) pass through whole.
-    static let previewByteCap = 16 * 1024
+    nonisolated static let previewByteCap = 16 * 1024
 
     private let directory: URL
     private var blobsDir: URL { directory.appendingPathComponent("blobs", isDirectory: true) }
@@ -75,8 +75,20 @@ final class ClipboardStore {
     /// selected preview / paste (`materializedEntry(id:)`). Use this for the launcher band; use
     /// `recentWindow` where full bytes are needed.
     func bandWindow(limit: Int) -> [ClipboardEntry] {
-        Self.recentWindow(entries, limit: limit).map(boundedForBand)
+        Self.recentWindow(entries, limit: limit).map { entry in
+            if let memo = boundedCache[entry.id] { return memo }
+            let bounded = boundedForBand(entry)
+            boundedCache[entry.id] = bounded
+            return bounded
+        }
     }
+
+    /// `boundedForBand` results memoized per entry. Entries loaded from disk hold `.blob` references,
+    /// so building the band after a relaunch did one `open`+`read` per large entry — synchronously, on
+    /// the main thread, at launcher-gesture activation. An entry's payload never changes after insert,
+    /// so the memo is invalidated only where its OTHER fields can change (recency refresh on a
+    /// duplicate copy, pin toggle) and pruned to live ids on insert.
+    private var boundedCache: [UUID: ClipboardEntry] = [:]
 
     /// The single, fully-materialized entry for `id` (all blob payloads resolved to inline), or nil if the
     /// id is unknown (e.g. evicted/cleared). On-demand full fetch for the paste path and the image preview,
@@ -101,6 +113,12 @@ final class ClipboardStore {
     func insert(_ entry: ClipboardEntry) {
         entries = Self.dedup(inserting: entry, into: entries)
         entries = Self.evict(entries, retention: retention, now: entry.capturedAt)
+        let live = Set(entries.map(\.id))
+        boundedCache = boundedCache.filter { live.contains($0.key) }
+        // A duplicate copy refreshed an existing entry's recency under its old id — drop that memo.
+        if let refreshed = entries.first(where: { $0.fingerprint == entry.fingerprint }) {
+            boundedCache[refreshed.id] = nil
+        }
         save()
     }
 
@@ -111,6 +129,7 @@ final class ClipboardStore {
     func togglePin(id: UUID) -> Bool? {
         guard let i = entries.firstIndex(where: { $0.id == id }) else { return nil }
         entries[i].pinned.toggle()
+        boundedCache[id] = nil
         save()
         return entries[i].pinned
     }
@@ -118,6 +137,7 @@ final class ClipboardStore {
     /// Clear history. By default keeps pinned entries; pass `includingPinned: true` to wipe everything.
     func clear(includingPinned: Bool = false) {
         entries = includingPinned ? [] : entries.filter(\.pinned)
+        boundedCache.removeAll()
         save()
     }
 
@@ -207,17 +227,52 @@ final class ClipboardStore {
     /// termination). The in-memory `entries` are always inline, so a concurrent bounded band read never
     /// races a blob write (only new, content-hashed blobs are written, and only once).
     private func save() {
-        let snapshot = entries
+        // Coalesce: while a drain is queued but hasn't run, a newer save only replaces the snapshot
+        // it will write. A burst of copies behind one slow multi-MB blob write previously parked N
+        // full copies of the store on the queue — transient memory that scaled with copy rate × store
+        // size. `flush()`'s `ioQueue.sync {}` still waits for the queued drain, so durability holds.
+        guard pendingSave.put(entries) else { return }
         let blobs = blobsDir
         let index = indexURL
+        let box = pendingSave
         ioQueue.async {
+            guard let snapshot = box.take() else { return }
             Self.persist(snapshot, schemaVersion: Self.currentSchemaVersion, blobsDir: blobs, indexURL: index)
         }
     }
 
+    /// Latest-wins handoff between the actor (`put`, on every save) and `ioQueue` (`take`, once per
+    /// queued drain). Lock-protected: the two sides run on different threads by design.
+    private final class PendingSave: @unchecked Sendable {
+        private let lock = NSLock()
+        private var latest: [ClipboardEntry]?
+        /// Stores the snapshot; returns true when no drain is queued yet (the caller must enqueue one).
+        func put(_ snapshot: [ClipboardEntry]) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            let needsDrain = latest == nil
+            latest = snapshot
+            return needsDrain
+        }
+        func take() -> [ClipboardEntry]? {
+            lock.lock(); defer { lock.unlock() }
+            let snapshot = latest
+            latest = nil
+            return snapshot
+        }
+    }
+    private let pendingSave = PendingSave()
+
     /// Block until all queued persistence has been written. For deterministic durability where async would
     /// race a subsequent read (a test that reloads the store, or an app-termination flush).
     func flush() { ioQueue.sync {} }
+
+    /// Bounded flush for app termination: wait for the queued drain, but never block quit longer than
+    /// `timeout` behind a multi-megabyte blob write (`flush()`'s unbounded `sync` is for tests).
+    func flush(timeout: TimeInterval) {
+        let done = DispatchSemaphore(value: 0)
+        ioQueue.async { done.signal() }
+        _ = done.wait(timeout: .now() + timeout)
+    }
 
     /// The disk half of `save`, run on `ioQueue`. `nonisolated static` so it touches no actor state — every
     /// input (the entries snapshot, the directory URLs) is passed in, keeping it safe to run off-main.
@@ -231,7 +286,25 @@ final class ClipboardStore {
         try? data.write(to: indexURL, options: .atomic)
         // Prune against the names the just-written index references.
         pruneOrphanBlobs(keeping: referencedBlobs(externalized), blobsDir: blobsDir)
+        // Keep the name memo bounded to entries that still exist.
+        let live = Set(entries.map(\.id.uuidString))
+        blobNames.names = blobNames.names.filter { live.contains($0.key.entryID) }
     }
+
+    /// Blob names memoized per (entry id, UTI). The content hash behind a name walks the FULL
+    /// payload byte by byte, and `persist` re-externalizes EVERY entry on EVERY copy (the in-memory
+    /// entries stay inline), so without the memo a history holding a few large images re-hashed tens
+    /// of megabytes per copy — CPU that grew with the store for the whole session. An entry's payload
+    /// never changes after insert (dedup re-inserts under a NEW id), so the memo can't go stale.
+    /// Touched only on the serial `ioQueue`, hence the unchecked conformance.
+    private final class BlobNameCache: @unchecked Sendable {
+        var names: [BlobKey: String] = [:]
+    }
+    private struct BlobKey: Hashable {
+        let entryID: String
+        let uti: String
+    }
+    nonisolated private static let blobNames = BlobNameCache()
 
     nonisolated private static func referencedBlobs(_ entries: [ClipboardEntry]) -> Set<String> {
         Set(entries.flatMap { entry in
@@ -245,20 +318,29 @@ final class ClipboardStore {
     /// Small payloads stay inline. Deterministic blob names (by content) make re-saves idempotent.
     nonisolated private static func externalizedForStorage(_ entry: ClipboardEntry, blobsDir: URL) -> ClipboardEntry {
         var e = entry
-        e.representations = entry.representations.mapValues { payload in
+        var reps: [String: ClipboardPayload] = [:]
+        for (uti, payload) in entry.representations {
             switch payload {
             case .blob:
-                return payload   // already external
+                reps[uti] = payload   // already external
             case .inline(let data):
-                guard data.count > blobThreshold else { return payload }
-                let name = "\(entry.id.uuidString)-\(stableName(for: data)).bin"
+                guard data.count > blobThreshold else { reps[uti] = payload; continue }
+                let key = BlobKey(entryID: entry.id.uuidString, uti: uti)
+                let name: String
+                if let memo = blobNames.names[key] {
+                    name = memo
+                } else {
+                    name = "\(entry.id.uuidString)-\(stableName(for: data)).bin"
+                    blobNames.names[key] = name
+                }
                 let url = blobsDir.appendingPathComponent(name)
                 if !FileManager.default.fileExists(atPath: url.path) {
                     try? data.write(to: url, options: .atomic)
                 }
-                return .blob(name)
+                reps[uti] = .blob(name)
             }
         }
+        e.representations = reps
         return e
     }
 
@@ -368,11 +450,15 @@ final class ClipboardStore {
     }
 
     nonisolated private static func stableName(for data: Data) -> String {
-        // Cheap, dependency-free content hash (FNV-1a 64-bit) for a deterministic blob filename.
+        // Cheap, dependency-free content hash (FNV-1a 64-bit) for a deterministic blob filename. Over
+        // the raw buffer, not `Data`'s generic iterator (which costs several ns per byte) — this is
+        // the full payload, since a blob NAME must be unique per content.
         var hash: UInt64 = 0xcbf29ce484222325
-        for byte in data {
-            hash ^= UInt64(byte)
-            hash = hash &* 0x100000001b3
+        data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+            for byte in buf {
+                hash ^= UInt64(byte)
+                hash = hash &* 0x100000001b3
+            }
         }
         return String(hash, radix: 16)
     }

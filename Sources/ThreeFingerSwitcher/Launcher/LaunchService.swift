@@ -228,8 +228,10 @@ final class LaunchService {
         var writes = pasteboardWrites(for: entry)
         writes = expandImageFormats(writes)            // offer both PNG + TIFF for broad image paste
         appendColorTextFallback(&writes, entry: entry) // hex text for a copied color
-        pasteboard.clearContents()
+        // Nothing to write (e.g. the entry's blob was pruned between band build and fire) must NOT
+        // wipe the user's current clipboard — clear only once there is content to replace it with.
         guard !writes.isEmpty else { return false }
+        pasteboard.clearContents()
         let pbItem = NSPasteboardItem()
         for write in writes {
             pbItem.setData(write.data, forType: NSPasteboard.PasteboardType(write.uti))
@@ -420,10 +422,14 @@ final class LaunchService {
     }
 
     private func emptyTrash() {
-        let fm = FileManager.default
-        guard let trash = try? fm.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: nil, create: false),
-              let items = try? fm.contentsOfDirectory(at: trash, includingPropertiesForKeys: nil) else { return }
-        for item in items { try? fm.removeItem(at: item) }
+        // Off the main thread: a large Trash (thousands of items) took seconds to unlink, freezing
+        // the app — gestures included — right after the launcher dismissed. Nothing is reported back.
+        DispatchQueue.global(qos: .utility).async {
+            let fm = FileManager.default
+            guard let trash = try? fm.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: nil, create: false),
+                  let items = try? fm.contentsOfDirectory(at: trash, includingPropertiesForKeys: nil) else { return }
+            for item in items { try? fm.removeItem(at: item) }
+        }
     }
 
     // MARK: - URL / link opening
@@ -436,15 +442,21 @@ final class LaunchService {
     private func openURL(_ url: URL, handler: URL?, newWindow: Bool) {
         if newWindow, let appName = Self.handlerAppName(handler: handler, for: url) {
             let script = Self.newWindowScript(url: url, appName: appName)
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-                p.arguments = ["-e", script]
-                let started = (try? p.run()) != nil
-                if started { p.waitUntilExit() }
-                if !started || p.terminationStatus != 0 {
-                    DispatchQueue.main.async { self?.plainOpen(url, handler: handler) }
+            // Completion via `terminationHandler` (see `run`): an `osascript` blocked on a pending
+            // Automation prompt otherwise held a global-queue thread for as long as the prompt sat.
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            p.arguments = ["-e", script]
+            p.terminationHandler = { [weak self] finished in
+                Task { @MainActor in
+                    self?.runningProcesses.remove(finished)
+                    if finished.terminationStatus != 0 { self?.plainOpen(url, handler: handler) }
                 }
+            }
+            if (try? p.run()) != nil {
+                runningProcesses.insert(p)
+            } else {
+                plainOpen(url, handler: handler)
             }
             return
         }
@@ -709,6 +721,10 @@ final class LaunchService {
     /// lands on the current Space), falling back to a synthesized ⌘N if the item can't be pressed.
     private func makeNewWindow(for app: NSRunningApplication) {
         let pid = app.processIdentifier
+        // One in-flight new-window request per app: a double-lift on the dwell-arm (two fires
+        // within the deferral) otherwise pressed New Window twice and opened two windows.
+        guard !pendingNewWindowPids.contains(pid) else { return }
+        pendingNewWindowPids.insert(pid)
         // Do NOT activate first. Activating fronts the app's existing window and, if it lives on
         // another Space, teleports the user there before the new window even exists. Triggering the
         // new window while we stay put makes it appear on the CURRENT Space (AX menu-press and ⌘N
@@ -719,10 +735,13 @@ final class LaunchService {
         // The new window is being created on the current Space; bring the app forward to it once it
         // exists. Deferred so we never activate while the only window is still off-Space.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            guard let self else { return }
+            self.pendingNewWindowPids.remove(pid)
             app.activate(options: [])
-            self?.raiseFrontWindow(pid: pid)
+            self.raiseFrontWindow(pid: pid)
         }
     }
+    private var pendingNewWindowPids: Set<pid_t> = []
 
     /// Focus a single-window app's existing window. If a window is already on the current Space we
     /// focus it locally (no teleport). If it lives only off-Space, macOS won't let an unprivileged app
@@ -759,13 +778,20 @@ final class LaunchService {
     /// become the active one after the reopen activates the app. An app that responds to neither needs
     /// the explicit `.quitAndReopenHere` strategy.
     private func reopenWindowlessApp(_ app: NSRunningApplication, bundleURL: URL) {
-        launch(bundleURL: bundleURL, newInstance: false)
         let pid = app.processIdentifier
+        // Same single-flight rule as `makeNewWindow`: two rapid fires on a windowless app must not
+        // both see "still no window" at +0.5 s and escalate to two New Window presses.
+        guard !pendingReopenPids.contains(pid) else { return }
+        pendingReopenPids.insert(pid)
+        launch(bundleURL: bundleURL, newInstance: false)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self, self.windowCount(pid: pid) == 0 else { return }
+            guard let self else { return }
+            self.pendingReopenPids.remove(pid)
+            guard self.windowCount(pid: pid) == 0 else { return }
             self.makeNewWindow(for: app)
         }
     }
+    private var pendingReopenPids: Set<pid_t> = []
 
     /// Number of the app's AX windows (across all Spaces) — used to tell whether a reopen actually
     /// produced a window before escalating to a new-window command.
@@ -839,25 +865,31 @@ final class LaunchService {
         }
     }
 
-    /// Run a process off the main thread and report success/failure when it exits.
+    /// Run a process and report success/failure when it exits. Completion arrives via
+    /// `terminationHandler` — NOT `waitUntilExit()` on a global queue, which parked one GCD worker
+    /// thread per running script for its whole lifetime (a hung script held it forever, and enough
+    /// of them starved every other global-queue user in the process).
     private func run(executable: String, args: [String], title: String) {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: executable)
-            process.arguments = args
-            var ok = false
-            var message = ""
-            do {
-                try process.run()
-                process.waitUntilExit()
-                ok = process.terminationStatus == 0
-                if !ok { message = "Exited with status \(process.terminationStatus)." }
-            } catch {
-                message = error.localizedDescription
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = args
+        process.terminationHandler = { [weak self] finished in
+            let ok = finished.terminationStatus == 0
+            let message = ok ? "Done." : "Exited with status \(finished.terminationStatus)."
+            Task { @MainActor in
+                self?.runningProcesses.remove(finished)
+                self?.notify(title: title, body: message, success: ok)
             }
-            Task { @MainActor in self?.notify(title: title, body: ok ? "Done." : message, success: ok) }
+        }
+        do {
+            try process.run()   // spawn only; returns immediately
+            runningProcesses.insert(process)
+        } catch {
+            notify(title: title, body: error.localizedDescription, success: false)
         }
     }
+    /// Keeps spawned processes alive until their termination handler fires.
+    private var runningProcesses: Set<Process> = []
 
     // MARK: - Accessibility: menu-bar new-window
 
@@ -884,8 +916,8 @@ final class LaunchService {
     /// Walk the app's menu bar for a File-menu item whose title matches a new-window candidate.
     private func findNewWindowItem(pid: pid_t) -> AXUIElement? {
         let appEl = AXUIElementCreateApplication(pid)
-        guard let menuBar = axCopy(appEl, kAXMenuBarAttribute as String),
-              let topItems = axChildren(menuBar as! AXUIElement) else { return nil }
+        guard let menuBar = axElement(appEl, kAXMenuBarAttribute as String),
+              let topItems = axChildren(menuBar) else { return nil }
         for top in topItems {
             // The File menu's single child is the AXMenu holding the items.
             guard let submenus = axChildren(top), let menu = submenus.first,

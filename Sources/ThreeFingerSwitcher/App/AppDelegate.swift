@@ -103,6 +103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Force-stop Keep Awake FIRST (synchronous) so a dimmed-to-black screen is restored and the
         // sleep/lock assertion released before the process exits. Idempotent — a no-op when inactive.
         coordinator?.stopKeepAwake()
+        coordinator?.flushStores()
         coordinator?.restoreSpacesRearrangeOnQuit()
         // NOTE: the vertical-gesture relocation is deliberately NOT restored on quit. It needs a
         // re-login to take effect, and logout quits the app — restoring here would undo the change

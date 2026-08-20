@@ -17,10 +17,10 @@ extension Color {
 struct LauncherView: View {
     @ObservedObject var model: LauncherModel
 
-    private var columns: [GridItem] {
+    private static let columns: [GridItem] =
         Array(repeating: GridItem(.fixed(LauncherGridLayout.cellWidth), spacing: LauncherGridLayout.spacing),
               count: LauncherGridLayout.columns)
-    }
+    private var columns: [GridItem] { Self.columns }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -119,8 +119,14 @@ struct LauncherView: View {
                 }
                 .padding(.top, LauncherGridLayout.gridTopInset)
             }
-            .onChange(of: model.selectedIndex) { scroll(proxy) }
-            .onChange(of: model.focus) { scroll(proxy) }
+            .onChange(of: model.selectedIndex) { old, new in
+                // Animate only when the step crosses a ROW: a within-row step every 30–60 ms
+                // otherwise starts a new 160 ms scroll animation before the previous one ends,
+                // stacking 3–5 in-flight animations (each re-measuring the grid) for the whole scrub.
+                let cols = LauncherGridLayout.columns
+                scroll(proxy, animated: old / cols != new / cols)
+            }
+            .onChange(of: model.focus) { scroll(proxy, animated: true) }
             .onChange(of: model.currentBand) { proxy.scrollTo(scrollTarget, anchor: .top) }
         }
     }
@@ -130,9 +136,13 @@ struct LauncherView: View {
         return model.items[model.selectedIndex].id
     }
 
-    private func scroll(_ proxy: ScrollViewProxy) {
+    private func scroll(_ proxy: ScrollViewProxy, animated: Bool) {
         guard let target = scrollTarget else { return }
-        withAnimation(.easeInOut(duration: 0.16)) { proxy.scrollTo(target, anchor: .center) }
+        if animated {
+            withAnimation(.easeInOut(duration: 0.16)) { proxy.scrollTo(target, anchor: .center) }
+        } else {
+            proxy.scrollTo(target, anchor: .center)
+        }
     }
 
     @ViewBuilder
@@ -202,19 +212,25 @@ struct LauncherView: View {
         }
     }
 
+    // Memoized (IconCache): this runs per cell per render, at gesture rate — see IconCache's doc.
     private func appIcon(for item: LaunchItem) -> NSImage {
         if case let .app(bundleURL, _) = item.kind {
-            return NSWorkspace.shared.icon(forFile: bundleURL.path)
+            return IconCache.icon(forFile: bundleURL.path)
         }
-        return NSImage(systemSymbolName: "app.dashed", accessibilityDescription: nil) ?? NSImage()
+        return Self.placeholderAppIcon
     }
 
     private func fileIcon(for item: LaunchItem) -> NSImage {
         if case let .path(url) = item.kind {
-            return NSWorkspace.shared.icon(forFile: url.path)
+            return IconCache.icon(forFile: url.path)
         }
-        return NSImage(systemSymbolName: "folder", accessibilityDescription: nil) ?? NSImage()
+        return Self.placeholderFolderIcon
     }
+
+    private static let placeholderAppIcon =
+        NSImage(systemSymbolName: "app.dashed", accessibilityDescription: nil) ?? NSImage()
+    private static let placeholderFolderIcon =
+        NSImage(systemSymbolName: "folder", accessibilityDescription: nil) ?? NSImage()
 }
 
 /// The single selection highlight: a Liquid Glass rounded square that starts nearly transparent and

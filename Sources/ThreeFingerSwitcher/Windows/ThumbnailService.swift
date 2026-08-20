@@ -95,9 +95,10 @@ final class ThumbnailService {
         guard !targets.isEmpty else { return }
         sweepGeneration += 1
         let generation = sweepGeneration
-        sweepTask = Task {
-            await self.refreshBatch(targets)
-            if self.sweepGeneration == generation { self.sweepTask = nil }
+        sweepTask = Task { [weak self] in
+            await self?.refreshBatch(targets)
+            guard let self, self.sweepGeneration == generation else { return }
+            self.sweepTask = nil
         }
     }
 
@@ -356,7 +357,11 @@ final class ThumbnailService {
     static func captureDimensions(windowSize: CGSize, backingScale: CGFloat, cap: CGSize) -> (width: Int, height: Int) {
         let nativeW = max(windowSize.width * backingScale, 1)
         let nativeH = max(windowSize.height * backingScale, 1)
+        // `Swift.max(NaN, 1)` is NaN, and `Int(NaN)` / `Int(inf)` TRAP — a degenerate SCWindow
+        // frame (zero-size, or a compositor glitch) must yield a 1×1 capture, not a crash.
+        guard nativeW.isFinite, nativeH.isFinite, nativeW > 0, nativeH > 0 else { return (1, 1) }
         let fit = min(cap.width / nativeW, cap.height / nativeH, 1)
+        guard fit.isFinite, fit > 0 else { return (1, 1) }
         return (max(Int(nativeW * fit), 1), max(Int(nativeH * fit), 1))
     }
 

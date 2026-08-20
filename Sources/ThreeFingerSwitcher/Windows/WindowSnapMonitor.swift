@@ -102,6 +102,7 @@ final class WindowSnapMonitor {
     }
 
     private func schedule(after delay: TimeInterval, _ body: @escaping @MainActor () -> Void) {
+        settleWork?.cancel()   // one pending settle read at a time — a superseded one must never fire
         let work = DispatchWorkItem { MainActor.assumeIsolated { body() } }
         settleWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
@@ -183,14 +184,21 @@ final class WindowSnapMonitor {
         return (hit.id, hit.frame)
     }
 
-    /// The window's current frame, re-read through the SAME on-screen enumeration the hit-test uses
-    /// (one option set, one coordinate space). Deliberately NOT `CGWindowListCreateDescriptionFromArray`:
-    /// that legacy API expects each array element to be the raw window ID cast directly into the
-    /// pointer slot — `[id] as CFArray` bridges to CFNumbers, which it silently fails to unbox,
-    /// returning nil for EVERY window (the documented landmine `WindowService.windowIDArray` exists
-    /// to avoid; here the enumeration is simpler than the pointer-cast dance).
+    /// The window's current frame via a single-id `CGWindowList` query (same `kCGWindowBounds`
+    /// coordinate space as the hit-test enumeration). This runs on EVERY global mouse-up while window
+    /// groups are on; re-running the full on-screen enumeration here doubled the per-click cost.
+    /// Deliberately NOT `CGWindowListCreateDescriptionFromArray`: that legacy API expects each array
+    /// element to be the raw window ID cast directly into the pointer slot — `[id] as CFArray` bridges
+    /// to CFNumbers, which it silently fails to unbox (the documented `WindowService.windowIDArray`
+    /// landmine). `.optionIncludingWindow` takes the id directly.
     private static func frame(of id: CGWindowID) -> CGRect? {
-        onScreenWindows().first { $0.id == id }?.frame
+        guard let list = CGWindowListCopyWindowInfo([.optionIncludingWindow], id) as? [[String: Any]],
+              let info = list.first,
+              let boundsDict = info[kCGWindowBounds as String] as? [String: Any],
+              let bounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) else {
+            return nil
+        }
+        return bounds
     }
 
     private static func changed(_ a: CGRect, _ b: CGRect) -> Bool {

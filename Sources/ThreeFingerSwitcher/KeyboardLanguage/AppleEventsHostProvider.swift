@@ -66,7 +66,16 @@ final class AppleEventsHostProvider: HostProvider {
     /// tab vocabulary differs by family: Chromium says "active tab", Safari says "current tab".
     private static func source(bundleID: String, family: BrowserFamily) -> String {
         let tab = (family == .safari) ? "current tab" : "active tab"
-        return "tell application id \"\(bundleID)\" to return URL of \(tab) of front window"
+        // `with timeout`: AppleScript's DEFAULT reply timeout is two minutes, and this executes
+        // synchronously on the main thread from a 0.5 s poll — a browser whose main thread is busy
+        // (heavy page, modal, beachball) would otherwise freeze the whole app, gestures included, for
+        // up to that long. One second is far beyond a responsive browser's reply and still bounded;
+        // a timed-out read returns nil → the caller falls back to the Accessibility reader.
+        return """
+        with timeout of 1 second
+            tell application id "\(bundleID)" to return URL of \(tab) of front window
+        end timeout
+        """
     }
 
     // MARK: - Parsing

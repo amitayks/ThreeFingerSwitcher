@@ -165,26 +165,36 @@ struct HubExcludedAppsEditor: View {
                 }
             }
             Menu("Add app…") {
-                ForEach(runningApps(), id: \.bundleID) { app in
+                ForEach(apps, id: \.bundleID) { app in
                     Button(app.name) {
                         if !excluded.contains(app.bundleID) { excluded.append(app.bundleID) }
                     }
                 }
             }
         }
+        // Enumerate once per appearance, not per render: this editor lives on a page with four
+        // sliders bound to AppSettings, so `body` re-ran (and re-walked + ICU-sorted every running
+        // app, plus a LaunchServices name lookup per excluded row) on every slider tick.
+        .onAppear { refreshApps() }
     }
 
-    private func displayName(_ bundleID: String) -> String {
-        NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first?.localizedName ?? bundleID
-    }
+    @State private var apps: [(bundleID: String, name: String)] = []
+    @State private var names: [String: String] = [:]
 
-    private func runningApps() -> [(bundleID: String, name: String)] {
-        NSWorkspace.shared.runningApplications
+    private func refreshApps() {
+        apps = NSWorkspace.shared.runningApplications
             .filter { $0.activationPolicy == .regular }
             .compactMap { app in
                 guard let id = app.bundleIdentifier else { return nil }
                 return (id, app.localizedName ?? id)
             }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        names = Dictionary(apps.map { ($0.bundleID, $0.name) }, uniquingKeysWith: { a, _ in a })
+    }
+
+    private func displayName(_ bundleID: String) -> String {
+        names[bundleID]
+            ?? NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first?.localizedName
+            ?? bundleID
     }
 }

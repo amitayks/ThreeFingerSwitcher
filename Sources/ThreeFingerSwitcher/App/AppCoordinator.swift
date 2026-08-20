@@ -135,11 +135,23 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     /// an app switch (which emits no `didActivateApplication`). Gated on BOTH the master keyboard-language
     /// toggle AND the per-site sub-toggle; fully inert otherwise.
     private lazy var keyboardLanguageBrowserMonitor = BrowserContextMonitor(
-        isSupportedBrowserFront: {
-            BrowserRegistry.isSupported(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "")
+        isSupportedBrowserFront: { [weak self] in
+            guard let front = NSWorkspace.shared.frontmostApplication else { return false }
+            // `NSRunningApplication.bundleIdentifier` is a LaunchServices round-trip, and this runs
+            // on every 0.5 s poll tick for as long as a browser is front — memoize it per pid.
+            let pid = front.processIdentifier
+            if let cached = self?.browserFrontByPid, cached.pid == pid { return cached.supported }
+            let supported = BrowserRegistry.isSupported(front.bundleIdentifier ?? "")
+            self?.browserFrontByPid = (pid, supported)
+            return supported
         },
         onTick: { [weak self] in self?.keyboardLanguageService.reevaluate() }
     )
+    private var browserFrontByPid: (pid: pid_t, supported: Bool)?
+    /// The pending delayed re-seed sweeps for the Hub's / wizard's switcher demos (cancelled and
+    /// replaced on each re-seed so repeated seeding can't stack a backlog of delayed sweeps).
+    private var hubSeedRetries: [DispatchWorkItem] = []
+    private var wizardSeedRetries: [DispatchWorkItem] = []
     private lazy var keyboardLanguageService = KeyboardLanguageService(
         store: keyboardLanguageStore,
         controller: CarbonInputSourceController(),
@@ -167,6 +179,16 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
 
     // The unified configuration Hub: one reusable window, its navigation state, and the wiring context.
     private var hubWindow: NSWindow?
+    /// The Hub window's visibility observers — held so they can be removed if the window is ever
+    /// released (discarded tokens would stack three permanent observers per re-creation).
+    private var hubWindowObservers: [NSObjectProtocol] = []
+    /// The Hub's `CGWindowID`, or nil when it has no window device. `NSWindow.windowNumber` is ≤ 0
+    /// for a closed (retained) window and `CGWindowID(Int)` traps on a negative — route every
+    /// conversion through here.
+    private var hubWindowID: CGWindowID? {
+        guard let number = hubWindow?.windowNumber, number > 0 else { return nil }
+        return CGWindowID(number)
+    }
     private let hubNav = HubNavigation()
     private lazy var hubContext: HubContext = makeHubContext()
     /// The Space the Hub was last presented on (captured in `showHub`). Used to place the synthetic
@@ -190,8 +212,11 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     var onMenuBarPulse: (() -> Void)?
 
     /// Live finger count from the most recent touch frame; drives the scroll tap's consume rule
-    /// (the switcher owns all three-finger scroll so it never leaks to the background).
+    /// (the switcher owns all three-finger scroll so it never leaks to the background). Reset to 0
+    /// wherever the touch engine stops, and treated as 0 by the tap once `lastTouchFrameTime` is
+    /// stale (see the consume predicate).
     private var currentFingerCount = 0
+    private var lastTouchFrameTime: CFTimeInterval = 0
 
     /// Pure decision for the scroll tap: consume (swallow) scroll while three or more fingers are
     /// down OR while the launcher overlay is open OR while the switcher overlay is open. The
@@ -217,6 +242,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         touchEngine.onFrame = { [weak self] frame in
             guard let self else { return }
             self.currentFingerCount = frame.fingerCount
+            self.lastTouchFrameTime = frame.time
             // The wizard's live-hand act still mirrors every frame (read-only). The Hub gesture previews are
             // pure autoplay (they don't read the touch feed), so nothing else taps the stream here.
             self.onWizardTouchFrame?(frame)
@@ -227,7 +253,12 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         }
         scrollTap.consumePredicate = { [weak self] in
             guard let self else { return false }
-            return Self.shouldConsumeScroll(fingerCount: self.currentFingerCount,
+            // Staleness guard: if the touch stream died mid-gesture (sleep with fingers down, the
+            // multitouch stream going silent), `currentFingerCount` would otherwise stay ≥ 3 and
+            // this tap would swallow EVERY scroll, in every app, until the app was quit. A finger
+            // count older than half a second is treated as no fingers.
+            let stale = CACurrentMediaTime() - self.lastTouchFrameTime > 0.5
+            return Self.shouldConsumeScroll(fingerCount: stale ? 0 : self.currentFingerCount,
                                             launcherOpen: self.launcherOverlay.isVisible,
                                             switcherOpen: self.overlay.isVisible)
         }
@@ -236,12 +267,16 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             // The wizard's demo strip listens along while it lives (the post-Screen-Recording reveal).
             self?.wizardModel?.demo.setThumbnail(image, for: id)
         }
+        // The menu-bar "Keep Awake — Active / Stop" line tracks the automation live (it otherwise
+        // only corrected itself on the next menu open).
+        keepAwakeController.onActiveChanged = { [weak self] in self?.onStateChange?() }
         launcherOverlay.onFire = { [weak self] item, band in self?.launchService.fire(item, inBand: band) }
         launcherOverlay.onTogglePin = { [weak self] item in
             guard case let .clipboardEntry(entry) = item.kind else { return }
             self?.clipboardStore.togglePin(id: entry.id)
         }
         observeSleepWake()
+        observeAccessibilityGrant()
         observeEnabledToggle()
         observeSpacesRearrangeToggle()
         observeVerticalGestureToggle()
@@ -354,6 +389,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         guard isEnabled else { return }
         recognizer.reset()
         touchEngine.stop()
+        currentFingerCount = 0
         scrollTap.stop()
         keyboardSwitcherTap.stop()
         keyboardSwitcher.forceCancel()   // tear down any open ⌘-Tab session before hiding the overlay
@@ -416,6 +452,23 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             .store(in: &cancellables)
     }
 
+    /// Re-arm the event taps when Accessibility is (re)granted mid-session. `CGEvent.tapCreate` fails
+    /// without the grant and its result was discarded — so a user who granted the permission outside
+    /// the wizard flow, or revoked and re-granted it, silently lost scroll consumption and ⌘-Tab until
+    /// a relaunch or a settings toggle happened to call the gate refresh. `removeDuplicates` keeps the
+    /// 1 Hz permission poll from re-running the refresh per tick.
+    private func observeAccessibilityGrant() {
+        permissions.$accessibility
+            .removeDuplicates()
+            .sink { [weak self] status in
+                MainActor.assumeIsolated {
+                    guard status == .granted, let self, self.isEnabled else { return }
+                    self.refreshRowSwitchingGate()
+                }
+            }
+            .store(in: &cancellables)
+    }
+
     // MARK: - Sleep / wake recovery
 
     /// Observer tokens for the workspace sleep/wake notifications (removed in deinit).
@@ -442,6 +495,23 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             MainActor.assumeIsolated { self?.handleWillSleep() }
         }
         wakeObservers.append(sleepToken)
+
+        // `missionControlOpen` is our own latch — set when WE synthesize Mission Control — and nothing
+        // told us when the user closed it some other way (clicking a window, picking a Space, F3).
+        // Stale-true meant every later switcher open floated at screen-saver level and every commit
+        // posted a stray Escape into the user's app. The two observable ways out of MC — a regular
+        // app being activated, or the active Space changing — clear it. (The Dock is `.prohibited`,
+        // so MC opening itself never trips the activation clear.)
+        let activation = center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  app.activationPolicy == .regular, app.processIdentifier != getpid() else { return }
+            MainActor.assumeIsolated { self?.missionControlOpen = false }
+        }
+        wakeObservers.append(activation)
+        let spaceChange = center.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.missionControlOpen = false }
+        }
+        wakeObservers.append(spaceChange)
     }
 
     private func handleWillSleep() {
@@ -462,6 +532,10 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         // model downloads that span a sleep). Stopping pre-sleep makes the post-wake `stop()` a no-op,
         // and `restartTouchEngineAfterWake()` attaches a fresh listener on `didWake`.
         touchEngine.stop()
+        // The stream is gone, so the last frame's finger count must not linger (the scroll tap
+        // would otherwise keep consuming), and any Mission Control we had open is closed by sleep.
+        currentFingerCount = 0
+        missionControlOpen = false
         // Tear down the focus tracker's AX observer (its main-run-loop source) pre-sleep, alongside
         // the multitouch listener; `restartTouchEngineAfterWake()` re-attaches a fresh one on wake.
         focus.stop()
@@ -474,13 +548,17 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         recognizer.reset()
         touchEngine.stop()
         touchEngine.start()
+        currentFingerCount = 0
         // Re-attach the focus tracker's AX observer torn down in `handleWillSleep`. Idempotent.
         focus.stop()
         focus.start()
-        // If the trackpad couldn't be re-acquired, reflect that in the menu state.
+        // If the trackpad couldn't be re-acquired, reflect that in the menu state — and stand the
+        // event taps down with it: flipping `isEnabled` alone left both taps armed against a dead
+        // engine, with `disable()` then a no-op (its guard already false), so nothing ever repaired it.
         let available = touchEngine.isAvailable
         if isEnabled != available {
             isEnabled = available
+            refreshRowSwitchingGate()
             onStateChange?()
         }
     }
@@ -564,7 +642,11 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
                      aboveMissionControl: missionControlOpen,
                      // Opted in but the relocation hasn't survived its re-login yet: the row dots
                      // dim with a pending glyph so the gated vertical axis explains itself.
-                     rowSwitchingPending: settings.manageVerticalGesture && !isSpaceRowSwitchingEffective,
+                     // Read the gate the recognizer already holds — NOT `isSpaceRowSwitchingEffective`,
+                     // which shells out to `/usr/bin/defaults` (fork + waitpid, 30–100 ms) on the
+                     // main thread. That spawn sat inline in EVERY switcher open for anyone with
+                     // Space-row switching on (the `&&` short-circuits it away on default installs).
+                     rowSwitchingPending: settings.manageVerticalGesture && !recognizer.rowSwitchingEnabled,
                      windowScale: CGFloat(settings.switcherWindowScale),
                      groups: validatedWindowGroups(against: windows))
         switcherOwner = owner
@@ -684,7 +766,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         // Never attempt a ScreenCaptureKit capture of our OWN Hub window (it's the synthetic icon-only
         // card) — exclude its id from both the cache seed and the live prefetch so no self-capture is
         // tried; the switcher already renders the app icon for it.
-        let hubID = hubWindow.map { CGWindowID($0.windowNumber) }
+        let hubID = hubWindowID
         let windows = overlay.model.windows.filter { $0.id != hubID }
         thumbnails.seed(into: overlay.model, ids: windows.map(\.id))  // instant from cache (no icon-only flash)
         thumbnails.prefetch(windows)                                  // refresh only cleanly-visible windows
@@ -698,7 +780,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     /// Off-screen Spaces can't be freshly captured anyway, so cache is their only preview source; the
     /// seed is idempotent (identical frames don't republish), so re-seeding the current row is free.
     private func seedAllRows() {
-        let hubID = hubWindow.map { CGWindowID($0.windowNumber) }
+        let hubID = hubWindowID
         let allIDs = overlay.model.rows.flatMap { $0 }.map(\.id).filter { $0 != hubID }
         thumbnails.seed(into: overlay.model, ids: allIDs)
     }
@@ -713,6 +795,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         previewRefreshTimer = Timer.scheduledTimer(withTimeInterval: Self.previewRefreshInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.prefetchCurrentRow() }
         }
+        previewRefreshTimer?.tolerance = 0.2   // drives a capture sweep, not an animation — let it coalesce
     }
 
     /// Stop the periodic preview refresh. Idempotent — safe when already stopped (the timer is nil) — so it
@@ -725,8 +808,21 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         thumbnails.cancelSweeps()
     }
 
+    /// The one pending commit action deferred past Mission Control's close animation. Single-slot:
+    /// a second commit inside that 0.3 s (MC already marked closed, so it raises immediately) must
+    /// not be overridden when the FIRST commit's deferred raise fires a beat later.
+    private var missionControlDismissDeferral: DispatchWorkItem?
+
+    private func deferPastMissionControlDismiss(_ body: @escaping @MainActor () -> Void) {
+        missionControlDismissDeferral?.cancel()
+        let work = DispatchWorkItem { MainActor.assumeIsolated { body() } }
+        missionControlDismissDeferral = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
     func gestureDidCommit() {
         switcherOwner = .none   // the session is ending regardless of which branch below runs
+        missionControlDismissDeferral?.cancel()   // a newer commit supersedes a pending deferred raise
         guard overlay.isVisible, let window = overlay.model.selectedWindow else {
             overlay.hide()
             stopPreviewRefresh()
@@ -744,9 +840,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             if missionControlOpen {
                 missionControlOpen = false
                 MissionControl.dismiss()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                    self?.present(self?.hubWindow)
-                }
+                deferPastMissionControlDismiss { [weak self] in self?.present(self?.hubWindow) }
             } else {
                 present(hubWindow)
             }
@@ -766,9 +860,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         if missionControlOpen {
             missionControlOpen = false
             MissionControl.dismiss()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                self?.raiseCommitted(window)
-            }
+            deferPastMissionControlDismiss { [weak self] in self?.raiseCommitted(window) }
         } else {
             raiseCommitted(window)
         }
@@ -1148,24 +1240,31 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     /// the window the user last had front there.
     private func focusFrontWindowAfterSpaceSwitch() {
         let before = SpaceService.currentModel()?.currentSpaceIDs ?? []
-        afterSpaceSettles(before: before, attempt: 0)
+        // A newer Space-switch action supersedes any poll still running for the previous one:
+        // without the token, rapid consecutive switches stacked N concurrent 16 Hz CGS polls, and a
+        // stale chain could focus the wrong Space's window after the user had already moved on.
+        spaceSettleGeneration &+= 1
+        afterSpaceSettles(before: before, attempt: 0, generation: spaceSettleGeneration)
     }
+    private var spaceSettleGeneration = 0
 
     /// Poll until the active Space flips, then wait for the WindowServer transition (and the
     /// Stage-Manager front-steal ~300ms post-switch) to finish before focusing — acting on the flip
-    /// instant gets steamrolled by the rest of the transition.
-    private func afterSpaceSettles(before: Set<CGSSpaceID>, attempt: Int) {
+    /// instant gets steamrolled by the rest of the transition. `generation` retires the chain the
+    /// moment a newer switch starts one.
+    private func afterSpaceSettles(before: Set<CGSSpaceID>, attempt: Int, generation: Int) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
-            guard let self else { return }
+            guard let self, self.spaceSettleGeneration == generation else { return }
             let now = SpaceService.currentModel()?.currentSpaceIDs ?? []
             if !now.isEmpty, now != before {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
-                    self?.focusFrontWindowOnCurrentSpace()
+                    guard let self, self.spaceSettleGeneration == generation else { return }
+                    self.focusFrontWindowOnCurrentSpace()
                 }
                 return
             }
             // A ⌃→ with no neighbour Space never flips — bail after ~1.9s rather than poll forever.
-            if attempt < 30 { afterSpaceSettles(before: before, attempt: attempt + 1) }
+            if attempt < 30 { afterSpaceSettles(before: before, attempt: attempt + 1, generation: generation) }
         }
     }
 
@@ -1263,7 +1362,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         nohup /bin/sh -c '
         exec >/tmp/tfs-relaunch.log 2>&1
         echo "relaunch: waiting for pid \(pid)"
-        while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 0.1; done
+        for _ in $(/usr/bin/seq 300); do /bin/kill -0 \(pid) 2>/dev/null || break; /bin/sleep 0.1; done
         /bin/sleep 0.4
         echo "relaunch: opening"
         /usr/bin/open "\(bundlePath)" || { echo "relaunch: retry"; /bin/sleep 1; /usr/bin/open "\(bundlePath)"; }
@@ -1918,14 +2017,19 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             let windows = model.windows
             self.thumbnails.seed(into: model, ids: windows.map(\.id))
             self.thumbnails.prefetch(windows)
-            for delay in [0.7, 2.0] {
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                    guard let self, let demo = self.wizardModel?.demo else { return }
-                    let missing = windows.filter { demo.thumbnails[$0.id] == nil }
-                    guard !missing.isEmpty else { return }
-                    self.thumbnails.seed(into: demo, ids: missing.map(\.id))
-                    self.thumbnails.prefetch(missing)
+            self.wizardSeedRetries.forEach { $0.cancel() }
+            self.wizardSeedRetries = [0.7, 2.0].map { delay in
+                let work = DispatchWorkItem { [weak self] in
+                    MainActor.assumeIsolated {
+                        guard let self, let demo = self.wizardModel?.demo else { return }
+                        let missing = windows.filter { demo.thumbnails[$0.id] == nil }
+                        guard !missing.isEmpty else { return }
+                        self.thumbnails.seed(into: demo, ids: missing.map(\.id))
+                        self.thumbnails.prefetch(missing)
+                    }
                 }
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+                return work
             }
         }
         ctx.trackpadClaimed = { [weak self] in self?.trackpadConfig.isClaimed ?? false }
@@ -2036,13 +2140,13 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             // flag stops every clock. Registered once (the window is reused), scoped to THIS window.
             let nc = NotificationCenter.default
             for name in [NSWindow.willCloseNotification, NSWindow.didMiniaturizeNotification] {
-                nc.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                hubWindowObservers.append(nc.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
                     MainActor.assumeIsolated { self?.pauseHubPreviews() }
-                }
+                })
             }
-            nc.addObserver(forName: NSWindow.didDeminiaturizeNotification, object: window, queue: .main) { [weak self] _ in
+            hubWindowObservers.append(nc.addObserver(forName: NSWindow.didDeminiaturizeNotification, object: window, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated { self?.resumeHubPreviews() }
-            }
+            })
             hubWindow = window
         }
         present(hubWindow)
@@ -2102,14 +2206,21 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             let windows = model.windows
             self.thumbnails.seed(into: model, ids: windows.map(\.id))
             self.thumbnails.prefetch(windows)
-            for delay in [0.7, 2.0] {
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak model] in
-                    guard let self, let model else { return }
-                    let missing = windows.filter { model.thumbnails[$0.id] == nil }
-                    guard !missing.isEmpty else { return }
-                    self.thumbnails.seed(into: model, ids: missing.map(\.id))
-                    self.thumbnails.prefetch(missing)
+            // Every Hub page re-navigation re-seeds; cancel the previous retries so rapid page
+            // switching can't stack a growing backlog of delayed sweeps.
+            self.hubSeedRetries.forEach { $0.cancel() }
+            self.hubSeedRetries = [0.7, 2.0].map { delay in
+                let work = DispatchWorkItem { [weak self, weak model] in
+                    MainActor.assumeIsolated {
+                        guard let self, let model else { return }
+                        let missing = windows.filter { model.thumbnails[$0.id] == nil }
+                        guard !missing.isEmpty else { return }
+                        self.thumbnails.seed(into: model, ids: missing.map(\.id))
+                        self.thumbnails.prefetch(missing)
+                    }
                 }
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+                return work
             }
         }
         ctx.launcherBands = { [weak self] clipboardOn in
@@ -2191,5 +2302,14 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         keyboardSwitcher.forceCancel()   // never leave a ⌘-Tab session open behind the hidden overlay
         overlay.hide()
         stopPreviewRefresh()
+        switcherOwner = .none
+        missionControlOpen = false
+    }
+
+    /// Land any coalesced persistence before the process exits (favorites edits are debounced; the
+    /// clipboard index is written on a serial queue). Bounded — quit is never held behind a slow write.
+    func flushStores() {
+        favoritesStore.flushPendingSave()
+        clipboardStore.flush(timeout: 1.0)
     }
 }

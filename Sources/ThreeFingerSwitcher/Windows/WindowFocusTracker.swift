@@ -68,8 +68,11 @@ final class WindowFocusTracker {
         // installed with an unretained refcon (`passUnretained`) — drop it before the tracker dies so
         // a late focus-change callback can never dereference freed memory.
         if let axObserver {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(axObserver), .defaultMode)
+            // Must match the mode the source was ADDED in (`.commonModes`) — removing from a
+            // different mode leaves it attached, and the callback would then reach freed memory.
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(axObserver), .commonModes)
         }
+        if let activationObserver { NSWorkspace.shared.notificationCenter.removeObserver(activationObserver) }
     }
 
     /// Move `wid` to the front (most recent). Idempotent — a re-promote of the already-front window
@@ -96,8 +99,7 @@ final class WindowFocusTracker {
     func focusedWindowID(pid: pid_t) -> CGWindowID? {
         guard pid != getpid(), AXIsProcessTrusted() else { return nil }
         let appEl = AXUIElementCreateApplication(pid)
-        guard let raw = axCopy(appEl, kAXFocusedWindowAttribute as String) else { return nil }
-        let element = raw as! AXUIElement
+        guard let element = axElement(appEl, kAXFocusedWindowAttribute as String) else { return nil }
         return axWindowID(element)
     }
 
@@ -120,7 +122,10 @@ final class WindowFocusTracker {
         // the app. Promote is idempotent, so a double-fire is harmless.
         AXObserverAddNotification(observer, appEl, kAXFocusedWindowChangedNotification as CFString, context)
         AXObserverAddNotification(observer, appEl, kAXMainWindowChangedNotification as CFString, context)
-        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        // `.commonModes`, not `.defaultMode`: the main run loop sits in a tracking mode during menu
+        // tracking, window drags, and scroll momentum — a focus change landing then was silently
+        // missed (the source isn't serviced in `.defaultMode` only), leaving the MRU order stale.
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
         axObserver = observer
         axObservedPID = pid
     }
@@ -128,7 +133,7 @@ final class WindowFocusTracker {
     /// Remove the current observer's run-loop source and drop it.
     private func teardownObserver() {
         if let axObserver {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(axObserver), .defaultMode)
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(axObserver), .commonModes)
         }
         axObserver = nil
         axObservedPID = nil

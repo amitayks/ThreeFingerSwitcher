@@ -111,13 +111,23 @@ final class FirstRunStore {
         self.defaults = defaults
     }
 
+    /// In-memory mirror of the persisted stage. `isCompleted` sits on the recognizer's per-frame
+    /// path (`wizardOwnsGestures` → `launcherFocusIsOnBandList`, 60–120×/s mid-gesture), and the
+    /// defaults read + String bridge + raw-value parse per frame was free to eliminate. The store is
+    /// the only writer of the key, so write-through keeps the mirror exact.
+    private var cachedStage: FirstRunStage?
+
     var stage: FirstRunStage {
         get {
-            guard let raw = defaults.string(forKey: Self.stageKey),
-                  let stage = FirstRunStage(rawValue: raw) else { return .fresh }
+            if let cachedStage { return cachedStage }
+            let stage = defaults.string(forKey: Self.stageKey).flatMap(FirstRunStage.init(rawValue:)) ?? .fresh
+            cachedStage = stage
             return stage
         }
-        set { defaults.set(newValue.rawValue, forKey: Self.stageKey) }
+        set {
+            cachedStage = newValue
+            defaults.set(newValue.rawValue, forKey: Self.stageKey)
+        }
     }
 
     var isCompleted: Bool { stage == .completed }
