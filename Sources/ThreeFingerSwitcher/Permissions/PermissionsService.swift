@@ -54,8 +54,10 @@ final class PermissionsService: ObservableObject {
 
     /// Injectable for tests: builds the (already-scheduled) repeating poll timer.
     var pollTimerFactory: (TimeInterval, @escaping @MainActor () -> Void) -> Timer = { interval, tick in
+        // Fires on the main run loop: assumeIsolated runs the tick synchronously (no per-tick Task,
+        // and no late tick landing after `stopPolling()` has invalidated the timer).
         Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { _ in
-            Task { @MainActor in tick() }
+            MainActor.assumeIsolated { tick() }
         }
     }
 

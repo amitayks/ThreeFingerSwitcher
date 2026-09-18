@@ -25,6 +25,21 @@ func axString(_ element: AXUIElement, _ attribute: String) -> String? {
     axCopy(element, attribute) as? String
 }
 
+/// An `AXUIElement`-valued attribute, type-checked before the cast. `axCopy` returns an untyped
+/// `CFTypeRef`, and `as!` on a CF value TRAPS on a type mismatch — nothing stops a misbehaving app's
+/// AX server (Electron, Qt, Java, Wine…) from answering a window attribute with a string or number.
+/// Every element-valued read must go through here, never `as! AXUIElement`.
+func axElement(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
+    guard let value = axCopy(element, attribute), CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+    return (value as! AXUIElement)
+}
+
+/// An `AXValue`-valued attribute (position / size), type-checked — same rationale as `axElement`.
+func axValue(_ element: AXUIElement, _ attribute: String) -> AXValue? {
+    guard let value = axCopy(element, attribute), CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+    return (value as! AXValue)
+}
+
 /// Build the 20-byte remote token AltTab uses with `_AXUIElementCreateWithRemoteToken`:
 /// pid (4) + 0 (4) + magic 0x636f636f "coco" (4) + axUiElementId (8).
 private func remoteToken(pid: pid_t, id: UInt) -> Data {

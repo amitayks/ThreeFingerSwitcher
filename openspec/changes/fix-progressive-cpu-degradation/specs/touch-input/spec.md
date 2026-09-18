@@ -12,6 +12,14 @@ The app SHALL own the multitouch listener's sleep/wake policy exclusively: at mo
 - **WHEN** the system posts its wake notifications
 - **THEN** only the app's own restart path re-attaches the listener; the package's internal wake handler does not start an additional device
 
+### Requirement: Scroll consumption never outlives the touch stream
+
+The scroll-consuming tap's finger-count input SHALL be treated as zero whenever the touch stream has stopped or gone silent — explicitly on disable / pre-sleep / wake-restart, and implicitly once the last frame is older than a short staleness bound. A gesture interrupted by sleep (or by the multitouch stream dying) SHALL NOT leave the tap consuming scroll events.
+
+#### Scenario: Sleep with fingers down does not disable scrolling system-wide
+- **WHEN** the machine sleeps while three fingers are on the trackpad and later wakes
+- **THEN** two-finger scrolling works in every app without relaunching ThreeFingerSwitcher
+
 ### Requirement: Consuming event taps self-heal
 
 Each consuming `CGEventTap` the app installs (scroll consume, ⌘-Tab) SHALL be re-enabled within a bounded interval after the system disables it (`tapDisabledByTimeout` / `tapDisabledByUserInput`), independently of event delivery — the in-band re-enable alone drops the first post-stall event, which presents as a gesture that "needs to wake up". Tap teardown SHALL destroy the underlying mach port deterministically.

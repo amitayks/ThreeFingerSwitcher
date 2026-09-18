@@ -198,14 +198,9 @@ final class LauncherModelTests: XCTestCase {
     /// `NSWorkspace.icon(forFile:)` returns a NEW `NSImage` per call, which defeated SwiftUI's image
     /// identity on every model publish; the cache hands back the same instance per path.
     func testIconCacheReturnsTheSameInstancePerPath() {
-        LauncherIconCache.clear()
-        let a = LauncherIconCache.icon(forFile: "/Applications")
-        let b = LauncherIconCache.icon(forFile: "/Applications")
+        let a = IconCache.icon(forFile: "/Applications")
+        let b = IconCache.icon(forFile: "/Applications")
         XCTAssertTrue(a === b, "one NSImage per path")
-        XCTAssertEqual(LauncherIconCache.count, 1)
-        _ = LauncherIconCache.icon(forFile: "/System")
-        XCTAssertEqual(LauncherIconCache.count, 2)
-        LauncherIconCache.clear()
-        XCTAssertEqual(LauncherIconCache.count, 0)
+        XCTAssertFalse(IconCache.icon(forFile: "/System") === a, "distinct paths get distinct images")
     }
 }

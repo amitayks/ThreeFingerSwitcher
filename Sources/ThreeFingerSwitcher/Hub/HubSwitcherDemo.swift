@@ -220,7 +220,9 @@ struct SwitcherActionMap: View {
         let detail: String
     }
 
-    private let steps: [Step] = [
+    // `static`: a stored instance property was rebuilt with the view struct on every parent
+    // re-render, minting five fresh UUIDs each time — ForEach then tore down and rebuilt all rows.
+    private static let steps: [Step] = [
         Step(symbol: "hand.raised.fill", title: "Slide three fingers", detail: "Swipe sideways to open the switcher"),
         Step(symbol: "hand.point.up.left.fill", title: "Lift one finger", detail: "Keep two fingers resting to navigate"),
         Step(symbol: "arrow.up.arrow.down", title: "Up / down", detail: "Move between Spaces (rows)"),
@@ -230,7 +232,7 @@ struct SwitcherActionMap: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            ForEach(Array(steps.enumerated()), id: \.element.id) { index, step in
+            ForEach(Array(Self.steps.enumerated()), id: \.element.id) { index, step in
                 HStack(alignment: .center, spacing: 12) {
                     ZStack {
                         Circle().fill(Color.accentColor.opacity(0.16)).frame(width: 26, height: 26)

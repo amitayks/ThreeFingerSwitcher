@@ -49,4 +49,11 @@ final class InputActivityMonitor {
         globalMonitor = nil
         localMonitor = nil
     }
+
+    deinit {
+        // Backstop (the GlobalCursorMonitor precedent): `removeMonitor` is safe off-main, and a
+        // skipped `stop()` must never leave two process-wide input monitors installed forever.
+        if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
+        if let localMonitor { NSEvent.removeMonitor(localMonitor) }
+    }
 }

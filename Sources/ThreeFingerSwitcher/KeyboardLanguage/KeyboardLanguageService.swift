@@ -107,6 +107,10 @@ final class KeyboardLanguageService {
         settledSourceForActiveContext = nil
     }
 
+    deinit {
+        if let activationObserver { NSWorkspace.shared.notificationCenter.removeObserver(activationObserver) }
+    }
+
     // MARK: - Picker source list
 
     /// The user's selectable keyboard / input-method sources (id + localized name), forwarded from the

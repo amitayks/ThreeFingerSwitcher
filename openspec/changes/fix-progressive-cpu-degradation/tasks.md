@@ -21,11 +21,56 @@
 - [x] 2.6 `GlobalCursorMonitor.start()`: install the per-move monitor pair only when `onMove` is wired (the window-snap consumer uses only down/up).
 - [x] 2.7 `LauncherOverlayController`: one lazily-built `NSHostingView` re-parented across disposable panels; `hide()` detaches it before `close()`.
 
-## 3. Verification
+## 3. Second sweep — five new lenses (retain cycles, main-thread I/O, SwiftUI storms, retry/poll correctness, crash/safety)
 
-- [x] 3.1 `swift build` clean (no new warnings in touched files).
-- [x] 3.2 `swift test` — full suite green (777 tests, 0 failures; the poll-tick NSApp guard keeps `PermissionsPollingTests` deterministic).
-- [ ] 3.3 On the user's stable-signed build: after a sleep/wake cycle, confirm gestures stay single-processed (idle CPU ~0%, no growth across wakes); confirm previews stay fresh during a long switcher dwell; confirm the trigger stays instant with a CPU-loaded background app.
+### 3a. Main-thread cost on hot paths
+- [x] `openSwitcher` read `isSpaceRowSwitchingEffective`, which shells out to `/usr/bin/defaults` (fork + waitpid, 30–100 ms) — inline in EVERY switcher open for anyone with Space-row switching on. Now reads the recognizer's cached gate.
+- [x] `ClipboardMonitor`: per-copy whole-payload FNV walk through `Data`'s generic iterator + a full `NSBitmapImageRep` decode (for "Image W×H") on main → bounded head/tail/length sample hash + ImageIO header-only dimensions. `ClipboardStore.stableName` walks the raw buffer.
+- [x] `AXHostProvider`: the 2 Hz breadth-first AX walk of the browser (≤400 round-trips serviced by the browser's main thread) now re-validates the remembered address field (one call) and re-walks only when it fails.
+- [x] `StageManager.isEnabled`: `CFPreferencesAppSynchronize` round-trip per raise / Dock hover / hold-guard tick → 2 s TTL cache.
+- [x] `WindowSnapMonitor.frame(of:)`: single-id `CGWindowList` query instead of a second full on-screen enumeration per global mouse-up.
+- [x] `LauncherView` / Bands editor: `NSWorkspace.icon(forFile:)` per cell per render at gesture rate → process-wide `IconCache` (stable `NSImage` identity also lets SwiftUI skip re-rasterizing). `columns` hoisted to a static.
+- [x] `FavoritesStore`: full-tree JSON re-encode per keystroke → 0.3 s coalesced save (`flushStores()` at quit; tests keep synchronous saves via `saveDelay: 0`).
+- [x] `ClipboardStore.bandWindow`: `.blob` entries loaded from disk did an `open`+`read` per large entry at launcher activation → per-id memo of the bounded preview.
+- [x] `FirstRunStore.stage`: defaults read + String bridge per touch frame (via `wizardOwnsGestures`) → in-memory mirror with write-through.
+- [x] `LaunchService.emptyTrash` off main; `run()` / `osascript` new-window use `terminationHandler` instead of parking a GCD thread in `waitUntilExit` per script.
+- [x] Dock right/left-click reads route through the same 80 ms TTL as cursor moves; `AXDockReader` reuses one `UserDefaults(suiteName:)`.
+- [x] SwiftUI: Hub "Window size" slider re-solve debounced (60 Hz → ~16/s); `HubWindowInspector` groups computed once per snapshot (was twice per render, per slider tick); `HubExcludedAppsEditor` enumerates running apps on appear, not per render; `SwitcherActionMap`/`LauncherActionMap` steps are `static` (stable `ForEach` identities); launcher scroll animates only on row changes; wizard `BreathingGlowBackdrop` mounted only while active.
+- [x] Timer tolerances on every non-critical poll (preview refresh, clipboard, browser host, keep-awake heartbeat); tap watchdogs added to `.common` run-loop mode; per-tick `Task` allocations in the wizard attract loop and permissions poll replaced with `assumeIsolated`.
+
+### 3b. Retry / poll / deferred-action correctness
+- [x] `afterSpaceSettles`: generation token (rapid Space switches stacked N concurrent 16 Hz CGS polls, and a stale chain could focus the WRONG Space's window).
+- [x] `raiseDeminimizing`'s deferred raise and `recover(attempt: 1)`'s async hop are `commitSeq`-guarded (a newer commit was being stomped / its watchdog tokens invalidated).
+- [x] Mission-Control-dismiss commit deferral is a single cancellable slot.
+- [x] `makeNewWindow` / `reopenWindowlessApp`: single-flight per pid (a double-lift opened two windows).
+- [x] Hub / wizard `seedThumbnails` retry sweeps are cancellable and superseded per re-seed.
+- [x] `WindowSnapMonitor.schedule` cancels the previous settle item.
+- [x] `WindowFocusTracker` AX source in `.commonModes` (focus changes during menu/drag tracking were missed) — add, teardown AND `deinit` all agree on the mode (a mismatch there would leave a source pointing at freed memory).
+- [x] `elementCache` soft-capped between snapshots; `bundleKeyByPid` pruned per snapshot; `BrowserContextMonitor`'s per-tick `bundleIdentifier` IPC memoized per pid.
+
+### 3c. Ownership / lifecycle
+- [x] `TouchEngine` consumer is generation-tagged (a stale stream side can never feed the engine alongside the new one — the app-layer twin of the framework's orphaned-device bug).
+- [x] `ThumbnailService` sweep task captures `self` weakly; Hub window observers are held (not discarded); `MRUTracker` / `KeyboardLanguageService` / `WindowFocusTracker` / `InputActivityMonitor` remove their observers in `deinit`.
+- [x] `KeepAwakeController.onActiveChanged` is finally wired (the menu's Active/Stop line only corrected itself on the next menu open).
+- [x] `ClipboardStore.save` coalesces snapshots (latest-wins) instead of queuing a full store copy per copy.
+
+### 3d. Crashes and stuck states
+- [x] `CGWindowID(NSWindow.windowNumber)` trapped on the ≤ 0 number of the retained-but-closed Hub — on EVERY switcher commit / preview tick after the Hub had been opened once. One `hubWindowID` chokepoint + a guard in `HubSwitcherEntry.isHub`.
+- [x] Unguarded `as! AXUIElement` / `as! AXValue` on cross-process AX data (traps when a misbehaving app's AX server returns another CF type) → typed `axElement` / `axValue` helpers.
+- [x] `captureDimensions` traps on NaN/inf (`Swift.max(NaN, 1)` is NaN) → finite guard.
+- [x] `currentFingerCount` was never reset when the touch stream stopped — sleep with three fingers down left the scroll tap swallowing EVERY scroll in every app until quit. Reset on disable / will-sleep / wake-restart, plus a 0.5 s staleness guard in the consume predicate.
+- [x] `missionControlOpen` latched true when MC was closed any way but ours (stray Escape into the user's app + screen-saver-level panel on every later open) → cleared on regular-app activation, active-Space change, will-sleep, and `hideOverlay`.
+- [x] `restartTouchEngineAfterWake` left both taps armed against a dead engine → `refreshRowSwitchingGate()` when availability flips.
+- [x] `DockPreviewController.emptyPID` stuck (an app with no current-Space windows never got a preview again until another preview cycled) → cleared on `.idle`.
+- [x] Taps re-arm on an Accessibility grant mid-session (`tapCreate` failure was discarded with nothing observing the permission).
+- [x] `writeToPasteboard` no longer wipes the clipboard when it has nothing to write; `flushStores()` at quit lands coalesced favorites + clipboard writes (bounded 1 s).
+- [x] `CursorMonitor` protocol is `@MainActor` (+ `onLeftUp`); `KeepAwakeController` constants are `nonisolated` — the two Swift-6 isolation warnings are gone.
+
+## 4. Verification
+
+- [x] 4.1 `swift build` clean (no new warnings in touched files).
+- [x] 4.2 `swift test` — full suite green (783 tests, 0 failures; `ResourceBoundsTests` pins the cache LRU/prune and MRU eviction; the poll-tick NSApp guard keeps `PermissionsPollingTests` deterministic).
+- [ ] 4.3 On the user's stable-signed build: after a sleep/wake cycle, confirm gestures stay single-processed (idle CPU ~0%, no growth across wakes); confirm previews stay fresh during a long switcher dwell; confirm the trigger stays instant with a CPU-loaded background app; confirm two-finger scroll still works after sleeping mid-gesture.
 
 ## Deferred (follow-ups, deliberately out of scope — see design.md Rejected)
 

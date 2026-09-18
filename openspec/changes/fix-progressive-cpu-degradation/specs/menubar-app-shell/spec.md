@@ -15,3 +15,15 @@ The process SHALL opt out of App Nap for its whole lifetime (a never-frontmost `
 #### Scenario: The Mac still sleeps
 - **WHEN** the machine reaches its idle-sleep timeout with the app running
 - **THEN** system sleep proceeds normally (the opt-out covers App Nap only)
+
+### Requirement: No subprocess or disk I/O on the gesture path
+
+Opening the switcher or the launcher from a gesture SHALL NOT spawn a subprocess, block on disk I/O, or perform a full-payload computation on the main thread. State that is expensive to read (native-gesture relocation state read via `defaults`, clipboard previews backed by blob files, app icons) SHALL be read off the gesture path and cached for it.
+
+#### Scenario: Switcher open with Space-row switching on
+- **WHEN** the user opens the switcher with the Space-row opt-in active
+- **THEN** the overlay appears without a `defaults` subprocess being spawned (the relocation state comes from the gate computed when the opt-in last changed)
+
+#### Scenario: Launcher open after a relaunch with large clipboard entries
+- **WHEN** the launcher opens with clipboard history containing entries whose payloads live in blob files
+- **THEN** the band builds from cached bounded previews after the first build, without re-reading the blobs on the gesture path

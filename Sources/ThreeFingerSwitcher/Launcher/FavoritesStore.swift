@@ -16,12 +16,15 @@ final class FavoritesStore: ObservableObject {
 
     @Published private(set) var favorites: Favorites
 
-    private convenience init() { self.init(defaults: .standard) }
+    // The app's store coalesces saves; `AppCoordinator.flushStores()` lands a pending edit at quit.
+    private convenience init() { self.init(defaults: .standard, saveDelay: 0.3) }
 
     /// Test/seam initializer: inject an isolated `UserDefaults`. Loads the stored record (migrating
-    /// older schema versions forward) or seeds the starter bands on first run.
-    init(defaults: UserDefaults) {
+    /// older schema versions forward) or seeds the starter bands on first run. `saveDelay` defaults
+    /// to 0 (synchronous saves) so tests can reload immediately after a mutation.
+    init(defaults: UserDefaults, saveDelay: TimeInterval = 0) {
         self.defaults = defaults
+        self.saveDelay = saveDelay
         if let data = defaults.data(forKey: key),
            let decoded = try? JSONDecoder().decode(Favorites.self, from: data) {
             let storedVersion = decoded.schemaVersion
@@ -38,11 +41,41 @@ final class FavoritesStore: ObservableObject {
 
     // MARK: - Mutation
 
-    /// Apply an edit and persist it. All editor/quick-add paths funnel through here.
+    /// Apply an edit and persist it. All editor/quick-add paths funnel through here. The in-memory
+    /// model updates synchronously (so the editor stays live); persistence is coalesced behind
+    /// `saveDelay` — eight Bands-editor fields call this per KEYSTROKE, and each save re-encodes the
+    /// whole favorites tree (every band, item, and script body) to JSON on the main thread.
     func mutate(_ block: (inout Favorites) -> Void) {
         var copy = favorites
         block(&copy)
         favorites = copy
+        scheduleSave()
+    }
+
+    /// Seconds a save is deferred to coalesce bursts. `0` saves synchronously (the test seam — the
+    /// default for `init(defaults:)`; the app's shared store passes a real delay).
+    private let saveDelay: TimeInterval
+    private var pendingSave: DispatchWorkItem?
+
+    private func scheduleSave() {
+        guard saveDelay > 0 else { save(); return }
+        pendingSave?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.pendingSave = nil
+                self.save()
+            }
+        }
+        pendingSave = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + saveDelay, execute: work)
+    }
+
+    /// Write any coalesced edit now (app termination, window close).
+    func flushPendingSave() {
+        guard let work = pendingSave else { return }
+        work.cancel()
+        pendingSave = nil
         save()
     }
 

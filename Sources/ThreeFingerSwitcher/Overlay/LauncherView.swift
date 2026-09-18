@@ -17,10 +17,10 @@ extension Color {
 struct LauncherView: View {
     @ObservedObject var model: LauncherModel
 
-    private var columns: [GridItem] {
+    private static let columns: [GridItem] =
         Array(repeating: GridItem(.fixed(LauncherGridLayout.cellWidth), spacing: LauncherGridLayout.spacing),
               count: LauncherGridLayout.columns)
-    }
+    private var columns: [GridItem] { Self.columns }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -119,8 +119,14 @@ struct LauncherView: View {
                 }
                 .padding(.top, LauncherGridLayout.gridTopInset)
             }
-            .onChange(of: model.selectedIndex) { scroll(proxy) }
-            .onChange(of: model.focus) { scroll(proxy) }
+            .onChange(of: model.selectedIndex) { old, new in
+                // Animate only when the step crosses a ROW: a within-row step every 30–60 ms
+                // otherwise starts a new 160 ms scroll animation before the previous one ends,
+                // stacking 3–5 in-flight animations (each re-measuring the grid) for the whole scrub.
+                let cols = LauncherGridLayout.columns
+                scroll(proxy, animated: old / cols != new / cols)
+            }
+            .onChange(of: model.focus) { scroll(proxy, animated: true) }
             // A band change resets the grid to its top. Bands are switched from the band LIST (focus
             // `.bands`), where `scrollTarget` is nil — so scrolling to it never did anything; the first
             // item is the row to land on while browsing bands.
@@ -135,9 +141,13 @@ struct LauncherView: View {
         return model.items[model.selectedIndex].id
     }
 
-    private func scroll(_ proxy: ScrollViewProxy) {
+    private func scroll(_ proxy: ScrollViewProxy, animated: Bool) {
         guard let target = scrollTarget else { return }
-        withAnimation(.easeInOut(duration: 0.16)) { proxy.scrollTo(target, anchor: .center) }
+        if animated {
+            withAnimation(.easeInOut(duration: 0.16)) { proxy.scrollTo(target, anchor: .center) }
+        } else {
+            proxy.scrollTo(target, anchor: .center)
+        }
     }
 
     @ViewBuilder
@@ -207,47 +217,27 @@ struct LauncherView: View {
         }
     }
 
+    // Memoized (IconCache): this runs per cell per render, at gesture rate — see IconCache's doc.
     private func appIcon(for item: LaunchItem) -> NSImage {
         if case let .app(bundleURL, _) = item.kind {
-            return LauncherIconCache.icon(forFile: bundleURL.path)
+            return IconCache.icon(forFile: bundleURL.path)
         }
-        return NSImage(systemSymbolName: "app.dashed", accessibilityDescription: nil) ?? NSImage()
+        return Self.placeholderAppIcon
     }
 
     private func fileIcon(for item: LaunchItem) -> NSImage {
         if case let .path(url) = item.kind {
-            return LauncherIconCache.icon(forFile: url.path)
+            return IconCache.icon(forFile: url.path)
         }
-        return NSImage(systemSymbolName: "folder", accessibilityDescription: nil) ?? NSImage()
-    }
-}
-
-/// Memoizes `NSWorkspace.icon(forFile:)` per path for the grid cells. `body` re-runs on every model
-/// publish (each scrub step), and resolving the icon inside it returned a NEW `NSImage` each time — which
-/// defeats SwiftUI's image identity, so every visible cell re-diffed and re-rendered its icon per step.
-/// One `NSImage` per path keeps identity stable across publishes and across shows (the hosting view is
-/// reused). Bounded: past `capacity` distinct paths the cache is dropped wholesale — a favorites set has
-/// tens of items, so the bound only guards a pathological one. An app whose icon changes on disk shows
-/// the cached icon until the cache clears (the Dock caches the same way). Main-actor only (`body`).
-@MainActor
-enum LauncherIconCache {
-    private static var icons: [String: NSImage] = [:]
-    private static let capacity = 512
-
-    static func icon(forFile path: String) -> NSImage {
-        if let cached = icons[path] { return cached }
-        if icons.count >= capacity { icons.removeAll(keepingCapacity: true) }
-        let image = NSWorkspace.shared.icon(forFile: path)
-        icons[path] = image
-        return image
+        return Self.placeholderFolderIcon
     }
 
-    /// Drop every cached icon (a refresh seam; also keeps tests independent).
-    static func clear() { icons.removeAll() }
-
-    /// Number of memoized paths (tests).
-    static var count: Int { icons.count }
+    private static let placeholderAppIcon =
+        NSImage(systemSymbolName: "app.dashed", accessibilityDescription: nil) ?? NSImage()
+    private static let placeholderFolderIcon =
+        NSImage(systemSymbolName: "folder", accessibilityDescription: nil) ?? NSImage()
 }
+
 
 /// The single selection highlight: a Liquid Glass rounded square that starts nearly transparent and
 /// darkens over the dwell, then locks when armed. No ring, no checkmark. Driven by `token` (bumped

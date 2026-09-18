@@ -78,10 +78,10 @@ final class AXDockReader: DockReader {
     private func tileFrame(_ item: AXUIElement) -> CGRect? {
         var origin = CGPoint.zero
         var size = CGSize.zero
-        guard let posValue = axCopy(item, kAXPositionAttribute as String),
-              let sizeValue = axCopy(item, kAXSizeAttribute as String) else { return nil }
-        AXValueGetValue(posValue as! AXValue, .cgPoint, &origin)
-        AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
+        guard let posValue = axValue(item, kAXPositionAttribute as String),
+              let sizeValue = axValue(item, kAXSizeAttribute as String) else { return nil }
+        AXValueGetValue(posValue, .cgPoint, &origin)
+        AXValueGetValue(sizeValue, .cgSize, &size)
         guard size.width > 0, size.height > 0 else { return nil }
         return Self.cocoaRect(fromAXTopLeft: CGRect(origin: origin, size: size))
     }

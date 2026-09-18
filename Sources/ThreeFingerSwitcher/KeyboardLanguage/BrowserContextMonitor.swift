@@ -68,6 +68,7 @@ final class BrowserContextMonitor {
         let t = Timer.scheduledTimer(withTimeInterval: max(0.1, pollInterval), repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
         }
+        t.tolerance = max(0.1, pollInterval) / 2   // a host re-check isn't deadline-critical
         timer = t
     }
 

@@ -8,6 +8,11 @@ import CoreGraphics
 /// `onMove` is called with the cursor in **Cocoa global coordinates** (bottom-left origin) — the same
 /// space as `DockTile.frame`. `start()` installs the monitor; `stop()` removes it. Installed ONLY while
 /// the feature is enabled (the controller calls `start`/`stop` off the opt-in toggle).
+///
+/// `@MainActor`: every conformer is main-actor-bound (the callbacks are written and read on main). A
+/// nonisolated protocol let a nonisolated holder of `any CursorMonitor` write the callbacks from any
+/// thread while the monitor read them on main — the Swift 6 conformance warning was pointing at that.
+@MainActor
 protocol CursorMonitor: AnyObject {
     var onMove: ((CGPoint) -> Void)? { get set }
     /// A right-click (anywhere) reported in Cocoa global coordinates. Observed passively — used to yield
@@ -17,6 +22,9 @@ protocol CursorMonitor: AnyObject {
     /// consumed, so the native Dock click is unaffected) — used to commit the highlighted preview when the
     /// click lands on the shown app's Dock tile.
     var onLeftDown: ((CGPoint) -> Void)? { get set }
+    /// A left-mouse-up (anywhere), Cocoa global coordinates; passive. Window-groups snap uses the
+    /// down/up pair for drag-end detection.
+    var onLeftUp: ((CGPoint) -> Void)? { get set }
     func start()
     func stop()
 }
@@ -26,6 +34,7 @@ final class ManualCursorMonitor: CursorMonitor {
     var onMove: ((CGPoint) -> Void)?
     var onRightClick: ((CGPoint) -> Void)?
     var onLeftDown: ((CGPoint) -> Void)?
+    var onLeftUp: ((CGPoint) -> Void)?
     private(set) var running = false
     func start() { running = true }
     func stop() { running = false }
