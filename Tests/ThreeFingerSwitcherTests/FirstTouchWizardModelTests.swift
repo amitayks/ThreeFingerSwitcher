@@ -133,12 +133,26 @@ final class FirstTouchWizardModelTests: XCTestCase {
 
     func testHandLiftAfterScrubAdvancesWithoutAButton() {
         let (model, touch) = resumeWithTouchFeed(at: .hand)
-        // Three fingers land away from the current column (the sample demo starts on column 1)…
+        // Three fingers land on the right of the pad (column 3 of 4)…
         touch(TouchFrame(testFingerCount: 3, centroid: CGPoint(x: 0.9, y: 0.5)))
         XCTAssertTrue(model.liveTouchActive)
+        // …travel to the left (column 0 — real movement between windows)…
+        touch(TouchFrame(testFingerCount: 3, centroid: CGPoint(x: 0.1, y: 0.5)))
+        XCTAssertEqual(model.demo.selectedIndex, 0, "the strip follows the hand")
         // …and the lift IS the continue: the wizard is already on the Accessibility act.
         touch(TouchFrame(testFingerCount: 0, centroid: .zero))
         XCTAssertEqual(model.stage, .permAX, "scrub + lift advances by itself")
+    }
+
+    func testHandLandingAwayFromTheAttractColumnIsNotAScrub() {
+        let (model, touch) = resumeWithTouchFeed(at: .hand)
+        // The attract loop parks the strip on column 1; the hand lands on column 3. The absolute
+        // mapping snaps the strip there — that snap is the touchdown, not travel between windows.
+        touch(TouchFrame(testFingerCount: 3, centroid: CGPoint(x: 0.9, y: 0.5)))
+        XCTAssertEqual(model.demo.selectedIndex, 3, "the strip snaps to where the hand landed")
+        touch(TouchFrame(testFingerCount: 0, centroid: .zero))
+        XCTAssertEqual(model.stage, .hand, "a touchdown + lift with no travel must not advance")
+        XCTAssertTrue(model.liftedWithoutScrub, "…the quiet manual way forward engages instead")
     }
 
     func testHandLiftWithoutScrubStaysAndOffersAQuietWayForward() {
@@ -148,11 +162,27 @@ final class FirstTouchWizardModelTests: XCTestCase {
         touch(TouchFrame(testFingerCount: 0, centroid: .zero))
         XCTAssertEqual(model.stage, .hand, "a lift that never scrubbed must not advance")
         XCTAssertTrue(model.liftedWithoutScrub, "…but the act re-offers a manual continue")
-        // The hand returns and scrubs: the fallback stands down, the next lift advances.
+        // The hand returns: the fallback stands down…
         touch(TouchFrame(testFingerCount: 3, centroid: CGPoint(x: 0.9, y: 0.5)))
         XCTAssertFalse(model.liftedWithoutScrub)
+        // …it scrubs (travels from its landing column to another), and the next lift advances.
+        touch(TouchFrame(testFingerCount: 3, centroid: CGPoint(x: 0.3, y: 0.5)))
         touch(TouchFrame(testFingerCount: 0, centroid: .zero))
         XCTAssertEqual(model.stage, .permAX)
+    }
+
+    func testScrubIsJudgedPerTouchNotAcrossLifts() {
+        let (model, touch) = resumeWithTouchFeed(at: .hand)
+        // Land on column 3, then wobble within the same column: still no travel.
+        touch(TouchFrame(testFingerCount: 3, centroid: CGPoint(x: 0.80, y: 0.5)))
+        touch(TouchFrame(testFingerCount: 3, centroid: CGPoint(x: 0.95, y: 0.5)))
+        touch(TouchFrame(testFingerCount: 0, centroid: .zero))
+        XCTAssertEqual(model.stage, .hand, "wobble inside the landing column is not a scrub")
+        XCTAssertTrue(model.liftedWithoutScrub)
+        // A fresh touch that lands on a different column than the LAST touch is still just a landing.
+        touch(TouchFrame(testFingerCount: 3, centroid: CGPoint(x: 0.1, y: 0.5)))
+        touch(TouchFrame(testFingerCount: 0, centroid: .zero))
+        XCTAssertEqual(model.stage, .hand, "each touch judges travel from its OWN landing column")
     }
 
     // MARK: - Auto-continue: a grant is the click

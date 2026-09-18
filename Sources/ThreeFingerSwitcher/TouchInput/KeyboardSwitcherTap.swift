@@ -105,6 +105,21 @@ final class KeyboardSwitcherTap {
     private func reviveIfDisabled() {
         guard let tap, !CGEvent.tapIsEnabled(tap: tap) else { return }
         CGEvent.tapEnable(tap: tap, enable: true)
+        // The tap was disabled, so events (a ⌘-up among them) were delivered past us — see `resync`.
+        resyncCommandState(from: CGEventSource.flagsState(.combinedSessionState))
+    }
+
+    /// Re-derive `commandHeld` from an authoritative flag set. While the tap is disabled (a stall in
+    /// the deferred ⌘-Tab open — the snapshot's AX round-trips — is enough to trip the WindowServer's
+    /// timeout) the WindowServer delivers events past it, so the `flagsChanged` for a ⌘ release is
+    /// never seen; `commandHeld` then stays true, the session stays `.active`, and every BARE Tab, Esc
+    /// and arrow system-wide is swallowed until the user happens to press and release ⌘ again. Every
+    /// re-enable path and every key event therefore re-derives the modifier state instead of trusting
+    /// the last observed transition.
+    private func resyncCommandState(from flags: CGEventFlags) {
+        let nowCmd = flags.contains(.maskCommand)
+        if nowCmd && !commandHeld { commandHeld = true; input?.commandDown() }
+        else if !nowCmd && commandHeld { commandHeld = false; input?.commandUp() }
     }
 
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -112,18 +127,21 @@ final class KeyboardSwitcherTap {
         // The system disables the tap if our callback stalls or input is interrupted; re-enable it.
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            resyncCommandState(from: CGEventSource.flagsState(.combinedSessionState))
             return pass
         }
         switch type {
         case .flagsChanged:
             // Track ⌘ and drive the session's arm/commit edges; NEVER consume a modifier change (other
             // apps must still see ⌘ press/release — we simply also emit no Tab in between).
-            let nowCmd = event.flags.contains(.maskCommand)
-            if nowCmd && !commandHeld { commandHeld = true; input?.commandDown() }
-            else if !nowCmd && commandHeld { commandHeld = false; input?.commandUp() }
+            resyncCommandState(from: event.flags)
             return pass
         case .keyDown:
             let code = event.getIntegerValueField(.keyboardEventKeycode)
+            // The event's own flags are authoritative for THIS keystroke: a missed ⌘ transition (tap
+            // disabled in between) is corrected here before the consume decision, so a bare Tab is never
+            // swallowed on stale state and a ⌘-Tab after a missed ⌘-down still opens the session.
+            resyncCommandState(from: event.flags)
             if code == kTab && commandHeld {
                 input?.tab(shift: event.flags.contains(.maskShift))
                 consumedKeyDowns.insert(code)

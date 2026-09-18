@@ -150,14 +150,17 @@ final class LauncherOverlayController {
     /// Auto-repeat stepping while a contact is held at a trackpad edge. `dx`/`dy` are −1 / 0 / +1 per
     /// axis (vertical switches bands on the band list / steps grid rows; horizontal crosses between the
     /// band list and the grid, then steps items). Horizontal is suppressed in the Clipboard band (there
-    /// horizontal is the deliberate pin / cross-to-band-list action). Vertical auto-repeat is kept
+    /// horizontal is the deliberate pin / cross-to-band-list action) — and that suppression is re-derived
+    /// on EVERY tick from the band the cursor is on (`horizontalEdgeStep`), not decided once here: the
+    /// raw `dx` is kept, so a held edge that scrubs (vertically) onto the Clipboard band stops stepping
+    /// horizontally at once (two ticks would otherwise auto-pin), and one that scrubs off it resumes
+    /// without the finger having to leave and re-enter the edge zone. Vertical auto-repeat is kept
     /// everywhere. When both axes are zero the timer stops. A step that doesn't move the selection
     /// (clamped at an end) does NOT reset the dwell, so holding at a dead edge still lets the current
     /// item arm and fire.
     func setEdgeAutoScroll(dx: Int, dy: Int) {
-        let hx = model.currentBandIsClipboard ? 0 : dx
-        guard hx != edgeDX || dy != edgeDY else { return }
-        edgeDX = hx
+        guard dx != edgeDX || dy != edgeDY else { return }
+        edgeDX = dx
         edgeDY = dy
         edgeTicks = 0   // restart the acceleration ramp when the edge direction changes
         if edgeDX == 0, edgeDY == 0 {
@@ -180,16 +183,27 @@ final class LauncherOverlayController {
         edgeTicks = 0
     }
 
-    private func edgeTick() {
+    /// Pure: the horizontal auto-repeat step that actually applies — the raw edge direction everywhere
+    /// except the Clipboard band, where horizontal is never auto-repeated (a held edge must not auto-pin).
+    nonisolated static func horizontalEdgeStep(_ dx: Int, isClipboardBand: Bool) -> Int {
+        isClipboardBand ? 0 : dx
+    }
+
+    /// Visible for testing: one auto-repeat tick (the edge timer also calls this).
+    func edgeTick() {
         let beforeBand = model.currentBand, beforeIndex = model.selectedIndex, beforeFocus = model.focus
-        if edgeDX != 0 { model.stepHorizontal(edgeDX) }
+        // Clipboard-only, horizontal-only suppression, decided per tick (see `setEdgeAutoScroll`).
+        let hx = Self.horizontalEdgeStep(edgeDX, isClipboardBand: model.currentBandIsClipboard)
+        if hx != 0 { model.stepHorizontal(hx) }
         if edgeDY != 0 { model.stepVertical(edgeDY) }
         let moved = model.currentBand != beforeBand || model.selectedIndex != beforeIndex || model.focus != beforeFocus
         if moved {
             if model.currentBand != beforeBand { if let panel { layout(panel, animated: true) } }
             manageDwell()   // a real move resets the dwell (so auto-repeat never arms mid-scroll)
         }
-        edgeTicks += 1
+        // Only an effective tick advances the acceleration ramp: a suppressed horizontal hold on the
+        // Clipboard band idles at the base cadence, so stepping resumes gently when the band changes.
+        if hx != 0 || edgeDY != 0 { edgeTicks += 1 }
         rescheduleEdge()
     }
 

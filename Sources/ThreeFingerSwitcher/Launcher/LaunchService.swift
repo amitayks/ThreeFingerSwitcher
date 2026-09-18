@@ -2,6 +2,11 @@ import AppKit
 import ApplicationServices
 import CoreAudio
 import AudioToolbox
+import os
+
+/// Raw OS / `Process` error text goes here (and into `LaunchError.copyableDetails`) — never into a
+/// notification headline (see CLAUDE.md, error handling).
+private let launchLog = Logger(subsystem: "ThreeFingerSwitcher", category: "Launcher")
 
 /// Executes a fired `LaunchItem`. Dispatch is split so the *decision* logic (strategy resolution,
 /// preset flattening, the new-window menu-title candidates) is pure and unit-testable, while the
@@ -67,23 +72,33 @@ final class LaunchService {
 
     // MARK: - Fire
 
+    /// Reports whether a fired item's effect actually landed (`true`) or failed (`false`). Called exactly
+    /// once, on the main actor, when the effect has SETTLED — immediately for synchronous kinds, and only
+    /// after the process exits / the launch or open calls back for asynchronous ones. A cancelled folder
+    /// prompt completes `true` (cancellation is not a failure).
+    typealias FireCompletion = @MainActor (_ succeeded: Bool) -> Void
+
     /// Fire an item that lives in `band` (the band supplies the inherited default app strategy).
-    func fire(_ item: LaunchItem, inBand band: ContextBand) {
+    /// `completion` (see `FireCompletion`) is ignored by default; `firePreset` counts its leaves' completions
+    /// so a preset's summary is never a false "Done" while a leaf is still running or about to fail.
+    func fire(_ item: LaunchItem, inBand band: ContextBand, completion: @escaping FireCompletion = { _ in }) {
         switch item.kind {
         case .app:
-            fireApp(item, strategy: Self.resolvedStrategy(for: item, bandDefault: band.defaultAppStrategy) ?? .smart)
+            fireApp(item, strategy: Self.resolvedStrategy(for: item, bandDefault: band.defaultAppStrategy) ?? .smart,
+                    completion: completion)
         case .path(let url):
-            NSWorkspace.shared.open(url)
+            completion(NSWorkspace.shared.open(url))   // Launch Services reports synchronously whether it took the URL
         case .url(let url, let handler, let newWindow):
-            openURL(url, handler: handler, newWindow: newWindow ?? false)
+            openURL(url, handler: handler, newWindow: newWindow ?? false, completion: completion)
         case .shortcut(let name):
-            runShortcut(named: name, title: item.title)
+            runShortcut(named: name, title: item.title, completion: completion)
         case .script(let body):
-            runScript(body, title: item.title)
+            runScript(body, title: item.title, completion: completion)
         case .action(let action, let adjustment, let toClipboard):
             perform(action, adjustment: adjustment, toClipboard: toClipboard ?? false)
+            completion(true)
         case .preset:
-            firePreset(item, inBand: band)
+            firePreset(item, inBand: band, completion: completion)
         case .automation(let kind, let dimPercent, let dimKeyboard, let lockOnStop):
             // Toggle the automation's stateful owner (start if inactive, stop if active). This is
             // NOT a one-shot that completes on the lift — it enters/leaves a persistent mode owned
@@ -92,20 +107,26 @@ final class LaunchService {
             onAutomation(kind, AutomationSettings(dimPercent: dimPercent,
                                                   dimKeyboard: dimKeyboard ?? false,
                                                   lockOnStop: lockOnStop ?? false))
+            completion(true)
         case .clipboardEntry(let entry):
             pasteEntry(entry)
+            completion(true)
         case .claudeProject(let folder, let command, let claudePath):
-            launchClaude(folder: folder, command: command, claudePath: claudePath, title: item.title)
+            launchClaude(folder: folder, command: command, claudePath: claudePath, title: item.title,
+                         completion: completion)
         case .terminalCommand(let folder, let command):
-            launchTerminal(folder: folder, command: command, title: item.title)
+            launchTerminal(folder: folder, command: command, title: item.title, completion: completion)
         case let .claudeProjectPrompt(lastFolder, command, claudePath):
-            promptFolderThenLaunch(lastFolder: lastFolder, item: item, band: band) { [weak self] folder in
-                self?.launchClaude(folder: folder, command: command, claudePath: claudePath, title: item.title)
+            let launched = promptFolderThenLaunch(lastFolder: lastFolder, item: item, band: band) { [weak self] folder in
+                self?.launchClaude(folder: folder, command: command, claudePath: claudePath, title: item.title,
+                                   completion: completion)
             }
+            if !launched { completion(true) }   // a cancelled prompt is not a failure
         case let .terminalCommandPrompt(lastFolder, command):
-            promptFolderThenLaunch(lastFolder: lastFolder, item: item, band: band) { [weak self] folder in
-                self?.launchTerminal(folder: folder, command: command, title: item.title)
+            let launched = promptFolderThenLaunch(lastFolder: lastFolder, item: item, band: band) { [weak self] folder in
+                self?.launchTerminal(folder: folder, command: command, title: item.title, completion: completion)
             }
+            if !launched { completion(true) }
         }
     }
 
@@ -117,11 +138,12 @@ final class LaunchService {
 
     /// Present a native folder chooser for a choose-folder-at-launch item (opening at its last-used
     /// folder, or home), then on a selection run `launch(folder)` AND remember the folder back onto the
-    /// item via `onPromptedFolderChosen`. A cancel is a no-op (not an error). The accessory app is briefly
-    /// activated so the panel comes forward and is interactive (the overlay has already ordered out by
-    /// fire time).
+    /// item via `onPromptedFolderChosen`. A cancel is a no-op (not an error) — returns `false` so the
+    /// caller can complete without a launch. The accessory app is briefly activated so the panel comes
+    /// forward and is interactive (the overlay has already ordered out by fire time).
+    @discardableResult
     private func promptFolderThenLaunch(lastFolder: URL?, item: LaunchItem, band: ContextBand,
-                                        launch: (URL) -> Void) {
+                                        launch: (URL) -> Void) -> Bool {
         NSApp.activate(ignoringOtherApps: true)
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -131,9 +153,10 @@ final class LaunchService {
         panel.message = "Choose a folder for “\(item.title)”"
         panel.directoryURL = Self.promptStartDirectory(
             lastFolder: lastFolder, home: FileManager.default.homeDirectoryForCurrentUser)
-        guard panel.runModal() == .OK, let folder = panel.url else { return }   // cancel → no-op
+        guard panel.runModal() == .OK, let folder = panel.url else { return false }   // cancel → no-op
         launch(folder)
         onPromptedFolderChosen(item.id, band.id, folder)
+        return true
     }
 
     // MARK: - Open Claude Here
@@ -143,7 +166,8 @@ final class LaunchService {
     /// process-spawning resolution + file write run off the main thread; the open + any failure
     /// notification hop back to the main actor. A *successful* open needs no notification (the terminal
     /// window is its own feedback); only failures surface (bounded, non-blocking — never an alert).
-    private func launchClaude(folder: URL, command: String?, claudePath: String?, title: String) {
+    private func launchClaude(folder: URL, command: String?, claudePath: String?, title: String,
+                              completion: @escaping FireCompletion = { _ in }) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             // Only the *default* (bare-claude) command uses the resolved binary path; a custom command is
             // run as written (its `claude`, if any, resolves on the login shell's PATH). Prefer the path
@@ -160,10 +184,14 @@ final class LaunchService {
                 switch writeResult {
                 case let .failure(error):
                     self.notify(title: title, body: error.errorDescription ?? "Couldn't start Claude.", success: false)
+                    completion(false)
                 case let .success(url):
                     if !NSWorkspace.shared.open(url) {
                         self.notify(title: title, body: ClaudeLaunchError.terminalOpenFailed(details: nil).errorDescription
                                     ?? "Couldn't open your terminal to start Claude.", success: false)
+                        completion(false)
+                    } else {
+                        completion(true)
                     }
                 }
             }
@@ -173,7 +201,8 @@ final class LaunchService {
     /// Open the user's default terminal at `folder` and run `command` (the general "Open in Terminal"
     /// item). Same no-permission `.command` handoff as `launchClaude`, without the claude resolution;
     /// only failures surface (the terminal window is its own success feedback).
-    private func launchTerminal(folder: URL, command: String, title: String) {
+    private func launchTerminal(folder: URL, command: String, title: String,
+                                completion: @escaping FireCompletion = { _ in }) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let writeResult: Result<URL, TerminalLaunchError>
             do { writeResult = .success(try TerminalLauncher.writeCommandFile(folder: folder, command: command)) }
@@ -185,10 +214,14 @@ final class LaunchService {
                 switch writeResult {
                 case let .failure(error):
                     self.notify(title: title, body: error.errorDescription ?? "Couldn't open your terminal.", success: false)
+                    completion(false)
                 case let .success(url):
                     if !NSWorkspace.shared.open(url) {
                         self.notify(title: title, body: TerminalLaunchError.terminalOpenFailed(details: nil).errorDescription
                                     ?? "Couldn't open your terminal.", success: false)
+                        completion(false)
+                    } else {
+                        completion(true)
                     }
                 }
             }
@@ -208,6 +241,10 @@ final class LaunchService {
         // truncated text pastes).
         let full = clipboardResolver(entry.id) ?? entry
         Self.writeToPasteboard(full)
+        // Tell the recorder this pasteboard change is OURS, so its next poll skips it instead of
+        // re-ingesting our own paste (`ClipboardStore.markOwnWrite` explains the damage that did). The
+        // shared store is the recorder's store.
+        ClipboardStore.shared.markOwnWrite(changeCount: NSPasteboard.general.changeCount)
         guard let app = frontApp() else { return }
         // The non-activating overlay never took key focus, so the captured app is still frontmost;
         // re-assert activation defensively, then synthesize ⌘V to its process.
@@ -433,7 +470,7 @@ final class LaunchService {
     /// AppleScript for common browsers (Safari makes a new document; Chromium makes a new window) and
     /// falls back to a normal open when that fails (unknown app, Automation denied) — so a link always
     /// opens. Controlling another app for the new-window path may prompt for Automation access once.
-    private func openURL(_ url: URL, handler: URL?, newWindow: Bool) {
+    private func openURL(_ url: URL, handler: URL?, newWindow: Bool, completion: @escaping FireCompletion) {
         if newWindow, let appName = Self.handlerAppName(handler: handler, for: url) {
             let script = Self.newWindowScript(url: url, appName: appName)
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -443,20 +480,27 @@ final class LaunchService {
                 let started = (try? p.run()) != nil
                 if started { p.waitUntilExit() }
                 if !started || p.terminationStatus != 0 {
-                    DispatchQueue.main.async { self?.plainOpen(url, handler: handler) }
+                    DispatchQueue.main.async { self?.plainOpen(url, handler: handler, completion: completion) }
+                } else {
+                    Task { @MainActor in completion(true) }
                 }
             }
             return
         }
-        plainOpen(url, handler: handler)
+        plainOpen(url, handler: handler, completion: completion)
     }
 
     /// Open `url` reusing the app's existing window: with the chosen handler app, or the system default.
-    private func plainOpen(_ url: URL, handler: URL?) {
-        guard let handler else { NSWorkspace.shared.open(url); return }
+    /// Completes with whether the open was accepted (synchronously for the default handler, via the
+    /// workspace callback for a chosen app).
+    private func plainOpen(_ url: URL, handler: URL?, completion: @escaping FireCompletion) {
+        guard let handler else { completion(NSWorkspace.shared.open(url)); return }
         let config = NSWorkspace.OpenConfiguration()
         config.activates = true
-        NSWorkspace.shared.open([url], withApplicationAt: handler, configuration: config, completionHandler: nil)
+        NSWorkspace.shared.open([url], withApplicationAt: handler, configuration: config) { _, error in
+            let accepted = error == nil
+            Task { @MainActor in completion(accepted) }
+        }
     }
 
     /// The AppleScript application name for the link's handler (the chosen app, else the system default
@@ -664,44 +708,68 @@ final class LaunchService {
     }
 
     /// Fire each leaf item of a preset in order, re-dispatching through `fire` so nested kinds use
-    /// the same paths. Reports overall success/failure via a notification.
-    private func firePreset(_ preset: LaunchItem, inBand band: ContextBand) {
+    /// the same paths. The summary notification is posted only once EVERY leaf has reported back
+    /// (scripts exited, app launches / terminal opens called back) — never on dispatch, which used to
+    /// report "Ran N steps." while a leaf could still be running or about to fail — and a failed run
+    /// says so ("2 of 3 steps failed.", `success: false`). Each failing leaf still posts its own typed
+    /// failure notification, exactly as when fired alone. Non-blocking throughout.
+    private func firePreset(_ preset: LaunchItem, inBand band: ContextBand,
+                            completion: @escaping FireCompletion = { _ in }) {
         let favorites = favoritesProvider()
         let leaves = Self.presetFireOrder(preset, in: favorites)
+        let tracker = PresetRunTracker(total: leaves.count) { [weak self] failed, total in
+            self?.notify(title: preset.title, body: Self.presetSummary(failed: failed, total: total),
+                         success: failed == 0)
+            completion(failed == 0)
+        }
         for leaf in leaves {
             // A leaf keeps its home band's strategy default; we approximate with the preset's band.
-            fire(leaf, inBand: bandFor(leaf, in: favorites) ?? band)
+            fire(leaf, inBand: bandFor(leaf, in: favorites) ?? band) { succeeded in
+                tracker.complete(succeeded: succeeded)
+            }
         }
-        notify(title: preset.title, body: "Ran \(leaves.count) step\(leaves.count == 1 ? "" : "s").", success: true)
+        tracker.finishIfEmpty()   // an empty preset has nothing to wait on
+    }
+
+    /// Pure: the preset summary line — "Ran N step(s)." when every leaf landed, else "M of N step(s) failed."
+    nonisolated static func presetSummary(failed: Int, total: Int) -> String {
+        let steps = "step\(total == 1 ? "" : "s")"
+        return failed == 0 ? "Ran \(total) \(steps)." : "\(failed) of \(total) \(steps) failed."
     }
 
     // MARK: - App firing
 
-    private func fireApp(_ item: LaunchItem, strategy: AppStrategy) {
-        guard case let .app(bundleURL, _) = item.kind else { return }
+    /// The running-app strategies are AX-driven and best-effort with no failure signal, so they complete
+    /// on dispatch (unchanged behavior); only a real launch through Launch Services reports its callback.
+    private func fireApp(_ item: LaunchItem, strategy: AppStrategy, completion: @escaping FireCompletion) {
+        guard case let .app(bundleURL, _) = item.kind else { completion(false); return }
         let running = runningInstance(forBundleURL: bundleURL)
 
         // Not running: launching it opens the first window on the current Space.
         guard let app = running else {
-            launch(bundleURL: bundleURL, newInstance: strategy == .newInstance)
+            launch(bundleURL: bundleURL, newInstance: strategy == .newInstance, completion: completion)
             return
         }
 
         switch strategy {
         case .newInstance:
-            launch(bundleURL: bundleURL, newInstance: true)
+            launch(bundleURL: bundleURL, newInstance: true, completion: completion)
         case .alwaysNewWindow:
             makeNewWindow(for: app)
+            completion(true)
         case .bringExistingHere:
             bringExistingHere(app, bundleURL: bundleURL)
+            completion(true)
         case .quitAndReopenHere:
             quitAndReopenHere(app, bundleURL: bundleURL)
+            completion(true)
         case .smart:
             if hasNewWindowMenuItem(pid: app.processIdentifier) {
                 makeNewWindow(for: app)
             } else {
                 bringExistingHere(app, bundleURL: bundleURL)
             }
+            completion(true)
         }
     }
 
@@ -809,53 +877,68 @@ final class LaunchService {
 
     // MARK: - Launch / shortcut / script effects
 
-    private func launch(bundleURL: URL, newInstance: Bool) {
+    /// Launch through Launch Services. A refusal is mapped to `LaunchError.appLaunchFailed` at this
+    /// boundary: the notification carries the clean headline, the raw OS text only reaches the log.
+    private func launch(bundleURL: URL, newInstance: Bool, completion: @escaping FireCompletion = { _ in }) {
         let config = NSWorkspace.OpenConfiguration()
         config.createsNewApplicationInstance = newInstance
         config.activates = true
         NSWorkspace.shared.openApplication(at: bundleURL, configuration: config) { [weak self] _, error in
-            if let error { Task { @MainActor in self?.notify(title: bundleURL.lastPathComponent,
-                                                             body: error.localizedDescription, success: false) } }
-        }
-    }
-
-    private func runShortcut(named name: String, title: String) {
-        run(executable: "/usr/bin/shortcuts", args: ["run", name], title: title)
-    }
-
-    private func runScript(_ body: ScriptBody, title: String) {
-        switch body {
-        case .shell(let code):
-            run(executable: "/bin/zsh", args: ["-c", code], title: title)
-        case .appleScript(let code):
-            run(executable: "/usr/bin/osascript", args: ["-e", code], title: title)
-        case .file(let url):
-            // .scpt → osascript; otherwise execute directly (respecting its shebang / +x bit).
-            if url.pathExtension.lowercased() == "scpt" {
-                run(executable: "/usr/bin/osascript", args: [url.path], title: title)
-            } else {
-                run(executable: url.path, args: [], title: title)
+            let failure = error.map { LaunchError.appLaunchFailed(details: String(describing: $0)) }
+            Task { @MainActor in
+                if let failure {
+                    launchLog.error("Launch of \(bundleURL.lastPathComponent, privacy: .public) failed: \(failure.copyableDetails ?? "", privacy: .public)")
+                    self?.notify(title: bundleURL.lastPathComponent,
+                                 body: failure.errorDescription ?? "Couldn't open the app.", success: false)
+                }
+                completion(failure == nil)
             }
         }
     }
 
-    /// Run a process off the main thread and report success/failure when it exits.
-    private func run(executable: String, args: [String], title: String) {
+    private func runShortcut(named name: String, title: String, completion: @escaping FireCompletion) {
+        run(executable: "/usr/bin/shortcuts", args: ["run", name], title: title, completion: completion)
+    }
+
+    private func runScript(_ body: ScriptBody, title: String, completion: @escaping FireCompletion) {
+        switch body {
+        case .shell(let code):
+            run(executable: "/bin/zsh", args: ["-c", code], title: title, completion: completion)
+        case .appleScript(let code):
+            run(executable: "/usr/bin/osascript", args: ["-e", code], title: title, completion: completion)
+        case .file(let url):
+            // .scpt → osascript; otherwise execute directly (respecting its shebang / +x bit).
+            if url.pathExtension.lowercased() == "scpt" {
+                run(executable: "/usr/bin/osascript", args: [url.path], title: title, completion: completion)
+            } else {
+                run(executable: url.path, args: [], title: title, completion: completion)
+            }
+        }
+    }
+
+    /// Run a process off the main thread and report success/failure when it exits. A `Process` error is
+    /// mapped to `LaunchError` at this boundary — the notification headline is the taxonomy's clean
+    /// string, the raw error text goes to the log only.
+    private func run(executable: String, args: [String], title: String, completion: @escaping FireCompletion) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: executable)
             process.arguments = args
-            var ok = false
-            var message = ""
+            let failure: LaunchError?
             do {
                 try process.run()
                 process.waitUntilExit()
-                ok = process.terminationStatus == 0
-                if !ok { message = "Exited with status \(process.terminationStatus)." }
+                failure = process.terminationStatus == 0 ? nil : .processExited(status: process.terminationStatus)
             } catch {
-                message = error.localizedDescription
+                failure = .processStartFailed(details: String(describing: error))
             }
-            Task { @MainActor in self?.notify(title: title, body: ok ? "Done." : message, success: ok) }
+            Task { @MainActor in
+                if let details = failure?.copyableDetails {
+                    launchLog.error("\(title, privacy: .public) failed to start: \(details, privacy: .public)")
+                }
+                self?.notify(title: title, body: failure?.errorDescription ?? "Done.", success: failure == nil)
+                completion(failure == nil)
+            }
         }
     }
 
@@ -991,6 +1074,75 @@ final class LaunchService {
         default:                    keyCode = 0x15
         }
         return (keyCode, flags)
+    }
+}
+
+/// The launcher's error taxonomy for its generic fire effects — an app launch through Launch Services
+/// and a subprocess run (scripts, Shortcuts). `LocalizedError` with a clean per-case headline; the OS /
+/// `Process` error text rides only in the opt-in `copyableDetails` (logged, never a headline). Parallel
+/// to `ClaudeLaunchError` / `TerminalLaunchError`, which remain the taxonomies for their own flows.
+enum LaunchError: Error, Equatable {
+    /// Launch Services refused to open the app bundle (damaged, quarantined, wrong architecture…).
+    case appLaunchFailed(details: String?)
+    /// The subprocess couldn't be started (missing executable, no +x bit, bad path).
+    case processStartFailed(details: String?)
+    /// The subprocess ran but exited non-zero.
+    case processExited(status: Int32)
+}
+
+extension LaunchError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .appLaunchFailed:           return "Couldn't open the app."
+        case .processStartFailed:        return "Couldn't start it — check the script or file path."
+        case let .processExited(status): return "Exited with status \(status)."
+        }
+    }
+
+    /// The opt-in raw detail (captured at the boundary), for logs only. `nil` when the headline says it all.
+    var copyableDetails: String? {
+        switch self {
+        case let .appLaunchFailed(details), let .processStartFailed(details): return details
+        case .processExited: return nil
+        }
+    }
+}
+
+/// Counts a preset's leaf completions so the summary fires exactly once — when the LAST leaf has settled,
+/// in whatever order the asynchronous leaves finish — carrying the failure count. No system access, so
+/// the sequencing is unit-tested.
+@MainActor
+final class PresetRunTracker {
+    let total: Int
+    private(set) var completed = 0
+    private(set) var failed = 0
+    private var onFinished: ((_ failed: Int, _ total: Int) -> Void)?
+
+    init(total: Int, onFinished: @escaping (_ failed: Int, _ total: Int) -> Void) {
+        self.total = total
+        self.onFinished = onFinished
+    }
+
+    var isFinished: Bool { onFinished == nil }
+
+    /// One leaf settled. Completions past `total` are ignored, so a leaf that reports twice can neither
+    /// double-count nor re-fire the summary.
+    func complete(succeeded: Bool) {
+        guard !isFinished, completed < total else { return }
+        completed += 1
+        if !succeeded { failed += 1 }
+        if completed == total { finish() }
+    }
+
+    /// An empty preset has no leaves to wait on — report immediately.
+    func finishIfEmpty() {
+        if total == 0 { finish() }
+    }
+
+    private func finish() {
+        guard let callback = onFinished else { return }
+        onFinished = nil
+        callback(failed, total)
     }
 }
 

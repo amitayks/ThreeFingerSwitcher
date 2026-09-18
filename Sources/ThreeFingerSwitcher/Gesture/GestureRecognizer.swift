@@ -5,6 +5,11 @@ import CoreGraphics
 /// these (it knows item count, so wrap/clamp lives there).
 @MainActor
 protocol GestureRecognizerDelegate: AnyObject {
+    /// Asked right before activation: may the recognizer take the switcher? A `false` (e.g. a ⌘-Tab
+    /// session already owns the overlay) makes the recognizer drop the gesture until the fingers lift —
+    /// no activation, no steps, no commit/cancel — so the touch can neither drive nor tear down the
+    /// other driver's session. Defaults to true.
+    func gestureShouldActivate() -> Bool
     /// Horizontal scrub crossed the activation threshold; show the switcher.
     func gestureDidActivate()
     /// Move the selection by one window (+1 next / -1 previous), already direction-adjusted.
@@ -49,6 +54,7 @@ protocol GestureRecognizerDelegate: AnyObject {
 }
 
 extension GestureRecognizerDelegate {
+    func gestureShouldActivate() -> Bool { true }
     func launcherDidActivate() {}
     func launcherDidStepItem(_ direction: Int) {}
     func launcherDidStepContext(_ direction: Int) {}
@@ -102,6 +108,10 @@ final class GestureRecognizer {
     private var mode: Mode = .switcher
     private var axis: Axis = .undetermined
     private var activated = false
+    /// Set when the delegate refused activation (`gestureShouldActivate() == false`): the rest of this
+    /// touch is ignored until every finger lifts, so a refused gesture emits nothing — in particular no
+    /// `gestureDidCancel`/`gestureDidCommit` that would hide or commit an overlay another driver owns.
+    private var suppressedUntilLift = false
     /// One-shot guard so a fresh vertical swipe triggers Mission Control / App Exposé only once.
     private var triggeredMissionControl = false
     /// Consecutive frames seen below the required finger count (to debounce edge flicker vs. a
@@ -142,6 +152,10 @@ final class GestureRecognizer {
     }
 
     func feed(_ frame: TouchFrame) {
+        if suppressedUntilLift {
+            if frame.fingerCount == 0 { suppressedUntilLift = false }
+            return
+        }
         let switcherTarget = settings.requireExactlyThree ? (frame.fingerCount == 3) : (frame.fingerCount >= 3)
 
         switch state {
@@ -168,6 +182,7 @@ final class GestureRecognizer {
 
     /// Abort any in-flight gesture (e.g. when the engine stops).
     func reset() {
+        suppressedUntilLift = false
         guard state == .tracking else { return }
         switch mode {
         case .switcher: cancel()
@@ -282,6 +297,15 @@ final class GestureRecognizer {
 
         if !activated {
             if abs(dx) >= CGFloat(settings.activationThreshold) {
+                // Refused (another driver owns the overlay): drop this touch entirely — `activated`
+                // must stay false so the lift never reaches `end()`, which would emit a cancel/commit
+                // into the other driver's session.
+                guard delegate?.gestureShouldActivate() ?? true else {
+                    state = .idle
+                    axis = .undetermined
+                    suppressedUntilLift = true
+                    return
+                }
                 activated = true
                 stepAccumulator = 0
                 stepAccumulatorY = 0

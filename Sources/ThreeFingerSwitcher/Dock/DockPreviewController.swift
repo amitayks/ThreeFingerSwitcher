@@ -99,6 +99,13 @@ final class DockPreviewController {
         }
     }
 
+    /// Drop cached tab frames of windows that no longer exist. The coordinator calls this at each switcher
+    /// open with the set of ALL currently existing window ids (from CGWindowList), so frames of closed
+    /// windows stop pinning memory in this cache too — it was never pruned before, only LRU-evicted.
+    func pruneThumbnails(keeping ids: Set<CGWindowID>) {
+        thumbnails.retain(only: ids)
+    }
+
     // MARK: - Cursor handling
 
     private func handleCursor(_ point: CGPoint) {
@@ -188,9 +195,10 @@ final class DockPreviewController {
         emptyPID = nil
         let windows = windowService.currentSpaceWindows(forApp: pid)
         guard !windows.isEmpty else {
-            // No current-Space windows → show nothing (spec). Remember so we don't re-enumerate per move.
-            emptyPID = pid
+            // No current-Space windows → show nothing (spec). Remember so we don't re-enumerate per move —
+            // set AFTER the dismiss (which clears the memo), or it never sticks.
             if overlay.isVisible { dismiss() }
+            emptyPID = pid
             return
         }
         // Capture the window to restore once, at the start of the peek session (before anything is
@@ -262,6 +270,10 @@ final class DockPreviewController {
     /// so they keep their last-good tab thumbnail and surface only on commit. Previously-front window is
     /// restored on leave.
     private func peek(_ id: CGWindowID) {
+        // Idempotent per card: SwiftUI's onHover flickers (the hover scale-up), and each re-entry would
+        // re-run `peekRaise` and restart the settle capture. `peekedID` is cleared in `dismiss` and moves
+        // on a card swap, so this only short-circuits a true repeat.
+        guard peekedID != id else { return }
         guard let w = currentWindows.first(where: { $0.id == id }) else { return }
         captureTask?.cancel()
         guard !w.isMinimized else { return }
@@ -304,7 +316,16 @@ final class DockPreviewController {
     private func dismiss(restore: Bool = true) {
         captureTask?.cancel()
         captureTask = nil
-        if restore, peekedID != nil, let target = restoreTarget {
+        // Restore ONLY while our peek is still what's in front. If the user meanwhile clicked / ⌘-Tabbed
+        // to a third app, re-fronting the pre-peek window would silently undo that ~250 ms later (on the
+        // grace dismiss). A nil `frontmostWindow()` is no evidence either way — never yank focus on it.
+        // Under Stage Manager `peekRaise` deliberately skips the per-app focus singletons (the switcher
+        // landmine), so the app's focused window may be a sibling of the peeked one — there the peek is
+        // "still in front" when its APP is frontmost; the exact window-id match applies otherwise.
+        if restore, let peeked = peekedID, let target = restoreTarget,
+           let front = windowService.frontmostWindow(),
+           front.id == peeked
+            || (StageManager.isEnabled && front.pid == currentWindows.first(where: { $0.id == peeked })?.pid) {
             windowService.peekRaise(target)
         }
         overlay.hide()                 // synchronous orderOut

@@ -99,6 +99,30 @@ final class KeyboardLanguageTests: XCTestCase {
         XCTAssertNil(reloaded.source(forBundleID: "com.unknown"), "an unseen bundle reads nil")
     }
 
+    /// A mutation that leaves the record equal neither publishes nor re-saves: `learnOutgoing` re-remembers
+    /// the same source for the same app on EVERY app switch, and each pass used to be a Hub re-render plus
+    /// a JSON encode + defaults write for nothing.
+    func testStoreSkipsPublishAndSaveWhenTheMutationChangesNothing() {
+        let store = KeyboardLanguageStore(defaults: defaults)
+        store.setSource(hebrew, forBundleID: "com.example.editor")
+        var emissions = 0
+        let sink = store.objectWillChange.sink { _ in emissions += 1 }
+        defer { sink.cancel() }
+        // Pose a foreign write under the key so a redundant `save()` would be observable.
+        defaults.set(Data("sentinel".utf8), forKey: "keyboardLanguageMap")
+
+        store.setSource(hebrew, forBundleID: "com.example.editor")   // same value → no-op
+        store.removeSource(forBundleID: "com.never.seen")             // nothing to remove → no-op
+        XCTAssertEqual(emissions, 0, "an unchanged record must not emit")
+        XCTAssertEqual(defaults.data(forKey: "keyboardLanguageMap"), Data("sentinel".utf8),
+                       "an unchanged record must not be re-saved")
+
+        store.setSource(abc, forBundleID: "com.example.editor")       // a real change
+        XCTAssertEqual(emissions, 1)
+        XCTAssertNotEqual(defaults.data(forKey: "keyboardLanguageMap"), Data("sentinel".utf8),
+                          "a real change still persists immediately")
+    }
+
     /// A first-run store (empty defaults) starts with an empty map at the current schema.
     func testStoreFirstRunIsEmptyMap() {
         let store = KeyboardLanguageStore(defaults: defaults)

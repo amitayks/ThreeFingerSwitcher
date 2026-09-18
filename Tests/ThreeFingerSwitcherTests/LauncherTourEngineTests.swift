@@ -54,12 +54,13 @@ final class LauncherTourEngineTests: XCTestCase {
         _ = engine.feed(fingerCount: 4, centroid: CGPoint(x: 0.30, y: 0.5), onBandList: true)
         _ = engine.feed(fingerCount: 4, centroid: CGPoint(x: 0.40, y: 0.5), onBandList: true)
         _ = engine.feed(fingerCount: 2, centroid: CGPoint(x: 0.40, y: 0.5), onBandList: true)   // re-baseline
-        // On the band list (bandStep 0.09): moving DOWN the pad (y up) by 0.10 → one next-band step.
-        XCTAssertEqual(engine.feed(fingerCount: 2, centroid: CGPoint(x: 0.40, y: 0.60), onBandList: true),
+        // Frames are y-UP (the trackpad's own convention). On the band list (bandStep 0.09): moving DOWN
+        // the pad (y decreasing) by 0.10 → one next-band step, `stepVertical(-1)`.
+        XCTAssertEqual(engine.feed(fingerCount: 2, centroid: CGPoint(x: 0.40, y: 0.40), onBandList: true),
                        [.stepVertical(-1)], "down the pad = next band; one bandStep crossing")
         // In the grid (itemStep 0.04): the same kind of move now steps rows at the finer distance.
-        _ = engine.feed(fingerCount: 2, centroid: CGPoint(x: 0.40, y: 0.60), onBandList: false)   // re-baseline (focus flip is a fresh frame)
-        let rows = engine.feed(fingerCount: 2, centroid: CGPoint(x: 0.40, y: 0.69), onBandList: false)
+        _ = engine.feed(fingerCount: 2, centroid: CGPoint(x: 0.40, y: 0.40), onBandList: false)   // re-baseline (focus flip is a fresh frame)
+        let rows = engine.feed(fingerCount: 2, centroid: CGPoint(x: 0.40, y: 0.31), onBandList: false)
         XCTAssertEqual(rows, [.stepVertical(-1), .stepVertical(-1)], "0.09 of travel at a 0.04 row step = 2 steps")
     }
 
@@ -68,9 +69,24 @@ final class LauncherTourEngineTests: XCTestCase {
         _ = engine.feed(fingerCount: 4, centroid: CGPoint(x: 0.30, y: 0.5), onBandList: true)
         _ = engine.feed(fingerCount: 4, centroid: CGPoint(x: 0.40, y: 0.5), onBandList: true)
         _ = engine.feed(fingerCount: 2, centroid: CGPoint(x: 0.40, y: 0.50), onBandList: true)
-        // Up the pad (y decreasing) = previous band = stepVertical(+1).
-        XCTAssertEqual(engine.feed(fingerCount: 2, centroid: CGPoint(x: 0.40, y: 0.40), onBandList: true),
+        // Up the pad (y INCREASING — frames are y-up) = previous band = stepVertical(+1), the sign
+        // `GestureRecognizer` emits and `LauncherModel.stepVertical` expects.
+        XCTAssertEqual(engine.feed(fingerCount: 2, centroid: CGPoint(x: 0.40, y: 0.60), onBandList: true),
                        [.stepVertical(1)])
+    }
+
+    func testPoseSwipeDownStrokeStepsToNextBand() {
+        // The pose driver's `.swipeDown` stroke travels from the pad's top (high y) toward the centre —
+        // fed frame by frame it must read as DOWN (`stepVertical(-1)`), the same direction the real
+        // recognizer reports for that physical motion. (The engine once had the sign inverted.)
+        let stroke = GesturePose.bandJourney(bandFraction: 0.5, inSurface: .swipeDown).strokes.last!
+        XCTAssertGreaterThan(stroke.from.y, stroke.to.y, "a downward stroke descends in y-up space")
+        var engine = makeEngine()
+        engine.beginNavigation()
+        _ = engine.feed(fingerCount: stroke.fingers, centroid: stroke.from, onBandList: true)   // press down
+        let intents = engine.feed(fingerCount: stroke.fingers, centroid: stroke.to, onBandList: true)
+        XCTAssertFalse(intents.isEmpty, "the stroke spans at least one band step")
+        XCTAssertTrue(intents.allSatisfy { $0 == .stepVertical(-1) }, "every step goes DOWN: \(intents)")
     }
 
     // MARK: - Re-baseline + end

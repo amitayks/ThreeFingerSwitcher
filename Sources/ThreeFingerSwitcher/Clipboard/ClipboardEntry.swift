@@ -19,8 +19,10 @@ enum ClipboardKind: String, Codable, Equatable, CaseIterable {
 
 /// One stored representation's bytes: kept **inline** for small payloads (text, color, url, rtf) or
 /// as a **blob** file (large payloads: image bytes, cached thumbnails) under the store's blob dir.
-/// The in-memory entries the band/preview/paste use always carry `.inline` (the store materializes
-/// blobs on load); `.blob` exists only in the on-disk index.
+/// In memory, a payload may be either: the store keeps small ones `.inline` and swaps LARGE ones to
+/// `.blob` once their file is safely on disk (`ClipboardStore.residentByteThreshold`), so a session's
+/// images aren't all resident. Every read path resolves `.blob` on demand (`materializedEntry`,
+/// `bandWindow`, `payloadSource`); consumers must never assume `.inline`.
 enum ClipboardPayload: Equatable {
     case inline(Data)
     case blob(String)   // blob file name, relative to the store's blob directory
@@ -69,6 +71,12 @@ struct ClipboardEntry: Codable, Equatable, Identifiable {
     /// Stable content fingerprint used for de-duplication (two copies with the same fingerprint are
     /// the same entry). Derived from the canonical representation at capture time.
     var fingerprint: String
+    /// Total payload bytes across all representations, **whether inline or externalized**. This is what
+    /// the byte-cap retention counts: `inlineByteSize` reads 0 for an unresolved `.blob`, so counting
+    /// inline bytes alone let every blob-backed entry cost nothing after a relaunch (disk bounded only
+    /// by `maxCount`). Set from the inline bytes at construction (capture); persisted; a legacy index
+    /// without the key loads as 0 and the store back-fills it from the blob files' sizes on load.
+    var payloadByteSize: Int
     /// Transient, **band-only** marker: true when the band's bounded preview omitted part of a larger
     /// payload (so the preview UI can say "truncated — full content will paste"). Derived at band-build
     /// time (`ClipboardStore.boundedForBand`); deliberately **excluded from `CodingKeys`** so it is never
@@ -77,9 +85,26 @@ struct ClipboardEntry: Codable, Equatable, Identifiable {
 
     /// Persisted keys only — `isPreviewTruncated` is intentionally absent so it stays transient and the
     /// index format is unchanged. `sourceApp` still decodes-if-present (legacy compat; a legacy
-    /// `origin` key from the removed device link is simply ignored on decode).
+    /// `origin` key from the removed device link is simply ignored on decode). `payloadByteSize` is
+    /// additive: absent in older indexes, so it is decoded-if-present (see `init(from:)`).
     private enum CodingKeys: String, CodingKey {
-        case id, capturedAt, kind, key, sourceApp, pinned, representations, fingerprint
+        case id, capturedAt, kind, key, sourceApp, pinned, representations, fingerprint, payloadByteSize
+    }
+
+    /// Hand-written so an index persisted before `payloadByteSize` existed still loads (a synthesized
+    /// decoder would fail the WHOLE index on the missing key — losing the user's history on upgrade).
+    /// Encoding stays synthesized (every key is written).
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        capturedAt = try c.decode(Date.self, forKey: .capturedAt)
+        kind = try c.decode(ClipboardKind.self, forKey: .kind)
+        key = try c.decode(String.self, forKey: .key)
+        sourceApp = try c.decodeIfPresent(String.self, forKey: .sourceApp)
+        pinned = try c.decode(Bool.self, forKey: .pinned)
+        representations = try c.decode([String: ClipboardPayload].self, forKey: .representations)
+        fingerprint = try c.decode(String.self, forKey: .fingerprint)
+        payloadByteSize = try c.decodeIfPresent(Int.self, forKey: .payloadByteSize) ?? 0
     }
 
     init(id: UUID = UUID(),
@@ -89,7 +114,8 @@ struct ClipboardEntry: Codable, Equatable, Identifiable {
          sourceApp: String? = nil,
          pinned: Bool = false,
          representations: [String: ClipboardPayload],
-         fingerprint: String) {
+         fingerprint: String,
+         payloadByteSize: Int? = nil) {
         self.id = id
         self.capturedAt = capturedAt
         self.kind = kind
@@ -98,6 +124,9 @@ struct ClipboardEntry: Codable, Equatable, Identifiable {
         self.pinned = pinned
         self.representations = representations
         self.fingerprint = fingerprint
+        // Default: the inline bytes (capture builds entries inline). An explicit size is for callers that
+        // construct blob-backed entries and know the on-disk size.
+        self.payloadByteSize = payloadByteSize ?? Self.inlineByteSize(of: representations)
     }
 
     // MARK: Convenience accessors (used by the preview + paste paths)
@@ -105,8 +134,12 @@ struct ClipboardEntry: Codable, Equatable, Identifiable {
     /// Inline bytes for a representation UTI, if present and materialized.
     func data(for uti: String) -> Data? { representations[uti]?.inlineData }
 
-    /// Approximate byte size of this entry's inline payloads (drives the byte-cap retention).
-    var inlineByteSize: Int {
+    /// Byte size of this entry's currently **resident** (inline) payloads — the per-capture ceiling and
+    /// memory diagnostics. NOT the retention measure: an externalized `.blob` counts 0 here; retention
+    /// uses `payloadByteSize`.
+    var inlineByteSize: Int { Self.inlineByteSize(of: representations) }
+
+    static func inlineByteSize(of representations: [String: ClipboardPayload]) -> Int {
         representations.values.reduce(0) { $0 + ($1.inlineData?.count ?? 0) }
     }
 }

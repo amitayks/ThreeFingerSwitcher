@@ -143,6 +143,23 @@ final class PerSiteKeyboardLanguageTests: XCTestCase {
         XCTAssertNil(resolver.contextID(forFrontmost: nil))
     }
 
+    /// The resolver signals the provider on every CHANGE of frontmost bundle id (an app activation) and
+    /// never on a same-app re-resolution (the within-browser poll tick) — the reset hook for the
+    /// providers' negative-result backoff.
+    func testResolverSignalsAppSwitchOnlyWhenTheFrontmostBundleChanges() {
+        let host = FakeHostProvider(hostsByBundle: [chrome: "keep.google.com"])
+        let resolver = ContextResolver(hostProvider: host, perSiteEnabled: { true })
+        _ = resolver.contextID(forFrontmost: chrome)
+        XCTAssertEqual(host.appSwitches, 1, "the first resolution is a switch from nothing")
+        _ = resolver.contextID(forFrontmost: chrome)
+        _ = resolver.contextID(forFrontmost: chrome)
+        XCTAssertEqual(host.appSwitches, 1, "poll ticks on the same app are not switches")
+        _ = resolver.contextID(forFrontmost: "com.apple.finder")
+        XCTAssertEqual(host.appSwitches, 2, "leaving the browser is a switch (even to a non-browser)")
+        _ = resolver.contextID(forFrontmost: chrome)
+        XCTAssertEqual(host.appSwitches, 3, "coming back is a switch — the backoff must be fresh")
+    }
+
     // MARK: - 8.4 Service per-site coordination (THE REGRESSION for the user scenario)
 
     /// On Chrome, `keep.google.com` learns Hebrew; navigating to `mail.google.com` applies/learns English;

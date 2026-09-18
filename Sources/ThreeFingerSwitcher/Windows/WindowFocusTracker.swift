@@ -118,8 +118,13 @@ final class WindowFocusTracker {
         let appEl = AXUIElementCreateApplication(pid)
         // Both notifications cover an external within-app focus change; either may fire depending on
         // the app. Promote is idempotent, so a double-fire is harmless.
-        AXObserverAddNotification(observer, appEl, kAXFocusedWindowChangedNotification as CFString, context)
-        AXObserverAddNotification(observer, appEl, kAXMainWindowChangedNotification as CFString, context)
+        let focusedAdded = AXObserverAddNotification(observer, appEl, kAXFocusedWindowChangedNotification as CFString, context)
+        let mainAdded = AXObserverAddNotification(observer, appEl, kAXMainWindowChangedNotification as CFString, context)
+        // An app still launching (its AX server not serving yet) fails BOTH adds. Recording it as observed
+        // anyway would mean it is never re-observed — the pid guard above short-circuits every later
+        // activation of that app — so drop the (never run-loop-attached) observer and leave `axObservedPID`
+        // nil, so the next activation of that app retries. One successful add is enough to keep it.
+        guard focusedAdded == .success || mainAdded == .success else { return }
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
         axObserver = observer
         axObservedPID = pid

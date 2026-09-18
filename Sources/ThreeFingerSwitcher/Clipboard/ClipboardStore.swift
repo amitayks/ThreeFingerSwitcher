@@ -20,8 +20,14 @@ final class ClipboardStore {
     }
 
     static let currentSchemaVersion = 1
-    /// Inline payloads larger than this are externalized to a blob file on save.
-    private static let blobThreshold = 16 * 1024
+    /// Inline payloads larger than this are externalized to a blob file on save. `nonisolated`: read by
+    /// the off-actor persist (`externalizedForStorage` runs on `ioQueue`).
+    nonisolated private static let blobThreshold = 16 * 1024
+    /// Payloads larger than this do not stay **resident** in memory: once a save has written their blob,
+    /// the in-memory copy is swapped to its `.blob` reference (`adoptPendingExternalizations`), so a
+    /// session's images/big texts aren't all held in RAM up to `maxBytes` (pinned ones unbounded). Reads
+    /// resolve `.blob` on demand. Kept above `blobThreshold` so everyday text stays instant.
+    static let residentByteThreshold = 256 * 1024
     /// Upper bound on the bytes a **band** item carries for its value preview. Textual payloads are
     /// truncated to this at band-build time so the band never holds (or renders) a large payload; the
     /// full content is materialized on demand for paste. Small payloads (≤ this) pass through whole.
@@ -39,6 +45,16 @@ final class ClipboardStore {
     /// The full set of stored entries, newest-influence kept by `capturedAt`. Private — callers use
     /// `recentWindow` / `allEntries`.
     private var entries: [ClipboardEntry] = []
+
+    /// The pasteboard `changeCount` of a write WE made (the launcher's paste), pending the recorder's
+    /// acknowledgement — see `markOwnWrite`. Lives on the store (not the monitor) because the paste path
+    /// (`LaunchService`) only knows the shared store, and the monitor already owns a store reference.
+    private var ownWriteChangeCount: Int?
+
+    /// Persist results produced on `ioQueue` that still need adopting on the main actor (the resident →
+    /// `.blob` swap). Lock-guarded rather than actor state because it's written off-actor; drained by the
+    /// async main hop AND synchronously by `flush()`, so a flush settles memory as well as disk.
+    private let pending = PendingAdoptions()
 
     private convenience init() {
         self.init(directory: Self.defaultDirectory(), retention: .default)
@@ -86,6 +102,19 @@ final class ClipboardStore {
         return materialized(entry)
     }
 
+    /// Where ONE representation's bytes live, resolved on the actor **without reading any blob** — so a
+    /// caller can do the (possibly tens-of-MB) file read off the main actor, and read only the single
+    /// representation it will use rather than materializing the whole entry (the image preview: PNG or
+    /// TIFF, never both). `nil` if the id or UTI is unknown.
+    func payloadSource(id: UUID, uti: String) -> ClipboardPayloadSource? {
+        guard let entry = entries.first(where: { $0.id == id }),
+              let payload = entry.representations[uti] else { return nil }
+        switch payload {
+        case .inline(let data): return .inline(data)
+        case .blob(let name):   return .file(blobsDir.appendingPathComponent(name))
+        }
+    }
+
     /// All entries (materialized), newest first — for settings / diagnostics.
     func allEntries() -> [ClipboardEntry] {
         entries.sorted { $0.capturedAt > $1.capturedAt }.map(materialized)
@@ -93,6 +122,29 @@ final class ClipboardStore {
 
     var isEmpty: Bool { entries.isEmpty }
     var count: Int { entries.count }
+    /// Bytes currently held inline in memory across all entries (diagnostics / tests): bounded by the
+    /// resident swap, unlike the retention measure `payloadByteSize`.
+    var residentInlineBytes: Int { entries.reduce(0) { $0 + $1.inlineByteSize } }
+
+    // MARK: - Own pasteboard writes (the recorder must not re-ingest our own paste)
+
+    /// Record that WE just wrote the general pasteboard (the launcher pasting an entry) and it now sits at
+    /// `changeCount`. The recorder (`ClipboardMonitor.poll`) skips exactly that change — adopting it as its
+    /// last-seen count — instead of capturing it: re-capturing our own paste would `dedup`-overwrite the
+    /// entry's `capturedAt` / `sourceApp` (with the paste TARGET app), re-serialize + rewrite it to disk on
+    /// every paste, and for an image captured with only TIFF the PNG we add on paste changes the
+    /// fingerprint → a duplicate entry. One-shot: a *newer* change arriving first is a real user copy, so
+    /// the stale marker is dropped and that copy is captured normally.
+    func markOwnWrite(changeCount: Int) {
+        ownWriteChangeCount = changeCount
+    }
+
+    /// Recorder-side: take (and clear) the pending own-write marker. Returns the marked `changeCount`, or
+    /// nil when no own write is pending.
+    func takeOwnWriteMarker() -> Int? {
+        defer { ownWriteChangeCount = nil }
+        return ownWriteChangeCount
+    }
 
     // MARK: - Mutations
 
@@ -133,6 +185,7 @@ final class ClipboardStore {
             out[i].key = entry.key
             out[i].kind = entry.kind
             out[i].sourceApp = entry.sourceApp
+            out[i].payloadByteSize = entry.payloadByteSize
             // pin + id preserved
         } else {
             out.append(entry)
@@ -155,13 +208,15 @@ final class ClipboardStore {
         if unpinned.count > countBudget {
             unpinned = Array(unpinned.prefix(countBudget))
         }
-        // Byte cap (non-pinned only): keep newest until the budget is spent.
+        // Byte cap (non-pinned only): keep newest until the budget is spent. Counts `payloadByteSize`
+        // (inline OR externalized), never `inlineByteSize` — a blob-backed entry would otherwise cost 0
+        // (every entry after a relaunch, and every large one once it's swapped to `.blob` in memory).
         if retention.maxBytes > 0 {
-            let pinnedBytes = pinned.reduce(0) { $0 + $1.inlineByteSize }
+            let pinnedBytes = pinned.reduce(0) { $0 + $1.payloadByteSize }
             var budget = max(0, retention.maxBytes - pinnedBytes)
             var kept: [ClipboardEntry] = []
             for e in unpinned {
-                let size = e.inlineByteSize
+                let size = e.payloadByteSize
                 if size <= budget { kept.append(e); budget -= size }
             }
             unpinned = kept
@@ -190,7 +245,28 @@ final class ClipboardStore {
     private func load() {
         guard let data = try? Data(contentsOf: indexURL),
               let decoded = try? JSONDecoder().decode(StoredIndex.self, from: data) else { return }
-        entries = Self.migrate(decoded).entries
+        entries = Self.backfillingPayloadSizes(Self.migrate(decoded).entries, blobsDir: blobsDir)
+    }
+
+    /// An index persisted before `payloadByteSize` existed loads every entry as 0 — which the byte cap
+    /// would count as free. Fill it once from the inline bytes plus the blob files' on-disk sizes so the
+    /// cap is honest from the first eviction. Entries that already carry a size are untouched (no stat).
+    nonisolated static func backfillingPayloadSizes(_ entries: [ClipboardEntry], blobsDir: URL) -> [ClipboardEntry] {
+        entries.map { entry in
+            guard entry.payloadByteSize == 0, !entry.representations.isEmpty else { return entry }
+            var e = entry
+            e.payloadByteSize = entry.representations.values.reduce(0) { sum, payload in
+                switch payload {
+                case .inline(let d):
+                    return sum + d.count
+                case .blob(let name):
+                    let path = blobsDir.appendingPathComponent(name).path
+                    let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? NSNumber
+                    return sum + (size?.intValue ?? 0)
+                }
+            }
+            return e
+        }
     }
 
     /// Forward-migrate an older index to the current schema. Identity for v1; future versions branch here.
@@ -203,34 +279,84 @@ final class ClipboardStore {
 
     /// Persist off the main thread: snapshot the entries on the actor, then do the disk work (blob writes +
     /// index write + orphan prune) on the serial `ioQueue`, so a large payload's I/O never blocks capture.
-    /// Durability is now asynchronous — call `flush()` when a synchronous guarantee is required (tests, app
-    /// termination). The in-memory `entries` are always inline, so a concurrent bounded band read never
-    /// races a blob write (only new, content-hashed blobs are written, and only once).
+    /// Durability is asynchronous — call `flush()` when a synchronous guarantee is required (tests, app
+    /// termination).
+    ///
+    /// Memory bound: only AFTER the persist has completed does the result hop back to the main actor, where
+    /// large inline payloads are swapped to their now-on-disk `.blob` references
+    /// (`adoptPendingExternalizations`). Ordering is what makes this race-free: a band read never sees a
+    /// `.blob` whose file isn't written yet, because the swap happens strictly after the write (and only new,
+    /// content-hashed blobs are ever written, only once).
     private func save() {
         let snapshot = entries
         let blobs = blobsDir
         let index = indexURL
-        ioQueue.async {
-            Self.persist(snapshot, schemaVersion: Self.currentSchemaVersion, blobsDir: blobs, indexURL: index)
+        let pending = self.pending
+        ioQueue.async { [weak self] in
+            guard let persisted = Self.persist(snapshot, schemaVersion: Self.currentSchemaVersion,
+                                               blobsDir: blobs, indexURL: index) else { return }
+            pending.push(PendingAdoption(snapshot: snapshot, persisted: persisted))
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.adoptPendingExternalizations() }
+            }
         }
     }
 
-    /// Block until all queued persistence has been written. For deterministic durability where async would
-    /// race a subsequent read (a test that reloads the store, or an app-termination flush).
-    func flush() { ioQueue.sync {} }
+    /// Block until all queued persistence has been written AND its memory swap adopted. For deterministic
+    /// durability where async would race a subsequent read (a test that reloads the store, or the
+    /// app-termination / danger-zone-wipe flush the coordinator wires).
+    func flush() {
+        ioQueue.sync {}
+        adoptPendingExternalizations()
+    }
+
+    /// Apply every completed persist's resident → `.blob` swap to the live entries (idempotent; a result
+    /// whose bytes no longer match the live entry — re-copied with different content, evicted, cleared —
+    /// is skipped, so a stale result can never point an entry at the wrong blob).
+    private func adoptPendingExternalizations() {
+        for adoption in pending.drain() {
+            entries = Self.adoptingExternalized(entries, snapshot: adoption.snapshot,
+                                                persisted: adoption.persisted,
+                                                threshold: Self.residentByteThreshold)
+        }
+    }
+
+    /// Pure: `live` with each inline payload larger than `threshold` replaced by the `.blob` reference
+    /// `persisted` gave it — only where the live bytes still EQUAL the `snapshot` bytes that were written
+    /// (same entry id, same UTI), so a payload that changed since the snapshot keeps its inline bytes until
+    /// its own save lands. Smaller payloads stay resident.
+    nonisolated static func adoptingExternalized(_ live: [ClipboardEntry], snapshot: [ClipboardEntry],
+                                                 persisted: [ClipboardEntry], threshold: Int) -> [ClipboardEntry] {
+        let written = Dictionary(snapshot.map { ($0.id, $0.representations) }, uniquingKeysWith: { a, _ in a })
+        let onDisk = Dictionary(persisted.map { ($0.id, $0.representations) }, uniquingKeysWith: { a, _ in a })
+        return live.map { entry in
+            guard let wrote = written[entry.id], let stored = onDisk[entry.id] else { return entry }
+            var e = entry
+            for (uti, payload) in entry.representations {
+                guard case let .inline(data) = payload, data.count > threshold,
+                      case let .blob(name)? = stored[uti],
+                      case let .inline(writtenData)? = wrote[uti], writtenData == data else { continue }
+                e.representations[uti] = .blob(name)
+            }
+            return e
+        }
+    }
 
     /// The disk half of `save`, run on `ioQueue`. `nonisolated static` so it touches no actor state — every
     /// input (the entries snapshot, the directory URLs) is passed in, keeping it safe to run off-main.
+    /// Returns the externalized (as-written) entries, or nil if the index could not be written — in which
+    /// case nothing is adopted in memory.
     nonisolated private static func persist(_ entries: [ClipboardEntry], schemaVersion: Int,
-                                            blobsDir: URL, indexURL: URL) {
+                                            blobsDir: URL, indexURL: URL) -> [ClipboardEntry]? {
         try? FileManager.default.createDirectory(at: blobsDir, withIntermediateDirectories: true)
         // Externalize large inline payloads to blobs so the index JSON stays small.
         let externalized = entries.map { externalizedForStorage($0, blobsDir: blobsDir) }
         let record = StoredIndex(schemaVersion: schemaVersion, entries: externalized)
-        guard let data = try? JSONEncoder().encode(record) else { return }
-        try? data.write(to: indexURL, options: .atomic)
+        guard let data = try? JSONEncoder().encode(record),
+              (try? data.write(to: indexURL, options: .atomic)) != nil else { return nil }
         // Prune against the names the just-written index references.
         pruneOrphanBlobs(keeping: referencedBlobs(externalized), blobsDir: blobsDir)
+        return externalized
     }
 
     nonisolated private static func referencedBlobs(_ entries: [ClipboardEntry]) -> Set<String> {
@@ -375,5 +501,47 @@ final class ClipboardStore {
             hash = hash &* 0x100000001b3
         }
         return String(hash, radix: 16)
+    }
+}
+
+/// Where one representation's bytes live (see `ClipboardStore.payloadSource`): resolved on the actor,
+/// **loaded** wherever the caller likes — `load()` is a plain file read with no actor state, so a
+/// detached task can do it off the main actor.
+enum ClipboardPayloadSource: Equatable, Sendable {
+    case inline(Data)
+    case file(URL)
+
+    /// The bytes (a file read for `.file`). Best-effort: nil if the blob file is missing.
+    func load() -> Data? {
+        switch self {
+        case .inline(let data): return data
+        case .file(let url):    return try? Data(contentsOf: url)
+        }
+    }
+}
+
+/// A completed persist awaiting its memory swap: the pre-externalization `snapshot` (the bytes that were
+/// written) and the `persisted` shape (which of them became `.blob`s).
+private struct PendingAdoption: Sendable {
+    let snapshot: [ClipboardEntry]
+    let persisted: [ClipboardEntry]
+}
+
+/// Persist results produced on the store's `ioQueue` and consumed on the main actor. A plain lock (not
+/// actor state) because the producer runs off-actor; `drain` empties it atomically.
+private final class PendingAdoptions: @unchecked Sendable {
+    private let lock = NSLock()
+    private var results: [PendingAdoption] = []
+
+    func push(_ result: PendingAdoption) {
+        lock.lock(); defer { lock.unlock() }
+        results.append(result)
+    }
+
+    func drain() -> [PendingAdoption] {
+        lock.lock(); defer { lock.unlock() }
+        let out = results
+        results.removeAll()
+        return out
     }
 }

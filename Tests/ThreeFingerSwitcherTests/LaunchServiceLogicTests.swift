@@ -94,4 +94,86 @@ final class LaunchServiceLogicTests: XCTestCase {
         XCTAssertEqual(LaunchService.promptStartDirectory(lastFolder: nil, home: home), home,
                        "and at home when no folder has been chosen yet")
     }
+
+    // MARK: - Preset summary + LaunchError taxonomy
+
+    func testPresetSummaryWording() {
+        XCTAssertEqual(LaunchService.presetSummary(failed: 0, total: 1), "Ran 1 step.")
+        XCTAssertEqual(LaunchService.presetSummary(failed: 0, total: 3), "Ran 3 steps.")
+        XCTAssertEqual(LaunchService.presetSummary(failed: 2, total: 3), "2 of 3 steps failed.")
+        XCTAssertEqual(LaunchService.presetSummary(failed: 1, total: 1), "1 of 1 step failed.")
+    }
+
+    /// Every case has a clean headline; raw OS / `Process` text lives only in `copyableDetails`.
+    func testLaunchErrorHeadlinesAreCleanAndNonEmpty() {
+        let cases: [LaunchError] = [
+            .appLaunchFailed(details: "raw NSWorkspace error 42"),
+            .processStartFailed(details: "raw POSIX EACCES"),
+            .processExited(status: 3),
+        ]
+        for error in cases {
+            let headline = error.errorDescription ?? ""
+            XCTAssertFalse(headline.isEmpty, "every case has a headline")
+            XCTAssertFalse(headline.contains("raw"), "raw error text never leaks into the headline")
+        }
+        XCTAssertEqual(LaunchError.processExited(status: 3).errorDescription, "Exited with status 3.")
+        XCTAssertEqual(LaunchError.appLaunchFailed(details: "boom").copyableDetails, "boom")
+        XCTAssertEqual(LaunchError.processStartFailed(details: "boom").copyableDetails, "boom")
+        XCTAssertNil(LaunchError.processExited(status: 1).copyableDetails)
+    }
+}
+
+/// The preset's completion tracker: the summary fires exactly once, when the LAST leaf settles (leaves
+/// complete asynchronously, in any order), and never reports "Done" while a leaf is still outstanding.
+@MainActor
+final class PresetRunTrackerTests: XCTestCase {
+
+    func testSummaryWaitsForTheLastLeaf() {
+        var reports: [(failed: Int, total: Int)] = []
+        let tracker = PresetRunTracker(total: 3) { reports.append(($0, $1)) }
+        tracker.complete(succeeded: true)
+        tracker.complete(succeeded: true)
+        XCTAssertTrue(reports.isEmpty, "no summary while a leaf is still running")
+        XCTAssertFalse(tracker.isFinished)
+        tracker.complete(succeeded: true)
+        XCTAssertEqual(reports.count, 1)
+        XCTAssertEqual(reports.first?.failed, 0)
+        XCTAssertEqual(reports.first?.total, 3)
+        XCTAssertTrue(tracker.isFinished)
+    }
+
+    func testALateFailureMakesTheRunFailedNotDone() {
+        var reports: [(failed: Int, total: Int)] = []
+        let tracker = PresetRunTracker(total: 2) { reports.append(($0, $1)) }
+        tracker.complete(succeeded: true)
+        tracker.complete(succeeded: false)   // e.g. a script exiting non-zero after the others landed
+        XCTAssertEqual(reports.first?.failed, 1, "the failure is observable, never a false Done")
+        XCTAssertEqual(reports.first?.total, 2)
+    }
+
+    func testExtraCompletionsNeverReFireOrOverCount() {
+        var reports = 0
+        let tracker = PresetRunTracker(total: 1) { _, _ in reports += 1 }
+        tracker.complete(succeeded: false)
+        tracker.complete(succeeded: false)
+        tracker.complete(succeeded: true)
+        XCTAssertEqual(reports, 1)
+        XCTAssertEqual(tracker.failed, 1)
+        XCTAssertEqual(tracker.completed, 1)
+    }
+
+    func testEmptyPresetFinishesImmediatelyOnlyViaFinishIfEmpty() {
+        var reports: [(failed: Int, total: Int)] = []
+        let tracker = PresetRunTracker(total: 0) { reports.append(($0, $1)) }
+        XCTAssertTrue(reports.isEmpty, "nothing fires on construction")
+        tracker.finishIfEmpty()
+        XCTAssertEqual(reports.count, 1)
+        XCTAssertEqual(reports.first?.total, 0)
+        tracker.finishIfEmpty()
+        XCTAssertEqual(reports.count, 1, "idempotent")
+
+        let nonEmpty = PresetRunTracker(total: 2) { _, _ in XCTFail("a non-empty preset must wait for its leaves") }
+        nonEmpty.finishIfEmpty()
+        XCTAssertFalse(nonEmpty.isFinished)
+    }
 }

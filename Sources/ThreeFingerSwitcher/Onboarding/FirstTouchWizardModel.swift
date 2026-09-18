@@ -30,6 +30,11 @@ final class FirstTouchWizardModel: ObservableObject {
     /// Whether the user's live touch actually scrubbed the strip (the column moved) — the
     /// "successfully moved between windows" half of the hand act's completion gesture.
     private var scrubbedDuringLiveTouch = false
+    /// The strip column the hand LANDED on for the current touch (nil between touches). The absolute
+    /// mapping snaps the strip to the hand's place on touchdown, so the landing column almost never
+    /// equals the attract loop's column — that snap is not a scrub. Only a later frame that carries
+    /// the highlight to a DIFFERENT column than this one is real travel and counts.
+    private var liveTouchLandingColumn: Int?
     /// True once the demo strip shows the user's real windows (post-Accessibility upgrade).
     @Published private(set) var demoShowsRealWindows = false
     /// Bumped on every in-place transformation of the demo scene (the hand taking over, sample
@@ -415,12 +420,21 @@ final class FirstTouchWizardModel: ObservableObject {
             let count = demo.windows.count
             guard count > 0 else { return }
             let column = min(count - 1, max(0, Int(frame.centroid.x * CGFloat(count))))
-            if column != demo.selectedIndex {
-                scrubbedDuringLiveTouch = true
-                demo.setColumn(column)
+            if let landing = liveTouchLandingColumn {
+                // A scrub is TRAVEL: the highlight moved away from where this touch landed. (Comparing
+                // against the strip's previous column instead made the touchdown snap itself count, so
+                // the documented lift-without-scrub fallback practically never engaged.)
+                if column != landing { scrubbedDuringLiveTouch = true }
+            } else {
+                // Touchdown: snap the strip to the hand, remember where it landed, and start this
+                // touch's scrub verdict fresh (the gesture is scrub-then-lift within ONE touch).
+                liveTouchLandingColumn = column
+                scrubbedDuringLiveTouch = false
             }
+            if column != demo.selectedIndex { demo.setColumn(column) }
         } else if frame.fingerCount == 0 {
             fingerDots = []
+            liveTouchLandingColumn = nil   // the touch ended; the next landing records its own column
             // The hand act's completion gesture IS the product's: scrub, then lift. The lift
             // advances — the user is already on the permission act while their fingers rise
             // (the strip stays live under them there). A lift that never scrubbed re-offers a

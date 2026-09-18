@@ -26,4 +26,14 @@ protocol HostProvider: AnyObject {
     /// `bundleID` is always a `BrowserRegistry`-supported browser when this is called (the resolver
     /// gates on `isSupported` first); a provider may still return nil for any browser it can't read.
     func host(forBrowser bundleID: String) -> String?
+
+    /// The frontmost app changed — `ContextResolver` calls this when the bundle id it resolves for
+    /// differs from the last one (an app activation; a within-browser poll tick never triggers it).
+    /// Providers that remember negative results (`HostReadBackoff`) forget them here, so a fresh visit
+    /// re-tries a read the previous one had given up on. Optional: defaults to a no-op.
+    func noteAppSwitch()
+}
+
+extension HostProvider {
+    func noteAppSwitch() {}
 }

@@ -58,9 +58,15 @@ final class FakeHostProvider: HostProvider {
     /// to nil (typing / private / unresolved)". A bundle id absent from the map also yields nil.
     var hostsByBundle: [String: String?]
 
+    /// How many times the resolver signalled an app switch (`noteAppSwitch`) — the reset hook the real
+    /// providers use to drop their negative-result backoff.
+    private(set) var appSwitches = 0
+
     init(hostsByBundle: [String: String?] = [:]) {
         self.hostsByBundle = hostsByBundle
     }
+
+    func noteAppSwitch() { appSwitches += 1 }
 
     /// Convenience setter so a test can re-point a single browser between calls (the per-site regression
     /// scenario navigates Chrome from `keep.` to `mail.google.com` and back by reassigning one host).

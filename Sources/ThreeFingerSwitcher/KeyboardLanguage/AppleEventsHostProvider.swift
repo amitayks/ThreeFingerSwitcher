@@ -26,15 +26,25 @@ final class AppleEventsHostProvider: HostProvider {
     /// scripts itself, not a hardcoded Chrome.
     private var compiled: [String: NSAppleScript] = [:]
 
+    /// Negative-result backoff for a FAILED Apple Event, keyed by bundle id: the Automation grant denied
+    /// or undetermined, no front window, a browser that isn't answering (the 2 s script timeout). Each
+    /// failure is a synchronous main-thread round-trip that the 0.5 s poll would otherwise repeat forever;
+    /// a miss holds the read for 2 s, doubling per consecutive miss up to 30 s. A script that ANSWERS —
+    /// even with a non-web URL (`chrome://newtab`, `about:blank`) — is a hit: the browser is responsive
+    /// and the next navigation must be seen promptly. An app switch (`noteAppSwitch`) clears the hold.
+    private var readBackoff = HostReadBackoff()
+
     init() {}
 
     /// Read `bundleID`'s exact active-tab host via Apple Events, normalized through `HostNormalizer`, or
     /// nil. nil covers every degradation — unsupported/unknown browser, the Automation permission denied
     /// or undetermined, no front window/tab, a non-URL result, or a private window — so the caller
-    /// silently falls back to the AX reader. Never throws, never blocks, never alerts.
+    /// silently falls back to the AX reader. Never throws, never alerts; a stalled browser holds the main
+    /// thread for at most the script's own 2 s timeout, and a failure is not retried on every tick.
     func host(forBrowser bundleID: String) -> String? {
         guard let family = BrowserRegistry.family(for: bundleID),
               let script = script(for: bundleID, family: family) else { return nil }
+        guard !readBackoff.shouldSkip(bundleID, now: Date()) else { return nil }
 
         var error: NSDictionary?
         let descriptor = script.executeAndReturnError(&error)
@@ -43,10 +53,17 @@ final class AppleEventsHostProvider: HostProvider {
         // Automation grant; we don't special-case it beyond logging, since every error degrades the same.
         if let error {
             logIfUnexpected(error, bundleID: bundleID)
+            readBackoff.recordMiss(bundleID, now: Date())
             return nil
         }
+        readBackoff.recordHit()
         guard let urlString = descriptor.stringValue else { return nil }
         return host(fromURL: urlString)
+    }
+
+    /// An app activation: forget the read backoff so the fresh visit re-tries the Apple Event once.
+    func noteAppSwitch() {
+        readBackoff.reset()
     }
 
     // MARK: - Script cache
@@ -64,10 +81,24 @@ final class AppleEventsHostProvider: HostProvider {
     /// itself (Brave/Edge/Arc/Vivaldi, not a hardcoded Chrome) — and asking only for the active tab's URL,
     /// never history, page content, or any other property (privacy: read the host and nothing else). The
     /// tab vocabulary differs by family: Chromium says "active tab", Safari says "current tab".
+    ///
+    /// The `with timeout` block bounds the synchronous Apple Event: without it AppleScript waits the
+    /// default ~60 s for a reply, so a browser that is hung, mid-launch, or blocked on its own modal would
+    /// hold OUR main thread — the gesture → switcher path — for a minute per poll tick. A timeout is an
+    /// ordinary script error here (→ nil, backed off), not a fault.
     private static func source(bundleID: String, family: BrowserFamily) -> String {
         let tab = (family == .safari) ? "current tab" : "active tab"
-        return "tell application id \"\(bundleID)\" to return URL of \(tab) of front window"
+        return """
+        set tabURL to missing value
+        with timeout of \(Int(replyTimeout)) seconds
+            tell application id "\(bundleID)" to set tabURL to URL of \(tab) of front window
+        end timeout
+        return tabURL
+        """
     }
+
+    /// How long one Apple Event may wait for the browser's reply before the read gives up (→ nil).
+    static let replyTimeout: TimeInterval = 2
 
     // MARK: - Parsing
 

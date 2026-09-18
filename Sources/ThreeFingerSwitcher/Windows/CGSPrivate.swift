@@ -24,10 +24,15 @@ private func loadSymbol<T>(_ name: String, _ type: T.Type) -> T? {
 }
 
 typealias FnMainConnectionID = @convention(c) () -> CGSConnectionID
-typealias FnCopyManagedDisplaySpaces = @convention(c) (CGSConnectionID) -> CFArray?
+// OWNERSHIP RULE for the `Copy`/`Create` symbols: they return a +1 (caller-owned) CF object, and a
+// `@convention(c)` pointer typed `-> CFArray?` makes Swift retain the result AGAIN on the way in — so
+// every call leaked the whole array (measured: retain count 2, ~1.5 KB per call, on the gesture-open
+// path). They MUST be typed `Unmanaged<CFArray>?` and consumed with `.takeRetainedValue()` — the same
+// pattern as `FnCreateWithRemoteToken` / `bruteForceWindows`. Don't "simplify" them back to `CFArray?`.
+typealias FnCopyManagedDisplaySpaces = @convention(c) (CGSConnectionID) -> Unmanaged<CFArray>?
 typealias FnManagedDisplayGetCurrentSpace = @convention(c) (CGSConnectionID, CFString) -> CGSSpaceID
 typealias FnCopyWindowsWithOptionsAndTags = @convention(c)
-    (CGSConnectionID, Int, CFArray, Int, UnsafeMutablePointer<Int>, UnsafeMutablePointer<Int>) -> CFArray?
+    (CGSConnectionID, Int, CFArray, Int, UnsafeMutablePointer<Int>, UnsafeMutablePointer<Int>) -> Unmanaged<CFArray>?
 typealias FnSetFrontProcessWithOptions = @convention(c)
     (UnsafeMutablePointer<ProcessSerialNumber>, CGWindowID, UInt32) -> CGError
 typealias FnPostEventRecordTo = @convention(c)

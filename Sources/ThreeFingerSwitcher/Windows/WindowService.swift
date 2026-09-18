@@ -19,9 +19,11 @@ final class WindowService {
     private let focus: WindowFocusTracker
     private let settings: AppSettings
 
-    /// Monotonic token bumped on every `raise()` commit. The watchdog closure captures the value
-    /// at schedule time and bails if it has advanced — so a later commit cancels an earlier
-    /// check and rapid switching never stacks recoveries.
+    /// Monotonic token bumped on every `raise()` commit — and on a deferred de-minimize commit, on a
+    /// `peekRaise`, and on the user's own input (see the user-input interrupt). Every deferred guard
+    /// (watchdog, hold guard, deferred raise) captures the value at schedule time and bails if it has
+    /// advanced — so a later commit cancels an earlier check, rapid switching never stacks recoveries,
+    /// and no guard ever fights what the user did next.
     private var commitSeq: UInt64 = 0
 
     /// Watchdog tuning. 180ms is the midpoint of the 150–250ms window: past the WindowServer's
@@ -63,6 +65,7 @@ final class WindowService {
         if let activationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
         }
+        if let userInputMonitor { NSEvent.removeMonitor(userInputMonitor) }   // safe off-main
     }
 
     /// Cache `pid`'s current-Space window elements (called on activation). Cheap — one app's windows.
@@ -91,7 +94,7 @@ final class WindowService {
             out.append("SpaceService.currentModel() = nil → would use legacySnapshot (\(legacySnapshot().count) windows)")
             return out.joined(separator: "\n")
         }
-        out.append("spaces: \(model.orderedSpaceIDs.count)  currentSpaceIDs: \(model.currentSpaceIDs.count) \(Array(model.currentSpaceIDs))")
+        out.append("spaces: \(model.orderedSpaceIDs.count)  currentSpaceIDs: \(model.currentSpaceIDs.count) \(Array(model.currentSpaceIDs))  primary: \(model.primaryCurrentSpaceID.map(String.init) ?? "-")")
         var spaceForWindow: [CGWindowID: (space: CGSSpaceID, z: Int)] = [:]
         for spaceID in model.orderedSpaceIDs {
             let wins = SpaceService.windowsInSpace(spaceID)
@@ -329,11 +332,17 @@ final class WindowService {
         // they already came through the CGS candidate set above (spike-dependent — acceptable v1).
         if settings.includeMinimizedWindows {
             let present = Set(ordered.map(\.id))
-            let curSpace = model.currentSpaceIDs.first
+            // The primary (first-display) current Space — deterministic, unlike `.first` on the Set.
+            let curSpace = model.primaryCurrentSpaceID
             let curIndex = curSpace.flatMap { model.indexBySpace[$0] } ?? Int.max
             var extras: [(wid: CGWindowID, el: AXUIElement, app: NSRunningApplication)] = []
             for app in appsByPid.values {
-                for (wid, el) in currentSpaceElements(pid: app.processIdentifier) {
+                let pid = app.processIdentifier
+                // Reuse the `kAXWindowsAttribute` read the main loop already did for this app (it lists
+                // the minimized windows too) — only an app with no current-Space candidate above costs
+                // a fresh cross-process AX round trip here.
+                if axCurrentByPid[pid] == nil { axCurrentByPid[pid] = currentSpaceElements(pid: pid) }
+                for (wid, el) in axCurrentByPid[pid] ?? [:] {
                     guard !present.contains(wid),
                           axBool(el, kAXMinimizedAttribute as String),
                           isSwitchable(el) else { continue }
@@ -379,13 +388,18 @@ final class WindowService {
         // A single running index across the whole enumeration so `z` is globally unique (like
         // snapshot()'s global z), keeping the appRank tiebreak unreachable on this path too.
         var z = 0
+        // Every id-bearing window seen (pre-filter) — the legacy analogue of snapshot()'s CGS candidate
+        // set, used to prune `elementCache` below.
+        var enumerated: Set<CGWindowID> = []
         for app in apps {
             let pid = app.processIdentifier
             let appEl = AXUIElementCreateApplication(pid)
             guard let axWindows = axCopy(appEl, kAXWindowsAttribute as String) as? [AXUIElement] else { continue }
             let appRank = mru.rank(pid)
             for axWin in axWindows {
-                guard isSwitchable(axWin), let wid = axWindowID(axWin) else { continue }
+                guard let wid = axWindowID(axWin) else { continue }
+                enumerated.insert(wid)
+                guard isSwitchable(axWin) else { continue }
                 let info = WindowInfo(
                     id: wid, pid: pid, appName: app.localizedName ?? "",
                     title: axString(axWin, kAXTitleAttribute as String) ?? "",
@@ -399,6 +413,10 @@ final class WindowService {
         // Prune the focus history to the enumerated ids (parity with snapshot()), so closed windows
         // don't linger on the legacy fallback path.
         focus.evict(keepingLive: Set(result.map(\.window.id)))
+        // Prune `elementCache` to the enumerated ids (parity with snapshot()'s prune): the Dock-preview /
+        // minimize-all / activation paths insert into it on this path too, so without this it grew for
+        // the whole process lifetime whenever off-Space support is unavailable.
+        elementCache = elementCache.filter { enumerated.contains($0.key) }
         // Phantom-duplicate suppression, parity with snapshot() (frame here is the AX frame).
         result = WindowFilter.dedupe(
             result, exemptPids: includeRulePids(apps.map(\.processIdentifier)),
@@ -433,6 +451,7 @@ final class WindowService {
     func raise(_ window: WindowInfo) {
         commitSeq &+= 1
         let token = commitSeq
+        pendingGuardChains = 0          // every guard of the previous commit is now superseded
 
         // Switcher commit is the most authoritative focus source: promote immediately so this window
         // is index 0 on the next snapshot (covers same-app/current-Space raises that emit no
@@ -454,8 +473,12 @@ final class WindowService {
         // don't fight a deliberate user switch-away for as long).
         if !window.isOnCurrentSpace {
             let maxTicks = StageManager.isEnabled ? offSpaceHoldTicks : offSpaceHoldShortTicks
+            pendingGuardChains += 1
             scheduleNextHoldTick(window, token: token, tick: 0, refronts: 0, maxTicks: maxTicks)
         }
+        // Guards must never fight the user: watch for their next click / shortcut only while a guard
+        // chain is actually pending (nothing to protect otherwise — just drop any stale monitor).
+        if pendingGuardChains > 0 { armUserInputInterrupt(for: window) } else { disarmUserInputInterrupt() }
     }
 
     // MARK: - Dock-preview variant (app-scoped, current-Space, minimized-inclusive)
@@ -520,8 +543,9 @@ final class WindowService {
 
     /// Dock-preview commit: bring `window` to the front, **un-minimizing it first** if needed, then run
     /// the standard raise sequence (inheriting the watchdog / Stage-Manager hold-guard hardening of
-    /// `raise`). Returns `false` when no AX element resolves (the window is gone) so the caller can
-    /// surface `DockPreviewError.windowUnavailable` instead of a silent no-op.
+    /// `raise`). Returns `false` when no AX element resolves (the window is gone) or the un-minimize
+    /// write is refused, so the caller can surface `DockPreviewError.windowUnavailable` instead of a
+    /// silent no-op / false success.
     @discardableResult
     func raiseDeminimizing(_ window: WindowInfo) -> Bool {
         guard let el = resolveElement(window) else { return false }
@@ -535,9 +559,25 @@ final class WindowService {
         // flash), and the +180ms watchdog would fire mid-genie and re-raise it (the "comes to front, then
         // flashes" symptom). So clear minimized now and defer the single hardened raise until the animation
         // settles: one clean front+focus, no mid-flight re-raise.
-        AXUIElementSetAttributeValue(el, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        // A refused write means the window never left the Dock — report it (the Dock path surfaces
+        // `DockPreviewError.windowUnavailable`) instead of scheduling a raise that lands on nothing.
+        guard AXUIElementSetAttributeValue(el, kAXMinimizedAttribute as CFString, kCFBooleanFalse) == .success else {
+            return false
+        }
+        // Token-gate the deferred raise exactly like the watchdog / hold guard: bump `commitSeq` NOW so
+        // this commit supersedes every pending guard of an earlier one, and bail if anything advances it
+        // during the settle window — another commit, a peek, or the user's own click / shortcut (the
+        // input interrupt is armed for exactly that) — so a stale raise never fronts over what the user
+        // did next.
+        commitSeq &+= 1
+        let token = commitSeq
+        pendingGuardChains = 1
+        armUserInputInterrupt(for: window)
         DispatchQueue.main.asyncAfter(deadline: .now() + deminimizeSettleDelay) { [weak self] in
-            MainActor.assumeIsolated { self?.raise(window) }
+            MainActor.assumeIsolated {
+                guard let self, self.commitSeq == token else { return }
+                self.raise(window)          // resets the chain count and re-arms for its own guards
+            }
         }
         return true
     }
@@ -619,6 +659,12 @@ final class WindowService {
     @discardableResult
     func peekRaise(_ window: WindowInfo) -> Bool {
         guard let el = resolveElement(window) else { return false }
+        // A peek is a user-initiated front: a guard still pending from an earlier commit must not
+        // re-front over it, so supersede them all (bump the token, drop the input monitor). Deliberately
+        // NO watchdog / hold guard is armed for the peek itself — those fight the put-back on leave.
+        commitSeq &+= 1
+        pendingGuardChains = 0
+        disarmUserInputInterrupt()
         let stageManager = StageManager.isEnabled
         // RELIABLE cross-app front: the SkyLight `setFront` handshake fronts the process + this specific
         // window in one shot, so a BACKGROUND app actually becomes active and renders the window live.
@@ -698,7 +744,7 @@ final class WindowService {
     private let offSpaceHoldMaxRefronts = 6
 
     private func scheduleNextHoldTick(_ window: WindowInfo, token: UInt64, tick: Int, refronts: Int, maxTicks: Int) {
-        guard tick < maxTicks else { return }
+        guard tick < maxTicks else { guardChainEnded(token: token); return }
         DispatchQueue.main.asyncAfter(deadline: .now() + offSpaceHoldInterval) { [weak self] in
             MainActor.assumeIsolated {
                 self?.offSpaceHoldTick(window, token: token, tick: tick, refronts: refronts, maxTicks: maxTicks)
@@ -716,11 +762,13 @@ final class WindowService {
         // Secure input held by another app: re-fronting can't help and may thrash — log and stop.
         if state.secureInputEnabled {
             logEntry(.trace, window: window, passed: false, state: state, note: "hold-guard: secure-input held; not re-fronting")
+            guardChainEnded(token: token)
             return
         }
         // WindowManager (or anyone) stole front — re-front immediately, bounded.
         if refronts >= offSpaceHoldMaxRefronts {
             logEntry(.gaveUp, window: window, passed: false, state: state, note: "hold-guard gave up after \(refronts) re-fronts")
+            guardChainEnded(token: token)
             return
         }
         focusSequence(window, offSpaceHandshake: true)
@@ -780,13 +828,69 @@ final class WindowService {
         NSRunningApplication(processIdentifier: window.pid)?.activate()
     }
 
+    // MARK: - User-input interrupt (guards must never fight the user)
+
+    /// Passive global monitor installed while a guard chain — the +180ms watchdog, the off-Space hold
+    /// guard, or a deferred de-minimize raise — is pending for the current commit. Only this app's own
+    /// `raise()` advances `commitSeq`, so before this a manual click / ⌘-Tab / Dock click inside the
+    /// 1.2–2.4 s hold window read as a "steal" and was undone (up to 6 re-fronts). It never consumes
+    /// events (global monitors can't): mouse-down needs no permission, and keyDown is delivered under
+    /// the Accessibility grant the app already holds. Removed when the last chain completes / gives up,
+    /// on the user's first qualifying input, on a peek, and before the next `raise()` re-installs it.
+    private var userInputMonitor: Any?
+    /// Guard chains still pending for the current `commitSeq`; the monitor is dropped when it hits 0.
+    private var pendingGuardChains = 0
+    /// System uptime at arm time (the `NSEvent.timestamp` base): the very event that triggered the commit
+    /// (a Dock-icon click, a card click) must never be the one that releases the guard it just armed.
+    private var userInputArmedAt: TimeInterval = 0
+
+    private func armUserInputInterrupt(for window: WindowInfo) {
+        disarmUserInputInterrupt()
+        userInputArmedAt = ProcessInfo.processInfo.systemUptime
+        userInputMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown]) { [weak self] event in
+            MainActor.assumeIsolated { self?.userDidAct(event, window: window) }
+        }
+    }
+
+    private func disarmUserInputInterrupt() {
+        if let userInputMonitor { NSEvent.removeMonitor(userInputMonitor) }
+        userInputMonitor = nil
+    }
+
+    /// A guard chain for `token` completed or gave up; once no chain is pending, stop watching input.
+    /// A superseded chain (stale token) is ignored — the newer commit reset the count for its own chains.
+    private func guardChainEnded(token: UInt64) {
+        guard token == commitSeq else { return }
+        pendingGuardChains = max(0, pendingGuardChains - 1)
+        if pendingGuardChains == 0 { disarmUserInputInterrupt() }
+    }
+
+    /// The user acted: a mouse-down anywhere, or a keyDown carrying ⌘ (a shortcut = navigation intent —
+    /// plain typing into the freshly raised window must NOT cancel its guard). Bump `commitSeq` so every
+    /// pending tick / watchdog / deferred raise bails on its token, then stand down.
+    private func userDidAct(_ event: NSEvent, window: WindowInfo) {
+        guard event.timestamp >= userInputArmedAt else { return }                 // the commit's own click
+        if event.type == .keyDown, !event.modifierFlags.contains(.command) { return }
+        // Events this process synthesizes (Mission Control / App Exposé key posts) are not the user.
+        if let cg = event.cgEvent, cg.getIntegerValueField(.eventSourceUnixProcessID) == Int64(getpid()) { return }
+        commitSeq &+= 1
+        pendingGuardChains = 0
+        disarmUserInputInterrupt()
+        logEntry(.trace, window: window, passed: nil, state: FocusLog.probe(targetPID: window.pid),
+                 note: "user input: guard released")
+    }
+
     // MARK: - Watchdog
 
     /// Schedule a single post-commit verify at +180ms. If the verify FAILs (and it isn't secure
     /// input), run a bounded recovery and re-schedule; give up after `maxRecoveries` attempts.
     /// Cancelled implicitly when a later commit advances `commitSeq`.
     private func scheduleWatchdog(_ window: WindowInfo, token: UInt64, attempt: Int) {
-        guard settings.focusWatchdogEnabled else { return }
+        guard settings.focusWatchdogEnabled else {
+            if attempt > 0 { guardChainEnded(token: token) }    // toggled off mid-chain: the chain is over
+            return
+        }
+        if attempt == 0 { pendingGuardChains += 1 }              // one chain per commit; recoveries continue it
         DispatchQueue.main.asyncAfter(deadline: .now() + watchdogDelay) { [weak self] in
             MainActor.assumeIsolated {
                 self?.runWatchdog(window, token: token, attempt: attempt)
@@ -804,6 +908,7 @@ final class WindowService {
 
         if healthy {
             logEntry(phase, window: window, passed: true, state: state, note: "")
+            guardChainEnded(token: token)
             return
         }
 
@@ -812,6 +917,7 @@ final class WindowService {
         if state.secureInputEnabled {
             logEntry(phase, window: window, passed: false, state: state, note: "secure-input (not our vacuum); no recovery")
             NSLog("[TFS-focus] FAIL secure-input held; not recovering pid=\(window.pid)")
+            guardChainEnded(token: token)
             return
         }
 
@@ -822,6 +928,7 @@ final class WindowService {
         if attempt >= maxRecoveries {
             logEntry(.gaveUp, window: window, passed: false, state: state, note: "gave up after \(maxRecoveries) attempts")
             NSLog("[TFS-focus] gave up after \(maxRecoveries) recoveries pid=\(window.pid)")
+            guardChainEnded(token: token)
             return
         }
 

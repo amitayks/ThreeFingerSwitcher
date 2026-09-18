@@ -16,18 +16,23 @@ struct BandsCanvas: View {
     @State private var selectedItemID: UUID?
     /// Set to a just-added item's id so its inspector lands the cursor on the first field for fast entry.
     @State private var autoFocusItemID: UUID?
+    /// The ONE in-flight reorder drag, shared by both surfaces (band rows + item grid) — see
+    /// `LauncherReorderDrag`. Lives here, above both columns, so a drop on either surface can end it.
+    @State private var reorderDrag: LauncherReorderDrag?
 
     var body: some View {
         HSplitView {
             // One merged column: bands list → click a band to expose its source picker inline, with the
             // band's settings pinned at the bottom.
             BandsColumn(store: store, selectedBandID: $selectedBandID,
-                        selectedItemID: $selectedItemID, autoFocusItemID: $autoFocusItemID)
+                        selectedItemID: $selectedItemID, autoFocusItemID: $autoFocusItemID,
+                        reorderDrag: $reorderDrag)
                 .frame(minWidth: 240, idealWidth: 300, maxWidth: 380)
 
             // The selected band's items — always visible in their own column.
             ItemsPane(store: store, bandID: activeBandID,
-                      selectedItemID: $selectedItemID, autoFocusItemID: $autoFocusItemID)
+                      selectedItemID: $selectedItemID, autoFocusItemID: $autoFocusItemID,
+                      reorderDrag: $reorderDrag)
                 .frame(minWidth: 320, idealWidth: 460, maxWidth: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -38,6 +43,34 @@ struct BandsCanvas: View {
     private var activeBandID: UUID? {
         guard let id = selectedBandID, store.favorites.bands.contains(where: { $0.id == id }) else { return nil }
         return id
+    }
+}
+
+/// The drag currently in flight on the canvas's two reorder surfaces, tagged by WHAT is being dragged.
+/// Both surfaces carry the same `NSItemProvider` shape (a UUID string, `.text`), so a band row happily
+/// receives an item and vice versa. Each surface used to keep its OWN id that only its own `performDrop`
+/// cleared — so an item dropped on a band row (or a cancelled drag) left a stale id that a LATER drag
+/// of the other kind replayed: `ItemReorderDrop.dropEntered` saw the stale item and `moveItems`
+/// relocated it to every hovered cell, persisting each move. SwiftUI has no drag-end callback, so the
+/// fix is structural: ONE record, a delegate acts only on its own kind and only on an id still in its
+/// own collection, and a drop on EITHER surface clears it. The next drag's `onDrag` overwrites whatever
+/// a cancelled drag left behind before any `dropEntered` can read it.
+private enum LauncherReorderDrag: Equatable {
+    case band(UUID)
+    case item(UUID)
+}
+
+/// Best-effort payload check for a hover move that already ran. The provider's UUID string loads
+/// ASYNCHRONOUSLY, so it can't gate the synchronous `dropEntered` move; instead it discards the recorded
+/// drag on a POSITIVE mismatch (a payload that loaded and is not our `expected` id), so a foreign text
+/// drag arriving after a cancelled in-app drag can replay at most one cell before the stale record goes.
+/// A failed load leaves the record alone — this can never break a genuine reorder.
+private func discardDragOnPayloadMismatch(_ info: DropInfo, expected: UUID,
+                                          drag: Binding<LauncherReorderDrag?>) {
+    guard let provider = info.itemProviders(for: [.text]).first else { return }
+    provider.loadObject(ofClass: NSString.self) { object, _ in
+        guard let payload = object as? NSString, (payload as String) != expected.uuidString else { return }
+        DispatchQueue.main.async { if drag.wrappedValue != nil { drag.wrappedValue = nil } }
     }
 }
 
@@ -471,7 +504,7 @@ private struct BandsColumn: View {
     @Binding var selectedBandID: UUID?
     @Binding var selectedItemID: UUID?
     @Binding var autoFocusItemID: UUID?
-    @State private var draggingBand: UUID?
+    @Binding var reorderDrag: LauncherReorderDrag?
     /// The pinned band-settings card starts collapsed (it's secondary to adding items) and is opened
     /// via its disclosure arrow; the state persists across band selections.
     @State private var bandSettingsExpanded = false
@@ -528,8 +561,8 @@ private struct BandsColumn: View {
                 .background(selected ? Color.accentColor.opacity(0.16) : Color.clear)
                 .contentShape(Rectangle())
                 .onTapGesture { tap(band) }
-                .onDrag { draggingBand = band.id; return NSItemProvider(object: band.id.uuidString as NSString) }
-                .onDrop(of: [.text], delegate: BandReorderDrop(target: band.id, store: store, dragging: $draggingBand))
+                .onDrag { reorderDrag = .band(band.id); return NSItemProvider(object: band.id.uuidString as NSString) }
+                .onDrop(of: [.text], delegate: BandReorderDrop(target: band.id, store: store, drag: $reorderDrag))
             if selectedBandID == band.id {
                 Divider()
                 SourcePicker(store: store, targetBandID: band.id,
@@ -569,7 +602,7 @@ private struct ItemsPane: View {
     let bandID: UUID?
     @Binding var selectedItemID: UUID?
     @Binding var autoFocusItemID: UUID?
-    @State private var dragging: UUID?
+    @Binding var reorderDrag: LauncherReorderDrag?
 
     private var band: ContextBand? { store.favorites.bands.first { $0.id == bandID } }
 
@@ -608,11 +641,11 @@ private struct ItemsPane: View {
                             delete(item, in: band.id)
                         }
                         .onDrag {
-                            dragging = item.id
+                            reorderDrag = .item(item.id)
                             return NSItemProvider(object: item.id.uuidString as NSString)
                         }
                         .onDrop(of: [.text], delegate: ItemReorderDrop(
-                            target: item.id, bandID: band.id, store: store, dragging: $dragging))
+                            target: item.id, bandID: band.id, store: store, drag: $reorderDrag))
                         // The picked source tile shrinks; the new item grows in here (the add runs in a
                         // `WizardMotion.arrival` transaction, so this insertion springs from small).
                         .transition(.scale(scale: 0.15).combined(with: .opacity))
@@ -630,20 +663,21 @@ private struct ItemsPane: View {
     }
 }
 
-/// Drag-reorder for band header rows (mirrors `ItemReorderDrop`). An item's id never matches a band, so
-/// the two drag sessions can't cross-contaminate.
+/// Drag-reorder for band header rows (mirrors `ItemReorderDrop`). Acts only on a `.band` drag whose id is
+/// still one of the store's bands; a drop here — an item's included — ends the shared drag record.
 private struct BandReorderDrop: DropDelegate {
     let target: UUID
     let store: FavoritesStore
-    @Binding var dragging: UUID?
+    @Binding var drag: LauncherReorderDrag?
     func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
     func dropEntered(info: DropInfo) {
-        guard let dragging, dragging != target,
+        guard case .band(let dragging)? = drag, dragging != target,
               let from = store.favorites.bands.firstIndex(where: { $0.id == dragging }),
               let to = store.favorites.bands.firstIndex(where: { $0.id == target }) else { return }
         store.moveBands(fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
+        discardDragOnPayloadMismatch(info, expected: dragging, drag: $drag)
     }
-    func performDrop(info: DropInfo) -> Bool { dragging = nil; return true }
+    func performDrop(info: DropInfo) -> Bool { drag = nil; return true }
 }
 
 private struct BandRow: View {
@@ -735,24 +769,27 @@ private struct ItemGridCell: View {
     }
 }
 
-/// Live drag-to-reorder for the items grid: as the dragged item hovers a cell, it moves there.
+/// Live drag-to-reorder for the items grid: as the dragged item hovers a cell, it moves there. Acts only
+/// on an `.item` drag whose id is still in THIS band; a drop here — a band's included — ends the shared
+/// drag record.
 private struct ItemReorderDrop: DropDelegate {
     let target: UUID
     let bandID: UUID
     let store: FavoritesStore
-    @Binding var dragging: UUID?
+    @Binding var drag: LauncherReorderDrag?
 
     func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
 
     func dropEntered(info: DropInfo) {
-        guard let dragging, dragging != target,
+        guard case .item(let dragging)? = drag, dragging != target,
               let items = store.favorites.bands.first(where: { $0.id == bandID })?.items,
               let from = items.firstIndex(where: { $0.id == dragging }),
               let to = items.firstIndex(where: { $0.id == target }) else { return }
         store.moveItems(inBand: bandID, fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
+        discardDragOnPayloadMismatch(info, expected: dragging, drag: $drag)
     }
 
-    func performDrop(info: DropInfo) -> Bool { dragging = nil; return true }
+    func performDrop(info: DropInfo) -> Bool { drag = nil; return true }
 }
 
 private struct BandInspector: View {

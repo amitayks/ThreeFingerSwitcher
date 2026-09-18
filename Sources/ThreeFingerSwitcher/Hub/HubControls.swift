@@ -179,10 +179,14 @@ struct HubExcludedAppsEditor: View {
     }
 
     private func runningApps() -> [(bundleID: String, name: String)] {
-        NSWorkspace.shared.runningApplications
+        // One row per bundle id (first instance wins): the menu's `ForEach` is keyed by bundle id, and
+        // one bundle can run several times — the launcher's own "New app instance" action makes that
+        // common — which would otherwise hand SwiftUI duplicate ids.
+        var seen: Set<String> = []
+        return NSWorkspace.shared.runningApplications
             .filter { $0.activationPolicy == .regular }
             .compactMap { app in
-                guard let id = app.bundleIdentifier else { return nil }
+                guard let id = app.bundleIdentifier, seen.insert(id).inserted else { return nil }
                 return (id, app.localizedName ?? id)
             }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }

@@ -91,6 +91,9 @@ final class SwitcherModel: ObservableObject {
         self.thumbnails = [:]
         thumbsFrozen = false            // a fresh show never inherits a prior slide's freeze…
         pendingThumbnails.removeAll()   // …nor its buffered (now-cleared) frames
+        stagedFlush?.cancel()           // …nor a coalescing flush of the previous session's captures
+        stagedFlush = nil
+        stagedThumbnails.removeAll()
         preferredX = nil
         recomputeGrids()
         applyCurrentRow(column: column)
@@ -273,12 +276,41 @@ final class SwitcherModel: ObservableObject {
     private var thumbsFrozen = false
     private var pendingThumbnails: [CGWindowID: NSImage] = [:]
 
+    /// Live captures that landed outside a slide freeze, held for one short coalescing window
+    /// (`coalesceInterval`) before ONE publish. A sweep now captures several windows concurrently, so
+    /// their frames arrive within a few milliseconds of each other; publishing each one separately
+    /// re-rendered the whole reel (every Space's cards) once per frame, on the same main actor that
+    /// consumes touch frames. One publish per ~frame is imperceptible and cuts that churn by the batch
+    /// size. Seeds (`seedThumbnail`) stay immediate — they must be visible in the slide's own tick.
+    private var stagedThumbnails: [CGWindowID: NSImage] = [:]
+    private var stagedFlush: DispatchWorkItem?
+    private let coalesceInterval: TimeInterval = 0.016
+
     func setThumbnail(_ image: NSImage, for id: CGWindowID) {
         if thumbsFrozen {
             pendingThumbnails[id] = image
-        } else {
-            thumbnails[id] = image
+            return
         }
+        stagedThumbnails[id] = image
+        guard stagedFlush == nil else { return }
+        let work = DispatchWorkItem { [weak self] in self?.publishStagedThumbnails() }
+        stagedFlush = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + coalesceInterval, execute: work)
+    }
+
+    /// Apply every staged frame in one mutation — the coalescing flush the scheduled work item runs
+    /// (internal so tests can drive the publish deterministically). A freeze that began meanwhile takes
+    /// the frames over as pending (so they still cut in after the slide, never mid-slide).
+    func publishStagedThumbnails() {
+        stagedFlush?.cancel()
+        stagedFlush = nil
+        guard !stagedThumbnails.isEmpty else { return }
+        if thumbsFrozen {
+            pendingThumbnails.merge(stagedThumbnails) { _, new in new }
+        } else {
+            thumbnails.merge(stagedThumbnails) { _, new in new }
+        }
+        stagedThumbnails.removeAll()
     }
 
     /// Apply a CACHED thumbnail IMMEDIATELY, bypassing the slide freeze. A seed is a known-good cached
@@ -289,6 +321,7 @@ final class SwitcherModel: ObservableObject {
     /// Space's cached previews until it flushes, so they'd appear a beat late.
     func seedThumbnail(_ image: NSImage, for id: CGWindowID) {
         if thumbnails[id] === image { return }   // identical re-seed: don't republish (no needless re-render)
+        stagedThumbnails.removeValue(forKey: id)   // a seed supersedes any staged (older) live frame for the id
         thumbnails[id] = image
     }
 
@@ -299,6 +332,12 @@ final class SwitcherModel: ObservableObject {
     /// together after the slide. Idempotent — safe to call when nothing is buffered.
     func flushThumbnails() {
         thumbsFrozen = false
+        // Fold any staged live frames in too, so a hide / slide end never leaves a frame stranded in the
+        // coalescing buffer (its flush would otherwise publish into a hidden or re-populated overlay).
+        stagedFlush?.cancel()
+        stagedFlush = nil
+        pendingThumbnails.merge(stagedThumbnails) { _, new in new }
+        stagedThumbnails.removeAll()
         guard !pendingThumbnails.isEmpty else { return }
         thumbnails.merge(pendingThumbnails) { _, new in new }
         pendingThumbnails.removeAll()

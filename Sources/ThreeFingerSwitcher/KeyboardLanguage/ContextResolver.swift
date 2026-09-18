@@ -28,6 +28,12 @@ final class ContextResolver {
     /// bool) so flipping the toggle takes effect on the very next context resolution with no re-wiring.
     private let perSiteEnabled: () -> Bool
 
+    /// The bundle id of the previous resolution. A change here IS the app-activation signal the host
+    /// providers need (`HostProvider.noteAppSwitch`) to drop their negative-result backoff — detected
+    /// at this seam so no provider has to own an `NSWorkspace` observer of its own (the observer-stacking
+    /// landmine); a same-app poll tick never counts as a switch.
+    private var lastFrontmostBundleID: String?
+
     /// - Parameters:
     ///   - hostProvider: the active-host reader (AX by default, Apple Events when opted in); swappable
     ///     in place via the `hostProvider` property when the opt-in changes.
@@ -43,6 +49,10 @@ final class ContextResolver {
     /// the per-site-off case resolves to the bundle id, a supported browser with a readable host resolves
     /// to `bundleID|host`, and an unreadable browser host degrades to the app-level bundle id.
     func contextID(forFrontmost bundleID: String?) -> String? {
+        if bundleID != lastFrontmostBundleID {
+            lastFrontmostBundleID = bundleID
+            hostProvider.noteAppSwitch()
+        }
         guard let bundleID else { return nil }
         // Per-site off, or not a browser we support → app-level context (unchanged per-app behavior).
         guard perSiteEnabled(), BrowserRegistry.isSupported(bundleID) else { return bundleID }

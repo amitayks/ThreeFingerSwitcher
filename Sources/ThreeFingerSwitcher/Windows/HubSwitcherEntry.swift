@@ -17,8 +17,9 @@ enum HubSwitcherEntry {
     /// Space placement: the Hub stays on the Space it was opened on (it does NOT join all Spaces), so
     /// the card must land in that Space's row. We copy the `spaceID`/`spaceIndex`/`isOnCurrentSpace` of
     /// any snapshot window already on `hubSpaceID` (the most reliable match for the row's index); if no
-    /// snapshot window shares that Space, we fall back to the current Space (`currentSpaceID` /
-    /// `currentSpaceIndex`) so the card is at least on a valid row.
+    /// snapshot window shares that Space, the card sits alone on the Hub's Space at `hubSpaceIndex`; with
+    /// no captured Space at all we fall back to the current Space (`currentSpaceID` / `currentSpaceIndex`)
+    /// so the card is at least on a valid row.
     ///
     /// - Parameters:
     ///   - isVisible: whether the Hub window is currently visible (the inclusion gate).
@@ -27,6 +28,8 @@ enum HubSwitcherEntry {
     ///   - appName: the app name for the card title (`"<appName> Hub"`).
     ///   - icon: the app icon shown on the card (the switcher's no-thumbnail fallback).
     ///   - hubSpaceID: the Space the Hub was opened on (captured when it was presented), or `nil`.
+    ///   - hubSpaceIndex: that Space's Mission Control index (`SpaceModel.indexBySpace[hubSpaceID]`), or
+    ///     `nil` when unknown — the row the card lands on when no snapshot window shares the Hub's Space.
     ///   - snapshot: the current all-Spaces window snapshot (to copy a matching Space-row's index).
     ///   - currentSpaceID: the active Space id (fallback when the Hub's Space has no other window).
     ///   - currentSpaceIndex: the active Space's Mission Control index (fallback).
@@ -36,6 +39,7 @@ enum HubSwitcherEntry {
         appName: String,
         icon: NSImage?,
         hubSpaceID: CGSSpaceID?,
+        hubSpaceIndex: Int?,
         snapshot: [WindowInfo],
         currentSpaceID: CGSSpaceID?,
         currentSpaceIndex: Int
@@ -57,10 +61,12 @@ enum HubSwitcherEntry {
             isOnCurrentSpace = sibling.isOnCurrentSpace
         } else if let hubSpaceID {
             // No co-resident window: use the Hub's captured Space. It is the current Space iff it
-            // equals the active Space id.
+            // equals the active Space id. The row is the Hub Space's OWN index — using the current
+            // Space's index here put the card of a Hub on another, otherwise-empty Space into the
+            // current row under a duplicate label. Only an unknown index falls back to the current row.
             spaceID = hubSpaceID
             isOnCurrentSpace = (currentSpaceID != nil && hubSpaceID == currentSpaceID)
-            spaceIndex = isOnCurrentSpace ? currentSpaceIndex : currentSpaceIndex
+            spaceIndex = hubSpaceIndex ?? currentSpaceIndex
         } else {
             // No captured Space at all (legacy / off-Space support unavailable): land on the current
             // Space so the card is reachable rather than dropped.

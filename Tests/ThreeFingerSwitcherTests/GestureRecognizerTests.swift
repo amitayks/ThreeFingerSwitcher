@@ -16,6 +16,8 @@ private final class MockDelegate: GestureRecognizerDelegate {
     }
 
     private(set) var events: [Event] = []
+    /// What `gestureShouldActivate()` answers (false = another driver owns the overlay).
+    var allowActivation = true
 
     var activateCount: Int { events.filter { $0 == .activate }.count }
     var commitCount: Int { events.filter { $0 == .commit }.count }
@@ -25,6 +27,7 @@ private final class MockDelegate: GestureRecognizerDelegate {
     var missionControls: [Bool] { events.compactMap { if case let .missionControl(up) = $0 { return up } else { return nil } } }
     var didActivate: Bool { activateCount > 0 }
 
+    func gestureShouldActivate() -> Bool { allowActivation }
     func gestureDidActivate() { events.append(.activate) }
     func gestureDidStep(_ direction: Int) { events.append(.step(direction)) }
     func gestureDidStepRow(_ direction: Int) { events.append(.stepRow(direction)) }
@@ -791,5 +794,47 @@ final class GestureRecognizerTests: XCTestCase {
         XCTAssertFalse(delegate.didActivate)
         XCTAssertEqual(delegate.cancelCount, 1)
         XCTAssertEqual(delegate.commitCount, 0)
+    }
+
+    // MARK: - Refused activation (another driver owns the overlay)
+
+    func testRefusedActivationSuppressesTheWholeTouchUntilLift() {
+        // While a ⌘-Tab session owns the overlay the delegate refuses activation; the recognizer must then
+        // emit NOTHING for the rest of the touch — no steps, and crucially no commit/cancel on lift, which
+        // used to raise the keyboard session's highlight or hide its overlay.
+        let settings = makeSettings()
+        let (rec, delegate) = makeRecognizer(settings)
+        delegate.allowActivation = false
+
+        feed(rec, x: 0.50, y: 0.50)
+        feed(rec, x: 0.60, y: 0.50)   // past the activation threshold → refused
+        feed(rec, x: 0.70, y: 0.50)   // would have been steps
+        feed(rec, x: 0.80, y: 0.50)
+        feed(rec, x: 0.80, y: 0.50, fingers: 0)   // lift
+
+        XCTAssertTrue(delegate.events.isEmpty, "a refused touch emits nothing, not even cancel: \(delegate.events)")
+
+        // The suppression ends at the lift: the next touch is recognized normally once activation is allowed.
+        delegate.allowActivation = true
+        feed(rec, x: 0.50, y: 0.50)
+        feed(rec, x: 0.60, y: 0.50)
+        XCTAssertEqual(delegate.activateCount, 1)
+        feed(rec, x: 0.60, y: 0.50, fingers: 0)
+        XCTAssertEqual(delegate.commitCount, 1)
+    }
+
+    func testRefusedActivationDoesNotRetryWhileFingersStayDown() {
+        // The refusal is asked ONCE per touch (not once per frame past the threshold).
+        let settings = makeSettings()
+        let (rec, delegate) = makeRecognizer(settings)
+        delegate.allowActivation = false
+        feed(rec, x: 0.50, y: 0.50)
+        feed(rec, x: 0.60, y: 0.50)
+        delegate.allowActivation = true   // owner released mid-touch: still suppressed until lift
+        feed(rec, x: 0.70, y: 0.50)
+        feed(rec, x: 0.90, y: 0.50)
+        XCTAssertEqual(delegate.activateCount, 0)
+        feed(rec, x: 0.90, y: 0.50, fingers: 0)
+        XCTAssertTrue(delegate.events.isEmpty)
     }
 }

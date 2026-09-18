@@ -52,6 +52,13 @@ final class TouchEngine {
 
     private let manager = OMSManager.shared
     private var consumer: Task<Void, Never>?
+    /// The vendored stream is a `share(bufferingPolicy: .bufferingLatest(1))`: a fresh consumer is
+    /// handed the LAST frame yielded before the previous consumer was cancelled — i.e. the frame from
+    /// just before sleep / display sleep / disable, replayed on the next `start()` possibly seconds
+    /// later. With contacts in it the recognizer would `begin()` a phantom gesture that the first real
+    /// frame then cancels (hiding any open overlay). Dropping exactly one frame after each start is the
+    /// cheap fix: a genuine first frame is followed by the next one ~8 ms later.
+    private var dropReplayedFrame = false
 
     init() {
         // `manager` (the property initializer above) has already forced the framework's ObjC
@@ -102,11 +109,16 @@ final class TouchEngine {
         guard started else { return }
         isListening = true
         resetMotion()
+        dropReplayedFrame = true
 
         consumer = Task { @MainActor [weak self] in
             guard let self else { return }
             for await frame in manager.touchDataStream {
                 if Task.isCancelled { break }
+                if self.dropReplayedFrame {
+                    self.dropReplayedFrame = false
+                    continue
+                }
                 self.process(frame)
             }
         }

@@ -164,6 +164,8 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     /// ThumbnailService's `inFlight` guard (a window whose capture is still in flight is skipped, not queued).
     private var previewRefreshTimer: Timer?
     static let previewRefreshInterval: TimeInterval = 0.8
+    /// The Hub Switcher page's demo model while that page is mounted — a fan-out target for live captures.
+    private weak var hubSwitcherDemo: SwitcherModel?
 
     // The unified configuration Hub: one reusable window, its navigation state, and the wiring context.
     private var hubWindow: NSWindow?
@@ -235,7 +237,14 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             self?.overlay.model.setThumbnail(image, for: id)
             // The wizard's demo strip listens along while it lives (the post-Screen-Recording reveal).
             self?.wizardModel?.demo.setThumbnail(image, for: id)
+            // The Hub's Switcher-page mini switcher too (weak; set by `makeHubContext.seedThumbnails`).
+            // It was only ever re-seeded at two fixed delays, so a capture landing after 2 s — or during
+            // a busy sweep — never reached it and the page sat on icons until re-navigated.
+            self?.hubSwitcherDemo?.setThumbnail(image, for: id)
         }
+        // Keep Awake start/stop → menu-bar rebuild (the "Active / Stop" line). Documented on the property
+        // above but never wired; without it only the menu's own open-time rebuild reflected the state.
+        keepAwakeController.onActiveChanged = { [weak self] in self?.onStateChange?() }
         launcherOverlay.onFire = { [weak self] item, band in self?.launchService.fire(item, inBand: band) }
         launcherOverlay.onTogglePin = { [weak self] item in
             guard case let .clipboardEntry(entry) = item.kind else { return }
@@ -351,7 +360,12 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     }
 
     func disable() {
-        guard isEnabled else { return }
+        // Deliberately NO `guard isEnabled`: after a wake where the trackpad could not be re-acquired
+        // (`restartTouchEngineAfterWake` flips `isEnabled` false without tearing anything down — a
+        // Bluetooth trackpad re-pairs seconds after `didWake`), the taps, trackers and clipboard recorder
+        // were still running while the master toggle read "off", and this method no-op'd — ⌘-Tab kept
+        // being intercepted and scroll kept being consumed behind a disabled UI. Every stop below is
+        // idempotent, so running the teardown unconditionally is always safe.
         recognizer.reset()
         touchEngine.stop()
         scrollTap.stop()
@@ -378,6 +392,11 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     /// Stop Keep Awake (restore brightness + release the assertion). The menu-bar fallback stop, and the
     /// force-restore path called on quit so a dimmed-to-black screen is never left behind. Idempotent.
     func stopKeepAwake() { keepAwakeController.stop() }
+
+    /// Block until the clipboard store's queued persistence has landed (called from the quit path):
+    /// saves are async on a serial I/O queue, so without this the last copy / pin toggle before Quit
+    /// could be lost. Cheap when nothing is queued.
+    func flushClipboardHistory() { clipboardStore.flush() }
 
     /// Guards `observeEnabledToggle` against re-entrancy: `enable()`/`disable()` themselves set
     /// `settings.enabled`, which re-emits on this publisher. Without the guard, the no-trackpad case
@@ -449,8 +468,10 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         // close forces it despite the assertion), restore brightness + release the assertion now so we
         // wake into a clean state. Idempotent, so it's harmless when inactive.
         keepAwakeController.stop()
-        // Drop any in-flight gesture/overlay so we don't wake into a half-committed state.
-        guard isEnabled else { return }
+        // Drop any in-flight gesture/overlay so we don't wake into a half-committed state. Gated on the
+        // OPT-IN (`settings.enabled`), not `isEnabled`: the latter is also false when the trackpad merely
+        // wasn't available at the last wake, and the taps/trackers are running regardless.
+        guard settings.enabled else { return }
         recognizer.reset()
         keyboardSwitcher.forceCancel()   // don't wake into a half-open ⌘-Tab session
         overlay.hide()
@@ -470,7 +491,10 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     /// Re-subscribe the multitouch listener after wake. Idempotent and guarded against
     /// double-start: stop() / start() are no-ops when already in the target state.
     private func restartTouchEngineAfterWake() {
-        guard isEnabled else { return }
+        // Gate on the opt-in, not `isEnabled`: a wake where the trackpad wasn't back yet (Bluetooth
+        // re-pairs after `didWake`) leaves `isEnabled` false, and gating on it meant every LATER wake
+        // skipped the restart too — the engine stayed dead until a manual toggle.
+        guard settings.enabled else { return }
         recognizer.reset()
         touchEngine.stop()
         touchEngine.start()
@@ -528,6 +552,14 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
 
     // MARK: - GestureRecognizerDelegate
 
+    /// A ⌘-Tab session owns the overlay: the trackpad gesture is refused outright (D7). Refusing HERE
+    /// (rather than ignoring only `gestureDidActivate`) makes the recognizer drop the whole touch until
+    /// the fingers lift, so it never emits the steps / commit / cancel that used to drive or dismiss
+    /// the keyboard's session (a three-finger rest on the trackpad while ⌘-Tabbing killed it).
+    func gestureShouldActivate() -> Bool {
+        switcherOwner != .keyboard
+    }
+
     func gestureDidActivate() {
         // While the wizard is on stage it owns the trackpad: its demo strip is the only thing
         // that responds (the live-hand act mirrors the same frames), so the real overlay would
@@ -553,10 +585,13 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             windows.append(hub)
         }
         guard !windows.isEmpty else { return false }
-        // Prune the last-good-frame cache to windows that still exist somewhere (the snapshot is the
-        // full cross-Space enumeration): closed windows' frames otherwise pin image memory and, under
-        // the LRU cap, evict frames of windows that are still alive.
-        thumbnails.retain(only: Set(windows.map(\.id)))
+        // Prune the last-good-frame caches (the switcher's AND the Dock preview's) to windows that still
+        // EXIST anywhere: closed windows' frames otherwise pin image memory and, under the LRU cap, evict
+        // frames of windows that are still alive. The prune set is every existing window (not this
+        // snapshot), so a window the switcher merely filtered out this open keeps its frame.
+        let existing = ThumbnailService.existingWindowIDs()
+        thumbnails.retain(only: existing)
+        dockPreviewController.pruneThumbnails(keeping: existing)
         let grid = SpaceGrouping.group(windows)
         // When the app has Mission Control open, float the overlay above it (otherwise it renders
         // behind the MC windows). The elevated config is scoped to this case in `OverlayController`.
@@ -569,7 +604,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
                      groups: validatedWindowGroups(against: windows))
         switcherOwner = owner
         seedAllRows()         // every Space's cached previews present up front (no first-visit rebuild)
-        prefetchCurrentRow()  // immediate capture of the whole visible row (no highlight needed)
+        prefetchAllRows()     // capture the visible row FIRST, then every other Space's row, in one sweep
         startPreviewRefresh()
         return true
     }
@@ -581,7 +616,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     private func hubSwitcherEntry(snapshot: [WindowInfo]) -> WindowInfo? {
         guard let hubWindow, hubWindow.isVisible else { return nil }
         let model = SpaceService.currentModel()
-        let currentSpaceID = model?.currentSpaceIDs.first
+        let currentSpaceID = model?.primaryCurrentSpaceID
         let currentSpaceIndex = currentSpaceID.flatMap { model?.indexBySpace[$0] } ?? 0
         return HubSwitcherEntry.make(
             isVisible: true,
@@ -589,6 +624,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             appName: Self.appDisplayName,
             icon: NSApp.applicationIconImage,
             hubSpaceID: hubSpaceID,
+            hubSpaceIndex: hubSpaceID.flatMap { model?.indexBySpace[$0] },
             snapshot: snapshot,
             currentSpaceID: currentSpaceID,
             currentSpaceIndex: currentSpaceIndex
@@ -608,6 +644,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     }
 
     func gestureDidStep(_ direction: Int) {
+        guard switcherOwner != .keyboard else { return }   // never steer a ⌘-Tab session (D7)
         guard overlay.isVisible else { return }
         guard overlay.model.windows.count > 0 else { return }
         // Horizontal scrub moves WITHIN the current visual row of the grid (the model clamps/wraps).
@@ -615,6 +652,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     }
 
     func gestureDidStepRow(_ direction: Int) {
+        guard switcherOwner != .keyboard else { return }   // never steer a ⌘-Tab session (D7)
         guard overlay.isVisible else { return }
         stepGridRow(direction)
     }
@@ -645,7 +683,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         }
         guard row != overlay.currentRow else { return }
         overlay.updateRowPositional(row, upward: delta > 0)
-        prefetchCurrentRow()   // seed the new Space's cached thumbnails now + immediately re-capture the row
+        prefetchCurrentRow(replacing: true)   // seed the new Space's cached thumbnails now + re-capture the row, superseding the old row's sweep
         // …then freeze: async captures landing during the slide are buffered (so they can't snap it) and
         // cut in once it settles. Must follow the seed (done inside prefetchCurrentRow) and precede the
         // captures it kicks.
@@ -680,14 +718,32 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         missionControlOpen = up ? !missionControlOpen : false
     }
 
-    private func prefetchCurrentRow() {
+    /// Seed + re-capture the visible Space-row. `replacing` (an explicit open / Space switch) supersedes a
+    /// sweep still refreshing the row the user just left — otherwise that explicit capture was dropped and
+    /// the new row showed stale frames until a later timer tick found the service idle.
+    private func prefetchCurrentRow(replacing: Bool = false) {
         // Never attempt a ScreenCaptureKit capture of our OWN Hub window (it's the synthetic icon-only
         // card) — exclude its id from both the cache seed and the live prefetch so no self-capture is
         // tried; the switcher already renders the app icon for it.
         let hubID = hubWindow.map { CGWindowID($0.windowNumber) }
         let windows = overlay.model.windows.filter { $0.id != hubID }
         thumbnails.seed(into: overlay.model, ids: windows.map(\.id))  // instant from cache (no icon-only flash)
-        thumbnails.prefetch(windows)                                  // refresh only cleanly-visible windows
+        thumbnails.prefetch(windows, replacing: replacing)            // refresh only cleanly-visible windows
+    }
+
+    /// The switcher-open sweep: the visible row first (its cards are what the user sees), then every
+    /// OTHER Space's row in reel order, all in ONE replacing sweep. The other rows used to be seed-only —
+    /// "off-screen Spaces can't be freshly captured" — but the Space-switch path captures exactly those
+    /// windows successfully (the WindowServer keeps every window's backing store), so a Space scrolled to
+    /// showed frames from the LAST session until its switch-time capture landed. Capturing them once per
+    /// open (the timer only ever re-captures the visible row) means every row is at most one open old.
+    private func prefetchAllRows() {
+        let hubID = hubWindow.map { CGWindowID($0.windowNumber) }
+        let current = overlay.model.windows.filter { $0.id != hubID }
+        thumbnails.seed(into: overlay.model, ids: current.map(\.id))
+        let currentIDs = Set(current.map(\.id))
+        let others = overlay.model.rows.flatMap { $0 }.filter { $0.id != hubID && !currentIDs.contains($0.id) }
+        thumbnails.prefetch(current + others, replacing: true)
     }
 
     /// Seed cached thumbnails for EVERY Space's windows the moment the switcher opens — not just the
@@ -726,6 +782,10 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     }
 
     func gestureDidCommit() {
+        // A ⌘-Tab session owns the overlay: a stray trackpad lift must neither raise its highlight nor
+        // release its ownership (D7). The recognizer already suppresses refused touches; this is the
+        // belt for a gesture that was in flight when the keyboard session opened.
+        guard switcherOwner != .keyboard else { return }
         switcherOwner = .none   // the session is ending regardless of which branch below runs
         guard overlay.isVisible, let window = overlay.model.selectedWindow else {
             overlay.hide()
@@ -822,6 +882,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     }
 
     func gestureDidCancel() {
+        guard switcherOwner != .keyboard else { return }   // a trackpad lift never hides a ⌘-Tab session (D7)
         switcherOwner = .none
         overlay.hide()
         stopPreviewRefresh()
@@ -911,7 +972,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     /// The tail of a ⌘-Tab Space crossing: seed + capture the new row and freeze late captures for the
     /// slide, exactly as `switchSpace` does for a trackpad grid-edge crossing.
     private func afterKeyboardRowChange() {
-        prefetchCurrentRow()
+        prefetchCurrentRow(replacing: true)
         overlay.beginSlideFreeze()
     }
 
@@ -1659,9 +1720,18 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         let hadAnything = trackpadConfig.hasBackup || verticalGesture.hasBackup
             || fourFingerGesture.hasBackup || spacesRearrange.hasBackup
             || settings.manageVerticalGesture || settings.enableLauncher || settings.manageSpacesRearrange
-        settings.manageVerticalGesture = false     // observer restores when a backup exists
-        settings.enableLauncher = false            // observer restores when a backup exists
-        settings.manageSpacesRearrange = false     // observer restores when a backup exists
+        // Restore SYNCHRONOUSLY, before flipping the flags. The flag observers restore too, but they
+        // defer their handler to the next run-loop turn (`DispatchQueue.main.async`), and the Danger-zone
+        // caller wipes the preferences domain — where every backup lives — synchronously right after
+        // this returns: the deferred handlers then found no backup and restored NOTHING, leaving the
+        // user with Mission Control on four fingers / four-finger swipes off and no in-app undo. Doing
+        // the restores inline makes the deferred handlers harmless no-ops (no backup left to restore).
+        if verticalGesture.hasBackup { _ = verticalGesture.restore() }
+        if fourFingerGesture.hasBackup { _ = fourFingerGesture.restore() }
+        if spacesRearrange.hasBackup { _ = spacesRearrange.restore() }
+        settings.manageVerticalGesture = false     // observer: nothing left to restore
+        settings.enableLauncher = false            // observer: nothing left to restore
+        settings.manageSpacesRearrange = false     // observer: nothing left to restore
         if trackpadConfig.hasBackup { _ = trackpadConfig.restore() }
         refreshRowSwitchingGate()
         onStateChange?()
@@ -1712,8 +1782,12 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         if selection.contains(.appData), anyGestureBackupExists {
             restoreAllNativeGestures(interactive: false)
         }
-        // 2. Quiesce writers so nothing re-creates what's being removed.
+        // 2. Quiesce writers so nothing re-creates what's being removed — and DRAIN the clipboard
+        //    store's async persistence: a `persist` still queued on its I/O queue (a large image blob
+        //    mid-write) would otherwise run AFTER the directory removal, recreate the blobs dir + index,
+        //    and resurrect the history the user just asked to delete.
         clipboardMonitor.stop()
+        clipboardStore.flush()
         // 3. Delete (preferences last, inside `clear`).
         let outcome = appDataReset.clear(selection)
         // 4. A cleared identity needs a fresh process (and a data wipe replays the wizard).
@@ -2052,7 +2126,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         // Remember which Space the Hub now lives on so the synthetic switcher entry lands in that
         // Space's row. `present` activates + makes the Hub key on the current Space, so the current
         // Space is where it is now visible (the Hub does not join all Spaces).
-        hubSpaceID = SpaceService.currentModel()?.currentSpaceIDs.first
+        hubSpaceID = SpaceService.currentModel()?.primaryCurrentSpaceID
     }
 
     /// Pause the Hub's self-playing gesture previews — called when the Hub leaves the screen (close /
@@ -2098,7 +2172,9 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             // cleanly-presented window now, leaving parked/set-aside ones as icon+title until a later
             // sweep can capture them. Two delayed sweeps retry the cards still missing an image. The
             // wizard sweeps re-capture `self.wizardModel?.demo`; here the PASSED `model` IS the Hub's
-            // switcher demo model, so the retries weakly target IT.
+            // switcher demo model, so the retries weakly target IT — and it joins the live `onThumbnail`
+            // fan-out (weakly) so captures landing at ANY time reach it, not just the two retries.
+            self.hubSwitcherDemo = model
             let windows = model.windows
             self.thumbnails.seed(into: model, ids: windows.map(\.id))
             self.thumbnails.prefetch(windows)

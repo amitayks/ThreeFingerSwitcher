@@ -62,10 +62,21 @@ final class ClipboardMonitor {
         timer = t
     }
 
-    /// Visible for testing: a single poll tick (the timer also calls this). Captures on a genuine change.
+    /// Visible for testing: a single poll tick (the timer also calls this). Skips a change that is OUR OWN
+    /// pasteboard write (the launcher pasting an entry — `ClipboardStore.markOwnWrite`), adopting it as
+    /// the last-seen count; captures on a genuine change.
     func poll() {
         guard !isPaused else { return }
         let current = pasteboard.changeCount
+        // Our own paste: if the board still sits at exactly the count the store marked, advance past it
+        // without capturing — re-ingesting it would `dedup`-rewrite the entry's recency/source app (the
+        // paste TARGET), cost a full re-serialize + disk write per paste, and duplicate a TIFF-only image
+        // (the PNG we add on paste changes the fingerprint). A *newer* count means a real user copy landed
+        // in between: the marker is stale (taken and dropped) and that copy is captured below.
+        if let own = store.takeOwnWriteMarker(), own == current {
+            lastChangeCount = current
+            return
+        }
         guard current != lastChangeCount else { return }
         lastChangeCount = current
         capture()

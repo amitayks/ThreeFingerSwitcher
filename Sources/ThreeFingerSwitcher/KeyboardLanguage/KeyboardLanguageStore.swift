@@ -74,10 +74,14 @@ final class KeyboardLanguageStore: ObservableObject {
 
     // MARK: - Mutation
 
-    /// Apply an edit and persist it. All write paths funnel through here.
+    /// Apply an edit and persist it. All write paths funnel through here. A mutation that leaves the
+    /// record equal is a no-op: `learnOutgoing` lands here on EVERY app switch (re-remembering the same
+    /// source for the same app), and each unconditional pass used to be a `@Published` emission (a Hub
+    /// re-render) plus a JSON encode + defaults write for nothing.
     func mutate(_ block: (inout KeyboardLanguageRecord) -> Void) {
         var copy = record
         block(&copy)
+        guard copy != record else { return }
         record = copy
         save()
     }

@@ -101,4 +101,87 @@ final class ClipboardMonitorTests: XCTestCase {
 
         XCTAssertEqual(store.count, 1, "re-capturing identical content does not duplicate")
     }
+
+    // MARK: - Own-write suppression (the launcher pasting an entry must not be re-ingested)
+
+    /// The paste path writes an entry back to the board and marks the resulting `changeCount` on the
+    /// store; the recorder's next poll skips exactly that change, so the entry keeps its capture time and
+    /// source app (re-capture would `dedup`-overwrite both with the paste's) and no duplicate is recorded.
+    func testOwnWriteMarkedOnStoreIsNotRecaptured() {
+        let pb = pasteboard()
+        let store = ClipboardStore(directory: tempDir())
+        let monitor = ClipboardMonitor(store: store, pasteboard: pb, sourceAppProvider: { nil })
+        let original = ClipboardEntry(capturedAt: Date(timeIntervalSince1970: 1000), kind: .text, key: "hello",
+                                      sourceApp: "com.example.source",
+                                      representations: [ClipboardUTI.plainText: .inline(Data("hello".utf8))],
+                                      fingerprint: "text:hello")
+        store.insert(original)
+
+        // Simulate `LaunchService.pasteEntry`: write the entry to the board, then mark the change as ours.
+        pb.clearContents()
+        pb.setString("hello", forType: .string)
+        store.markOwnWrite(changeCount: pb.changeCount)
+
+        monitor.poll()
+
+        XCTAssertEqual(store.count, 1, "our own paste is not captured as a second entry")
+        let kept = store.recentWindow(limit: 1).first
+        XCTAssertEqual(kept?.capturedAt, Date(timeIntervalSince1970: 1000), "recency is not bumped by our own paste")
+        XCTAssertEqual(kept?.sourceApp, "com.example.source", "the source app is not overwritten by the paste target")
+    }
+
+    /// The skip ADOPTS the marked count as last-seen: a further poll with no new change captures nothing.
+    func testSkippedOwnWriteIsAdoptedAsLastSeenChange() {
+        let pb = pasteboard()
+        let store = ClipboardStore(directory: tempDir())
+        let monitor = ClipboardMonitor(store: store, pasteboard: pb, sourceAppProvider: { nil })
+
+        pb.setString("pasted by us", forType: .string)
+        store.markOwnWrite(changeCount: pb.changeCount)
+        monitor.poll()   // skipped
+        monitor.poll()   // nothing new — must not capture the (now unmarked) board content
+
+        XCTAssertTrue(store.isEmpty, "the own write is neither captured on the skip nor on the next poll")
+        XCTAssertNil(store.takeOwnWriteMarker(), "the marker was consumed by the skip")
+    }
+
+    /// The marker matches exactly ONE `changeCount`: if a *newer* (real user) copy lands before the poll,
+    /// the stale marker is dropped and that copy IS captured (no lost captures).
+    func testNewerChangeBeforePollIsStillCaptured() {
+        let pb = pasteboard()
+        let store = ClipboardStore(directory: tempDir())
+        let monitor = ClipboardMonitor(store: store, pasteboard: pb, sourceAppProvider: { nil })
+
+        pb.setString("our write", forType: .string)
+        let ours = pb.changeCount
+        store.markOwnWrite(changeCount: ours)
+
+        // A real user copy lands before the poll → newer changeCount.
+        pb.clearContents()
+        pb.setString("user copy", forType: .string)
+        XCTAssertNotEqual(pb.changeCount, ours)
+
+        monitor.poll()
+
+        XCTAssertEqual(store.recentWindow(limit: 1).first?.key, "user copy",
+                       "a real copy that superseded our write is still captured")
+    }
+
+    /// The marker is one-shot: after the skip, the very next genuine change is captured normally.
+    func testOwnWriteMarkerIsOneShot() {
+        let pb = pasteboard()
+        let store = ClipboardStore(directory: tempDir())
+        let monitor = ClipboardMonitor(store: store, pasteboard: pb, sourceAppProvider: { nil })
+
+        pb.setString("our write", forType: .string)
+        store.markOwnWrite(changeCount: pb.changeCount)
+        monitor.poll()                       // consumes (skips) the marker
+        XCTAssertTrue(store.isEmpty)
+
+        pb.clearContents()
+        pb.setString("real copy", forType: .string)
+        monitor.poll()                       // next change is captured
+
+        XCTAssertEqual(store.recentWindow(limit: 1).first?.key, "real copy")
+    }
 }

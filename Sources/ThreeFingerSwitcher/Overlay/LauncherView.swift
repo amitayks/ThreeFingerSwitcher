@@ -121,7 +121,12 @@ struct LauncherView: View {
             }
             .onChange(of: model.selectedIndex) { scroll(proxy) }
             .onChange(of: model.focus) { scroll(proxy) }
-            .onChange(of: model.currentBand) { proxy.scrollTo(scrollTarget, anchor: .top) }
+            // A band change resets the grid to its top. Bands are switched from the band LIST (focus
+            // `.bands`), where `scrollTarget` is nil — so scrolling to it never did anything; the first
+            // item is the row to land on while browsing bands.
+            .onChange(of: model.currentBand) {
+                if let first = model.items.first?.id { proxy.scrollTo(first, anchor: .top) }
+            }
         }
     }
 
@@ -204,17 +209,44 @@ struct LauncherView: View {
 
     private func appIcon(for item: LaunchItem) -> NSImage {
         if case let .app(bundleURL, _) = item.kind {
-            return NSWorkspace.shared.icon(forFile: bundleURL.path)
+            return LauncherIconCache.icon(forFile: bundleURL.path)
         }
         return NSImage(systemSymbolName: "app.dashed", accessibilityDescription: nil) ?? NSImage()
     }
 
     private func fileIcon(for item: LaunchItem) -> NSImage {
         if case let .path(url) = item.kind {
-            return NSWorkspace.shared.icon(forFile: url.path)
+            return LauncherIconCache.icon(forFile: url.path)
         }
         return NSImage(systemSymbolName: "folder", accessibilityDescription: nil) ?? NSImage()
     }
+}
+
+/// Memoizes `NSWorkspace.icon(forFile:)` per path for the grid cells. `body` re-runs on every model
+/// publish (each scrub step), and resolving the icon inside it returned a NEW `NSImage` each time — which
+/// defeats SwiftUI's image identity, so every visible cell re-diffed and re-rendered its icon per step.
+/// One `NSImage` per path keeps identity stable across publishes and across shows (the hosting view is
+/// reused). Bounded: past `capacity` distinct paths the cache is dropped wholesale — a favorites set has
+/// tens of items, so the bound only guards a pathological one. An app whose icon changes on disk shows
+/// the cached icon until the cache clears (the Dock caches the same way). Main-actor only (`body`).
+@MainActor
+enum LauncherIconCache {
+    private static var icons: [String: NSImage] = [:]
+    private static let capacity = 512
+
+    static func icon(forFile path: String) -> NSImage {
+        if let cached = icons[path] { return cached }
+        if icons.count >= capacity { icons.removeAll(keepingCapacity: true) }
+        let image = NSWorkspace.shared.icon(forFile: path)
+        icons[path] = image
+        return image
+    }
+
+    /// Drop every cached icon (a refresh seam; also keeps tests independent).
+    static func clear() { icons.removeAll() }
+
+    /// Number of memoized paths (tests).
+    static var count: Int { icons.count }
 }
 
 /// The single selection highlight: a Liquid Glass rounded square that starts nearly transparent and

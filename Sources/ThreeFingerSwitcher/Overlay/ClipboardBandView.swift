@@ -314,19 +314,27 @@ private struct ClipboardTextPreview: View {
     }
 }
 
-/// Loads and downsamples the full image for a clipboard entry **on demand**. The band entry carries no
-/// image bytes (`ClipboardStore.bandWindow` drops them to keep the band lightweight), so this fetches the
-/// full entry by id from the shared store (the same singleton the coordinator uses) and downsamples off the
-/// main thread via ImageIO — so a giant source image never fully decodes into memory. `.task(id:)` cancels
-/// a superseded load when the selection scrubs to another entry, so only one image is ever resident (the
-/// crash we fix: the old band held every windowed entry's full image bytes at once).
+/// Loads and downsamples the image for a clipboard entry **on demand**. The band entry carries no image
+/// bytes (`ClipboardStore.bandWindow` drops them to keep the band lightweight), so this resolves ONE
+/// representation (PNG, else TIFF) by id from the shared store (the same singleton the coordinator uses)
+/// and reads + downsamples it off the main thread via ImageIO — so a giant source image never fully
+/// decodes into memory, and the main actor never reads a blob (materializing the whole entry read every
+/// representation — PNG and TIFF, tens of MB — on main, per scrub step). Like `ClipboardTextPreview` it
+/// waits a short settle window first, so a scrub gliding past images loads none of them; `.task(id:)`
+/// cancels a superseded load when the selection moves on, so only one image is ever resident (the crash we
+/// fix: the old band held every windowed entry's full image bytes at once).
 private struct ClipboardImagePreview: View {
     let entryID: UUID
     @State private var image: NSImage?
     @State private var loaded = false
+    /// Bumped per load so a superseded load's late continuation never touches state a newer load owns.
+    @State private var generation = 0
 
     /// Longest-edge budget for the downsampled preview — crisp enough on-screen, bounded in memory.
     private static let maxPixel: CGFloat = 1400
+    /// Settle window (mirrors `ClipboardTextPreview`): a scrub that moves on within this cancels the pending
+    /// load before it touches the disk, so only the image you actually stop on is read.
+    private static let settle = Duration.milliseconds(55)
 
     var body: some View {
         Group {
@@ -344,17 +352,31 @@ private struct ClipboardImagePreview: View {
 
     @MainActor
     private func load() async {
+        generation += 1
+        let mine = generation
         image = nil
         loaded = false
-        // Fetch the full entry (with image bytes) from the shared store, then downsample off-main.
-        guard let entry = ClipboardStore.shared.materializedEntry(id: entryID),
-              let data = entry.data(for: ClipboardUTI.png) ?? entry.data(for: ClipboardUTI.tiff) else {
+        do {
+            try await Task.sleep(for: Self.settle)
+        } catch {
+            // Cancelled mid-settle. A superseding load (new `entryID`) has already bumped `generation` and
+            // owns the state; with NO successor (the launcher hid — its hosting view is retained between
+            // shows) mark it loaded so the spinner isn't stranded when the same entry is shown again.
+            if generation == mine { loaded = true }
+            return
+        }
+        // Resolve WHERE the one representation we'll use lives (a cheap actor lookup, no blob read on
+        // main), then read + downsample it off the main actor. PNG first, TIFF as the fallback — never both.
+        guard let source = ClipboardStore.shared.payloadSource(id: entryID, uti: ClipboardUTI.png)
+                ?? ClipboardStore.shared.payloadSource(id: entryID, uti: ClipboardUTI.tiff) else {
             loaded = true
             return
         }
         let maxPixel = Self.maxPixel
-        let img = await Task.detached(priority: .userInitiated) { Self.downsample(data, maxPixel: maxPixel) }.value
-        guard !Task.isCancelled else { return }   // scrubbed away mid-load — drop this result
+        let img = await Task.detached(priority: .userInitiated) {
+            source.load().flatMap { Self.downsample($0, maxPixel: maxPixel) }
+        }.value
+        guard generation == mine else { return }   // scrubbed away mid-load — the newer load owns the state
         image = img
         loaded = true
     }

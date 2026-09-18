@@ -6,8 +6,14 @@ import CoreGraphics
 struct SpaceModel {
     /// All Space ids in display/Mission-Control order.
     let orderedSpaceIDs: [CGSSpaceID]
-    /// Space ids that are currently active (one per display).
+    /// Space ids that are currently active (one per display). For MEMBERSHIP tests only — it is a Set,
+    /// so `.first` is hash-order arbitrary on a multi-display Mac; when one Space must stand for "the"
+    /// current Space, use `primaryCurrentSpaceID`.
     let currentSpaceIDs: Set<CGSSpaceID>
+    /// The current Space of the FIRST display in the `CGSCopyManagedDisplaySpaces` array (the "Main"
+    /// display comes first), so it is deterministic across calls and displays. `nil` only when no display
+    /// reported a current Space (then `currentSpaceIDs` is empty too).
+    let primaryCurrentSpaceID: CGSSpaceID?
     /// spaceID → order index (for cross-Space ordering tiebreaks).
     let indexBySpace: [CGSSpaceID: Int]
 }
@@ -18,11 +24,28 @@ enum SpaceService {
         guard let mainConn = cgs.mainConnectionID,
               let copySpaces = cgs.copyManagedDisplaySpaces else { return nil }
         let cid = mainConn()
-        guard let displays = copySpaces(cid) as? [[String: Any]] else { return nil }
+        // `Copy` = +1: take the retained value, or the array leaks on every call (see CGSPrivate.swift).
+        guard let displays = copySpaces(cid)?.takeRetainedValue() as? [[String: Any]] else { return nil }
+        return model(fromDisplays: displays) { identifier in
+            guard let getCurrent = cgs.managedDisplayGetCurrentSpace else { return nil }
+            let id = getCurrent(cid, identifier as CFString)
+            return id != 0 ? id : nil
+        }
+    }
 
+    /// Pure model builder over the `CGSCopyManagedDisplaySpaces` dictionary array — one dict per display,
+    /// in display order, each with `Spaces: [{id64}]`, `Current Space: {id64}` and a `Display Identifier` —
+    /// so the selection rules are unit-testable without the private API. `apiCurrentSpace` refines the
+    /// current Space of a REAL display UUID via `CGSManagedDisplayGetCurrentSpace` (return `nil` when the
+    /// API is unavailable or answers 0); it is never asked about the "Main" sentinel.
+    static func model(
+        fromDisplays displays: [[String: Any]],
+        apiCurrentSpace: (String) -> CGSSpaceID? = { _ in nil }
+    ) -> SpaceModel? {
         var ordered: [CGSSpaceID] = []
         var index: [CGSSpaceID: Int] = [:]
         var current: Set<CGSSpaceID> = []
+        var primary: CGSSpaceID?
 
         for display in displays {
             if let spaces = display["Spaces"] as? [[String: Any]] {
@@ -36,20 +59,26 @@ enum SpaceService {
             // Current Space: the dict is authoritative (always read it); refine via the API for
             // real display UUIDs. The "Main" sentinel is not a valid UUID for the API (returns 0),
             // so skip the API for it — the dict already provided the current Space.
+            var displayCurrent: CGSSpaceID?
             if let cur = display["Current Space"] as? [String: Any],
                let id = (cur["id64"] as? NSNumber)?.uint64Value {
                 current.insert(id)
+                displayCurrent = id
             }
             if let identifier = display["Display Identifier"] as? String,
                identifier != "Main",
-               let getCurrent = cgs.managedDisplayGetCurrentSpace {
-                let apiCur = getCurrent(cid, identifier as CFString)
-                if apiCur != 0 { current.insert(apiCur) }
+               let apiCur = apiCurrentSpace(identifier) {
+                current.insert(apiCur)
+                if displayCurrent == nil { displayCurrent = apiCur }
             }
+            // The primary is the FIRST display's current Space (its dict value, the API as fallback);
+            // a display that reports none is skipped so a later one can still supply it.
+            if primary == nil { primary = displayCurrent }
         }
 
         guard !ordered.isEmpty else { return nil }
-        return SpaceModel(orderedSpaceIDs: ordered, currentSpaceIDs: current, indexBySpace: index)
+        return SpaceModel(orderedSpaceIDs: ordered, currentSpaceIDs: current,
+                          primaryCurrentSpaceID: primary, indexBySpace: index)
     }
 
     /// Ordered window ids on a given Space (front-to-back), via `CGSCopyWindowsWithOptionsAndTags`.
@@ -62,7 +91,8 @@ enum SpaceService {
         let spaces = [spaceID] as CFArray
         // options 7 = screenSaverLevel1000 | invisible1 | invisible2 (AltTab includeInvisible=true):
         // includes minimized/hidden/invisible windows on off-Spaces, not just visible ones.
-        guard let wins = copyWindows(cid, 0, spaces, 7, &setTags, &clearTags) as? [NSNumber] else { return [] }
+        // `Copy` = +1: take the retained value, or the array leaks on every call (see CGSPrivate.swift).
+        guard let wins = copyWindows(cid, 0, spaces, 7, &setTags, &clearTags)?.takeRetainedValue() as? [NSNumber] else { return [] }
         return wins.map { $0.uint32Value }
     }
 }

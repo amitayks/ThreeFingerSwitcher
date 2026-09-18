@@ -83,7 +83,13 @@ final class PermissionsService: ObservableObject {
     private func pollTick() {
         // `NSApp` is nil under `swift test` (no NSApplication is ever created there) — poll
         // unconditionally in that case so the timer's contract stays testable.
-        if let app = NSApp, !app.windows.contains(where: { $0.isVisible && !($0 is NSPanel) }) {
+        // `.titled` is load-bearing: the menu-bar status item owns an always-visible, non-panel
+        // `NSStatusBarWindow`, which satisfied the previous `!NSPanel` test on its own — so the guard
+        // never tripped and a Hub closed on the Setup page kept polling for the whole process. The Hub
+        // and wizard windows are both titled; the status-item window (and every overlay) is not.
+        if let app = NSApp, !app.windows.contains(where: {
+            $0.isVisible && !($0 is NSPanel) && $0.styleMask.contains(.titled)
+        }) {
             return
         }
         refresh()

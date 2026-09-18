@@ -32,6 +32,25 @@ final class ThumbnailService {
     /// Monotonic sweep token so a finished sweep never clears a slot a newer sweep now owns.
     private var sweepGeneration = 0
 
+    /// How many ScreenCaptureKit screenshots a sweep keeps in flight at once. The captures were strictly
+    /// sequential (each awaited before the next), so a Space-row of N windows filled in one card at a
+    /// time and its last card waited N captures. A few in parallel land the whole row within roughly one
+    /// capture's latency; bounded so a wide row can't fan out into dozens of concurrent WindowServer
+    /// requests.
+    private let maxConcurrentCaptures = 4
+
+    /// The last `SCShareableContent` enumeration, reused across the sweeps of one switcher session.
+    /// The enumeration is the expensive half of a sweep (a cross-process listing of EVERY window on the
+    /// system, ~100–300 ms and growing with the window count) and it was paid on every 0.8 s tick and on
+    /// every Dock peek. Within `shareableContentTTL` a sweep whose targets are all present in the cached
+    /// listing skips it; a missing id (a new window) or a stale listing re-enumerates. The `SCWindow`
+    /// objects stay valid capture handles (the filter keys on the window id); the capture SIZE is taken
+    /// from the window's live bounds, not the cached frame, so a resized window still captures at its
+    /// current size.
+    private var cachedContent: SCShareableContent?
+    private var cachedContentAt: TimeInterval = 0
+    private let shareableContentTTL: TimeInterval = 3.0
+
     /// When set (env var `TFS_THUMB_LOG`), each capture logs its ScreenCaptureKit frame next to the
     /// window's logical frame so the set-aside/off-screen "degraded" signal can be confirmed and the
     /// thresholds in `isDegradedCapture` tuned against real data (see the change's task 1.2 / 1.3).
@@ -83,15 +102,26 @@ final class ThumbnailService {
     /// a Stage-Manager strip proxy — is skipped and served from cache/icon instead. The `inFlight` guard
     /// gives per-window back-pressure so an in-flight capture is never duplicated. Off-Space-but-on-screen
     /// windows still capture; minimized windows never reach here (`snapshot()`'s `isSwitchable` excludes them).
-    func prefetch(_ windows: [WindowInfo]) {
+    ///
+    /// `replacing`: an EXPLICIT refresh (switcher open, Space switch) cancels a sweep already in flight
+    /// and starts this one — the in-flight sweep is refreshing the row the user just LEFT. With plain
+    /// skip-if-busy semantics that explicit refresh was dropped whenever the previous row's timer sweep
+    /// was still running, and the next timer tick was often skipped for the same reason, so the newly
+    /// visible Space showed its stale cached frames for up to ~1.6 s. The periodic timer keeps
+    /// `replacing: false` (skip-if-busy — a tick is an idempotent refresh, never a queue).
+    func prefetch(_ windows: [WindowInfo], replacing: Bool = false) {
         guard CGPreflightScreenCaptureAccess() else { return }
-        // Per-sweep back-pressure: while the previous sweep still runs, this tick is skipped (the
-        // next one re-captures everything anyway — sweeps are idempotent refreshes, never a queue).
-        guard sweepTask == nil else { return }
+        if sweepTask != nil {
+            guard replacing else { return }
+            cancelSweeps()
+        }
         // Skip minimized windows: macOS renders no fresh pixels for a minimized window, so a live capture
         // would be wasted/degraded. They keep their seeded last-good frame or icon and surface live only on
         // commit (which un-minimizes). Load-bearing now that the include-minimized-windows opt-in can list them.
-        let targets = windows.filter { !inFlight.contains($0.id) && !$0.isMinimized }
+        // A window whose capture is still in flight from a cancelled sweep is NOT filtered out here: the
+        // batch waits briefly for that capture to release the id (see `captureSlot`), so the one card
+        // that happened to be mid-capture at hide/switch no longer sits out the whole next sweep.
+        let targets = windows.filter { !$0.isMinimized }
         guard !targets.isEmpty else { return }
         sweepGeneration += 1
         let generation = sweepGeneration
@@ -116,39 +146,85 @@ final class ThumbnailService {
     /// minimize once it returns, so a mid-genie frame is never grabbed.
     func captureNow(_ windows: [WindowInfo]) async {
         guard CGPreflightScreenCaptureAccess() else { return }
-        await refreshBatch(windows.filter { !inFlight.contains($0.id) })
+        await refreshBatch(windows)
     }
 
-    /// Capture every cleanly-presented window in `windows` from ONE shared `SCShareableContent` enumeration
-    /// (the enumeration is the expensive part — paying it once per sweep instead of once per window is the
-    /// batch win). Each window is degraded-gated against its fresh enumerated frame and captured as a
-    /// concurrent child task, self-paced by `inFlight`.
-    private func refreshBatch(_ windows: [WindowInfo]) async {
-        let displayUnion = Self.displayUnion()
-        let content: SCShareableContent
-        do {
-            content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        } catch {
-            return  // Enumeration failed (permission, transient): leave cached frames in place.
+    /// The shareable-content listing for a batch: the cached enumeration when it is fresh and already
+    /// lists every target id, else a new enumeration (cached for the next batch). `nil` when the
+    /// enumeration fails (permission, transient) — callers leave the cached frames in place.
+    private func shareableContent(covering ids: [CGWindowID]) async -> SCShareableContent? {
+        let now = CACurrentMediaTime()
+        if let cached = cachedContent, now - cachedContentAt < shareableContentTTL {
+            let listed = Set(cached.windows.map(\.windowID))
+            if ids.allSatisfy({ listed.contains($0) }) { return cached }
         }
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            cachedContent = content
+            cachedContentAt = CACurrentMediaTime()
+            return content
+        } catch {
+            return nil
+        }
+    }
+
+    /// Capture every cleanly-presented window in `windows` from ONE shared `SCShareableContent` listing
+    /// (the enumeration is the expensive part — paying it once per sweep, and reusing it across a
+    /// session's sweeps, is the batch win). Each window is degraded-gated against its enumerated frame and
+    /// captured through a bounded task group (`maxConcurrentCaptures` at a time, in the caller's order so
+    /// the visible row's first cards land first), self-paced per window by `inFlight`.
+    private func refreshBatch(_ windows: [WindowInfo]) async {
+        guard !windows.isEmpty else { return }
+        let displayUnion = Self.displayUnion()
+        guard let content = await shareableContent(covering: windows.map(\.id)) else { return }
+        if Task.isCancelled { return }
         let byID = Dictionary(content.windows.map { ($0.windowID, $0) }, uniquingKeysWith: { _, new in new })
-        for w in windows {
-            if Task.isCancelled { return }   // session ended: stop capturing into a hidden overlay
-            guard !inFlight.contains(w.id) else { continue }
-            // Skip a not-cleanly-presented window (parked off every display, or a Stage-Manager strip
-            // proxy); `seed` already shows its cached/icon. Pass the real (AX) frame as the logical frame
-            // so the degraded check compares the SCK frame against the TRUE size.
+        // Resolve the capturable targets up front (cheap, synchronous): skip a not-cleanly-presented window
+        // (parked off every display, or a Stage-Manager strip proxy) — `seed` already shows its cached /
+        // icon — and pass the real (AX) frame as the logical frame so the degraded check compares the SCK
+        // frame against the TRUE size.
+        let targets: [(id: CGWindowID, scWindow: SCWindow, logical: CGRect)] = windows.compactMap { w in
             guard Self.shouldPrefetchCapture(displayedFrame: w.frame, realFrame: w.realFrame,
                                              displayUnion: displayUnion),
-                  let scWindow = byID[w.id] else { continue }
-            let logical = w.realFrame.width > 1 ? w.realFrame : w.frame
-            // Capture sequentially (each window awaited before the next): the visible row is bounded and a
-            // single screenshot is cheap, so the whole sweep lands well within the refresh interval, while
-            // `inFlight` still guards an overlapping sweep from re-capturing the same window.
-            inFlight.insert(w.id)
-            await captureWindow(scWindow, id: w.id, logicalFrame: logical, displayUnion: displayUnion)
-            inFlight.remove(w.id)
+                  let scWindow = byID[w.id] else { return nil }
+            return (w.id, scWindow, w.realFrame.width > 1 ? w.realFrame : w.frame)
         }
+        guard !targets.isEmpty else { return }
+        await withTaskGroup(of: Void.self) { group in
+            var pending = targets[...]
+            func enqueueNext() {
+                guard let t = pending.first else { return }
+                pending = pending.dropFirst()
+                group.addTask { @MainActor [self] in
+                    await self.captureSlot(t.scWindow, id: t.id, logicalFrame: t.logical, displayUnion: displayUnion)
+                }
+            }
+            // Prime up to the concurrency bound, then top up as each capture finishes (caller order).
+            for _ in 0..<min(maxConcurrentCaptures, targets.count) { enqueueNext() }
+            while await group.next() != nil {
+                if Task.isCancelled { break }   // session ended: stop capturing into a hidden overlay
+                enqueueNext()
+            }
+        }
+    }
+
+    /// One capture slot of a batch: wait (briefly) for a still-running capture of the same window to
+    /// release the id, then run the gated capture under `inFlight`. The wait exists for the window that was
+    /// mid-capture when a sweep was cancelled (overlay hide / Space switch): its `inFlight` entry outlives
+    /// the cancellation until ScreenCaptureKit returns, and without the wait the very next sweep skipped
+    /// that card entirely (it sat on its stale frame for a whole extra tick). Bounded so a wedged capture
+    /// can never stall a sweep.
+    private func captureSlot(_ scWindow: SCWindow, id: CGWindowID, logicalFrame: CGRect, displayUnion: CGRect) async {
+        var waits = 0
+        while inFlight.contains(id) {
+            guard !Task.isCancelled, waits < 20 else { return }
+            waits += 1
+            try? await Task.sleep(nanoseconds: 15_000_000)
+        }
+        if Task.isCancelled { return }
+        inFlight.insert(id)
+        defer { inFlight.remove(id) }
+        await captureWindow(scWindow, id: id, logicalFrame: logicalFrame, displayUnion: displayUnion)
     }
 
     /// Union of all active displays in the global (top-left origin) coordinate space that both
@@ -296,13 +372,11 @@ final class ThumbnailService {
         inFlight.insert(id)
         defer { inFlight.remove(id) }
         let displayUnion = Self.displayUnion()
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            guard let scWindow = content.windows.first(where: { $0.windowID == id }) else { return }
-            await captureWindow(scWindow, id: id, logicalFrame: logicalFrame, displayUnion: displayUnion)
-        } catch {
-            // Enumeration failed (permission, transient): leave the cached frame untouched.
-        }
+        // Reuses the session's cached listing (a Dock hover session peeks several windows in a row);
+        // a nil listing means the enumeration failed — leave the cached frame untouched.
+        guard let content = await shareableContent(covering: [id]),
+              let scWindow = content.windows.first(where: { $0.windowID == id }) else { return }
+        await captureWindow(scWindow, id: id, logicalFrame: logicalFrame, displayUnion: displayUnion)
     }
 
     /// Capture a single already-enumerated `SCWindow` and store + notify on success — but only when the frame
@@ -325,7 +399,9 @@ final class ThumbnailService {
             return
         }
         do {
-            let config = streamConfiguration(for: scWindow)
+            // Size the capture from the LIVE bounds (`frameBefore`), not the listing's frame: the listing
+            // may be the session-cached enumeration, whose frame predates a resize.
+            let config = streamConfiguration(forWindowSize: frameBefore.size)
             let filter = SCContentFilter(desktopIndependentWindow: scWindow)
             let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
             // Motion gate: a frame change across the capture means the window was animating — the grabbed
@@ -364,10 +440,10 @@ final class ThumbnailService {
     /// sized by `captureDimensions` (native pixels bounded to `thumbnailMaxSize`, the display target),
     /// no cursor, no surrounding shadow. Behavior-identical across both paths so the fast live capture
     /// matches the enumeration capture pixel-for-pixel.
-    private func streamConfiguration(for scWindow: SCWindow) -> SCStreamConfiguration {
+    private func streamConfiguration(forWindowSize windowSize: CGSize) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
         let backing = NSScreen.main?.backingScaleFactor ?? 2
-        let dims = Self.captureDimensions(windowSize: scWindow.frame.size, backingScale: backing, cap: thumbnailMaxSize)
+        let dims = Self.captureDimensions(windowSize: windowSize, backingScale: backing, cap: thumbnailMaxSize)
         config.width = dims.width
         config.height = dims.height
         config.showsCursor = false
@@ -396,5 +472,18 @@ final class ThumbnailService {
         guard !live.isEmpty else { return }
         cacheOrder.removeAll { !live.contains($0) }
         cache = cache.filter { live.contains($0.key) }
+    }
+
+    /// The ids of EVERY window that currently exists in the session — on-screen, off-Space, minimized
+    /// and hidden alike (`kCGWindowListOptionAll`). The prune set for the last-good-frame caches:
+    /// pruning to the switcher's own snapshot evicted frames of windows the switcher merely FILTERED OUT
+    /// (a minimized window while the include-minimized opt-in is off, a window skipped this open by the
+    /// brute-force budget), so those came back icon-only the next time they were listed. Empty on failure
+    /// (`retain(only:)` then ignores it — an enumeration hiccup must not wipe the store).
+    static func existingWindowIDs() -> Set<CGWindowID> {
+        guard let infoList = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else {
+            return []
+        }
+        return Set(infoList.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value })
     }
 }

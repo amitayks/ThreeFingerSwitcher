@@ -193,4 +193,19 @@ final class LauncherModelTests: XCTestCase {
                        LauncherGridLayout.windowHeight(itemCount: 3), "default matches the no-list case")
     }
 
+    // MARK: - Grid icon memoization (stable image identity across publishes)
+
+    /// `NSWorkspace.icon(forFile:)` returns a NEW `NSImage` per call, which defeated SwiftUI's image
+    /// identity on every model publish; the cache hands back the same instance per path.
+    func testIconCacheReturnsTheSameInstancePerPath() {
+        LauncherIconCache.clear()
+        let a = LauncherIconCache.icon(forFile: "/Applications")
+        let b = LauncherIconCache.icon(forFile: "/Applications")
+        XCTAssertTrue(a === b, "one NSImage per path")
+        XCTAssertEqual(LauncherIconCache.count, 1)
+        _ = LauncherIconCache.icon(forFile: "/System")
+        XCTAssertEqual(LauncherIconCache.count, 2)
+        LauncherIconCache.clear()
+        XCTAssertEqual(LauncherIconCache.count, 0)
+    }
 }

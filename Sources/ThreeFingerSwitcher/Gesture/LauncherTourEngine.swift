@@ -123,10 +123,12 @@ struct LauncherTourEngine {
             a.x += CGFloat(dir) * itemStep
         }
         while abs(centroid.y - a.y) >= verticalStep {
-            // Up on the pad (y decreasing) = `stepVertical(+1)` (previous band / a row up), matching the model.
-            let up = centroid.y < a.y
-            intents.append(.stepVertical(up ? 1 : -1))
-            a.y += (up ? -verticalStep : verticalStep)
+            // Frames are y-UP (bottom-left origin — the real trackpad's convention, the same one
+            // `GestureRecognizer` and the `GesturePose` strokes use), so up on the pad is y INCREASING =
+            // `stepVertical(+1)` (previous band / a row up), matching `LauncherModel.stepVertical`.
+            let dir = centroid.y > a.y ? 1 : -1
+            intents.append(.stepVertical(dir))
+            a.y += CGFloat(dir) * verticalStep
         }
         anchor = a
         return intents

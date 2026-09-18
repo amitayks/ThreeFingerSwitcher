@@ -7,6 +7,9 @@ struct SetupPage: View {
     let context: HubContext
     @ObservedObject private var permissions: PermissionsService
     @ObservedObject private var settings: AppSettings
+    /// The coordinator-driven "is the Hub on screen?" flag. This page stays mounted in the RETAINED Hub
+    /// window after it closes (`.onDisappear` never fires), so the ambient re-reads below gate on it.
+    @ObservedObject private var previewActivity: HubPreviewActivity
     /// The native-gesture/restore state is read via plain closures over non-observable config objects
     /// (TrackpadGestureConfig etc.), so toggling this after an action forces the cards to re-read them.
     @State private var refresh = false
@@ -17,11 +20,16 @@ struct SetupPage: View {
     @State private var trackpadClaimed = false
     @State private var spacesAutoRearrangeOn = false
     @State private var gestureStateLoaded = false
+    /// When the last ambient (visibility-driven) re-read ran. A Hub reopen from another app fires BOTH
+    /// ambient signals back-to-back (`previewActivity` flips true, then the app becomes active); this
+    /// coalesces them into one pair of process spawns. Explicit reads (appear, post-action) never coalesce.
+    @State private var lastAmbientReread = Date.distantPast
 
     init(context: HubContext) {
         self.context = context
         _permissions = ObservedObject(wrappedValue: context.permissions)
         _settings = ObservedObject(wrappedValue: context.settings)
+        _previewActivity = ObservedObject(wrappedValue: context.previewActivity)
     }
 
     /// Run a gesture/restore action, then nudge `refresh` so the (non-observable) live-state cards re-read.
@@ -33,6 +41,22 @@ struct SetupPage: View {
         spacesAutoRearrangeOn = context.spacesAutoRearrangeOn()
         gestureStateLoaded = true
     }
+
+    /// The ambient re-read: only while the Hub is actually on screen, and at most once per second. Every
+    /// app activation (an alert, the wizard, a launcher-driven activation) used to spawn the two
+    /// `/usr/bin/defaults` processes here with nothing on screen, because this page outlives the Hub's
+    /// close inside the retained window. `previewActivity.isActive` is the coordinator's authoritative
+    /// visibility signal (flipped on show / close / miniaturize), so a hidden Hub now reads nothing.
+    private func rereadGestureStateIfVisible() {
+        guard previewActivity.isActive else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastAmbientReread) >= Self.ambientRereadCoalesce else { return }
+        lastAmbientReread = now
+        rereadGestureState()
+    }
+
+    /// The window inside which back-to-back ambient signals collapse into one re-read.
+    private static let ambientRereadCoalesce: TimeInterval = 1.0
 
     var body: some View {
         HubPage(HubDestination.setup.title,
@@ -154,12 +178,17 @@ struct SetupPage: View {
         }
         // Live status while visible: the refcounted poll (plus a didBecomeActive refresh) replaces
         // the old refresh-on-appear-only behavior, finally honoring the spec's live-status scenario.
-        // The trackpad/Spaces snapshots re-read on appear and whenever the app comes back to front
-        // (returning from System Settings) — event-time, never per-render.
+        // The trackpad/Spaces snapshots re-read on appear, whenever the app comes back to front while
+        // the Hub is showing (returning from System Settings), and when the Hub itself returns to the
+        // screen (reopen / deminiaturize — `.onAppear` doesn't re-fire for the retained window, and the
+        // app may already be active then). Event-time, never per-render; never while the Hub is hidden.
         .onAppear { permissions.startPolling(); rereadGestureState() }
         .onDisappear { permissions.stopPolling() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            rereadGestureState()
+            rereadGestureStateIfVisible()
+        }
+        .onChange(of: previewActivity.isActive) { _, active in
+            if active { rereadGestureStateIfVisible() }
         }
     }
 

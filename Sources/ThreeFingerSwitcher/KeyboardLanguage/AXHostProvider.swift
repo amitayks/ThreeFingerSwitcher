@@ -25,6 +25,15 @@ final class AXHostProvider: HostProvider {
     /// The frontmost app, injectable so the AX traversal is exercisable without a real running browser.
     private let frontmostApp: () -> NSRunningApplication?
 
+    /// Negative-result backoff for the address-bar walk, keyed by process + focused window (`walkKey`).
+    /// The walk is the expensive part of a read — up to `maxElementsVisited` synchronous AX round-trips on
+    /// the main thread, each subject to the 0.5 s AX timeout — and when a window has no findable bar
+    /// (full-screen video, presentation mode, an unmatched layout) every 0.5 s poll tick used to spend
+    /// that whole budget again. A miss now holds the walk for 2 s, doubling per consecutive miss up to
+    /// 30 s; a hit or an app switch (`noteAppSwitch`) clears it, and a focused-window change starts a
+    /// fresh ladder by construction (different key). Held reads resolve nil, exactly as the miss did.
+    private var walkBackoff = HostReadBackoff()
+
     init(frontmostApp: @escaping () -> NSRunningApplication? = { NSWorkspace.shared.frontmostApplication }) {
         self.frontmostApp = frontmostApp
     }
@@ -43,7 +52,15 @@ final class AXHostProvider: HostProvider {
         // Guard: never record a private/incognito window's host (best-effort; "if unsure, skip").
         guard !looksPrivate(window) else { return nil }
 
-        guard let field = addressField(in: window) else { return nil }
+        // The walk is the one costly step, so only IT sits behind the backoff; the cheap guards above and
+        // below (a few single attribute reads) still run on every tick.
+        let key = walkKey(pid: app.processIdentifier, window: window)
+        guard !walkBackoff.shouldSkip(key, now: Date()) else { return nil }
+        guard let field = addressField(in: window) else {
+            walkBackoff.recordMiss(key, now: Date())
+            return nil
+        }
+        walkBackoff.recordHit()
 
         // Guard: if the address field is the focused element, its value is the user's typed text mid-edit,
         // not a committed host — treat as no-host so we never learn/apply from a half-typed URL.
@@ -53,7 +70,20 @@ final class AXHostProvider: HostProvider {
         return HostNormalizer.normalize(raw)
     }
 
+    /// An app activation: forget the walk backoff so the fresh visit re-tries the read once.
+    func noteAppSwitch() {
+        walkBackoff.reset()
+    }
+
     // MARK: - Window resolution
+
+    /// The identity a walk miss is cached under: the process plus its focused window — the window's
+    /// `CGWindowID` (via the AX SPI the switcher already relies on), or its AX title when the id can't be
+    /// read. A different focused window is a different key, so it always gets its own first walk.
+    private func walkKey(pid: pid_t, window: AXUIElement) -> String {
+        if let windowID = axWindowID(window) { return "\(pid):w\(windowID)" }
+        return "\(pid):t\(axString(window, kAXTitleAttribute as String) ?? "")"
+    }
 
     /// The browser's focused (else main) window AX element, or nil. Mirrors how the app's other AX
     /// readers reach the front window (`kAXFocusedWindow` first, `kAXMainWindow` as fallback).

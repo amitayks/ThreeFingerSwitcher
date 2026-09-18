@@ -163,6 +163,7 @@ final class SwitcherModelTests: XCTestCase {
         // Arrange
         let model = SwitcherModel()
         model.setThumbnail(NSImage(), for: 10)
+        model.publishStagedThumbnails()
         XCTAssertFalse(model.thumbnails.isEmpty)
 
         // Act
@@ -399,6 +400,7 @@ final class SwitcherModelTests: XCTestCase {
 
         // Act
         model.setThumbnail(image, for: 42)
+        model.publishStagedThumbnails()   // the coalescing flush (scheduled ~one frame later in production)
 
         // Assert
         XCTAssertTrue(model.thumbnails[42] === image)
@@ -410,9 +412,11 @@ final class SwitcherModelTests: XCTestCase {
         let first = NSImage()
         let second = NSImage()
         model.setThumbnail(first, for: 7)
+        model.publishStagedThumbnails()
 
         // Act
         model.setThumbnail(second, for: 7)
+        model.publishStagedThumbnails()
 
         // Assert: same id now maps to the new image.
         XCTAssertTrue(model.thumbnails[7] === second)
@@ -428,11 +432,85 @@ final class SwitcherModelTests: XCTestCase {
         // Act
         model.setThumbnail(imageA, for: 1)
         model.setThumbnail(imageB, for: 2)
+        model.publishStagedThumbnails()
 
         // Assert
         XCTAssertTrue(model.thumbnails[1] === imageA)
         XCTAssertTrue(model.thumbnails[2] === imageB)
         XCTAssertEqual(model.thumbnails.count, 2)
+    }
+
+    // MARK: - Live-capture coalescing (one publish per ~frame)
+
+    func testSetThumbnailStagesUntilTheCoalescingFlush() {
+        // A live capture is staged, not published on the spot: several captures landing within a frame
+        // publish together (one reel re-render instead of one per frame).
+        let model = SwitcherModel()
+        let image = NSImage()
+
+        model.setThumbnail(image, for: 42)
+        XCTAssertNil(model.thumbnails[42], "staged, not yet published")
+
+        model.publishStagedThumbnails()
+        XCTAssertTrue(model.thumbnails[42] === image)
+    }
+
+    func testCoalescingFlushPublishesTheWholeBatchAtOnce() {
+        let model = SwitcherModel()
+        let a = NSImage(), b = NSImage(), c = NSImage()
+        model.setThumbnail(a, for: 1)
+        model.setThumbnail(b, for: 2)
+        model.setThumbnail(c, for: 2)   // later frame for the same id wins
+        XCTAssertTrue(model.thumbnails.isEmpty)
+
+        model.publishStagedThumbnails()
+        XCTAssertTrue(model.thumbnails[1] === a)
+        XCTAssertTrue(model.thumbnails[2] === c)
+        XCTAssertEqual(model.thumbnails.count, 2)
+    }
+
+    func testFreezeStartedAfterStagingHoldsTheStagedFramesUntilFlush() {
+        // A slide that begins while frames sit in the coalescing buffer must not let the pending flush
+        // publish them mid-slide: they become part of the freeze's buffer and cut in on flush.
+        let model = SwitcherModel()
+        let image = NSImage()
+        model.setThumbnail(image, for: 5)   // staged
+        model.freezeThumbnails()
+        model.publishStagedThumbnails()     // the coalescing flush fires during the slide
+        XCTAssertNil(model.thumbnails[5], "held back by the freeze")
+
+        model.flushThumbnails()
+        XCTAssertTrue(model.thumbnails[5] === image)
+    }
+
+    func testSeedSupersedesAStagedLiveFrame() {
+        // A cached seed applied while an older live frame for the same id is staged wins — and the later
+        // coalescing flush must not overwrite it with the stale staged frame.
+        let model = SwitcherModel()
+        let stale = NSImage(), cached = NSImage()
+        model.setThumbnail(stale, for: 1)   // staged
+        model.seedThumbnail(cached, for: 1) // immediate
+        XCTAssertTrue(model.thumbnails[1] === cached)
+
+        model.publishStagedThumbnails()
+        XCTAssertTrue(model.thumbnails[1] === cached, "the staged stale frame was dropped by the seed")
+    }
+
+    func testFlushFoldsStagedFramesIn() {
+        // `flushThumbnails` (hide / slide end) must never leave a frame stranded in the coalescing buffer.
+        let model = SwitcherModel()
+        let image = NSImage()
+        model.setThumbnail(image, for: 9)   // staged, flush pending
+        model.flushThumbnails()
+        XCTAssertTrue(model.thumbnails[9] === image)
+    }
+
+    func testSetRowsDropsStagedFrames() {
+        let model = SwitcherModel()
+        model.setThumbnail(NSImage(), for: 99)   // staged
+        model.setRows([[makeWindow(id: 1)]], labels: ["1"], startRow: 0, column: 0)
+        model.publishStagedThumbnails()
+        XCTAssertNil(model.thumbnails[99], "a previous session's staged capture never lands in the new one")
     }
 
     // MARK: - Thumbnail freeze (per Space-switch slide)
@@ -472,7 +550,8 @@ final class SwitcherModelTests: XCTestCase {
         let seeded = NSImage()
         let captured = NSImage()
 
-        model.setThumbnail(seeded, for: 1)   // seed (pre-freeze) -> published
+        model.setThumbnail(seeded, for: 1)   // capture (pre-freeze) -> published on the coalescing flush
+        model.publishStagedThumbnails()
         model.freezeThumbnails()
         model.setThumbnail(captured, for: 2) // capture during slide -> buffered
 
@@ -506,6 +585,7 @@ final class SwitcherModelTests: XCTestCase {
 
         let image = NSImage()
         model.setThumbnail(image, for: 5)       // no longer frozen
+        model.publishStagedThumbnails()
         XCTAssertTrue(model.thumbnails[5] === image)
     }
 
@@ -519,6 +599,7 @@ final class SwitcherModelTests: XCTestCase {
 
         let fresh = NSImage()
         model.setThumbnail(fresh, for: 1)       // should publish (not frozen) and not see id 99
+        model.publishStagedThumbnails()
         XCTAssertTrue(model.thumbnails[1] === fresh)
         XCTAssertNil(model.thumbnails[99], "stale buffered frame was dropped on re-show")
     }
