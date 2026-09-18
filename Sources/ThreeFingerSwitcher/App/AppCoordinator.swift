@@ -781,11 +781,20 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         thumbnails.cancelSweeps()
     }
 
+    /// Trackpad lift after activation. A ⌘-Tab session owns the overlay: a stray trackpad lift must
+    /// neither raise its highlight nor release its ownership (D7). The recognizer already suppresses
+    /// refused touches; this is the belt for a gesture that was in flight when the keyboard session
+    /// opened. The ownership gate lives HERE, in the trackpad entry point only — `commitSwitcher` below
+    /// is the shared session logic the keyboard driver also calls (with `.keyboard` as the owner), so
+    /// gating it would have made a ⌘ release unable to close its own session.
     func gestureDidCommit() {
-        // A ⌘-Tab session owns the overlay: a stray trackpad lift must neither raise its highlight nor
-        // release its ownership (D7). The recognizer already suppresses refused touches; this is the
-        // belt for a gesture that was in flight when the keyboard session opened.
         guard switcherOwner != .keyboard else { return }
+        commitSwitcher()
+    }
+
+    /// Commit the open switcher session, whichever driver owns it: hide, stop the preview refresh, and
+    /// raise the highlighted window (Hub card / Mission-Control-open handling included).
+    private func commitSwitcher() {
         switcherOwner = .none   // the session is ending regardless of which branch below runs
         guard overlay.isVisible, let window = overlay.model.selectedWindow else {
             overlay.hide()
@@ -881,8 +890,15 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         return validated
     }
 
+    /// Trackpad gesture ended without committing. Same ownership gate as `gestureDidCommit`: a trackpad
+    /// lift never hides a ⌘-Tab session (D7); the shared teardown is `cancelSwitcher`.
     func gestureDidCancel() {
-        guard switcherOwner != .keyboard else { return }   // a trackpad lift never hides a ⌘-Tab session (D7)
+        guard switcherOwner != .keyboard else { return }
+        cancelSwitcher()
+    }
+
+    /// Dismiss the open switcher session without raising, whichever driver owns it.
+    private func cancelSwitcher() {
         switcherOwner = .none
         overlay.hide()
         stopPreviewRefresh()
@@ -957,7 +973,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     func keyboardSwitcherCommit() {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.switcherOwner == .keyboard else { return }
-            self.gestureDidCommit()
+            self.commitSwitcher()   // the shared path — NOT the trackpad entry point, which refuses `.keyboard`
         }
     }
 
@@ -965,7 +981,7 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     func keyboardSwitcherCancel() {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.switcherOwner == .keyboard else { return }
-            self.gestureDidCancel()
+            self.cancelSwitcher()   // the shared path — NOT the trackpad entry point, which refuses `.keyboard`
         }
     }
 
