@@ -143,7 +143,10 @@ struct LauncherView: View {
 
     private func scroll(_ proxy: ScrollViewProxy, animated: Bool) {
         guard let target = scrollTarget else { return }
-        if animated {
+        // A scroll that is part of the SHOW itself (the model reset lands `focus`/`selectedIndex` changes
+        // in the first update after the panel swap) must not animate: inside that update an animated
+        // transaction also animates every cell's first layout — see `LauncherModel.isPresenting`.
+        if animated, !model.isPresenting {
             withAnimation(.easeInOut(duration: 0.16)) { proxy.scrollTo(target, anchor: .center) }
         } else {
             proxy.scrollTo(target, anchor: .center)

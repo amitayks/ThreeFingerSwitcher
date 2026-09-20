@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 import Combine
 
 /// Drives the launcher overlay. The bands render as a **vertical title list on the LEFT** (focus
@@ -36,6 +37,19 @@ final class LauncherModel: ObservableObject {
     /// Bumped every time arming (re)starts, so the highlight re-animates per item selection.
     @Published private(set) var armingToken: Int = 0
     @Published var dwell: Double = 0.5
+
+    /// When the overlay was last (re)presented (`notePresented`, called by the controller at the top of
+    /// `show`). The view's scroll helper skips its animation while `isPresenting`: the model is mutated
+    /// while the reusable hosting view is DETACHED from its destroyed panel, so the SwiftUI update that
+    /// applies those changes runs together with the fresh panel's geometry — and an animated `scrollTo`
+    /// started by an `onChange` in that same update animated EVERY cell from its previous layout to its
+    /// new place (the "icons fly in from the middle of the screen" symptom on the shipped 2.0 build).
+    /// Time-boxed rather than a flag so it holds whether that update runs synchronously
+    /// (`layoutSubtreeIfNeeded` in `show`) or on the next run-loop turn; a real navigation step cannot
+    /// arrive within the window (activation needs travel first).
+    private(set) var lastPresentedAt: CFTimeInterval = 0
+    func notePresented() { lastPresentedAt = CACurrentMediaTime() }
+    var isPresenting: Bool { CACurrentMediaTime() - lastPresentedAt < 0.15 }
 
     /// Index of the synthetic Clipboard band, when present (always the last band). It navigates as a
     /// single-column master-detail list and repurposes horizontal travel (see `stepHorizontal`).

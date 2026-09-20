@@ -46,6 +46,7 @@ final class LauncherOverlayController {
               clipboardBandIndex: Int? = nil) {
         self.bands = bands
         self.dwell = dwell
+        model.notePresented()   // the reset below + the panel swap must lay out WITHOUT animation
         model.dwell = dwell
         model.onPinToggle = onTogglePin
         model.clipboardPinStepThreshold = clipboardPinSteps
@@ -59,6 +60,12 @@ final class LauncherOverlayController {
         let panel = self.panel ?? makePanel()
         self.panel = panel
         layout(panel)
+        // Commit the reused graph's first layout in its NEW panel now, before the window is shown: the
+        // model was reset while the hosting view was detached (`hide` destroys the panel), so this update
+        // carries both the content reset and the fresh geometry. Landing it here, synchronously and with
+        // the presentation window's animation suppression in force, means the first frame the user sees
+        // is the settled grid — not cells sliding from the previous panel's layout into place.
+        hosting?.layoutSubtreeIfNeeded()
         panel.orderFrontRegardless()
         manageDwell()
     }
