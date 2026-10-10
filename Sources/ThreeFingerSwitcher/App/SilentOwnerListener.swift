@@ -238,7 +238,7 @@ final class SilentOwnerListener {
         if let slot = touchIDSlot {
             // Password entry: the sensor icon sits beside the field; the field keeps keyboard focus.
             slot.subviews.forEach { $0.removeFromSuperview() }
-            let view = LAAuthenticationView(context: ctx, controlSize: .regular)
+            let view = LAAuthenticationView(context: ctx, controlSize: .small)
             view.frame = slot.bounds
             view.autoresizingMask = [.width, .height]
             slot.addSubview(view)
@@ -491,7 +491,10 @@ final class NoMatchWatcher {
         }
     }
 
+    /// A real coreauthd no-match line. NOT the stream's own banner, which echoes the predicate
+    /// ("Filtering the log data using \"… received no-match\"") — matching it opened the password
+    /// card a few ms after every curtain start (owner report 2026-10-10).
     nonisolated static func isNoMatch(_ line: String) -> Bool {
-        line.contains("coreauthd") && line.contains("received no-match")
+        !line.hasPrefix("Filtering") && line.contains("coreauthd[") && line.contains("has received no-match")
     }
 }

@@ -366,9 +366,9 @@ final class KeepAwakeCurtainTests: XCTestCase {
     func testNoMatchWatcherFiresOncePerNoMatchLine() {
         var hits = 0
         let w = NoMatchWatcher { hits += 1 }
-        w.consume("Filtering the log data using \"process == coreauthd\"\n")
+        w.consume("Filtering the log data using \"process == \"coreauthd\" AND composedMessage CONTAINS \"received no-match\"\"\n")
         w.consume("2026-10-10 20:03:55.116 Df coreauthd[955:aa839] [com.apple.LocalAuthentication:Server] MechanismTouchId[378](run) has received no-")
-        XCTAssertEqual(hits, 0, "a split line waits for its end")
+        XCTAssertEqual(hits, 0, "the stream's banner echoes the predicate and must not count; a split line waits")
         w.consume("match from <private> (lockout state:1)\n2026-10-10 20:04:04 Df coreauthd[955] has matched by <private>\n")
         XCTAssertEqual(hits, 1)
     }
