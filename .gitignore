@@ -13,3 +13,9 @@ dist/
 .claude/scheduled_tasks.lock
 
 working-desk.md
+# Local agent state and backups — never commit (may hold account info / transcripts)
+.claude/worktrees/
+backups/
+projects/
+.napkin/
+NAPKIN.md
