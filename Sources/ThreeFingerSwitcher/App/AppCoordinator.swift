@@ -259,6 +259,9 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
             // Keep Awake's first-touch-to-stop arming (non-consuming — a no-op unless it's active, and it
             // never swallows the frame; the recognizer still sees it below).
             self.keepAwakeController.noteTouch(fingerCount: frame.fingerCount)
+            // Behind the Keep Awake curtain the trackpad belongs to nobody: the raw multitouch stream
+            // bypasses the curtain's event tap, so the switcher / launcher gestures are gated here.
+            if self.keepAwakeController.isCurtained { return }
             self.recognizer.feed(frame)
         }
         scrollTap.consumePredicate = { [weak self] in

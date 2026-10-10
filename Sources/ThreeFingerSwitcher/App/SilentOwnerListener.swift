@@ -55,6 +55,7 @@ final class SilentOwnerListener {
     private var verifying = false
     /// Where the Touch ID view sits during password entry (nil otherwise).
     private var touchIDSlot: NSView?
+    private var passwordCard: CurtainPasswordCard?
     private var window: NSWindow?
     private var context: LAContext?
     private var evaluating = false
@@ -304,22 +305,15 @@ final class SilentOwnerListener {
     private func beginPasswordEntry() {
         guard let window, passwordField == nil else { return }
         passwordTries = 0
-        let side = CGSize(width: 360, height: 64)
-        let container = NSView(frame: NSRect(origin: .zero, size: side))
-        container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-        container.layer?.cornerRadius = 12
-        let slot = NSView(frame: NSRect(x: 12, y: 12, width: 40, height: 40))
-        container.addSubview(slot)
-        touchIDSlot = slot
-        let field = NSSecureTextField(frame: NSRect(x: 64, y: 18, width: side.width - 80, height: 28))
-        field.placeholderString = "Password"
-        field.font = .systemFont(ofSize: 15)
-        field.bezelStyle = .roundedBezel
+        let card = CurtainPasswordCard()
+        let side = CurtainPasswordCard.size
+        touchIDSlot = card.touchIDSlot
+        passwordCard = card
+        let field = card.field
         field.target = self
         field.action = #selector(passwordSubmitted(_:))
-        container.addSubview(field)
-        window.contentView = container
+        window.contentView = card
+        window.hasShadow = true
         if let screen = NSScreen.main ?? NSScreen.screens.first {
             let f = screen.frame
             window.setFrame(NSRect(x: f.midX - side.width / 2, y: f.midY - side.height / 2,
@@ -377,6 +371,7 @@ final class SilentOwnerListener {
         }
         passwordTries += 1
         field.stringValue = ""
+        passwordCard?.shake()
         GuardLog.write("password-entry wrong (\(passwordTries))")
         if passwordTries >= Self.maxPasswordTries {
             endPasswordEntry(resume: true)
@@ -391,6 +386,8 @@ final class SilentOwnerListener {
         guard passwordField != nil else { return }
         cancelEvaluation()
         touchIDSlot = nil
+        passwordCard = nil
+        window?.hasShadow = false
         retryAfter = 0
         passwordField?.stringValue = ""
         passwordField = nil
