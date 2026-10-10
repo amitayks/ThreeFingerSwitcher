@@ -33,11 +33,40 @@ final class ThumbnailService {
     /// ScreenCaptureKit call that never returned) and superseded even by a skip-if-busy timer tick —
     /// otherwise one hung capture silently froze every periodic refresh for the rest of the app's life.
     private var sweepStartedAt: TimeInterval = 0
-    private let sweepStaleAfter: TimeInterval = 4.0
+    static let sweepStaleAfter: TimeInterval = 4.0
     /// Upper bound on any single ScreenCaptureKit call. SCK (replayd) occasionally never completes a
     /// request; without a bound the awaiting capture pinned its id in `inFlight` forever (that window never
     /// refreshed again) and kept the sweep alive. Accumulating hangs = the "slower the longer it runs" lag.
     private let sckTimeout: TimeInterval = 2.0
+    /// How long a CALLER waits for the system-wide window enumeration before it gives up for this tick.
+    /// Deliberately NOT `sckTimeout`: with a very high WindowServer window count (a leaked-window process,
+    /// 9,000+ windows measured) `SCShareableContent` takes 3–4 s, and a 2 s bound abandoned EVERY
+    /// enumeration, so no capture ever ran. The enumeration itself is never abandoned on this bound (see
+    /// `enumerationTask`): its late result still fills `cachedContent`, so the next tick captures from it.
+    /// Kept BELOW `sweepStaleAfter` so the sweep watchdog never supersedes a sweep that is only waiting.
+    static let enumerationWait: TimeInterval = 3.0
+    /// Hard ceiling for ONE enumeration. Past it, replayd is treated as hung (not slow): the task is
+    /// abandoned and the next caller issues one new request. Without a ceiling a single hung enumeration
+    /// would be joined forever and previews would never recover. Bounds orphaned replayd requests to one
+    /// per ceiling, not one per 0.8 s tick.
+    static let enumerationCeiling: TimeInterval = 15.0
+    /// How old a covering cached listing may be and still be served while a fresh one is fetched
+    /// (stale-while-refresh). Capture handles key on the window id and the capture size comes from live
+    /// bounds, so a listing this old is still a correct capture source for windows it lists.
+    static let staleContentLimit: TimeInterval = 30.0
+    /// The ONE in-flight `SCShareableContent` enumeration (single-flight). Concurrent sweeps, the Dock
+    /// peek, warm-up and diagnostics join it instead of issuing their own. Not cancelled when a caller
+    /// stops waiting. Before this, each timed-out caller left a request queued in replayd and the next
+    /// tick queued another behind it — the queue only grew, so each later enumeration was slower.
+    private var enumerationTask: Task<SCShareableContent?, Never>?
+    private var enumerationStartedAt: TimeInterval = 0
+    private var enumerationGeneration = 0
+    /// Start time of the enumeration that produced `cachedContent`, so a late result from an abandoned
+    /// (older) enumeration never overwrites a newer listing.
+    private var cachedContentIssuedAt: TimeInterval = -1
+    /// Duration of the last completed enumeration — surfaced in diagnostics (a multi-second value means
+    /// WindowServer is tracking far too many windows; see `diagnosticFrames`).
+    private(set) var lastEnumerationDuration: TimeInterval?
     /// The LOW-PRIORITY sweep of the other Spaces' rows (switcher open). Kept in its own slot so it never
     /// occupies `sweepTask`: when the open sweep covered every Space in one task, the 0.8 s timer's
     /// skip-if-busy tick was blocked until ALL rows finished — with many windows the visible row went
@@ -82,21 +111,72 @@ final class ThumbnailService {
     /// smooth). No-op without Screen Recording permission (the live path re-tries on real use). The one
     /// throwaway capture is tiny and discarded — it exists only to warm the screenshot pipeline, not the
     /// cache. Best-effort: every failure is swallowed.
+    /// The enumeration goes through the shared single-flight `enumeration()`, so it also FILLS the listing
+    /// cache (the first open after launch/wake can serve from it) and never races a real sweep with a
+    /// second concurrent request.
     func warmUp() async {
         guard CGPreflightScreenCaptureAccess() else { return }
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            guard let w = content.windows.first(where: { $0.windowLayer == 0 && $0.frame.width > 1 }) else { return }
-            let config = SCStreamConfiguration()
-            config.width = 32
-            config.height = 32
-            config.showsCursor = false
-            config.ignoreShadowsSingleWindow = true
-            let filter = SCContentFilter(desktopIndependentWindow: w)
-            _ = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-        } catch {
-            // Best-effort warmup; the real capture paths re-enumerate and re-try on use.
+        guard let content = await enumeration().value,
+              let w = content.windows.first(where: { $0.windowLayer == 0 && $0.frame.width > 1 }) else { return }
+        let config = SCStreamConfiguration()
+        config.width = 32
+        config.height = 32
+        config.showsCursor = false
+        config.ignoreShadowsSingleWindow = true
+        let filter = SCContentFilter(desktopIndependentWindow: w)
+        _ = try? await Self.withTimeout(sckTimeout, {
+            try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+        })
+    }
+
+    /// The shared single-flight enumeration: join the running one, or start one. A running enumeration
+    /// older than `enumerationCeiling` is abandoned as hung and replaced. The result lands in
+    /// `cachedContent` whenever it arrives, even after every caller stopped waiting.
+    private func enumeration() -> Task<SCShareableContent?, Never> {
+        let now = CACurrentMediaTime()
+        if let running = enumerationTask,
+           !Self.isEnumerationHung(startedAt: enumerationStartedAt, now: now) {
+            return running
         }
+        enumerationGeneration += 1
+        let generation = enumerationGeneration
+        let startedAt = now
+        enumerationStartedAt = startedAt
+        let task = Task { [weak self] () -> SCShareableContent? in
+            let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            guard let self else { return content }
+            if let content, startedAt >= self.cachedContentIssuedAt {
+                self.cachedContent = content
+                self.cachedContentAt = CACurrentMediaTime()
+                self.cachedContentIssuedAt = startedAt
+            }
+            if self.enumerationGeneration == generation {
+                self.enumerationTask = nil
+                self.lastEnumerationDuration = CACurrentMediaTime() - startedAt
+                if self.frameLoggingEnabled {
+                    NSLog("[TFS-thumb] enumeration \(content == nil ? "FAILED" : "ok") \(Int((CACurrentMediaTime() - startedAt) * 1000)) ms windows=\(content?.windows.count ?? 0)")
+                }
+            }
+            return content
+        }
+        enumerationTask = task
+        return task
+    }
+
+    /// Pure: a running enumeration is treated as hung (abandoned, replaced) past `enumerationCeiling`.
+    static func isEnumerationHung(startedAt: TimeInterval, now: TimeInterval) -> Bool {
+        now - startedAt >= enumerationCeiling
+    }
+
+    /// Pure: how to serve a listing request from the cache. `.fresh` = within TTL, use it; `.stale` = use it
+    /// AND refresh in the background (stale-while-refresh); `.miss` = wait for an enumeration (no cache,
+    /// too old, or a target id the cache does not cover — a new window).
+    enum CacheDecision: Equatable { case fresh, stale, miss }
+    static func cacheDecision(age: TimeInterval?, covers: Bool, ttl: TimeInterval) -> CacheDecision {
+        guard let age, covers else { return .miss }
+        if age < ttl { return .fresh }
+        if age < staleContentLimit { return .stale }
+        return .miss
     }
 
     /// Apply any cached thumbnails to the model immediately, so repeat showings render the
@@ -129,7 +209,7 @@ final class ThumbnailService {
     func prefetch(_ windows: [WindowInfo], replacing: Bool = false) {
         guard CGPreflightScreenCaptureAccess() else { return }
         if sweepTask != nil {
-            let wedged = CACurrentMediaTime() - sweepStartedAt > sweepStaleAfter
+            let wedged = CACurrentMediaTime() - sweepStartedAt > Self.sweepStaleAfter
             guard replacing || wedged else { return }
             cancelSweeps()
         }
@@ -195,22 +275,23 @@ final class ThumbnailService {
     /// enumeration fails (permission, transient) — callers leave the cached frames in place.
     private func shareableContent(covering ids: [CGWindowID]) async -> SCShareableContent? {
         let now = CACurrentMediaTime()
-        if let cached = cachedContent, now - cachedContentAt < shareableContentTTL {
+        if let cached = cachedContent {
             let listed = Set(cached.windows.map(\.windowID))
-            if ids.allSatisfy({ listed.contains($0) || unlistedAtEnumeration.contains($0) }) { return cached }
+            let covers = ids.allSatisfy { listed.contains($0) || unlistedAtEnumeration.contains($0) }
+            switch Self.cacheDecision(age: now - cachedContentAt, covers: covers, ttl: shareableContentTTL) {
+            case .fresh: return cached
+            case .stale: _ = enumeration(); return cached   // refresh behind the user, never block on it
+            case .miss: break
+            }
         }
-        do {
-            guard let content = try await Self.withTimeout(sckTimeout, {
-                try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            }) else { return nil }
-            cachedContent = content
-            cachedContentAt = CACurrentMediaTime()
-            let listed = Set(content.windows.map(\.windowID))
-            unlistedAtEnumeration = Set(ids.filter { !listed.contains($0) })
-            return content
-        } catch {
-            return nil
-        }
+        let task = enumeration()
+        // Wait a bounded time for the shared enumeration. On a timeout the enumeration keeps running and
+        // fills the cache when it lands; this tick just leaves the cached frames in place.
+        guard let waited = try? await Self.withTimeout(Self.enumerationWait, { await task.value }),
+              let content = waited else { return nil }
+        let listed = Set(content.windows.map(\.windowID))
+        unlistedAtEnumeration = Set(ids.filter { !listed.contains($0) })
+        return content
     }
 
     /// Capture every cleanly-presented window in `windows` from ONE shared `SCShareableContent` listing
@@ -390,8 +471,12 @@ final class ThumbnailService {
         }
         let union = Self.displayUnion()
         out.append("displayUnion = \(Int(union.minX)),\(Int(union.minY)) \(Int(union.width))x\(Int(union.height))")
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        out.append(Self.windowCountReport())
+        let started = CACurrentMediaTime()
+        let content = await enumeration().value
+        out.append("SCShareableContent enumeration: \(Int((CACurrentMediaTime() - started) * 1000)) ms (joined or fresh)"
+            + ", last completed: \(lastEnumerationDuration.map { "\(Int($0 * 1000)) ms" } ?? "n/a")")
+        if let content {
             for w in content.windows.sorted(by: { $0.windowID < $1.windowID }) {
                 guard w.windowLayer == 0, let app = w.owningApplication,
                       app.applicationName != "ThreeFingerSwitcher" else { continue }
@@ -401,10 +486,37 @@ final class ThumbnailService {
                     + "sc=\(Int(f.width))x\(Int(f.height))@\(Int(f.origin.x)),\(Int(f.origin.y)) "
                     + "offAllDisplays=\(off ? 1 : 0)  [\(app.applicationName)] '\(w.title ?? "")'")
             }
-        } catch {
-            out.append("SCShareableContent error: \(error)")
+        } else {
+            out.append("SCShareableContent error: enumeration failed")
         }
         return out.joined(separator: "\n")
+    }
+
+    /// A single process owning more windows than this is a window leak (seen: CursorUIViewService with
+    /// 9,033 windows). Every SCK enumeration then pays for all of them.
+    static let leakedWindowThreshold = 1_000
+
+    /// Pure: the window owners sorted by window count (descending, then name), top `limit`.
+    static func topWindowOwners(_ owners: [String], limit: Int = 5) -> [(owner: String, count: Int)] {
+        let counts = Dictionary(owners.map { ($0, 1) }, uniquingKeysWith: +)
+        return counts.map { (owner: $0.key, count: $0.value) }
+            .sorted { $0.count != $1.count ? $0.count > $1.count : $0.owner < $1.owner }
+            .prefix(limit).map { $0 }
+    }
+
+    /// Diagnostic: total WindowServer windows and the top owners, with a leak warning. One click on
+    /// "Write Diagnostics" then shows why previews are slow on a Mac with a leaked-window process.
+    static func windowCountReport() -> String {
+        let infoList = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
+        let owners = infoList.map { $0[kCGWindowOwnerName as String] as? String ?? "?" }
+        let top = topWindowOwners(owners)
+        var lines = ["WindowServer windows: \(infoList.count) total; top owners: "
+            + top.map { "\($0.owner)=\($0.count)" }.joined(separator: ", ")]
+        for t in top where t.count > leakedWindowThreshold {
+            lines.append("WARNING: \(t.owner) owns \(t.count) windows (leak) — window enumeration is slow; "
+                + "log out or restart to clear it (do NOT kill it: WindowServer can hang and end the session)")
+        }
+        return lines.joined(separator: "\n")
     }
 
     /// One-shot capture of a single window by id: enumerate, find the window, then capture it through the
