@@ -23,9 +23,14 @@ final class CurtainEventTap {
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
     private var watchdog: Timer?
-    /// While true every event passes (a password prompt needs the keyboard). Set only by the
-    /// controller, only for the password fallback path, only for the bounded auth window.
+    /// While true the owner can answer the system password prompt: keyboard events pass (they go to
+    /// the prompt, which is key) and pointer events pass only inside the prompt's window
+    /// (`coreautha`). Set only by the controller, only while that prompt is open.
     var passThrough = false
+    /// Sees every trusted event first; returning true HOLDS it (swallowed here, re-posted later by the
+    /// silent Touch ID listener once the agent's app is in front again).
+    var onTrusted: ((CGEventType, CGEvent) -> Bool)?
+    private var promptFrames: (frames: [CGRect], at: TimeInterval) = ([], 0)
 
     init(policy: @escaping () -> InputTrustPolicy, onIntrusion: @escaping (CGEventType, InputOrigin) -> Void) {
         self.policy = policy
@@ -82,10 +87,42 @@ final class CurtainEventTap {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return Unmanaged.passUnretained(event)
         }
+        // The listener's own re-posts of held agent keys: pass untouched.
+        if event.getIntegerValueField(.eventSourceUserData) == SilentOwnerListener.repostMarker {
+            return Unmanaged.passUnretained(event)
+        }
         let origin = policy().classify(sourcePID: event.getIntegerValueField(.eventSourceUnixProcessID))
-        if origin.isTrusted || passThrough { return Unmanaged.passUnretained(event) }
+        if origin.isTrusted {
+            if onTrusted?(type, event) == true { return nil }
+            return Unmanaged.passUnretained(event)
+        }
+        if passThrough, allowedForPrompt(type, event) { return Unmanaged.passUnretained(event) }
         onIntrusion(type, origin)
         return nil   // swallowed: the stranger's input never reaches any app
+    }
+
+    /// While the password prompt is open: keys (the prompt is the key window) and pointer events inside
+    /// the prompt's own window. Everything else stays swallowed.
+    private func allowedForPrompt(_ type: CGEventType, _ event: CGEvent) -> Bool {
+        if SilentOwnerListener.isKeyboard(type) { return true }
+        let pointer: Set<CGEventType> = [.mouseMoved, .leftMouseDown, .leftMouseUp, .leftMouseDragged]
+        guard pointer.contains(type) else { return false }
+        if type == .mouseMoved { return true }   // moving the pointer is harmless and needed to aim
+        return promptWindowFrames().contains { $0.contains(event.location) }
+    }
+
+    /// Frames of the system authentication prompt's windows, cached for 0.5 s.
+    private func promptWindowFrames() -> [CGRect] {
+        let now = Date().timeIntervalSinceReferenceDate
+        if now - promptFrames.at < 0.5 { return promptFrames.frames }
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+        let frames: [CGRect] = list.compactMap { w in
+            guard (w[kCGWindowOwnerName as String] as? String) == "coreautha",
+                  let b = w[kCGWindowBounds as String] as? NSDictionary else { return nil }
+            return CGRect(dictionaryRepresentation: b as CFDictionary)
+        }
+        promptFrames = (frames, now)
+        return frames
     }
 
     /// Every event type (`kCGEventMaskForAllEvents`): pointer, keys, modifiers, scroll, tablet,

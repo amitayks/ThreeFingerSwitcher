@@ -56,6 +56,13 @@ final class KeepAwakeCurtainTests: XCTestCase {
         var notes: [String] = []
         var monitorInput: (() -> Void)?
         var clock: TimeInterval = 1000
+        // Silent listener fakes (nil-by-default = no Touch ID: the visible-prompt path).
+        var listenerAvailable = false
+        var listenerResult: ((SilentOwnerListener.Result) -> Void)?
+        var attends = 0
+        var pauses: [Bool] = []
+        var listenerEnds = 0
+        var pending: [(TimeInterval, () -> Void)] = []
     }
 
     private func effects(_ r: Rec) -> KeepAwakeController.Effects {
@@ -84,6 +91,14 @@ final class KeepAwakeCurtainTests: XCTestCase {
         e.stopWatchdog = { r.watchdogStops += 1; r.sequence.append("endWatchdog") }
         e.notify = { ev, _ in r.notes.append(ev) }
         e.now = { r.clock }
+        e.beginListener = { cb in
+            guard r.listenerAvailable else { return nil }
+            r.listenerResult = cb; r.sequence.append("listener"); return NSObject()
+        }
+        e.endListener = { _ in r.listenerEnds += 1; r.sequence.append("endListener") }
+        e.attendListener = { _ in r.attends += 1 }
+        e.pauseListener = { _, on in r.pauses.append(on) }
+        e.after = { delay, block in r.pending.append((delay, block)) }
         return e
     }
 
@@ -235,6 +250,105 @@ final class KeepAwakeCurtainTests: XCTestCase {
         XCTAssertFalse(r.sequence.contains("monitor"))
         c.noteTouch(fingerCount: 1)
         XCTAssertFalse(c.isActive, "plain Keep Awake: first touch ends it")
+    }
+
+    // MARK: - Silent Touch ID (keep-awake-silent-touch-id)
+
+    private func silent(lock: Bool = false, curtain: Bool = true) -> (Rec, KeepAwakeController) {
+        let r = Rec()
+        r.listenerAvailable = true
+        return (r, armed(r, lock: lock, curtain: curtain))
+    }
+
+    func testArmStartsTheSilentListenerBehindTheCurtain() {
+        let (r, c) = silent()
+        XCTAssertEqual(r.sequence.filter { $0 == "listener" }.count, 1)
+        c.stop()
+        XCTAssertEqual(r.listenerEnds, 1)
+    }
+
+    func testPersonInputShowsNoPromptOnlyAttends() {
+        // The owner's complaint: a touch on the trackpad or keyboard must not raise the prompt.
+        let (r, c) = silent()
+        r.onIntrusion?("keyDown from hardware")
+        c.noteTouch(fingerCount: 2)
+        r.onIntrusion?("mouseDown from hardware")
+        XCTAssertEqual(r.authStarts, 0, "no visible message for a stranger")
+        XCTAssertEqual(r.attends, 3, "each touch hands focus to the listener")
+        XCTAssertEqual(r.notes, ["intrusion"])
+        XCTAssertTrue(c.isActive)
+        XCTAssertTrue(r.pending.isEmpty, "Curtain mode has no deadline")
+        c.stop()
+    }
+
+    func testOwnerFingerEndsTheSessionSilentlyWithoutLock() {
+        let (r, c) = silent(lock: true, curtain: false)
+        r.listenerResult?(.success)                    // a finger alone, no prior touch
+        XCTAssertFalse(c.isActive)
+        XCTAssertFalse(r.sequence.contains("lock"))
+        XCTAssertEqual(r.authStarts, 0)
+        XCTAssertEqual(r.notes, ["auth-ok"])
+    }
+
+    func testUnrecognizedFingerOpensPromptWithPasswordInCurtainMode() {
+        let (r, c) = silent()
+        r.authStartResult = (true, true)
+        r.listenerResult?(.failed)
+        XCTAssertEqual(r.authAllowPassword, [true], "the prompt offers the password")
+        XCTAssertEqual(r.passThrough, [true], "the owner can type into the prompt")
+        XCTAssertEqual(r.pauses, [true], "the listener yields focus to the prompt")
+        r.authCompletion?(.success)
+        XCTAssertFalse(c.isActive)
+        XCTAssertFalse(r.sequence.contains("lock"))
+    }
+
+    func testPasswordPromptFailureResumesSilentListening() {
+        let (r, c) = silent()
+        r.authStartResult = (true, true)
+        r.listenerResult?(.failed)
+        r.authCompletion?(.failure)
+        XCTAssertTrue(c.isActive)
+        XCTAssertEqual(r.passThrough, [true, false])
+        XCTAssertEqual(r.pauses, [true, false])
+        c.stop()
+    }
+
+    func testUnrecognizedFingerLocksInLockMode() {
+        let (r, c) = silent(lock: true, curtain: false)
+        r.listenerResult?(.failed)
+        XCTAssertFalse(c.isActive)
+        XCTAssertEqual(r.authStarts, 0)
+        let lock = r.sequence.firstIndex(of: "lock")!
+        XCTAssertLessThan(lock, r.sequence.firstIndex(of: "endCurtain")!)
+        XCTAssertLessThan(r.sequence.firstIndex(of: "endListener")!, lock, "focus is handed back before the lock")
+    }
+
+    func testLockModeSilentDeadlineLocks() {
+        let (r, c) = silent(lock: true, curtain: false)
+        r.onIntrusion?("keyDown from hardware")
+        r.onIntrusion?("keyDown from hardware")
+        XCTAssertEqual(r.pending.count, 1, "one deadline per session")
+        XCTAssertEqual(r.pending.first?.0, KeepAwakeController.authTimeout)
+        r.pending.first?.1()
+        XCTAssertFalse(c.isActive)
+        XCTAssertTrue(r.sequence.contains("lock"))
+    }
+
+    func testDeadlineAfterOwnerFingerIsIgnored() {
+        let (r, c) = silent(lock: true, curtain: false)
+        r.onIntrusion?("keyDown from hardware")
+        r.listenerResult?(.success)
+        r.pending.first?.1()
+        XCTAssertFalse(c.isActive)
+        XCTAssertFalse(r.sequence.contains("lock"), "a stale deadline never locks the owner")
+    }
+
+    func testListenerResultAfterStopIsIgnored() {
+        let (r, c) = silent()
+        c.stop()
+        r.listenerResult?(.failed)
+        XCTAssertEqual(r.authStarts, 0)
+        XCTAssertFalse(r.sequence.contains("lock"))
     }
 
     // MARK: - Watchdog rules

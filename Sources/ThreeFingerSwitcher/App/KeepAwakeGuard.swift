@@ -13,11 +13,12 @@ enum GuardAuthResult: Equatable {
     case failure
 }
 
-/// The owner check: **Touch ID only** whenever biometrics are available (no password button — so the
-/// curtain never has to let a click or key through while the prompt is up). The finger already on the
-/// sensor is read as soon as the prompt opens, so one touch both raises and answers it. Only when
-/// biometrics are unavailable (clamshell, no sensor, locked out) and the caller allows it does it fall
-/// back to the system password prompt (`needsPassThrough == true`).
+/// The VISIBLE owner check (the silent `SilentOwnerListener` is the first line).
+/// - `allowPassword == false` (Lock mode): **Touch ID only**, no password button; the real lock screen
+///   handles passwords.
+/// - `allowPassword == true` (Curtain mode, after an unrecognized finger or without Touch ID): the
+///   system prompt with Touch ID AND "Use Password…" (`needsPassThrough == true`: the curtain lets
+///   keys and clicks inside the prompt through while it is open).
 @MainActor
 final class GuardAuthenticator {
     private var context: LAContext?
@@ -36,11 +37,11 @@ final class GuardAuthenticator {
                       completion: @escaping (GuardAuthResult) -> Void) -> (started: Bool, needsPassThrough: Bool) {
         cancel()
         let ctx = LAContext()
-        ctx.localizedFallbackTitle = ""          // hide "Use Password…" on the Touch ID prompt
+        if !allowPassword { ctx.localizedFallbackTitle = "" }   // Lock mode: no "Use Password…"
         ctx.localizedCancelTitle = "Stay locked"
         let biometric = Self.biometricsAvailable()
         guard biometric || allowPassword else { return (false, false) }
-        let policy: LAPolicy = biometric ? .deviceOwnerAuthenticationWithBiometrics : .deviceOwnerAuthentication
+        let policy: LAPolicy = allowPassword ? .deviceOwnerAuthentication : .deviceOwnerAuthenticationWithBiometrics
         context = ctx
         var finished = false
         let finish: (GuardAuthResult) -> Void = { [weak self] r in
@@ -59,7 +60,7 @@ final class GuardAuthenticator {
         ctx.evaluatePolicy(policy, localizedReason: "end Keep Awake and show your screen") { ok, _ in
             finish(ok ? .success : .failure)
         }
-        return (true, !biometric)
+        return (true, allowPassword)
     }
 
     func cancel() {

@@ -79,13 +79,26 @@ final class KeepAwakeController {
         /// nil = unavailable (no Accessibility) → the controller falls back to the passive monitor + lock.
         var beginCurtain: (@escaping (String) -> Void) -> Any? = { _ in nil }
         var endCurtain: (Any) -> Void = { _ in }
-        /// Let every event through (password fallback only, for the bounded auth window).
+        /// Let the owner answer the visible password prompt (keys + clicks inside the prompt only).
         var setCurtainPassThrough: (Any, Bool) -> Void = { _, _ in }
         /// Start one owner check (Touch ID; password only when `allowPassword` and no biometrics).
         /// Returns whether it started and whether it needs input pass-through. Completion runs once.
         var authenticate: (_ allowPassword: Bool, _ completion: @escaping (GuardAuthResult) -> Void)
             -> (started: Bool, needsPassThrough: Bool) = { _, _ in (false, false) }
         var cancelAuthentication: () -> Void = {}
+        /// The SILENT owner check (`keep-awake-silent-touch-id`): Touch ID listens with no prompt while
+        /// the curtain is up. nil = unavailable (no Touch ID) → the controller uses the visible prompt.
+        var beginListener: (@escaping (SilentOwnerListener.Result) -> Void) -> Any? = { _ in nil }
+        var endListener: (Any) -> Void = { _ in }
+        /// A person touched the Mac: the listener takes focus now and shows the fingerprint icon.
+        var attendListener: (Any) -> Void = { _ in }
+        /// Pause / resume the listener (paused while the visible password prompt owns focus).
+        var pauseListener: (Any, Bool) -> Void = { _, _ in }
+        /// Run a block later on the main thread (Lock mode's silent deadline).
+        var after: (TimeInterval, @escaping () -> Void) -> Void = { delay, block in
+            nonisolated(unsafe) let run = block   // always scheduled on, and run on, the main queue
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { run() }
+        }
         /// Start / stop the crash watchdog that locks the Mac if this process dies with the curtain up.
         var startWatchdog: () -> Bool = { false }
         var stopWatchdog: () -> Void = {}
@@ -100,6 +113,7 @@ final class KeepAwakeController {
         static func live(policy: @escaping () -> InputTrustPolicy, hookCommand: @escaping () -> String) -> Effects {
             let poke = UserActivityPoke()
             let authenticator = MainActor.assumeIsolated { GuardAuthenticator() }
+            let link = ListenerLink()
             return Effects(
                 activeDisplays: { DisplayBrightness.activeDisplays() },
                 getBrightness: { DisplayBrightness.get($0) },
@@ -129,6 +143,7 @@ final class KeepAwakeController {
                         let tap = CurtainEventTap(policy: policy) { type, origin in
                             onIntrusion("\(type.guardLogName) from \(origin)")
                         }
+                        tap.onTrusted = { type, event in link.listener?.noteTrusted(type, event) ?? false }
                         return tap.start() ? tap : nil
                     }
                 },
@@ -144,6 +159,25 @@ final class KeepAwakeController {
                     }
                 },
                 cancelAuthentication: { MainActor.assumeIsolated { authenticator.cancel() } },
+                beginListener: { onResult in
+                    MainActor.assumeIsolated {
+                        guard SilentOwnerListener.available() else { return nil }
+                        let l = SilentOwnerListener(onResult: onResult)
+                        link.listener = l
+                        l.start()
+                        return l
+                    }
+                },
+                endListener: { token in
+                    MainActor.assumeIsolated {
+                        (token as? SilentOwnerListener)?.stop()
+                        link.listener = nil
+                    }
+                },
+                attendListener: { token in MainActor.assumeIsolated { (token as? SilentOwnerListener)?.attend() } },
+                pauseListener: { token, on in
+                    MainActor.assumeIsolated { (token as? SilentOwnerListener)?.setPaused(on) }
+                },
                 startWatchdog: { CurtainWatchdog.start() },
                 stopWatchdog: { CurtainWatchdog.stop() },
                 notify: { event, detail in
@@ -192,6 +226,10 @@ final class KeepAwakeController {
     private var activityToken: NSObjectProtocol?
     private var inputMonitorToken: Any?
     private var curtainToken: Any?
+    private var listenerToken: Any?
+    /// Lock mode's silent deadline: bumped to invalidate a pending one.
+    private var deadlineGeneration = 0
+    private var deadlinePending = false
     private var watchdogRunning = false
     private var authInFlight = false
     private var intrusionNotified = false
@@ -269,6 +307,14 @@ final class KeepAwakeController {
             authInFlight = false
             effects.cancelAuthentication()
         }
+        deadlineGeneration += 1
+        deadlinePending = false
+        // The listener goes before the lock: it may hand focus back to an app, which must happen
+        // under the curtain (and, in Lock mode, before the lock screen comes up).
+        if let token = listenerToken {
+            effects.endListener(token)
+            listenerToken = nil
+        }
         // An input-path stop locks when the item asks for it — and ALWAYS when the curtain was wanted
         // but could not be installed (the passive fallback must fail closed, never leave the Mac open).
         if reason == .input, config.lockOnStop || (config.curtain && curtainToken == nil) {
@@ -318,7 +364,10 @@ final class KeepAwakeController {
                 // Preferred: the curtain (swallow + Touch ID). Fallback: the passive monitor + lock.
                 if curtainToken == nil {
                     curtainToken = effects.beginCurtain { [weak self] detail in self?.intrusion(detail) }
-                    if curtainToken != nil { watchdogRunning = effects.startWatchdog() }
+                    if curtainToken != nil {
+                        watchdogRunning = effects.startWatchdog()
+                        listenerToken = effects.beginListener { [weak self] r in self?.listenerEnded(r) }
+                    }
                 }
                 if curtainToken == nil, inputMonitorToken == nil {
                     inputMonitorToken = effects.beginInputMonitoring { [weak self] in
@@ -336,14 +385,37 @@ final class KeepAwakeController {
 
     // MARK: - Curtain: intrusion → owner check
 
-    /// A swallowed input (or a trackpad contact) behind the curtain. Opens ONE owner check at a time;
-    /// the first intrusion of a session is reported to the hook.
+    /// A swallowed input (or a trackpad contact) behind the curtain. The first intrusion of a session
+    /// is reported to the hook.
+    /// - With the silent listener: NOTHING visible happens beyond the fingerprint icon — the listener
+    ///   takes focus so the owner's finger ends the session. Lock mode also starts a silent deadline:
+    ///   no owner finger within `authTimeout` → lock.
+    /// - Without it (no Touch ID): ONE visible owner check at a time (the pre-silent behaviour).
     func intrusion(_ detail: String) {
-        guard isActive, let token = curtainToken, !authInFlight, effects.now() >= cooldownUntil else { return }
+        guard isActive, curtainToken != nil, !authInFlight, effects.now() >= cooldownUntil else { return }
         if !intrusionNotified {
             intrusionNotified = true
             effects.notify("intrusion", detail)
         }
+        if let listener = listenerToken {
+            effects.attendListener(listener)
+            if config.lockOnStop, !deadlinePending {
+                deadlinePending = true
+                let generation = deadlineGeneration
+                effects.after(Self.authTimeout) { [weak self] in
+                    guard let self, self.isActive, self.deadlineGeneration == generation else { return }
+                    self.effects.notify("auth-failed", "no owner finger within \(Int(Self.authTimeout)) s")
+                    self.stop(reason: .input)
+                }
+            }
+            return
+        }
+        openVisibleCheck()
+    }
+
+    /// The visible owner check: Lock mode = Touch ID only; Curtain mode = Touch ID or password.
+    private func openVisibleCheck() {
+        guard isActive, let token = curtainToken, !authInFlight else { return }
         authInFlight = true
         // Lock mode never needs the password path: on failure the real lock screen takes over.
         let allowPassword = config.curtain && !config.lockOnStop
@@ -356,10 +428,30 @@ final class KeepAwakeController {
         if r.needsPassThrough { effects.setCurtainPassThrough(token, true) }
     }
 
+    /// The silent listener's answer: the owner's finger ends the session; an unrecognized finger opens
+    /// the visible prompt WITH a password option (Curtain) or locks (Lock).
+    private func listenerEnded(_ result: SilentOwnerListener.Result) {
+        guard isActive, !authInFlight else { return }
+        switch result {
+        case .success:
+            effects.notify("auth-ok", "touch id (silent)")
+            stop(reason: .explicit)
+        case .failed:
+            effects.notify("auth-failed", "finger not recognized")
+            if config.lockOnStop {
+                stop(reason: .input)
+            } else {
+                if let l = listenerToken { effects.pauseListener(l, true) }
+                openVisibleCheck()
+            }
+        }
+    }
+
     private func authEnded(_ result: GuardAuthResult) {
         guard isActive else { return }
         authInFlight = false
         if let token = curtainToken { effects.setCurtainPassThrough(token, false) }
+        if result == .failure, !config.lockOnStop, let l = listenerToken { effects.pauseListener(l, false) }
         effects.notify(result == .success ? "auth-ok" : "auth-failed", "")
         switch result {
         case .success:
@@ -402,4 +494,10 @@ private final class UserActivityPoke {
             kIOPMUserActiveLocal,
             &assertionID)
     }
+}
+
+/// Lets the live curtain tap reach the live silent listener (both are created inside `Effects.live`
+/// closures; the controller only holds opaque tokens).
+private final class ListenerLink: @unchecked Sendable {
+    weak var listener: SilentOwnerListener?
 }
