@@ -19,8 +19,10 @@ import LocalAuthenticationEmbeddedUI
 ///   is active is held, the agent's app is re-activated, and the held keys are re-posted ~0.15 s later
 ///   (marked with `repostMarker` so the curtain passes them untouched). Agent clicks activate their
 ///   target app by themselves.
-/// - Wrong finger / Touch ID lockout → `.failed` (the controller decides: password prompt or lock).
-///   Cancels caused by losing focus are not failures; the listener re-arms when it is in front again.
+/// - Wrong finger → `.failed` at once (the controller decides: password prompt or lock). An embedded
+///   evaluation does NOT end on a wrong finger — the system silently retries (owner test 2026-10-10) —
+///   so a `NoMatchWatcher` reads the system's own "no-match" log line. Touch ID lockout also ends in
+///   `.failed`. Cancels caused by losing focus are not failures; the listener re-arms in front again.
 @MainActor
 final class SilentOwnerListener {
     enum Result: Equatable { case success, failed }
@@ -47,6 +49,7 @@ final class SilentOwnerListener {
     private var retryAfter: TimeInterval = 0
     private var timer: Timer?
     private var activationObserver: NSObjectProtocol?
+    private var noMatchWatcher: NoMatchWatcher?
 
     /// Touch ID can read a finger now (no sensor / clamshell / lockout → false; the controller then
     /// uses the visible prompt instead).
@@ -88,12 +91,17 @@ final class SilentOwnerListener {
         t.tolerance = 0.3
         RunLoop.main.add(t, forMode: .common)
         timer = t
+        let watcher = NoMatchWatcher { [weak self] in self?.fingerNotRecognized() }
+        watcher.start()
+        noMatchWatcher = watcher
         takeFocus()   // listen from the first second (the agent is idle at arm time)
     }
 
     func stop() {
         timer?.invalidate()
         timer = nil
+        noMatchWatcher?.stop()
+        noMatchWatcher = nil
         if let o = activationObserver { NSWorkspace.shared.notificationCenter.removeObserver(o) }
         activationObserver = nil
         cancelEvaluation()
@@ -227,6 +235,15 @@ final class SilentOwnerListener {
         }
     }
 
+    /// The system reported a wrong finger. Only OUR silent evaluation counts (the visible prompt has
+    /// its own retries and its password option).
+    private func fingerNotRecognized() {
+        guard evaluating, !paused, isFront else { return }
+        cancelEvaluation()
+        paused = true
+        onResult(.failed)
+    }
+
     private func cancelEvaluation() {
         generation += 1
         guard let ctx = context else { evaluating = false; return }
@@ -256,4 +273,57 @@ final class SilentOwnerListener {
 private final class KeyableWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+}
+
+/// Watches the system log for Touch ID's "no-match" (a finger was read and it is not enrolled).
+/// LocalAuthentication has no public per-attempt callback, and an embedded evaluation keeps retrying
+/// silently, so this is the only signal for "wrong finger" before lockout. `/usr/bin/log stream` runs
+/// as the user (admin needed to read the log; without it nothing arrives and lockout stays the
+/// fallback). Fail-soft: if Apple changes the message, the listener still works, it just waits for
+/// lockout to show the prompt.
+@MainActor
+final class NoMatchWatcher {
+    nonisolated static let predicate = #"process == "coreauthd" AND eventMessage CONTAINS "received no-match""#
+    private let onNoMatch: () -> Void
+    private var process: Process?
+    private var buffer = ""
+
+    init(onNoMatch: @escaping () -> Void) { self.onNoMatch = onNoMatch }
+
+    func start() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/log")
+        p.arguments = ["stream", "--style", "compact", "--predicate", Self.predicate]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let data = h.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.consume(text) } }
+        }
+        do { try p.run(); process = p } catch { pipe.fileHandleForReading.readabilityHandler = nil }
+    }
+
+    func stop() {
+        if let p = process {
+            (p.standardOutput as? Pipe)?.fileHandleForReading.readabilityHandler = nil
+            if p.isRunning { p.terminate() }
+        }
+        process = nil
+    }
+
+    /// Exposed for tests: feed raw stream text; fires once per no-match line.
+    func consume(_ text: String) {
+        buffer += text
+        while let nl = buffer.firstIndex(of: "\n") {
+            let line = String(buffer[..<nl])
+            buffer.removeSubrange(...nl)
+            if Self.isNoMatch(line) { onNoMatch() }
+        }
+    }
+
+    nonisolated static func isNoMatch(_ line: String) -> Bool {
+        line.contains("coreauthd") && line.contains("received no-match")
+    }
 }
