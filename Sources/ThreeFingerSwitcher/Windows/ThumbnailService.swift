@@ -29,6 +29,23 @@ final class ThumbnailService {
     /// with the system's total window count) sweeps stacked without bound: each paid a full
     /// `SCShareableContent` enumeration before discovering every window was already in flight.
     private var sweepTask: Task<Void, Never>?
+    /// When the current sweep started. A sweep older than `sweepStaleAfter` is treated as WEDGED (a
+    /// ScreenCaptureKit call that never returned) and superseded even by a skip-if-busy timer tick —
+    /// otherwise one hung capture silently froze every periodic refresh for the rest of the app's life.
+    private var sweepStartedAt: TimeInterval = 0
+    private let sweepStaleAfter: TimeInterval = 4.0
+    /// Upper bound on any single ScreenCaptureKit call. SCK (replayd) occasionally never completes a
+    /// request; without a bound the awaiting capture pinned its id in `inFlight` forever (that window never
+    /// refreshed again) and kept the sweep alive. Accumulating hangs = the "slower the longer it runs" lag.
+    private let sckTimeout: TimeInterval = 2.0
+    /// The LOW-PRIORITY sweep of the other Spaces' rows (switcher open). Kept in its own slot so it never
+    /// occupies `sweepTask`: when the open sweep covered every Space in one task, the 0.8 s timer's
+    /// skip-if-busy tick was blocked until ALL rows finished — with many windows the visible row went
+    /// seconds without a refresh. Background captures run one at a time and yield to the foreground.
+    private var backgroundTask: Task<Void, Never>?
+    /// Ids requested but NOT present in the last enumeration (e.g. windows SCK never lists). Without this,
+    /// one such id made every tick re-pay the full system-wide enumeration (cost grows with total windows).
+    private var unlistedAtEnumeration: Set<CGWindowID> = []
     /// Monotonic sweep token so a finished sweep never clears a slot a newer sweep now owns.
     private var sweepGeneration = 0
 
@@ -112,7 +129,8 @@ final class ThumbnailService {
     func prefetch(_ windows: [WindowInfo], replacing: Bool = false) {
         guard CGPreflightScreenCaptureAccess() else { return }
         if sweepTask != nil {
-            guard replacing else { return }
+            let wedged = CACurrentMediaTime() - sweepStartedAt > sweepStaleAfter
+            guard replacing || wedged else { return }
             cancelSweeps()
         }
         // Skip minimized windows: macOS renders no fresh pixels for a minimized window, so a live capture
@@ -125,6 +143,7 @@ final class ThumbnailService {
         guard !targets.isEmpty else { return }
         sweepGeneration += 1
         let generation = sweepGeneration
+        sweepStartedAt = CACurrentMediaTime()
         sweepTask = Task { [weak self] in
             await self?.refreshBatch(targets)
             guard let self, self.sweepGeneration == generation else { return }
@@ -138,6 +157,27 @@ final class ThumbnailService {
         sweepGeneration += 1
         sweepTask?.cancel()
         sweepTask = nil
+        backgroundTask?.cancel()
+        backgroundTask = nil
+    }
+
+    /// Low-priority refresh of windows the user is NOT looking at (the other Spaces' rows). Replaces any
+    /// previous background sweep, captures one window at a time, and waits while a foreground sweep runs,
+    /// so it never delays the visible row or blocks the periodic timer.
+    func prefetchBackground(_ windows: [WindowInfo]) {
+        guard CGPreflightScreenCaptureAccess() else { return }
+        backgroundTask?.cancel()
+        let targets = windows.filter { !$0.isMinimized }
+        guard !targets.isEmpty else { backgroundTask = nil; return }
+        backgroundTask = Task { [weak self] in
+            for w in targets {
+                guard let self, !Task.isCancelled else { return }
+                while self.sweepTask != nil, !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                }
+                await self.refreshBatch([w], concurrency: 1)
+            }
+        }
     }
 
     /// Capture the given windows NOW and AWAIT completion — used to grab each window's live frame right
@@ -157,12 +197,16 @@ final class ThumbnailService {
         let now = CACurrentMediaTime()
         if let cached = cachedContent, now - cachedContentAt < shareableContentTTL {
             let listed = Set(cached.windows.map(\.windowID))
-            if ids.allSatisfy({ listed.contains($0) }) { return cached }
+            if ids.allSatisfy({ listed.contains($0) || unlistedAtEnumeration.contains($0) }) { return cached }
         }
         do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            guard let content = try await Self.withTimeout(sckTimeout, {
+                try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            }) else { return nil }
             cachedContent = content
             cachedContentAt = CACurrentMediaTime()
+            let listed = Set(content.windows.map(\.windowID))
+            unlistedAtEnumeration = Set(ids.filter { !listed.contains($0) })
             return content
         } catch {
             return nil
@@ -174,7 +218,7 @@ final class ThumbnailService {
     /// session's sweeps, is the batch win). Each window is degraded-gated against its enumerated frame and
     /// captured through a bounded task group (`maxConcurrentCaptures` at a time, in the caller's order so
     /// the visible row's first cards land first), self-paced per window by `inFlight`.
-    private func refreshBatch(_ windows: [WindowInfo]) async {
+    private func refreshBatch(_ windows: [WindowInfo], concurrency: Int? = nil) async {
         guard !windows.isEmpty else { return }
         let displayUnion = Self.displayUnion()
         guard let content = await shareableContent(covering: windows.map(\.id)) else { return }
@@ -201,7 +245,7 @@ final class ThumbnailService {
                 }
             }
             // Prime up to the concurrency bound, then top up as each capture finishes (caller order).
-            for _ in 0..<min(maxConcurrentCaptures, targets.count) { enqueueNext() }
+            for _ in 0..<min(concurrency ?? maxConcurrentCaptures, targets.count) { enqueueNext() }
             while await group.next() != nil {
                 if Task.isCancelled { break }   // session ended: stop capturing into a hidden overlay
                 enqueueNext()
@@ -404,7 +448,12 @@ final class ThumbnailService {
             // may be the session-cached enumeration, whose frame predates a resize.
             let config = streamConfiguration(forWindowSize: frameBefore.size)
             let filter = SCContentFilter(desktopIndependentWindow: scWindow)
-            let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            guard let cgImage = try await Self.withTimeout(sckTimeout, {
+                try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            }) else {
+                if frameLoggingEnabled { NSLog("[TFS-thumb] capture id=\(id) TIMED OUT") }
+                return   // releases `inFlight` (caller's defer) so the next sweep can retry this window
+            }
             // Motion gate: a frame change across the capture means the window was animating — the grabbed
             // pixels are the tilted "sideways" frame. Discard so the last good frame is kept; a later sweep
             // re-captures it once settled.
@@ -456,6 +505,35 @@ final class ThumbnailService {
         return config
     }
 
+    /// Await `operation`, but give up after `seconds` and return nil. Deliberately NOT a task group: a
+    /// group's scope waits for every child, so a hung SCK child would still block the caller. Here the
+    /// operation runs in an unstructured task that is abandoned (and cancelled) on timeout; the first of
+    /// result / error / deadline resumes the continuation exactly once.
+    nonisolated static func withTimeout<T: Sendable>(
+        _ seconds: TimeInterval, _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T? {
+        let once = TimeoutOnce()
+        var work: Task<Void, Never>?
+        var timer: Task<Void, Never>?
+        let result: T? = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<T?, Error>) in
+            work = Task {
+                do {
+                    let value = try await operation()
+                    if once.claim() { cont.resume(returning: value) }
+                } catch {
+                    if once.claim() { cont.resume(throwing: error) }
+                }
+            }
+            timer = Task {
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                if once.claim() { cont.resume(returning: nil) }
+            }
+        }
+        timer?.cancel()
+        work?.cancel()
+        return result
+    }
+
     private func store(_ id: CGWindowID, _ image: NSImage) {
         // True LRU: a re-store moves the id to the back. The previous insert-order-only (FIFO)
         // eviction let long-dead windows outlive actively-refreshed ones, degrading the hit rate
@@ -491,4 +569,11 @@ final class ThumbnailService {
         }
         return Set(infoList.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value })
     }
+}
+
+/// One-shot claim flag for `ThumbnailService.withTimeout` (whichever of result / deadline lands first wins).
+private final class TimeoutOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+    func claim() -> Bool { lock.lock(); defer { lock.unlock() }; if done { return false }; done = true; return true }
 }

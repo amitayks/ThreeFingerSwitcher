@@ -496,7 +496,12 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         ]
         for name in wakeNames {
             let token = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.restartTouchEngineAfterWake() }
+                MainActor.assumeIsolated {
+                    self?.restartTouchEngineAfterWake()
+                    // ScreenCaptureKit goes cold across sleep; re-pay its warm-up now (background) so the
+                    // first post-wake switcher open doesn't wait seconds for its first preview.
+                    if let self { Task { await self.thumbnails.warmUp() } }
+                }
             }
             wakeObservers.append(token)
         }
@@ -817,7 +822,8 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
         thumbnails.seed(into: overlay.model, ids: current.map(\.id))
         let currentIDs = Set(current.map(\.id))
         let others = overlay.model.rows.flatMap { $0 }.filter { $0.id != hubID && !currentIDs.contains($0.id) }
-        thumbnails.prefetch(current + others, replacing: true)
+        thumbnails.prefetch(current, replacing: true)   // foreground: the visible row, timer-refreshable
+        thumbnails.prefetchBackground(others)           // low priority: never blocks the visible row's ticks
     }
 
     /// Seed cached thumbnails for EVERY Space's windows the moment the switcher opens — not just the
