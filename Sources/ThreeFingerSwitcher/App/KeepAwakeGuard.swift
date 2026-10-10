@@ -169,15 +169,20 @@ enum GuardLog {
             .appendingPathComponent("Logs/ThreeFingerSwitcher/keep-awake-guard.log")
     }
 
+    /// One serial queue: concurrent appends overwrote each other (truncated "ouch id" lines).
+    private static let queue = DispatchQueue(label: "tfs.guard-log", qos: .utility)
+    nonisolated(unsafe) private static let stampFormatter = ISO8601DateFormatter()
+
     static func write(_ line: String) {
         let u = url
-        DispatchQueue.global(qos: .utility).async {
+        let date = Date()
+        queue.async {
             let fm = FileManager.default
             try? fm.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
             if let size = (try? fm.attributesOfItem(atPath: u.path))?[.size] as? Int, size > 256_000 {
                 try? fm.removeItem(at: u)
             }
-            let stamp = ISO8601DateFormatter().string(from: Date())
+            let stamp = stampFormatter.string(from: date)
             let data = Data("\(stamp) \(line)\n".utf8)
             if let h = try? FileHandle(forWritingTo: u) {
                 h.seekToEndOfFile(); h.write(data); try? h.close()

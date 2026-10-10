@@ -285,10 +285,25 @@ final class KeepAwakeCurtainTests: XCTestCase {
         c.noteTouch(fingerCount: 2)
         r.onIntrusion?("mouseDown from hardware")
         XCTAssertEqual(r.authStarts, 0, "no visible message for a stranger")
-        XCTAssertEqual(r.attends, 3, "each touch hands focus to the listener")
+        XCTAssertEqual(r.attends, 1, "a burst of touches hands focus over ONCE (throttled)")
         XCTAssertEqual(r.notes, ["intrusion"])
         XCTAssertTrue(c.isActive)
         XCTAssertTrue(r.pending.isEmpty, "Curtain mode has no deadline")
+        c.stop()
+    }
+
+    func testInputStormNeverDrivesPerEventFocusWork() {
+        // Perf audit 2026-10-10: per-event re-focus leaked thousands of text-cursor indicators and
+        // pinned WindowServer. 1,000 swallowed events in under a second → at most one attend.
+        let (r, c) = silent()
+        for i in 0..<1000 {
+            r.clock = 1000 + Double(i) * 0.0009
+            r.onIntrusion?("mouseMoved from hardware")
+        }
+        XCTAssertEqual(r.attends, 1)
+        r.clock += KeepAwakeController.attendInterval
+        r.onIntrusion?("mouseMoved from hardware")
+        XCTAssertEqual(r.attends, 2, "a person still touching gets focus re-checked once per interval")
         c.stop()
     }
 

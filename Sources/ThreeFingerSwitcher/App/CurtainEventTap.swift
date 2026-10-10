@@ -34,6 +34,9 @@ final class CurtainEventTap {
     /// app is active — so they land in its focused password field and nowhere else.
     var ownPasswordEntry = false
     private var promptFrames: (frames: [CGRect], at: TimeInterval) = ([], 0)
+    /// Intrusion reports are coalesced: at most one per `reportInterval` (input runs at 60–120 Hz).
+    private var lastReport: TimeInterval = 0
+    nonisolated static let reportInterval: TimeInterval = 0.25
 
     init(policy: @escaping () -> InputTrustPolicy, onIntrusion: @escaping (CGEventType, InputOrigin) -> Void) {
         self.policy = policy
@@ -94,7 +97,9 @@ final class CurtainEventTap {
         if event.getIntegerValueField(.eventSourceUserData) == SilentOwnerListener.repostMarker {
             return Unmanaged.passUnretained(event)
         }
-        let origin = policy().classify(sourcePID: event.getIntegerValueField(.eventSourceUnixProcessID))
+        let pid = event.getIntegerValueField(.eventSourceUnixProcessID)
+        // Hardware (PID 0) needs no policy lookup — the hot path for a person's input.
+        let origin: InputOrigin = pid <= 0 ? .hardware : policy().classify(sourcePID: pid)
         if origin.isTrusted {
             if onTrusted?(type, event) == true { return nil }
             return Unmanaged.passUnretained(event)
@@ -103,7 +108,11 @@ final class CurtainEventTap {
         if ownPasswordEntry, SilentOwnerListener.isKeyboard(type), NSApp.isActive {
             return Unmanaged.passUnretained(event)
         }
-        onIntrusion(type, origin)
+        let t = Date().timeIntervalSinceReferenceDate
+        if t - lastReport >= Self.reportInterval {
+            lastReport = t
+            onIntrusion(type, origin)
+        }
         return nil   // swallowed: the stranger's input never reaches any app
     }
 

@@ -56,6 +56,9 @@ final class SilentOwnerListener {
     /// Where the Touch ID view sits during password entry (nil otherwise).
     private var touchIDSlot: NSView?
     private var passwordCard: CurtainPasswordCard?
+    private var typingObserver: NSObjectProtocol?
+    /// Back-off for Touch ID re-arms that end without an answer (1 s doubling to 15 s).
+    private var rearmDelay: TimeInterval = 1
     private var window: NSWindow?
     private var context: LAContext?
     private var evaluating = false
@@ -133,6 +136,8 @@ final class SilentOwnerListener {
         cancelEvaluation()
         flushHeld()
         let wasFront = isFront
+        window?.makeFirstResponder(nil)
+        window?.contentView = nil
         window?.orderOut(nil)
         window = nil
         // Give the screen back to the app that was in front before the curtain took focus.
@@ -197,6 +202,7 @@ final class SilentOwnerListener {
     private func otherAppActivated(_ app: NSRunningApplication?) {
         guard let app, app.processIdentifier != getpid() else { return }
         returnApp = app
+        rearmDelay = 1
         // Touch ID stops reading once we are not in front; drop the context so the next grab is clean.
         cancelEvaluation()
         hideIcon()
@@ -210,14 +216,14 @@ final class SilentOwnerListener {
         }
         guard !paused, !handingBack else { return }
         if isFront {
-            if !evaluating { window?.makeKey(); startEvaluation() }
+            if !evaluating { ensureKey(); startEvaluation() }
         } else if now - lastTrusted >= Self.idleGrab, now - lastGrab >= 5 {
             takeFocus()
         }
     }
 
     private func takeFocus() {
-        guard !paused, !handingBack, let window else { return }
+        guard !paused, !handingBack, window != nil else { return }
         lastGrab = now
         if !isFront {
             if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != getpid() {
@@ -225,9 +231,26 @@ final class SilentOwnerListener {
             }
             NSApp.activate(ignoringOtherApps: true)
         }
+        ensureKey()
+        startEvaluation()
+    }
+
+    /// Order front + key ONLY when not already key: each call is a WindowServer round trip, and the
+    /// per-input path must never repeat it (perf audit 2026-10-10).
+    private func ensureKey() {
+        guard let window, !(isFront && window.isKeyWindow) else { return }
         window.orderFrontRegardless()
         window.makeKey()
-        startEvaluation()
+    }
+
+    /// True when the password field is already being edited (its field editor is first responder).
+    /// `makeFirstResponder(field)` while editing ENDS and RESTARTS editing — each restart spawned a new
+    /// CursorUIViewService indicator; at input rates that leaked thousands and pinned WindowServer.
+    private var passwordFieldIsEditing: Bool {
+        guard let window, let field = passwordField else { return false }
+        if window.firstResponder === field { return true }
+        if let editor = window.firstResponder as? NSText, editor.delegate === field { return true }
+        return false
     }
 
     private func startEvaluation() {
@@ -242,7 +265,7 @@ final class SilentOwnerListener {
             view.frame = slot.bounds
             view.autoresizingMask = [.width, .height]
             slot.addSubview(view)
-            if let field = passwordField { window.makeFirstResponder(field) }
+            if let field = passwordField, !passwordFieldIsEditing { window.makeFirstResponder(field) }
         } else {
             let view = LAAuthenticationView(context: ctx, controlSize: .large)
             view.frame = NSRect(origin: .zero, size: window.frame.size)
@@ -266,6 +289,7 @@ final class SilentOwnerListener {
         guard g == generation, evaluating else { return }   // a cancelled context's late answer
         context = nil
         evaluating = false
+        if ok || code == .authenticationFailed || code == .biometryLockout { rearmDelay = 1 }
         if ok {
             if inPasswordEntry { GuardLog.write("password-entry closed by touch id") }
             endPasswordEntry(resume: false)
@@ -282,8 +306,10 @@ final class SilentOwnerListener {
             // A finger was read and it is not the owner's (or Touch ID gave up).
             wrongFinger()
         default:
-            // Lost focus, system cancel, not interactive…: not an answer. Re-arm on the next tick.
-            retryAfter = now + 1
+            // Lost focus, system cancel, not interactive…: not an answer. Re-arm with back-off so a
+            // repeating non-answer can't rebuild the Touch ID view every second forever.
+            retryAfter = now + rearmDelay
+            rearmDelay = min(rearmDelay * 2, 15)
         }
     }
 
@@ -322,6 +348,9 @@ final class SilentOwnerListener {
         window.alphaValue = 1
         passwordField = field
         setKeyPassThrough(true)
+        typingObserver = NotificationCenter.default.addObserver(
+            forName: NSControl.textDidChangeNotification, object: field, queue: .main
+        ) { [weak self] _ in MainActor.assumeIsolated { self?.armPasswordDeadline() } }
         retryAfter = now + 1          // the wrong finger is probably still on the sensor
         focusPasswordField()
         armPasswordDeadline()
@@ -331,10 +360,9 @@ final class SilentOwnerListener {
     private func focusPasswordField() {
         guard let window, let field = passwordField else { return }
         if !isFront { NSApp.activate(ignoringOtherApps: true) }
-        window.orderFrontRegardless()
-        window.makeKey()
-        window.makeFirstResponder(field)
-        armPasswordDeadline()
+        ensureKey()
+        if !passwordFieldIsEditing { window.makeFirstResponder(field) }
+        // The idle deadline is re-armed by real typing (textDidChange), never by pointer noise.
     }
 
     private func armPasswordDeadline() {
@@ -385,6 +413,12 @@ final class SilentOwnerListener {
         passwordDeadline = nil
         guard passwordField != nil else { return }
         cancelEvaluation()
+        if let o = typingObserver { NotificationCenter.default.removeObserver(o) }
+        typingObserver = nil
+        // Leave no text field behind in the key window (a stale secure field kept re-activating text
+        // input on every later makeKey).
+        window?.makeFirstResponder(nil)
+        window?.contentView = NSView()
         touchIDSlot = nil
         passwordCard = nil
         window?.hasShadow = false
@@ -426,6 +460,8 @@ final class SilentOwnerListener {
         guard let window, let screen = NSScreen.main ?? NSScreen.screens.first else { return }
         let side: CGFloat = 96
         let f = screen.frame
+        let target = NSRect(x: f.midX - side / 2, y: f.midY - side / 2, width: side, height: side)
+        if window.frame == target, window.alphaValue == 1 { return }
         window.setFrame(NSRect(x: f.midX - side / 2, y: f.midY - side / 2, width: side, height: side), display: true)
         window.alphaValue = 1
     }

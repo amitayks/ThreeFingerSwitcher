@@ -234,6 +234,9 @@ final class KeepAwakeController {
     /// Lock mode's silent deadline: bumped to invalidate a pending one.
     private var deadlineGeneration = 0
     private var deadlinePending = false
+    /// Last time a person's input handed focus to the listener (throttle: input arrives at 60–120 Hz).
+    private var attendedAt: TimeInterval = -.infinity
+    nonisolated static let attendInterval: TimeInterval = 1
     private var watchdogRunning = false
     private var authInFlight = false
     private var intrusionNotified = false
@@ -335,6 +338,7 @@ final class KeepAwakeController {
         }
         intrusionNotified = false
         cooldownUntil = 0
+        attendedAt = -.infinity
         for (keyboard, level) in savedKeyboard {
             effects.setKeyboardBrightness(keyboard, level)
         }
@@ -404,7 +408,13 @@ final class KeepAwakeController {
             effects.notify("intrusion", detail)
         }
         if let listener = listenerToken {
-            effects.attendListener(listener)
+            // Throttled: NO focus / window / responder work per input event (perf audit 2026-10-10 —
+            // per-event re-focus leaked thousands of text-cursor indicators and pinned WindowServer).
+            let t = effects.now()
+            if t - attendedAt >= Self.attendInterval {
+                attendedAt = t
+                effects.attendListener(listener)
+            }
             if config.lockOnStop, !deadlinePending {
                 deadlinePending = true
                 let generation = deadlineGeneration
