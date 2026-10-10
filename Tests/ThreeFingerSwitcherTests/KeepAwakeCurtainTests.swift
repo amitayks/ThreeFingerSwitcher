@@ -62,6 +62,7 @@ final class KeepAwakeCurtainTests: XCTestCase {
         var attends = 0
         var pauses: [Bool] = []
         var listenerEnds = 0
+        var listenerPasswordMode: [Bool] = []
         var pending: [(TimeInterval, () -> Void)] = []
     }
 
@@ -91,8 +92,9 @@ final class KeepAwakeCurtainTests: XCTestCase {
         e.stopWatchdog = { r.watchdogStops += 1; r.sequence.append("endWatchdog") }
         e.notify = { ev, _ in r.notes.append(ev) }
         e.now = { r.clock }
-        e.beginListener = { cb in
+        e.beginListener = { pw, cb in
             guard r.listenerAvailable else { return nil }
+            r.listenerPasswordMode.append(pw)
             r.listenerResult = cb; r.sequence.append("listener"); return NSObject()
         }
         e.endListener = { _ in r.listenerEnds += 1; r.sequence.append("endListener") }
@@ -265,6 +267,15 @@ final class KeepAwakeCurtainTests: XCTestCase {
         XCTAssertEqual(r.sequence.filter { $0 == "listener" }.count, 1)
         c.stop()
         XCTAssertEqual(r.listenerEnds, 1)
+    }
+
+    func testCurtainModeListenerHandlesWrongFingerWithBlindPasswordLockModeDoesNot() {
+        let (r, c) = silent()
+        XCTAssertEqual(r.listenerPasswordMode, [true], "Curtain: password entry lives in the listener")
+        c.stop()
+        let (r2, c2) = silent(lock: true, curtain: false)
+        XCTAssertEqual(r2.listenerPasswordMode, [false], "Lock: a wrong finger locks")
+        c2.stop()
     }
 
     func testPersonInputShowsNoPromptOnlyAttends() {

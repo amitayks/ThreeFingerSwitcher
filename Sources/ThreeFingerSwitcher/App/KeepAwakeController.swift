@@ -88,7 +88,9 @@ final class KeepAwakeController {
         var cancelAuthentication: () -> Void = {}
         /// The SILENT owner check (`keep-awake-silent-touch-id`): Touch ID listens with no prompt while
         /// the curtain is up. nil = unavailable (no Touch ID) → the controller uses the visible prompt.
-        var beginListener: (@escaping (SilentOwnerListener.Result) -> Void) -> Any? = { _ in nil }
+        /// `passwordOnNoMatch` (Curtain mode): a wrong finger opens blind password entry inside the
+        /// listener instead of reporting `.failed`.
+        var beginListener: (_ passwordOnNoMatch: Bool, @escaping (SilentOwnerListener.Result) -> Void) -> Any? = { _, _ in nil }
         var endListener: (Any) -> Void = { _ in }
         /// A person touched the Mac: the listener takes focus now and shows the fingerprint icon.
         var attendListener: (Any) -> Void = { _ in }
@@ -144,6 +146,7 @@ final class KeepAwakeController {
                             onIntrusion("\(type.guardLogName) from \(origin)")
                         }
                         tap.onTrusted = { type, event in link.listener?.noteTrusted(type, event) ?? false }
+                        link.tap = tap
                         return tap.start() ? tap : nil
                     }
                 },
@@ -159,10 +162,11 @@ final class KeepAwakeController {
                     }
                 },
                 cancelAuthentication: { MainActor.assumeIsolated { authenticator.cancel() } },
-                beginListener: { onResult in
+                beginListener: { passwordOnNoMatch, onResult in
                     MainActor.assumeIsolated {
                         guard SilentOwnerListener.available() else { return nil }
-                        let l = SilentOwnerListener(onResult: onResult)
+                        let l = SilentOwnerListener(passwordOnNoMatch: passwordOnNoMatch, onResult: onResult)
+                        l.setKeyPassThrough = { on in link.tap?.ownPasswordEntry = on }
                         link.listener = l
                         l.start()
                         return l
@@ -366,7 +370,9 @@ final class KeepAwakeController {
                     curtainToken = effects.beginCurtain { [weak self] detail in self?.intrusion(detail) }
                     if curtainToken != nil {
                         watchdogRunning = effects.startWatchdog()
-                        listenerToken = effects.beginListener { [weak self] r in self?.listenerEnded(r) }
+                        listenerToken = effects.beginListener(config.curtain && !config.lockOnStop) { [weak self] r in
+                            self?.listenerEnded(r)
+                        }
                     }
                 }
                 if curtainToken == nil, inputMonitorToken == nil {
@@ -500,4 +506,5 @@ private final class UserActivityPoke {
 /// closures; the controller only holds opaque tokens).
 private final class ListenerLink: @unchecked Sendable {
     weak var listener: SilentOwnerListener?
+    weak var tap: CurtainEventTap?
 }

@@ -2,6 +2,7 @@ import AppKit
 import CoreGraphics
 import LocalAuthentication
 import LocalAuthenticationEmbeddedUI
+import OpenDirectory
 
 /// Keep Awake's **silent owner check** (`keep-awake-silent-touch-id`): Touch ID listens behind the
 /// curtain with no prompt, so the owner's finger on the sensor ends the session and a stranger gets
@@ -23,6 +24,12 @@ import LocalAuthenticationEmbeddedUI
 ///   evaluation does NOT end on a wrong finger — the system silently retries (owner test 2026-10-10) —
 ///   so a `NoMatchWatcher` reads the system's own "no-match" log line. Touch ID lockout also ends in
 ///   `.failed`. Cancels caused by losing focus are not failures; the listener re-arms in front again.
+/// - With `passwordOnNoMatch` (Curtain mode) a wrong finger does not report `.failed`: the listener
+///   switches to **blind password entry** — a focused secure field in its own key window, so the owner
+///   types the login password and presses Return even on a screen dimmed to black (no click on "Use
+///   Password…"). The password is checked with OpenDirectory; while entry is open the curtain passes
+///   hardware keys ONLY while this app is active (they land in the field). 30 s without a key, or 5
+///   wrong passwords, return to silent Touch ID listening.
 @MainActor
 final class SilentOwnerListener {
     enum Result: Equatable { case success, failed }
@@ -34,7 +41,18 @@ final class SilentOwnerListener {
     /// `eventSourceUserData` stamp on re-posted agent keys (the curtain passes them as-is).
     nonisolated static let repostMarker: Int64 = 0x5446_5343   // "TFSC"
 
+    /// Owner-check outcomes.
     private let onResult: (Result) -> Void
+    /// Curtain mode: a wrong finger opens blind password entry instead of reporting `.failed`.
+    private let passwordOnNoMatch: Bool
+    /// Lets the curtain pass hardware keys into the password field (set only during entry).
+    var setKeyPassThrough: (Bool) -> Void = { _ in }
+    nonisolated static let passwordIdleTimeout: TimeInterval = 30
+    nonisolated static let maxPasswordTries = 5
+    private var passwordField: NSSecureTextField?
+    private var passwordTries = 0
+    private var passwordDeadline: DispatchWorkItem?
+    private var verifying = false
     private var window: NSWindow?
     private var context: LAContext?
     private var evaluating = false
@@ -58,9 +76,13 @@ final class SilentOwnerListener {
         return LAContext().canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &err)
     }
 
-    init(onResult: @escaping (Result) -> Void) {
+    init(passwordOnNoMatch: Bool = false, onResult: @escaping (Result) -> Void) {
+        self.passwordOnNoMatch = passwordOnNoMatch
         self.onResult = onResult
     }
+
+    /// True while blind password entry is open.
+    var inPasswordEntry: Bool { passwordField != nil }
 
     private var now: TimeInterval { Date().timeIntervalSinceReferenceDate }
     private var isFront: Bool { NSApp.isActive }
@@ -102,6 +124,7 @@ final class SilentOwnerListener {
         timer = nil
         noMatchWatcher?.stop()
         noMatchWatcher = nil
+        endPasswordEntry(resume: false)
         if let o = activationObserver { NSWorkspace.shared.notificationCenter.removeObserver(o) }
         activationObserver = nil
         cancelEvaluation()
@@ -115,6 +138,7 @@ final class SilentOwnerListener {
 
     /// A person touched the Mac: take focus now and show the fingerprint icon (the owner's cue).
     func attend() {
+        if inPasswordEntry { focusPasswordField(); return }
         paused = false
         retryAfter = 0
         showIcon()
@@ -133,10 +157,11 @@ final class SilentOwnerListener {
     /// returns to the agent's app). Only keyboard events need this: they go to the key window — ours.
     func noteTrusted(_ type: CGEventType, _ event: CGEvent) -> Bool {
         lastTrusted = now
-        guard isFront || handingBack, Self.isKeyboard(type), let copy = event.copy() else { return false }
+        guard isFront || handingBack || inPasswordEntry, Self.isKeyboard(type), let copy = event.copy() else { return false }
         copy.setIntegerValueField(.eventSourceUserData, value: Self.repostMarker)
         held.append(copy)
-        if !handingBack { handBack() }
+        // During password entry the agent waits: its keys must not land in the owner's field.
+        if !handingBack, !inPasswordEntry { handBack() }
         return true
     }
 
@@ -225,10 +250,8 @@ final class SilentOwnerListener {
         if ok { onResult(.success); return }
         switch code {
         case .authenticationFailed?, .biometryLockout?:
-            // A finger was read and it is not the owner's (or Touch ID gave up): stop listening until
-            // the controller resumes us after the visible prompt.
-            paused = true
-            onResult(.failed)
+            // A finger was read and it is not the owner's (or Touch ID gave up).
+            wrongFinger()
         default:
             // Lost focus, system cancel, not interactive…: not an answer. Re-arm on the next tick.
             retryAfter = now + 1
@@ -240,8 +263,121 @@ final class SilentOwnerListener {
     private func fingerNotRecognized() {
         guard evaluating, !paused, isFront else { return }
         cancelEvaluation()
+        wrongFinger()
+    }
+
+    private func wrongFinger() {
         paused = true
-        onResult(.failed)
+        if passwordOnNoMatch { beginPasswordEntry() } else { onResult(.failed) }
+    }
+
+    // MARK: - Blind password entry (Curtain mode, after a wrong finger)
+
+    private func beginPasswordEntry() {
+        guard let window, passwordField == nil else { return }
+        passwordTries = 0
+        let side = CGSize(width: 320, height: 64)
+        let container = NSView(frame: NSRect(origin: .zero, size: side))
+        container.wantsLayer = true
+        container.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        container.layer?.cornerRadius = 12
+        let field = NSSecureTextField(frame: NSRect(x: 16, y: 16, width: side.width - 32, height: 28))
+        field.placeholderString = "Password"
+        field.font = .systemFont(ofSize: 15)
+        field.bezelStyle = .roundedBezel
+        field.target = self
+        field.action = #selector(passwordSubmitted(_:))
+        container.addSubview(field)
+        window.contentView = container
+        if let screen = NSScreen.main ?? NSScreen.screens.first {
+            let f = screen.frame
+            window.setFrame(NSRect(x: f.midX - side.width / 2, y: f.midY - side.height / 2,
+                                   width: side.width, height: side.height), display: true)
+        }
+        window.alphaValue = 1
+        passwordField = field
+        setKeyPassThrough(true)
+        focusPasswordField()
+        armPasswordDeadline()
+        GuardLog.write("password-entry open (finger not recognized)")
+    }
+
+    private func focusPasswordField() {
+        guard let window, let field = passwordField else { return }
+        if !isFront { NSApp.activate(ignoringOtherApps: true) }
+        window.orderFrontRegardless()
+        window.makeKey()
+        window.makeFirstResponder(field)
+        armPasswordDeadline()
+    }
+
+    private func armPasswordDeadline() {
+        passwordDeadline?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.endPasswordEntry(resume: true) }
+        }
+        passwordDeadline = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.passwordIdleTimeout, execute: work)
+    }
+
+    @objc private func passwordSubmitted(_ sender: NSSecureTextField) {
+        let password = sender.stringValue
+        guard !password.isEmpty, !verifying else { return }
+        verifying = true
+        armPasswordDeadline()
+        let user = NSUserName()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let ok = Self.verifyLoginPassword(user: user, password: password)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.passwordChecked(ok) }
+            }
+        }
+    }
+
+    private func passwordChecked(_ ok: Bool) {
+        verifying = false
+        guard let field = passwordField else { return }
+        if ok {
+            GuardLog.write("password-entry ok")
+            endPasswordEntry(resume: false)
+            onResult(.success)
+            return
+        }
+        passwordTries += 1
+        field.stringValue = ""
+        GuardLog.write("password-entry wrong (\(passwordTries))")
+        if passwordTries >= Self.maxPasswordTries {
+            endPasswordEntry(resume: true)
+            retryAfter = now + 30
+        }
+    }
+
+    /// Close entry. `resume` returns to silent Touch ID listening (timeout / too many tries).
+    private func endPasswordEntry(resume: Bool) {
+        passwordDeadline?.cancel()
+        passwordDeadline = nil
+        guard passwordField != nil else { return }
+        passwordField?.stringValue = ""
+        passwordField = nil
+        setKeyPassThrough(false)
+        hideIcon()
+        if resume {
+            GuardLog.write("password-entry closed")
+            paused = false
+            if !held.isEmpty { handBack() }
+        }
+    }
+
+    /// The login password check (OpenDirectory, the local user's record). Never logs the password.
+    nonisolated static func verifyLoginPassword(user: String, password: String) -> Bool {
+        do {
+            let node = try ODNode(session: ODSession.default(), type: ODNodeType(kODNodeTypeAuthentication))
+            let record = try node.record(withRecordType: kODRecordTypeUsers, name: user, attributes: nil)
+            try record.verifyPassword(password)
+            return true
+        } catch {
+            return false
+        }
     }
 
     private func cancelEvaluation() {

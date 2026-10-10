@@ -30,6 +30,9 @@ final class CurtainEventTap {
     /// Sees every trusted event first; returning true HOLDS it (swallowed here, re-posted later by the
     /// silent Touch ID listener once the agent's app is in front again).
     var onTrusted: ((CGEventType, CGEvent) -> Bool)?
+    /// Blind password entry (Curtain mode, after a wrong finger): hardware keys pass ONLY while this
+    /// app is active — so they land in its focused password field and nowhere else.
+    var ownPasswordEntry = false
     private var promptFrames: (frames: [CGRect], at: TimeInterval) = ([], 0)
 
     init(policy: @escaping () -> InputTrustPolicy, onIntrusion: @escaping (CGEventType, InputOrigin) -> Void) {
@@ -97,6 +100,9 @@ final class CurtainEventTap {
             return Unmanaged.passUnretained(event)
         }
         if passThrough, allowedForPrompt(type, event) { return Unmanaged.passUnretained(event) }
+        if ownPasswordEntry, SilentOwnerListener.isKeyboard(type), NSApp.isActive {
+            return Unmanaged.passUnretained(event)
+        }
         onIntrusion(type, origin)
         return nil   // swallowed: the stranger's input never reaches any app
     }
