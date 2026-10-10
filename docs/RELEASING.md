@@ -72,13 +72,17 @@ The workflow derives `CFBundleShortVersionString` from the tag (`v0.1.0` → `0.
 Download the DMG from the Release, then:
 ```bash
 hdiutil attach ThreeFingerSwitcher-0.1.0.dmg
-spctl -a -t open --context context:primary-signed -v "/Volumes/ThreeFingerSwitcher 0.1.0/ThreeFingerSwitcher.app"
+spctl -a -t exec -vv "/Volumes/ThreeFingerSwitcher 0.1.0/ThreeFingerSwitcher.app"
 codesign --verify --deep --strict --verbose=2 "/Volumes/ThreeFingerSwitcher 0.1.0/ThreeFingerSwitcher.app"
 xcrun stapler validate ThreeFingerSwitcher-0.1.0.dmg
 hdiutil detach "/Volumes/ThreeFingerSwitcher 0.1.0"
 ```
-All four should pass: Gatekeeper accepts it, the signature is valid + sealed, and the
-notarization ticket is stapled (works offline).
+All three should pass: Gatekeeper accepts the app (`accepted · source=Notarized Developer ID`),
+the signature is valid + sealed, and the notarization ticket is stapled (works offline).
+
+> Use `-t exec` for the **app**. `spctl -a -t open …` against the .app (or the DMG) reports
+> `rejected · source=Insufficient Context` on current macOS even for a perfectly notarized
+> artifact — it's the wrong assessment type, not a broken release (verified on v2.0.0).
 
 ## Troubleshooting
 
