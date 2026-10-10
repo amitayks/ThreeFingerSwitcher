@@ -185,6 +185,37 @@ struct AutomationSettings: Equatable {
     var dimKeyboard: Bool = false
     /// The guard: any input while armed stops the session and locks the screen.
     var lockOnStop: Bool = false
+    /// The curtain: swallow a person's input, let trusted apps' input through, end on Touch ID.
+    var curtain: Bool = false
+}
+
+/// Keep Awake's guard as the inspector presents it — one choice over the two persisted flags
+/// (`lockOnStop`, `curtain`). Lock wins if a record somehow carries both.
+enum KeepAwakeGuardMode: String, CaseIterable, Hashable {
+    case off, lock, curtain
+
+    init(lockOnStop: Bool, curtain: Bool) {
+        self = lockOnStop ? .lock : (curtain ? .curtain : .off)
+    }
+
+    var title: String {
+        switch self {
+        case .off: return "Off"
+        case .lock: return "Lock"
+        case .curtain: return "Curtain"
+        }
+    }
+
+    var caption: String {
+        switch self {
+        case .off:
+            return "The first trackpad touch ends Keep Awake and restores the screen. Nothing is blocked."
+        case .lock:
+            return "Input from a person does nothing; it opens a Touch ID check. Your finger ends Keep Awake (no lock). A wrong finger, Cancel, or no answer in 20 s locks the screen. Trusted apps (General page) keep working the Mac."
+        case .curtain:
+            return "Agents keep working: trusted apps (General page) control the Mac while input from a person does nothing. Touch ID ends it; a failed check keeps the curtain up. If the app quits unexpectedly, the Mac locks."
+        }
+    }
 }
 
 /// How firing an `.app` item should produce a usable window. Resolution order is: an item's own
@@ -235,9 +266,10 @@ enum LaunchItemKind: Codable, Equatable {
     /// the setting existed decodes to `nil` (interpreted as minimum), exactly like `.action`'s later values.
     /// `dimKeyboard` and `lockOnStop` (`keep-awake-guard-effects`) are the two per-item session options —
     /// also-zero-the-keyboard-backlight and the any-input guard lock — **Optional** for the same
-    /// decode-safety (nil = off, no schema bump).
+    /// decode-safety (nil = off, no schema bump). `curtain` (`keep-awake-agent-curtain`) is the
+    /// agent-curtain guard — Optional for the same reason (pre-curtain items decode to nil = off).
     case automation(AutomationKind, dimPercent: Double? = nil,
-                    dimKeyboard: Bool? = nil, lockOnStop: Bool? = nil)
+                    dimKeyboard: Bool? = nil, lockOnStop: Bool? = nil, curtain: Bool? = nil)
     /// A clipboard-history entry shown in the synthetic Clipboard band. **Synthetic and ephemeral**:
     /// built at launcher-open from `ClipboardStore`, never created in the editor and never written
     /// into the persisted `Favorites` record. Firing it pastes the entry into the captured front app.

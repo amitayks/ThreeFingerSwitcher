@@ -15,7 +15,7 @@ final class AutomationItemCodableTests: XCTestCase {
         let data = try JSONEncoder().encode(item)
         let decoded = try JSONDecoder().decode(LaunchItem.self, from: data)
         XCTAssertEqual(decoded, item)
-        guard case let .automation(kind, dimPercent, _, _) = decoded.kind else {
+        guard case let .automation(kind, dimPercent, _, _, _) = decoded.kind else {
             return XCTFail("expected .automation, got \(decoded.kind)")
         }
         XCTAssertEqual(kind, .keepAwake)
@@ -29,7 +29,7 @@ final class AutomationItemCodableTests: XCTestCase {
         let data = try JSONEncoder().encode(item)
         let decoded = try JSONDecoder().decode(LaunchItem.self, from: data)
         XCTAssertEqual(decoded, item)
-        guard case let .automation(kind, dimPercent, _, _) = decoded.kind else {
+        guard case let .automation(kind, dimPercent, _, _, _) = decoded.kind else {
             return XCTFail("expected .automation, got \(decoded.kind)")
         }
         XCTAssertEqual(kind, .keepAwake)
@@ -45,7 +45,7 @@ final class AutomationItemCodableTests: XCTestCase {
         let data = try JSONEncoder().encode(item)
         let decoded = try JSONDecoder().decode(LaunchItem.self, from: data)
         XCTAssertEqual(decoded, item)
-        guard case let .automation(_, dimPercent, dimKeyboard, lockOnStop) = decoded.kind else {
+        guard case let .automation(_, dimPercent, dimKeyboard, lockOnStop, _) = decoded.kind else {
             return XCTFail("expected .automation, got \(decoded.kind)")
         }
         XCTAssertEqual(dimPercent, 30)
@@ -61,7 +61,7 @@ final class AutomationItemCodableTests: XCTestCase {
                               kind: .automation(.keepAwake, dimPercent: 30))
         let data = try JSONEncoder().encode(item)
         let decoded = try JSONDecoder().decode(LaunchItem.self, from: data)
-        guard case let .automation(_, dimPercent, dimKeyboard, lockOnStop) = decoded.kind else {
+        guard case let .automation(_, dimPercent, dimKeyboard, lockOnStop, _) = decoded.kind else {
             return XCTFail("expected .automation, got \(decoded.kind)")
         }
         XCTAssertEqual(dimPercent, 30)

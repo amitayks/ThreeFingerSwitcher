@@ -37,6 +37,14 @@ final class KeepAwakeController {
         /// The guard: once armed, ANY input (trackpad, mouse, keys) stops the session and locks the
         /// screen — lock first, then restore, so unlocked content never flashes.
         var lockOnStop: Bool = false
+        /// The curtain (`keep-awake-agent-curtain`): once armed, input from a person or an untrusted app
+        /// is SWALLOWED (an active event tap) while trusted apps' synthesized input passes, so agents
+        /// keep working. The first swallowed input opens a Touch ID check: success ends the session
+        /// (no lock); failure keeps the curtain up — or, with `lockOnStop`, locks the screen.
+        var curtain: Bool = false
+
+        /// Any guard at all (lock and/or curtain) — both run behind the curtain tap when it is available.
+        var guarded: Bool { lockOnStop || curtain }
     }
 
     /// Why a stop fired. Only `.input` (the armed touch / the guard's monitor) may lock; every
@@ -67,9 +75,31 @@ final class KeepAwakeController {
         /// Returns an opaque token for `endInputMonitoring` (nil = unavailable).
         var beginInputMonitoring: (@escaping () -> Void) -> Any? = { _ in nil }
         var endInputMonitoring: (Any) -> Void = { _ in }
+        /// Install the curtain tap; the callback reports each swallowed input (a short description).
+        /// nil = unavailable (no Accessibility) → the controller falls back to the passive monitor + lock.
+        var beginCurtain: (@escaping (String) -> Void) -> Any? = { _ in nil }
+        var endCurtain: (Any) -> Void = { _ in }
+        /// Let every event through (password fallback only, for the bounded auth window).
+        var setCurtainPassThrough: (Any, Bool) -> Void = { _, _ in }
+        /// Start one owner check (Touch ID; password only when `allowPassword` and no biometrics).
+        /// Returns whether it started and whether it needs input pass-through. Completion runs once.
+        var authenticate: (_ allowPassword: Bool, _ completion: @escaping (GuardAuthResult) -> Void)
+            -> (started: Bool, needsPassThrough: Bool) = { _, _ in (false, false) }
+        var cancelAuthentication: () -> Void = {}
+        /// Start / stop the crash watchdog that locks the Mac if this process dies with the curtain up.
+        var startWatchdog: () -> Bool = { false }
+        var stopWatchdog: () -> Void = {}
+        /// Guard events for the log + the user's hook: ("intrusion" | "auth-ok" | "auth-failed", detail).
+        var notify: (String, String) -> Void = { _, _ in }
+        var now: () -> TimeInterval = { Date().timeIntervalSinceReferenceDate }
 
-        static var live: Effects {
+        static var live: Effects { live(policy: InputTrustPolicy.live(trustedBundleIDs: { ["ai.shift.vex.desktop"] }),
+                                         hookCommand: { "" }) }
+
+        /// The live effects over the user's trusted-apps list and intrusion hook (both read per use).
+        static func live(policy: @escaping () -> InputTrustPolicy, hookCommand: @escaping () -> String) -> Effects {
             let poke = UserActivityPoke()
+            let authenticator = MainActor.assumeIsolated { GuardAuthenticator() }
             return Effects(
                 activeDisplays: { DisplayBrightness.activeDisplays() },
                 getBrightness: { DisplayBrightness.get($0) },
@@ -89,10 +119,36 @@ final class KeepAwakeController {
                 lockScreen: { ScreenLocker.lock() },
                 // The controller is @MainActor and only invokes these there; the monitor is too.
                 beginInputMonitoring: { onInput in
-                    MainActor.assumeIsolated { InputActivityMonitor(onInput: onInput) }
+                    MainActor.assumeIsolated { InputActivityMonitor(policy: policy, onInput: onInput) }
                 },
                 endInputMonitoring: { token in
                     MainActor.assumeIsolated { (token as? InputActivityMonitor)?.stop() }
+                },
+                beginCurtain: { onIntrusion in
+                    MainActor.assumeIsolated {
+                        let tap = CurtainEventTap(policy: policy) { type, origin in
+                            onIntrusion("\(type.guardLogName) from \(origin)")
+                        }
+                        return tap.start() ? tap : nil
+                    }
+                },
+                endCurtain: { token in MainActor.assumeIsolated { (token as? CurtainEventTap)?.stop() } },
+                setCurtainPassThrough: { token, on in
+                    MainActor.assumeIsolated { (token as? CurtainEventTap)?.passThrough = on }
+                },
+                authenticate: { allowPassword, completion in
+                    MainActor.assumeIsolated {
+                        authenticator.authenticate(allowPassword: allowPassword,
+                                                   timeoutSec: KeepAwakeController.authTimeout,
+                                                   completion: completion)
+                    }
+                },
+                cancelAuthentication: { MainActor.assumeIsolated { authenticator.cancel() } },
+                startWatchdog: { CurtainWatchdog.start() },
+                stopWatchdog: { CurtainWatchdog.stop() },
+                notify: { event, detail in
+                    GuardLog.write("\(event) \(detail)")
+                    GuardHook.run(command: hookCommand(), event: event, detail: detail)
                 })
         }
     }
@@ -111,6 +167,11 @@ final class KeepAwakeController {
     nonisolated static let dimLevel: Float = 0
     /// Heartbeat cadence: re-pin brightness + re-declare user activity.
     nonisolated static let heartbeatInterval: TimeInterval = 300
+    /// How long one owner check may stay open before it counts as a failure.
+    nonisolated static let authTimeout: TimeInterval = 20
+    /// After a failed check behind a curtain (no lock), ignore further input this long so a resting
+    /// palm can't re-open the prompt in a loop.
+    nonisolated static let authCooldown: TimeInterval = 5
 
     /// Convert an item's optional 0…100 dim percent (nil = minimum) to a clamped 0…1 brightness fraction.
     nonisolated static func fraction(fromPercent percent: Double?) -> Float {
@@ -130,6 +191,14 @@ final class KeepAwakeController {
     private var savedKeyboard: [UInt64: Float] = [:]
     private var activityToken: NSObjectProtocol?
     private var inputMonitorToken: Any?
+    private var curtainToken: Any?
+    private var watchdogRunning = false
+    private var authInFlight = false
+    private var intrusionNotified = false
+    private var cooldownUntil: TimeInterval = 0
+
+    /// Whether the curtain tap is up (a guarded, armed session with the tap available).
+    var isCurtained: Bool { curtainToken != nil }
     private var heartbeat: Timer?
 
     init(effects: Effects = .live,
@@ -196,9 +265,26 @@ final class KeepAwakeController {
             effects.endInputMonitoring(token)
             inputMonitorToken = nil
         }
-        if reason == .input, config.lockOnStop {
+        if authInFlight {
+            authInFlight = false
+            effects.cancelAuthentication()
+        }
+        // An input-path stop locks when the item asks for it — and ALWAYS when the curtain was wanted
+        // but could not be installed (the passive fallback must fail closed, never leave the Mac open).
+        if reason == .input, config.lockOnStop || (config.curtain && curtainToken == nil) {
             effects.lockScreen()
         }
+        // The curtain comes down only AFTER the lock (so no input slips through in between).
+        if let token = curtainToken {
+            effects.endCurtain(token)
+            curtainToken = nil
+        }
+        if watchdogRunning {
+            effects.stopWatchdog()
+            watchdogRunning = false
+        }
+        intrusionNotified = false
+        cooldownUntil = 0
         for (keyboard, level) in savedKeyboard {
             effects.setKeyboardBrightness(keyboard, level)
         }
@@ -228,14 +314,62 @@ final class KeepAwakeController {
         case .awaitingEmpty:
             if fingerCount == 0 {
                 arm = .armed
-                if config.lockOnStop, inputMonitorToken == nil {
+                guard config.guarded else { return }
+                // Preferred: the curtain (swallow + Touch ID). Fallback: the passive monitor + lock.
+                if curtainToken == nil {
+                    curtainToken = effects.beginCurtain { [weak self] detail in self?.intrusion(detail) }
+                    if curtainToken != nil { watchdogRunning = effects.startWatchdog() }
+                }
+                if curtainToken == nil, inputMonitorToken == nil {
                     inputMonitorToken = effects.beginInputMonitoring { [weak self] in
                         self?.stop(reason: .input)
                     }
                 }
             }
         case .armed:
-            if fingerCount > 0 { stop(reason: .input) }
+            guard fingerCount > 0 else { return }
+            // Behind the curtain a trackpad contact is an intrusion (owner check), not an instant stop:
+            // a palm resting while the owner reaches for Touch ID must not lock the Mac.
+            if curtainToken != nil { intrusion("trackpad contact (\(fingerCount))") } else { stop(reason: .input) }
+        }
+    }
+
+    // MARK: - Curtain: intrusion → owner check
+
+    /// A swallowed input (or a trackpad contact) behind the curtain. Opens ONE owner check at a time;
+    /// the first intrusion of a session is reported to the hook.
+    func intrusion(_ detail: String) {
+        guard isActive, let token = curtainToken, !authInFlight, effects.now() >= cooldownUntil else { return }
+        if !intrusionNotified {
+            intrusionNotified = true
+            effects.notify("intrusion", detail)
+        }
+        authInFlight = true
+        // Lock mode never needs the password path: on failure the real lock screen takes over.
+        let allowPassword = config.curtain && !config.lockOnStop
+        let r = effects.authenticate(allowPassword) { [weak self] result in self?.authEnded(result) }
+        if !r.started {
+            authInFlight = false
+            authEnded(.failure)
+            return
+        }
+        if r.needsPassThrough { effects.setCurtainPassThrough(token, true) }
+    }
+
+    private func authEnded(_ result: GuardAuthResult) {
+        guard isActive else { return }
+        authInFlight = false
+        if let token = curtainToken { effects.setCurtainPassThrough(token, false) }
+        effects.notify(result == .success ? "auth-ok" : "auth-failed", "")
+        switch result {
+        case .success:
+            stop(reason: .explicit)          // the owner: restore, never lock
+        case .failure:
+            if config.lockOnStop {
+                stop(reason: .input)         // lock first, then restore (D3)
+            } else {
+                cooldownUntil = effects.now() + Self.authCooldown   // stay curtained
+            }
         }
     }
 

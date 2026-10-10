@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import AppKit
 
 /// A toggle with an explanatory caption beneath it — the master/opt-in row used across feature pages.
@@ -142,15 +143,18 @@ struct LabeledIntSlider: View {
     }
 }
 
-/// Manages the clipboard-history app-exclusion list — ported from the former Settings window. Shows
-/// current entries with a remove control and an "Add app…" menu of running regular applications.
+/// Manages a bundle-id app list — the clipboard-history exclusion list (ported from the former Settings
+/// window) and Keep Awake's trusted-apps list. Shows current entries with a remove control, an "Add
+/// app…" menu of running regular applications, and "Choose app…" for an app that is not running.
 struct HubExcludedAppsEditor: View {
     @Binding var excluded: [String]
+    var title: String = "Excluded apps"
+    var emptyCaption: String = "Copies from apps you add here are never recorded."
 
     var body: some View {
-        DisclosureGroup("Excluded apps (\(excluded.count))") {
+        DisclosureGroup("\(title) (\(excluded.count))") {
             if excluded.isEmpty {
-                Text("Copies from apps you add here are never recorded.")
+                Text(emptyCaption)
                     .font(.caption).foregroundStyle(.secondary)
             }
             ForEach(excluded, id: \.self) { bundleID in
@@ -164,12 +168,15 @@ struct HubExcludedAppsEditor: View {
                     .foregroundStyle(.secondary)
                 }
             }
-            Menu("Add app…") {
-                ForEach(apps, id: \.bundleID) { app in
-                    Button(app.name) {
-                        if !excluded.contains(app.bundleID) { excluded.append(app.bundleID) }
+            HStack {
+                Menu("Add app…") {
+                    ForEach(apps, id: \.bundleID) { app in
+                        Button(app.name) {
+                            if !excluded.contains(app.bundleID) { excluded.append(app.bundleID) }
+                        }
                     }
                 }
+                Button("Choose app…") { chooseApp() }
             }
         }
         // Enumerate once per appearance, not per render: this editor lives on a page with four
@@ -194,6 +201,20 @@ struct HubExcludedAppsEditor: View {
             }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         names = Dictionary(apps.map { ($0.bundleID, $0.name) }, uniquingKeysWith: { a, _ in a })
+    }
+
+    /// Pick any installed app (running or not) from /Applications.
+    private func chooseApp() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.applicationBundle]
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.allowsMultipleSelection = true
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls {
+            guard let bundle = Bundle(url: url), let id = bundle.bundleIdentifier else { continue }
+            if !excluded.contains(id) { excluded.append(id) }
+            names[id] = FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
+        }
     }
 
     private func displayName(_ bundleID: String) -> String {

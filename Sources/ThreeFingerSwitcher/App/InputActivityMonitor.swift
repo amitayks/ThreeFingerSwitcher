@@ -9,9 +9,10 @@ import AppKit
 ///   already stops the session on any contact, sooner and more reliably.
 /// - **`scrollWheel` is excluded** so a momentum tail from the firing gesture can't self-trip the guard
 ///   at arm time; a stranger using a mouse fires `mouseMoved` before any scroll anyway.
-/// - **Events synthesized by THIS process are filtered by source PID** — the computer-use agent acts by
-///   posting CGEvents, and the guard must never lock the screen out from under an acting agent.
-///   Hardware events carry source PID 0 and pass.
+/// - **Events synthesized by a trusted app are ignored** (`InputTrustPolicy`): this app, plus the user's
+///   trusted-apps list (default Vex) — an agent acts by posting CGEvents, and the guard must never lock
+///   the screen out from under it. Hardware events (source PID 0) and untrusted synthesizers trip it.
+///   This passive monitor is the FALLBACK; the curtain tap (`CurtainEventTap`) is the primary guard.
 @MainActor
 final class InputActivityMonitor {
     private var globalMonitor: Any?
@@ -20,23 +21,23 @@ final class InputActivityMonitor {
     private static let mask: NSEvent.EventTypeMask =
         [.mouseMoved, .leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown, .flagsChanged]
 
-    /// True for an event posted by this very process (agent-synthesized) — never trips the guard.
-    private static func isSelfSynthesized(_ event: NSEvent) -> Bool {
+    /// True for an event synthesized by a trusted app — never trips the guard.
+    private static func isTrusted(_ event: NSEvent, _ policy: () -> InputTrustPolicy) -> Bool {
         guard let cg = event.cgEvent else { return false }
-        return cg.getIntegerValueField(.eventSourceUnixProcessID) == Int64(getpid())
+        return policy().classify(sourcePID: cg.getIntegerValueField(.eventSourceUnixProcessID)).isTrusted
     }
 
-    /// `onInput` fires once per observed human input; the caller decides what to do (and typically
-    /// tears this monitor down first thing).
-    init(onInput: @escaping () -> Void) {
+    /// `onInput` fires once per observed input from a person or an untrusted app; the caller decides
+    /// what to do (and typically tears this monitor down first thing).
+    init(policy: @escaping () -> InputTrustPolicy, onInput: @escaping () -> Void) {
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: Self.mask) { event in
-            guard !Self.isSelfSynthesized(event) else { return }
+            guard !Self.isTrusted(event, policy) else { return }
             MainActor.assumeIsolated { onInput() }
         }
         // Global monitors never see events routed to our own app (e.g. the Hub is frontmost);
         // the local monitor covers that, returning the event unmodified (non-consuming).
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: Self.mask) { event in
-            if !Self.isSelfSynthesized(event) {
+            if !Self.isTrusted(event, policy) {
                 MainActor.assumeIsolated { onInput() }
             }
             return event

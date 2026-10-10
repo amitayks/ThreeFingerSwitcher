@@ -518,6 +518,22 @@ struct GeneralPage: View {
                 SwitchRow("Show diagnostic tools", isOn: $settings.showDiagnostics,
                           caption: "Adds “Write Diagnostics” and “Copy Focus Log” to the menu-bar menu — handy when reporting a bug. Off by default.")
             }
+            HubSection("Keep Awake guard",
+                       footnote: "Applies to Keep Awake items whose Guard is Lock or Curtain. A person's input (and any app not listed) is blocked and opens a Touch ID check; listed apps' synthetic input passes, so an agent can keep working the Mac. Log: ~/Library/Logs/ThreeFingerSwitcher/keep-awake-guard.log") {
+                HubExcludedAppsEditor(excluded: $settings.keepAwakeTrustedApps,
+                                      title: "Trusted apps",
+                                      emptyCaption: "No app may control the Mac while the guard is up — not even an agent.")
+                Divider()
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("On guard event, run")
+                    TextField("e.g. ~/bin/notify-me.sh", text: $settings.keepAwakeHookCommand)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                    Text("Optional shell command, run on each guard event with TFS_GUARD_EVENT = intrusion, auth-ok or auth-failed, and TFS_GUARD_DETAIL. Use it to get a message when someone touches the Mac.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
             HubSection {
                 HStack {
                     Spacer()

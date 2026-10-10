@@ -10,6 +10,8 @@ import AppKit
 /// This is the single public symbol of the ThreeFingerSwitcherCore library; the thin
 /// `ThreeFingerSwitcher` executable target calls it from its own `main.swift`.
 public func runThreeFingerSwitcher() {
+    // `--curtain-watchdog <pid> <marker>`: this launch is Keep Awake's crash watchdog, not the app.
+    CurtainWatchdog.runIfRequested()
     MainActor.assumeIsolated {
         let app = NSApplication.shared
         let delegate = AppDelegate()

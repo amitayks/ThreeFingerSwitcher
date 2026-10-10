@@ -61,7 +61,14 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
     /// item is fired (which toggles it via `LaunchService.onAutomation`). Fed the touch stream for its
     /// first-touch-to-stop arming, and force-stopped on quit / will-sleep so a dimmed screen is never
     /// stranded. `onActiveChanged` is wired in `init` to rebuild the menu-bar "Active / Stop" line.
-    private let keepAwakeController = KeepAwakeController()
+    /// The guard (`keep-awake-agent-curtain`) reads the trusted-apps list and the hook command from
+    /// settings per use, so edits on the General page apply to a running session at once.
+    private lazy var keepAwakeController: KeepAwakeController = {
+        let settings = self.settings
+        return KeepAwakeController(effects: .live(
+            policy: InputTrustPolicy.live(trustedBundleIDs: { settings.keepAwakeTrustedApps }),
+            hookCommand: { settings.keepAwakeHookCommand }))
+    }()
 
     // Four-finger launcher.
     private let favoritesStore = FavoritesStore.shared
@@ -96,7 +103,8 @@ final class AppCoordinator: GestureRecognizerDelegate, KeyboardSwitcherDelegate 
                 self?.keepAwakeController.toggle(KeepAwakeController.Config(
                     dimLevel: KeepAwakeController.fraction(fromPercent: settings.dimPercent),
                     dimKeyboard: settings.dimKeyboard,
-                    lockOnStop: settings.lockOnStop))
+                    lockOnStop: settings.lockOnStop,
+                    curtain: settings.curtain))
             }
         },
         // The band carries only bounded/light clipboard previews (see `bandWindow`); resolve the FULL

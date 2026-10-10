@@ -99,14 +99,15 @@ final class LaunchService {
             completion(true)
         case .preset:
             firePreset(item, inBand: band, completion: completion)
-        case .automation(let kind, let dimPercent, let dimKeyboard, let lockOnStop):
+        case .automation(let kind, let dimPercent, let dimKeyboard, let lockOnStop, let curtain):
             // Toggle the automation's stateful owner (start if inactive, stop if active). This is
             // NOT a one-shot that completes on the lift — it enters/leaves a persistent mode owned
             // outside the launcher (see `onAutomation`). The item's authored optionals resolve here
             // (nil = default) into one `AutomationSettings` for the owner.
             onAutomation(kind, AutomationSettings(dimPercent: dimPercent,
                                                   dimKeyboard: dimKeyboard ?? false,
-                                                  lockOnStop: lockOnStop ?? false))
+                                                  lockOnStop: lockOnStop ?? false,
+                                                  curtain: curtain ?? false))
             completion(true)
         case .clipboardEntry(let entry):
             pasteEntry(entry)

@@ -158,6 +158,14 @@ final class AppSettings: ObservableObject {
     /// Bundle ids whose copies are never recorded (e.g. password managers the user wants excluded).
     @Published var clipboardExcludedApps: [String] { didSet { defaults.set(clipboardExcludedApps, forKey: Keys.clipboardExcludedApps) } }
 
+    /// Keep Awake guard (`keep-awake-agent-curtain`): bundle ids whose SYNTHESIZED input passes the
+    /// guard — an agent working the Mac (default: Vex). Input from a person, or from any app not on
+    /// this list, trips it. Edited on the General page; read per event, so edits apply at once.
+    @Published var keepAwakeTrustedApps: [String] { didSet { defaults.set(keepAwakeTrustedApps, forKey: Keys.keepAwakeTrustedApps) } }
+    /// Keep Awake guard hook: a shell command run on `intrusion`, `auth-ok`, `auth-failed`
+    /// (env `TFS_GUARD_EVENT`, `TFS_GUARD_DETAIL`). Empty = off.
+    @Published var keepAwakeHookCommand: String { didSet { defaults.set(keepAwakeHookCommand, forKey: Keys.keepAwakeHookCommand) } }
+
     // MARK: - Per-app keyboard language (opt-in; default OFF)
 
     /// Opt-in to remembering and re-selecting the keyboard input source per application (bundle id),
@@ -302,6 +310,8 @@ final class AppSettings: ObservableObject {
         clipboardEdgeAcceleration = defaults.object(forKey: Keys.clipboardEdgeAcceleration) as? Double ?? Defaults.clipboardEdgeAcceleration
         clipboardPinDistance = defaults.object(forKey: Keys.clipboardPinDistance) as? Double ?? Defaults.clipboardPinDistance
         clipboardExcludedApps = defaults.object(forKey: Keys.clipboardExcludedApps) as? [String] ?? Defaults.clipboardExcludedApps
+        keepAwakeTrustedApps = defaults.object(forKey: Keys.keepAwakeTrustedApps) as? [String] ?? Defaults.keepAwakeTrustedApps
+        keepAwakeHookCommand = defaults.string(forKey: Keys.keepAwakeHookCommand) ?? Defaults.keepAwakeHookCommand
         keyboardLanguageEnabled = defaults.object(forKey: Keys.keyboardLanguageEnabled) as? Bool ?? Defaults.keyboardLanguageEnabled
         keyboardLanguageDefaultSourceID = defaults.object(forKey: Keys.keyboardLanguageDefaultSourceID) as? String ?? Defaults.keyboardLanguageDefaultSourceID
         keyboardLanguagePerSiteEnabled = defaults.object(forKey: Keys.keyboardLanguagePerSiteEnabled) as? Bool ?? Defaults.keyboardLanguagePerSiteEnabled
@@ -428,6 +438,8 @@ final class AppSettings: ObservableObject {
         static let clipboardEdgeAcceleration = 1.0 // edge-scroll acceleration sensitivity
         static let clipboardPinDistance = 0.08     // deliberate horizontal flick to pin (≈2 item steps); left-exit is a single step
         static let clipboardExcludedApps: [String] = []
+        static let keepAwakeTrustedApps: [String] = ["ai.shift.vex.desktop"]   // Vex (agent computer use)
+        static let keepAwakeHookCommand = ""
         static let keyboardLanguageEnabled = false // opt-in; gates per-app input-source learn/apply (no re-login)
         static let keyboardLanguageDefaultSourceID = ""  // "" = no global default (pure learn-as-you-go)
         // Per-host memory inside browsers rides along by default when the keyboard-language master
@@ -480,6 +492,8 @@ final class AppSettings: ObservableObject {
         static let clipboardEdgeAcceleration = "clipboardEdgeAcceleration"
         static let clipboardPinDistance = "clipboardPinDistance"
         static let clipboardExcludedApps = "clipboardExcludedApps"
+        static let keepAwakeTrustedApps = "keepAwakeTrustedApps"
+        static let keepAwakeHookCommand = "keepAwakeHookCommand"
         static let keyboardLanguageEnabled = "keyboardLanguageEnabled"
         static let keyboardLanguageDefaultSourceID = "keyboardLanguageDefaultSourceID"
         static let keyboardLanguagePerSiteEnabled = "keyboardLanguagePerSiteEnabled"
