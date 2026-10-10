@@ -53,6 +53,8 @@ final class SilentOwnerListener {
     private var passwordTries = 0
     private var passwordDeadline: DispatchWorkItem?
     private var verifying = false
+    /// Where the Touch ID view sits during password entry (nil otherwise).
+    private var touchIDSlot: NSView?
     private var window: NSWindow?
     private var context: LAContext?
     private var evaluating = false
@@ -200,6 +202,11 @@ final class SilentOwnerListener {
     }
 
     private func tick() {
+        // Password entry: Touch ID keeps listening beside the field (another enrolled finger works).
+        if inPasswordEntry {
+            if isFront, !evaluating, !verifying { startEvaluation() }
+            return
+        }
         guard !paused, !handingBack else { return }
         if isFront {
             if !evaluating { window?.makeKey(); startEvaluation() }
@@ -223,13 +230,24 @@ final class SilentOwnerListener {
     }
 
     private func startEvaluation() {
-        guard !evaluating, !paused, now >= retryAfter, let window else { return }
+        guard !evaluating, now >= retryAfter, let window else { return }
+        guard !paused || inPasswordEntry else { return }
         let ctx = LAContext()
         ctx.localizedFallbackTitle = ""
-        let view = LAAuthenticationView(context: ctx, controlSize: .large)
-        view.frame = NSRect(origin: .zero, size: window.frame.size)
-        view.autoresizingMask = [.width, .height]
-        window.contentView = view
+        if let slot = touchIDSlot {
+            // Password entry: the sensor icon sits beside the field; the field keeps keyboard focus.
+            slot.subviews.forEach { $0.removeFromSuperview() }
+            let view = LAAuthenticationView(context: ctx, controlSize: .regular)
+            view.frame = slot.bounds
+            view.autoresizingMask = [.width, .height]
+            slot.addSubview(view)
+            if let field = passwordField { window.makeFirstResponder(field) }
+        } else {
+            let view = LAAuthenticationView(context: ctx, controlSize: .large)
+            view.frame = NSRect(origin: .zero, size: window.frame.size)
+            view.autoresizingMask = [.width, .height]
+            window.contentView = view
+        }
         context = ctx
         evaluating = true
         generation += 1
@@ -247,7 +265,17 @@ final class SilentOwnerListener {
         guard g == generation, evaluating else { return }   // a cancelled context's late answer
         context = nil
         evaluating = false
-        if ok { onResult(.success); return }
+        if ok {
+            if inPasswordEntry { GuardLog.write("password-entry closed by touch id") }
+            endPasswordEntry(resume: false)
+            onResult(.success)
+            return
+        }
+        if inPasswordEntry {
+            // Wrong finger again or lockout: the password field stays; re-arm Touch ID unless locked out.
+            retryAfter = now + (code == .biometryLockout ? 3600 : 1)
+            return
+        }
         switch code {
         case .authenticationFailed?, .biometryLockout?:
             // A finger was read and it is not the owner's (or Touch ID gave up).
@@ -276,12 +304,15 @@ final class SilentOwnerListener {
     private func beginPasswordEntry() {
         guard let window, passwordField == nil else { return }
         passwordTries = 0
-        let side = CGSize(width: 320, height: 64)
+        let side = CGSize(width: 360, height: 64)
         let container = NSView(frame: NSRect(origin: .zero, size: side))
         container.wantsLayer = true
         container.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
         container.layer?.cornerRadius = 12
-        let field = NSSecureTextField(frame: NSRect(x: 16, y: 16, width: side.width - 32, height: 28))
+        let slot = NSView(frame: NSRect(x: 12, y: 12, width: 40, height: 40))
+        container.addSubview(slot)
+        touchIDSlot = slot
+        let field = NSSecureTextField(frame: NSRect(x: 64, y: 18, width: side.width - 80, height: 28))
         field.placeholderString = "Password"
         field.font = .systemFont(ofSize: 15)
         field.bezelStyle = .roundedBezel
@@ -297,6 +328,7 @@ final class SilentOwnerListener {
         window.alphaValue = 1
         passwordField = field
         setKeyPassThrough(true)
+        retryAfter = now + 1          // the wrong finger is probably still on the sensor
         focusPasswordField()
         armPasswordDeadline()
         GuardLog.write("password-entry open (finger not recognized)")
@@ -357,6 +389,9 @@ final class SilentOwnerListener {
         passwordDeadline?.cancel()
         passwordDeadline = nil
         guard passwordField != nil else { return }
+        cancelEvaluation()
+        touchIDSlot = nil
+        retryAfter = 0
         passwordField?.stringValue = ""
         passwordField = nil
         setKeyPassThrough(false)
